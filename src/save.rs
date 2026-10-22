@@ -130,30 +130,17 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
     Ok(Baked { path: path_s, backup: backup_s })
 }
 
+/// 把 epoch 秒格式化成**本地时间**的 `YYYYMMDD-HHMMSS`(备份文件名)。
+///
+/// 备份文件放在 `<原图同级>/photooriginals/`,名字取自原图的 mtime ——
+/// 用本地时间才和资源管理器里看到的"修改日期"对得上。
 fn chrono_fmt(epoch_secs: i64) -> String {
-    // 无 chrono 依赖,手写 UTC→本地近似(直接用 UTC 时间戳格式化)
-    let days = epoch_secs / 86400;
-    let secs = epoch_secs % 86400;
-    let (y, m, d) = civil_from_days(days);
-    format!(
-        "{y:04}{m:02}{d:02}-{ks:02}{mm:02}{ss:02}",
-        ks = secs / 3600,
-        mm = (secs % 3600) / 60,
-        ss = secs % 60
-    )
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d as u32)
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(epoch_secs, 0)
+        .single()
+        .map(|dt| dt.format("%Y%m%d-%H%M%S").to_string())
+        .unwrap_or_else(|| "19700101-000000".into())
 }
 
 #[cfg(test)]
@@ -171,8 +158,25 @@ mod tests {
         assert_eq!(got[0], vec![b'E'; 10]);
     }
 
+    /// 回归:备份文件名里的日期必须是**本地时间**,不是 UTC。
+    ///
+    /// 之前手写日期逻辑时直接按 UTC 格式化,导致备份文件名比资源管理器里
+    /// 显示的修改时间差一整个时区(中国 +8h),用户无法按日期定位备份。
     #[test]
-    fn civil_epoch() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    fn chrono_fmt_uses_local_time() {
+        use chrono::TimeZone;
+        // 2026-10-22 16:00:00 UTC
+        let epoch: i64 = 1_769_414_400;
+        let s = chrono_fmt(epoch);
+        // 把「本地时间字符串」解析回时间戳,应无损还原成原 epoch ——
+        // 若还在按 UTC 输出,这个往返会正好差一个时区偏移。
+        let naive = chrono::NaiveDateTime::parse_from_str(&s, "%Y%m%d-%H%M%S")
+            .expect("格式应为 YYYYMMDD-HHMMSS");
+        let back = chrono::Local
+            .from_local_datetime(&naive)
+            .single()
+            .expect("本地时间无歧义")
+            .timestamp();
+        assert_eq!(back, epoch, "备份文件名应可无损还原为原 mtime");
     }
 }

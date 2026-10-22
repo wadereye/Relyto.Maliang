@@ -22,15 +22,17 @@
 //!
 //! # 本模块的实现范围(诚实声明)
 //!
-//! 完整对齐需要 WPD COM(`IPortableDevice` 枚举),依赖 `Win32_Devices_...`
-//! 一组 crate feature,在当前离线依赖集里不可得。因此本模块实现的是:
 //! - **消息层**:`WM_DEVICECHANGE` + 3 个 wParam +
-//!   `dbcc_devicetype == 2` 的粗过滤;
+//!   `dbcc_devicetype == 2` 的粗过滤。
 //! - **动作层**:"置刷新标志 + 触发刷新",即
-//!   **检测到设备变化 → 触发一次可移动卷重扫**;
-//! - **设备列表层**:用 `GetLogicalDrives` + `GetDriveTypeW` 枚举
-//!   `DRIVE_REMOVABLE` 卷作为"可移动磁盘列表"的最小实现;
-//!   WPD 相机/手机枚举未实现(需要 COM 依赖)。
+//!   **检测到设备变化 → 触发一次可移动卷重扫**。
+//! - **设备列表层**:
+//!   - 盘符卷:用 `GetLogicalDrives` + `GetDriveTypeW` 枚举 `DRIVE_REMOVABLE`;
+//!   - 便携设备(相机/手机):**已实现**,见 `crate::wpd::devices()`
+//!     (`IPortableDeviceManager` 同一 coclass GUID)。
+//!   - 两者的合流与降级见 `crate::wpd::devices_unified()`。
+//! - **仍未做**:便携设备的**照片传输**(需 WPD 对象流),
+//!   UI 已明示并给出「扫描此卷」的替代路径。
 //!
 //! 设备变化 → 通过 channel 通知 UI → UI 重新扫描新出现的卷。
 use std::ffi::c_void;
