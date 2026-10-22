@@ -1,0 +1,37 @@
+[package]
+name = "maliang"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+wgpu = { version = "27", features = ["vulkan", "dx12", "gles", "wgsl"] }
+egui = "0.33"
+egui_extras = "0.33"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "tiff", "bmp", "gif"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+rayon = "1"
+walkdir = "2"
+notify-debouncer-full = "0.7"
+chrono = "0.4"
+kamadak-exif = "0.6"
+anyhow = "1"
+dirs = "6"
+rfd = "0.15"
+clap = { version = "4", features = ["derive"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Imapi", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_PortableDevices", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+default = []
+# 模型功能(OCR/人脸/CLIP)默认关闭;需要 onnxruntime 下载与模型文件
+ai = ["dep:ort"]
+
+[dependencies.ort]
+version = "2.0.0-rc.10"
+optional = true
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
