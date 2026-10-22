@@ -160,6 +160,8 @@ pub struct App {
     fx_oneclick: Option<String>,
     /// 颗粒强度。
     fx_grain_amount: f32,
+    /// 锐化强度(0~100)。
+    fx_sharpen_amount: f32,
     /// P1-14:字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
     pool_probe_id: i64,
     /// P1-13:从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
@@ -501,6 +503,7 @@ impl App {
             fx_curve_draft_id: None,
             fx_oneclick: None,
             fx_grain_amount: 0.15,
+            fx_sharpen_amount: 60.0,
             pool_probe_id: 0,
             show_import_devices: false,
             import_devices: Vec::new(),
@@ -731,7 +734,9 @@ impl App {
     }
 
     /// 星标/标签变更后写 XMP sidecar + picasa.ini(M3 互操作),不复制不移动原图。
-    /// 数据库是权威源:XMP 只作为 DB 的镜像输出(本项目没有 XMP 导入流程),
+    ///
+    /// 数据库是权威源,XMP 只是 DB 的镜像输出。**首次导入**由
+    /// `timeline::import_xmp_batch` 一次性完成(`xmp_imported` 标记,之后不再回灌),
     /// 否则删除标签后,旧标签会被 XMP 残留"复活"回数据库。
     fn sync_sidecars(&mut self, id: i64, star: i32) {
         let path = match self.rows.iter().find(|r| r.id == id) {
@@ -1664,13 +1669,27 @@ impl App {
             }
         });
         if self.fx_oneclick.as_deref() == Some("grain") {
-            let mut amount = 0.15f32;
+            // 直接绑定状态字段,不用每帧重建的局部变量 ——
+            // 否则滑块松手后会弹回初值(值其实存进去了,只是视觉上回跳)。
             if ui
-                .add(egui::Slider::new(&mut amount, 0.0..=1.0).text("颗粒强度"))
+                .add(
+                    egui::Slider::new(&mut self.fx_grain_amount, 0.0..=1.0)
+                        .text("颗粒强度"),
+                )
                 .changed()
             {
                 self.fx_applied_sig = None;
-                self.fx_grain_amount = amount;
+            }
+        }
+        if self.fx_oneclick.as_deref() == Some("unsharp") {
+            if ui
+                .add(
+                    egui::Slider::new(&mut self.fx_sharpen_amount, 0.0..=100.0)
+                        .text("锐化强度"),
+                )
+                .changed()
+            {
+                self.fx_applied_sig = None;
             }
         }
         ui.horizontal(|ui| {
@@ -1704,7 +1723,10 @@ impl App {
                     );
                 }
                 if name == "unsharp" {
-                    params.insert("amount".into(), "60.0000".into());
+                    params.insert(
+                        "amount".into(),
+                        format!("{:.4}", self.fx_sharpen_amount),
+                    );
                 }
                 self.fx_commit_effect(
                     id,

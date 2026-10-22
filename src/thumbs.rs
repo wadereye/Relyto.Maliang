@@ -598,11 +598,70 @@ mod tests {
 
     /// 生成测试专用的**唯一**照片 id。
     ///
-    /// 缩略图/预览缓存目录是全局共享的(`~/.cache/Relyto/Maliang`),
+    /// 缩略图/预览缓存目录是**跨进程共享**的(`~/.cache/Relyto/Maliang`),
     /// 用固定 id 会与其它测试(或历史遗留文件)撞车 ——
     /// 表现为"初始应无缓存"这类断言偶发失败。
-    fn unique_id(offset: i64) -> i64 {
-        900_000_000 + (std::process::id() as i64 % 1_000_000) * 100 + offset
+    ///
+    /// 因此 id 由「纳秒时间戳低位 + 进程内自增序号」合成:
+    /// - 时间戳保证**跨运行**不重复 —— 单靠 PID 不够,系统会循环复用 PID;
+    /// - 自增序号保证**同进程内**多个测试互不干扰。
+    fn unique_id() -> i64 {
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed) as i64;
+        900_000_000 + ((nanos % 900_000) * 1_000) + seq
+    }
+
+    /// 清掉某个 id 在所有档位目录下留下的缓存文件。
+    ///
+    /// 缓存目录位于进程之外、不会被自动回收,测试写完必须自己清:
+    /// 否则既会无限堆积(此前单目录已积累数百个历史文件),
+    /// 也让「初始应无缓存」这类断言变成靠运气。
+    fn purge_cache(id: i64) {
+        for tier in ALL_TIERS {
+            let _ = std::fs::remove_file(tier_path(tier, id));
+        }
+    }
+
+    /// 测试期缓存清理守卫:`Drop` 时清掉该 id 的缓存文件。
+    ///
+    /// 用守卫而非在测试末尾手写清理,是为了**断言失败时也能清干净** ——
+    /// 否则一次失败的测试留下脏文件,会反过来污染下一次运行。
+    struct CacheGuard(i64);
+
+    impl Drop for CacheGuard {
+        fn drop(&mut self) {
+            purge_cache(self.0);
+        }
+    }
+
+    /// 回归:缓存清理必须覆盖**全部**档位目录。
+    ///
+    /// 缓存目录跨进程共享、且不会被自动回收。只要漏掉一个档位,
+    /// 那个目录就会永久堆积历史文件,最终被后续运行的 `unique_id()` 撞上
+    /// (表现为「初始应无缓存」偶发失败)。
+    #[test]
+    fn purge_cache_clears_every_tier() {
+        let id = unique_id();
+        let _guard = CacheGuard(id);
+        // 每个档位目录各放一个文件,模拟刚生成完缓存的状态。
+        for tier in ALL_TIERS {
+            let p = tier_path(tier, id);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+            assert!(p.exists(), "{tier:?} 缓存应已写入");
+        }
+        purge_cache(id);
+        for tier in ALL_TIERS {
+            assert!(
+                !tier_path(tier, id).exists(),
+                "{tier:?} 缓存清理后不应残留"
+            );
+        }
     }
 
     /// 内嵌 EXIF 缩略图路径端到端(把一张真编码的 JPEG 塞进 APP1 当内嵌预览)。
@@ -650,7 +709,9 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let src = dir.join("cam.jpg");
         std::fs::write(&src, &full).unwrap();
-        let tid = unique_id(1);
+        let tid = unique_id();
+        let _guard = CacheGuard(tid);
+        purge_cache(tid);
         let h = generate(tid, &src).expect("内嵌缩略图路径应成功");
         assert!(h != 0, "dHash 不应为 0");
         assert!(existing(tid).is_some(), "应落盘缩略图");
@@ -674,7 +735,9 @@ mod tests {
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
-        let id = unique_id(2);
+        let id = unique_id();
+        let _guard = CacheGuard(id);
+        purge_cache(id);
         generate(id, &src).expect("应生成缩略图");
         let cached = load_cached(id).expect("应能读回落盘缩略图");
         assert_eq!(cached.width(), THUMB_SIZE);
@@ -698,11 +761,15 @@ mod tests {
 
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
         // 手动插一行(thumb_ok=0),模拟"扫描已入库但缩略图未生成"。
+        // id 走 unique_id():两个各自开 in-memory 库的测试若都用自增 id 1,
+        // 会同时往同一批缓存文件上写。
+        let photo_id = unique_id();
+        let _guard = CacheGuard(photo_id);
         {
             let conn = store.0.lock().unwrap();
             conn.execute(
-                "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,?2,0,0)",
-                rusqlite::params![src.to_string_lossy(), dir.to_string_lossy()],
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
+                rusqlite::params![photo_id, src.to_string_lossy(), dir.to_string_lossy()],
             )
             .unwrap();
         }
@@ -772,7 +839,9 @@ mod tests {
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
-        let id = unique_id(3);
+        let id = unique_id();
+        let _guard = CacheGuard(id);
+        purge_cache(id);
         for tier in [Tier::Small, Tier::Normal, Tier::Big] {
             generate_tier(tier, id, &src).expect("应生成该档");
             let got = load_cached_tier(tier, id).expect("应能读回该档");
@@ -804,15 +873,16 @@ mod tests {
         std::fs::write(&src, &buf).unwrap();
 
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
-        let photo_id: i64 = {
+        let photo_id = unique_id();
+        let _guard = CacheGuard(photo_id);
+        {
             let conn = store.0.lock().unwrap();
             conn.execute(
-                "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,?2,0,0)",
-                rusqlite::params![src.to_string_lossy(), dir.to_string_lossy()],
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
+                rusqlite::params![photo_id, src.to_string_lossy(), dir.to_string_lossy()],
             )
             .unwrap();
-            conn.last_insert_rowid()
-        };
+        }
 
         // Big 档(2):不写 thumb_ok,只写 thumb_tiers。
         let ids = backfill_tier(&store, Tier::Big, 10).unwrap();
@@ -854,7 +924,9 @@ mod tests {
 
         // 用进程内唯一的 id,避免与其它测试的缓存文件撞车
         // (缓存目录是全局共享的 ~/.cache/Relyto/Maliang)。
-        let id = unique_id(4);
+        let id = unique_id();
+        let _guard = CacheGuard(id);
+        purge_cache(id);
         assert!(load_preview_cached(id).is_none(), "初始应无缓存");
         build_preview(id, &src).expect("应生成预览");
         let got = load_preview_cached(id).expect("应能读回预览");
