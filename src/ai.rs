@@ -28,8 +28,9 @@ pub fn try_load(path: &std::path::Path) -> Result<String, String> {
     Ok(format!("{path:?}: inputs={inputs:?}, outputs={outputs:?}"))
 }
 
-/// 适度现代地列出可用模型(无则空;预留:UI 侧据此显示"未启用")。
-#[allow(dead_code)]
+/// 列出模型目录里已放置的 `.onnx` 模型文件名(无则空)。
+///
+/// UI 据此在语义面板上直说"模型目录还没有模型",而不是等用户点了索引才报错。
 pub fn available_models() -> Vec<String> {
     models_dir()
         .and_then(|d| std::fs::read_dir(d).ok())

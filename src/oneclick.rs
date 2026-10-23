@@ -1,4 +1,4 @@
-//! 一键效果(oneclick):黑白 / 双色调 / 颗粒 / 锐化。
+//! 一键效果(oneclick):黑白 / 双色调 / 颗粒 / 锐化 + 自主设计的暖调 / 冷调 / 暗角 / 褪色。
 //!
 //! # 行为要点
 //!
@@ -16,10 +16,14 @@
 //! | `grain` 噪声强度 | 强度换算 | `收敛系数 = ROUND(256.0 - amount·256.0)` |
 //! | `grain` 噪声混合 | 噪声混合计算 | `out = src + ((0xa0 - |0x80-src|)·(noise-0x80)) >> 8`,clamp `[0,255]` |
 //! | `unsharp` / `unsharp2` | 3×3 锐化核 | 同一条锐化路径,差异是滑块范围 1.0→3.0 与全分辨率/慢速开关 |
+//! | `warm` / `cool` | 三通道增益 + 亮度归一 | 自主设计,见 [`apply_warm`] |
+//! | `vignette` | smoothstep 边缘衰减 | 自主设计,见 [`apply_vignette`] |
+//! | `faded` | 抬黑位 + 压白位 + 去饱和 | 自主设计,见 [`apply_faded`] |
 //!
 //! # 参数来源有限的项(不做无依据的推测)
 //!
-//! - **`warm` 的色值/矩阵系数**:没有可靠来源 → **不实现**。
+//! - **`warm` 的色值/矩阵系数**:没有可靠的外部来源 → **改为本项目自主设计的
+//!   色温偏移**(见 [`apply_warm`]);三段增益放资源包 `warm.gain`,可只调数据。
 //! - **`grain` 的 low/high/seed 默认值**:没有可靠来源 → 提供一组
 //!   可用的预设(见 `grain_preset`)。
 //! - **`unsharp` 的 USM 半径/阈值/数量**:没有可靠来源 → 沿用 3×3 锐化核
@@ -296,6 +300,126 @@ pub fn grain_preset(seed: u32) -> GrainParams {
     GrainParams { seed, ..d }
 }
 
+//
+// 以下 4 个效果是**本项目自主设计**的调色(不参照任何外部产品的数值):
+// 暖调 / 冷调 / 暗角 / 褪色。强度一律用 `amount`(0..100),
+// 通道增益等参数取自内置资源包,便于只调数据不改代码。
+//
+
+/// 取资源包里的一段,按索引取值、缺失时回退到给定默认值。
+fn asset3(key: &str, fallback: [f64; 3]) -> [f32; 3] {
+    let v = crate::assets::f64s(key);
+    [
+        v.first().copied().unwrap_or(fallback[0]) as f32,
+        v.get(1).copied().unwrap_or(fallback[1]) as f32,
+        v.get(2).copied().unwrap_or(fallback[2]) as f32,
+    ]
+}
+
+/// 色温偏移(暖调 / 冷调共用)。
+///
+/// `key` 指向资源包里的三通道增益段(`warm.gain` / `cool.gain`),
+/// 取的是 `amount=100` 时的增益;中间强度按 `t = amount/100` 线性插值。
+///
+/// **归一化这一步是自主设计**:直接乘通道增益会连带改变整体亮度
+/// (暖调整体发亮、冷调整体发暗),所以最后统一除以「增益的亮度加权和」,
+/// 让中性灰的亮度基本不变 —— 用户看到的是**偏色**,而不是**变亮/变暗**。
+fn color_temp(img: &mut image::RgbaImage, amount: f32, key: &str, fallback: [f64; 3]) {
+    let base = asset3(key, fallback);
+    let t = amount.clamp(0.0, 100.0) / 100.0;
+    let g = [
+        1.0 + (base[0] - 1.0) * t,
+        1.0 + (base[1] - 1.0) * t,
+        1.0 + (base[2] - 1.0) * t,
+    ];
+    let w = luma_weights();
+    let keep = w[0] * g[0] + w[1] * g[1] + w[2] * g[2];
+    if keep <= 0.0 {
+        return;
+    }
+    let gn = [g[0] / keep, g[1] / keep, g[2] / keep];
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            p[c] = (p[c] as f32 * gn[c]).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// 暖调(色温偏黄红)。
+pub fn apply_warm(img: &mut image::RgbaImage, amount: f32) {
+    color_temp(img, amount, "warm.gain", [1.18, 1.02, 0.84]);
+}
+
+/// 冷调(色温偏蓝青)。
+pub fn apply_cool(img: &mut image::RgbaImage, amount: f32) {
+    color_temp(img, amount, "cool.gain", [0.84, 1.01, 1.18]);
+}
+
+/// 三次平滑过渡;用于暗角的边缘柔化(线性衰减会在圆环边界留下硬边)。
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    if e0 >= e1 {
+        return 0.0;
+    }
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 暗角(四角压暗)。
+///
+/// 资源包 `vignette` 段 = [内半径, 角落最大压暗比例]:
+/// 距中心的**归一化椭圆距离**(中心 0、四角 1)小于内半径时不受影响,
+/// 之后用 `smoothstep` 平滑过渡到角落的最大压暗量;
+/// 实际压暗量再乘 `amount/100`。
+pub fn apply_vignette(img: &mut image::RgbaImage, amount: f32) {
+    let v = crate::assets::f64s("vignette");
+    let start = v.first().copied().unwrap_or(0.55) as f32;
+    let max = v.get(1).copied().unwrap_or(0.55) as f32;
+    let strength = max * (amount.clamp(0.0, 100.0) / 100.0);
+    if strength <= 0.0 {
+        return;
+    }
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let (cx, cy) = (w * 0.5, h * 0.5);
+    // 以半对角线为 1,把任意宽高比都归一到"四角 = 1.0"。
+    let max_d = (cx * cx + cy * cy).sqrt();
+    if max_d <= 0.0 {
+        return;
+    }
+    for (x, y, p) in img.enumerate_pixels_mut() {
+        let dx = x as f32 + 0.5 - cx;
+        let dy = y as f32 + 0.5 - cy;
+        let d = (dx * dx + dy * dy).sqrt() / max_d;
+        let f = 1.0 - strength * smoothstep(start, 1.0, d);
+        for c in 0..3 {
+            p[c] = (p[c] as f32 * f).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// 褪色(胶片感:抬黑位、压白位、轻微去饱和)。
+///
+/// 资源包 `faded` 段 = [黑位抬升值, 白位增益, 去饱和比例],均为 `amount=100` 时的值。
+/// 三个动作合成出老照片那种"灰蒙蒙但不过曝"的观感;单独降对比会显得发脏,
+/// 所以配了一点向亮度收敛的去饱和。
+pub fn apply_faded(img: &mut image::RgbaImage, amount: f32) {
+    let base = asset3("faded", [26.0, 0.84, 0.30]);
+    let t = amount.clamp(0.0, 100.0) / 100.0;
+    let lift = base[0] * t;
+    let gain = 1.0 + (base[1] - 1.0) * t;
+    let desat = base[2] * t;
+    for p in img.pixels_mut() {
+        let c = [
+            lift + p[0] as f32 * gain,
+            lift + p[1] as f32 * gain,
+            lift + p[2] as f32 * gain,
+        ];
+        let y = luma(c[0], c[1], c[2]);
+        for i in 0..3 {
+            p[i] = (c[i] + (y - c[i]) * desat).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,5 +586,68 @@ mod tests {
                 assert!((a[0] as i32 - b[0] as i32).abs() <= 1, "零强度应几乎不变");
             }
         }
+    }
+
+    /// 中性灰做暖调:应该只是**偏色**,整体亮度基本不变
+    /// (这就是增益归一化那一步的意义 —— 否则暖调会连带把照片调亮)。
+    #[test]
+    fn warm_cools_and_warms_without_shifting_exposure() {
+        let gray = image::Rgba([128, 128, 128, 255]);
+        let mut warm = image::RgbaImage::from_pixel(2, 2, gray);
+        apply_warm(&mut warm, 100.0);
+        let w = warm.get_pixel(0, 0);
+        assert!(w[0] > w[2], "暖调应红 > 蓝,got {w:?}");
+        let y_w = luma(w[0] as f32, w[1] as f32, w[2] as f32);
+        let y_0 = luma(128.0, 128.0, 128.0);
+        assert!((y_w - y_0).abs() < 6.0, "暖调不应明显改变亮度:{y_w} vs {y_0}");
+
+        let mut cool = image::RgbaImage::from_pixel(2, 2, gray);
+        apply_cool(&mut cool, 100.0);
+        let c = cool.get_pixel(0, 0);
+        assert!(c[2] > c[0], "冷调应蓝 > 红,got {c:?}");
+        let y_c = luma(c[0] as f32, c[1] as f32, c[2] as f32);
+        assert!((y_c - y_0).abs() < 6.0, "冷调不应明显改变亮度:{y_c} vs {y_0}");
+    }
+
+    /// amount=0 时四个自主设计效果都必须是**恒等**变换 —— 滑块归零不该动像素。
+    #[test]
+    fn tone_effects_are_identity_at_zero() {
+        let base = image::Rgba([30, 140, 220, 255]);
+        let mut img = image::RgbaImage::from_pixel(4, 4, base);
+        apply_warm(&mut img, 0.0);
+        apply_cool(&mut img, 0.0);
+        apply_faded(&mut img, 0.0);
+        let p = img.get_pixel(1, 1);
+        assert_eq!((p[0], p[1], p[2]), (30, 140, 220), "零强度应不动像素,got {p:?}");
+        // 暗角零强度同样不动(内部直接 return)
+        let mut img2 = image::RgbaImage::from_pixel(4, 4, base);
+        apply_vignette(&mut img2, 0.0);
+        assert_eq!(img2.get_pixel(3, 3)[0], 30);
+    }
+
+    /// 暗角:**中心不变、四角变暗**,且中间区域是渐变的(不是一刀切的圆环)。
+    #[test]
+    fn vignette_darkens_corners_not_center() {
+        let mut img = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 200, 200, 255]));
+        apply_vignette(&mut img, 100.0);
+        let center = img.get_pixel(32, 32)[0];
+        let corner = img.get_pixel(0, 0)[0];
+        assert_eq!(center, 200, "中心不应被压暗");
+        assert!(corner < 200, "四角应被压暗,got {corner}");
+        // 从中心往外应单调不增(渐变而非硬边)
+        let edge = img.get_pixel(32, 0)[0];
+        assert!(corner < edge && edge <= center, "应由中心向外递减:{center}/{edge}/{corner}");
+    }
+
+    /// 褪色:抬黑位(纯黑变灰)+ 压白位(纯白不再满值)。
+    #[test]
+    fn faded_lifts_blacks_and_compresses_whites() {
+        let mut black = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        apply_faded(&mut black, 100.0);
+        assert!(black.get_pixel(0, 0)[0] > 8, "黑位应被抬起,got {:?}", black.get_pixel(0, 0));
+
+        let mut white = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
+        apply_faded(&mut white, 100.0);
+        assert!(white.get_pixel(0, 0)[0] < 255, "白位应被压低,got {:?}", white.get_pixel(0, 0));
     }
 }

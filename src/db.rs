@@ -1059,7 +1059,12 @@ pub fn scannable_volumes() -> Vec<(String, bool)> {
             Some(crate::win::DriveType::NoRootDir) => ("无根目录", false),
             _ => ("未知", false),
         };
-        v.push((format!("{root} ({kind})"), scannable));
+        // 顺带标出文件系统名(NTFS / exFAT / FAT32 …):
+        // 用户据此判断这个卷是不是自己想扫的那个(比如插上的相机卡)。
+        let fs = crate::win::volume_filesystem(&p)
+            .map(|s| format!(", {s}"))
+            .unwrap_or_default();
+        v.push((format!("{root} ({kind}{fs})"), scannable));
     }
     v
 }

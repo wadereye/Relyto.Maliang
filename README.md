@@ -20,15 +20,16 @@ Picasa 3 的体验现代化：更顺滑的浏览、更智能的组织，以及�
 - **标签 / 星标**：读写经典 `picasa.ini`，与原版 Picasa 互通。
 - **重复检测**：基于 dHash 的感知哈希，找出视觉近似的照片（超出原版能力）。
 - **EXIF 与 GPS**：读取拍摄参数、经纬度，支持 KML 导出。
-- **人脸与相簿**：人脸检测、模板匹配、聚类与命名（需 `ai` 特性）。
+- **人脸与相簿**：人脸检测、模板匹配、聚类与命名（随 `ai` 特性默认启用）。
 - **编辑与一键增强**：曲线（自然三次样条）、曝光 / 黑白 / 颗粒等效果；
-  一键增强（oneclick）。效果参数集中在资源包中，便于调校。
+  一键增强（oneclick）除黑白、棕褐、颗粒、锐化外，另含自主设计的
+  暖调、冷调、暗角、褪色。效果参数集中在资源包中，便于调校。
 - **设备导入**：通过 WPD / WIA 接入相机、手机等便携设备（Windows）。
 - **视频支持**：识别常见视频格式，抽取缩略图，调用系统播放器播放。
 - **XMP 镜像**：将编辑与元数据镜像为 XMP，便于与其他工具互通。
 - **导出 / 保存**：带编辑参数烘焙导出，保留原始文件。
 
-### 计划中的 AI 能力（需启用 `ai` 特性）
+### AI 能力（默认启用 `ai` 特性）
 - OCR 文字识别
 - 人脸自动归类建议与半自动聚类
 - CLIP 语义搜索（"找有猫的照片"）
@@ -68,18 +69,23 @@ cargo build --release
 cargo run            # 或运行 target/release/maliang.exe
 ```
 
-### 启用 AI 特性
-`ai` 特性会引入 ONNX Runtime 与模型文件（OCR / 人脸 / CLIP），默认关闭：
+### 精简构建（不含 AI）
+`ai` 特性会引入 ONNX Runtime 与模型文件（OCR / 人脸 / CLIP），**默认已启用**：
 ```bash
-cargo build --release --features ai
+cargo build --release          # 默认 = 含 ai
 ```
+不想要这份体积与依赖时用：
+```bash
+cargo build --release --no-default-features
+```
+精简构建下「人物」与「语义搜索」视图会提示未编译，其余功能不受影响。
 启用前请确保已配置 `onnxruntime` 运行环境与对应的模型权重文件。
 
 ### 常用命令
 ```bash
 cargo check          # 仅类型检查（快）
-cargo test           # 运行测试
-cargo test --features ai   # 含 AI 模块测试
+cargo test           # 运行测试（默认含 AI 模块测试）
+cargo test --no-default-features   # 精简构建的测试
 ```
 
 ### 构建排错（Windows）
