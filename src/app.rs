@@ -156,12 +156,14 @@ pub struct App {
     fx_curve_draft: crate::curves::Curves,
     /// 曲线草稿所属照片 id(换照片时才重载)。
     fx_curve_draft_id: Option<i64>,
-    /// 一键效果草稿(bw / sepia / grain / unsharp)。
+    /// 一键效果草稿(bw / sepia / grain / unsharp / warm / cool / vignette / faded)。
     fx_oneclick: Option<String>,
     /// 颗粒强度。
     fx_grain_amount: f32,
     /// 锐化强度(0~100)。
     fx_sharpen_amount: f32,
+    /// 自主设计调色(暖调/冷调/暗角/褪色)的共通强度(0~100)。
+    fx_tone_amount: f32,
     /// P1-14:字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
     pool_probe_id: i64,
     /// P1-13:从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
@@ -504,6 +506,7 @@ impl App {
             fx_oneclick: None,
             fx_grain_amount: 0.15,
             fx_sharpen_amount: 60.0,
+            fx_tone_amount: 50.0,
             pool_probe_id: 0,
             show_import_devices: false,
             import_devices: Vec::new(),
@@ -1647,7 +1650,8 @@ impl App {
     /// 一键效果区 UI。
     ///
     /// - `bw`/`sepia`/`grain`/`unsharp` 的算法已实现 → 可用。
-    /// - `warm` 的色值/矩阵暂无可靠来源 → **不提供**。
+    /// - `warm`/`cool`/`vignette`/`faded` 是本项目自主设计的调色 → 可用,
+    ///   强度共用一个滑块(量程 0~100)。
     fn fx_oneclick_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         ui.heading("一键效果");
         ui.horizontal_wrapped(|ui| {
@@ -1656,6 +1660,10 @@ impl App {
                 ("棕褐色", "sepia"),
                 ("颗粒", "grain"),
                 ("锐化", "unsharp"),
+                ("暖调", "warm"),
+                ("冷调", "cool"),
+                ("暗角", "vignette"),
+                ("褪色", "faded"),
             ] {
                 let on = self.fx_oneclick.as_deref() == Some(key);
                 if ui.selectable_label(on, label).clicked() {
@@ -1687,6 +1695,21 @@ impl App {
                     egui::Slider::new(&mut self.fx_sharpen_amount, 0.0..=100.0)
                         .text("锐化强度"),
                 )
+                .changed()
+            {
+                self.fx_applied_sig = None;
+            }
+        }
+        // 自主设计调色四件套共用一个强度滑块(语义都是"0 = 不动,100 = 最重")。
+        if let Some(text) = match self.fx_oneclick.as_deref() {
+            Some("warm") => Some("暖调强度"),
+            Some("cool") => Some("冷调强度"),
+            Some("vignette") => Some("暗角强度"),
+            Some("faded") => Some("褪色强度"),
+            _ => None,
+        } {
+            if ui
+                .add(egui::Slider::new(&mut self.fx_tone_amount, 0.0..=100.0).text(text))
                 .changed()
             {
                 self.fx_applied_sig = None;
@@ -1728,6 +1751,13 @@ impl App {
                         format!("{:.4}", self.fx_sharpen_amount),
                     );
                 }
+                // 自主设计调色:只有一个 amount 参数。
+                if matches!(
+                    name.as_str(),
+                    "warm" | "cool" | "vignette" | "faded"
+                ) {
+                    params.insert("amount".into(), format!("{:.4}", self.fx_tone_amount));
+                }
                 self.fx_commit_effect(
                     id,
                     "一键效果",
@@ -1735,10 +1765,11 @@ impl App {
                 );
             }
             if ui.button("移除一键效果").clicked() {
-                self.fx_remove_effect(id, "一键效果", "bw");
-                self.fx_remove_effect(id, "一键效果", "sepia");
-                self.fx_remove_effect(id, "一键效果", "grain");
-                self.fx_remove_effect(id, "一键效果", "unsharp");
+                for n in [
+                    "bw", "sepia", "grain", "unsharp", "warm", "cool", "vignette", "faded",
+                ] {
+                    self.fx_remove_effect(id, "一键效果", n);
+                }
                 self.fx_oneclick = None;
             }
         });
@@ -3356,6 +3387,14 @@ impl eframe::App for App {
                         "中文",
                     );
                 });
+                // 模型目录里实际放了哪些 .onnx:一个都没有就直说,
+                // 免得用户点了「语义索引」才在后台线程里撞到"模型缺失"。
+                let models = crate::ai::available_models();
+                if models.is_empty() {
+                    ui.small("模型目录还没有 .onnx 模型文件,请先放入后再索引");
+                } else {
+                    ui.small(format!("已装模型:{}", models.join("、")));
+                }
                 let indexed = crate::clip::clip_count_lang(&self.store, self.clip_lang);
                 let total_zh = crate::clip::clip_count_lang(&self.store, crate::clip::Lang::Zh);
                 let total_en = crate::clip::clip_count_lang(&self.store, crate::clip::Lang::En);
@@ -3627,7 +3666,9 @@ impl eframe::App for App {
                         #[cfg(not(feature = "ai"))]
                         {
                             ui.heading("人物");
-                            ui.label("人脸功能未编译进当前构建(需要 --features ai)。");
+                            ui.label(
+                                "人脸功能未编译进当前构建(构建时用了 --no-default-features)。",
+                            );
                         }
                     }
                     ViewKind::Tags => match self.sel_tag.clone() {
@@ -3668,7 +3709,9 @@ impl eframe::App for App {
                         #[cfg(not(feature = "ai"))]
                         {
                             ui.heading("语义搜索");
-                            ui.label("语义搜索未编译进当前构建(需要 --features ai)。");
+                            ui.label(
+                                "语义搜索未编译进当前构建(构建时用了 --no-default-features)。",
+                            );
                         }
                     }
                     ViewKind::Folder => {

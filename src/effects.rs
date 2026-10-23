@@ -205,10 +205,21 @@ impl Effect {
     }
 
     /// 该项是否为一键效果(原版 oneclick)。
+    ///
+    /// 前 6 个是与原版同名的一键效果;后 4 个是本项目自主设计的调色。
     pub fn is_oneclick(&self) -> bool {
         matches!(
             self.name.to_ascii_lowercase().as_str(),
-            "bw" | "sepia" | "grain" | "grain2" | "unsharp" | "unsharp2" | "warm"
+            "bw"
+                | "sepia"
+                | "grain"
+                | "grain2"
+                | "unsharp"
+                | "unsharp2"
+                | "warm"
+                | "cool"
+                | "vignette"
+                | "faded"
         )
     }
 }
@@ -690,21 +701,30 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             };
             crate::oneclick::apply_grain(img, &gp);
         }
+        // 自主设计的调色四件套,强度统一用 amount(0..100)。
+        "warm" => crate::oneclick::apply_warm(img, oneclick_amount(e, 50.0)),
+        "cool" => crate::oneclick::apply_cool(img, oneclick_amount(e, 50.0)),
+        "vignette" => crate::oneclick::apply_vignette(img, oneclick_amount(e, 50.0)),
+        "faded" => crate::oneclick::apply_faded(img, oneclick_amount(e, 50.0)),
         "unsharp" | "unsharp2" => {
             // unsharp 与 unsharp2 是**同一个**锐化操作,
             // 差异仅在滑块量程(1.0 vs 3.0)与全分辨率/慢速标志。
             // USM 半径/阈值无可靠来源,沿用 3×3 锐化核。
-            let v = e
-                .params
-                .get("amount")
-                .and_then(|v| v.parse::<f32>().ok())
-                .unwrap_or(60.0);
+            let v = oneclick_amount(e, 60.0);
             if v > 0.0 {
                 apply_sharpen(img, v.clamp(0.0, 100.0));
             }
         }
         _ => {}
     }
+}
+
+/// 一键效果的通用强度参数(`amount`,量程 0..100)。
+fn oneclick_amount(e: &Effect, default: f32) -> f32 {
+    e.params
+        .get("amount")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
 }
 
 /// 解析 `#rrggbb` / `rrggbb` 形式的颜色。

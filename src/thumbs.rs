@@ -132,27 +132,40 @@ pub fn load_cached_tier(tier: Tier, id: i64) -> Option<image::DynamicImage> {
     image::open(&p).ok()
 }
 
-/// 加载原图用于**预览大图**（P0-7）。
+/// 预览大图的**统一取图入口**。
 ///
-/// 相机 RAW（`.NEF/.CR2/.ARW/.RAF` 等）image crate 解不了，
-/// 这里借 Windows Shell 缩略图扩展出图（与原版一致的 COM 路线）。
-/// 普通格式走 `image::open`。
+/// 取值顺序(快的优先,能不出全图就不出):
 ///
-/// Shell 也拿不到时返回 `None`（预览窗显示"加载失败"）。
+/// 1. 视频 → Shell 抽帧(`image` crate 解不了容器格式);
+/// 2. JPEG 内嵌 EXIF 缩略图(≥128px)—— 相机原图几乎都有,免整图解码;
+/// 3. 相机 RAW → 借 Windows Shell 已安装的解码扩展;
+/// 4. 其余格式走 `image::open`。
 ///
-/// P1-10 起 UI 的预览走后台 worker(`build_preview` + 落盘缓存),
-/// 本函数保留给**同步**场景(如导出前取原图、测试)。
-#[allow(dead_code)]
-pub fn load_for_preview(src: &Path, max_side: u32) -> Option<image::DynamicImage> {
-    // P2-17 视频预览:直接走 Shell 抽帧。
+/// 第二个返回值 `from_thumb` 表示**图像已由解码器按 EXIF 方向摆正**
+/// (内嵌缩略图 / Shell 出图都是摆正过的),调用方不应再旋一次;
+/// 只有第 4 条路线返回 false,需要调用方自己摆正。
+///
+/// 四条路线全部失败时返回 `None`(预览窗显示"加载失败")。
+pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImage, bool)> {
+    // 1) 视频:Shell 抽帧。
     if crate::video::is_video(src) {
-        return decode_via_shell_sized(src, max_side);
+        return decode_via_shell_sized(src, max_side).map(|i| (i, true));
     }
-    let img = match image::open(src) {
-        Ok(i) => i,
-        Err(_) => decode_via_shell_sized(src, max_side)?,
-    };
-    Some(img)
+    // 2) 内嵌 EXIF 缩略图(小于 128px 的不够看,不如解原图)。
+    if let Some(t) = crate::exif::read_jpeg_embedded_thumb(src)
+        .and_then(|b| image::load_from_memory(&b).ok())
+        .filter(|t| t.width() >= 128 || t.height() >= 128)
+    {
+        return Some((t, true));
+    }
+    // 3) 相机 RAW:借系统解码扩展。
+    if crate::scan::is_raw(src) {
+        if let Some(t) = decode_via_shell_sized(src, max_side) {
+            return Some((t, true));
+        }
+    }
+    // 4) 常规格式。
+    image::open(src).ok().map(|i| (i, false))
 }
 
 /// 生成指定档位的缩略图;返回 dHash。
@@ -386,8 +399,9 @@ pub fn spawn_worker(store: Arc<crate::db::Store>) -> ThumbWorker {
     let tier2 = tier.clone();
     let handle = std::thread::spawn(move || {
         crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
-        // 每批的规模:一轮最多 64 张,避免长时间占用锁。
-        const BATCH: usize = 64;
+        // 每批规模随核数缩放:批内是 rayon 并行的,单核机器给小批
+        // (一次补太多会长时间占住 DB 锁、拖慢 UI),多核机器给大批(少几轮往返)。
+        let batch = (crate::win::cpu_count() * 8).clamp(16, 128);
         let mut last_tier = Tier::Normal;
         while !stop2.load(Ordering::Relaxed) {
             let cur = tier2.load(Ordering::Relaxed);
@@ -396,7 +410,7 @@ pub fn spawn_worker(store: Arc<crate::db::Store>) -> ThumbWorker {
             if t != last_tier {
                 last_tier = t;
             }
-            let ids = backfill_tier(&store, t, BATCH).unwrap_or_default();
+            let ids = backfill_tier(&store, t, batch).unwrap_or_default();
             if !ids.is_empty() {
                 let _ = tx.send(ids);
                 // 立刻继续下一批,直到这一轮补完。
@@ -473,27 +487,13 @@ pub fn load_preview_cached(id: i64) -> Option<image::DynamicImage> {
 
 /// 生成预览图并落盘(后台线程调用)。返回是否成功。
 ///
-/// 流程:优先 EXIF 内嵌缩略图(≥128px)→ RAW 走 Shell 扩展 → 全图解码;
-/// 最后等比缩到 1024 内、按 EXIF 方向摆正、存 jpeg。
+/// 取图统一走 `load_for_preview`(内嵌缩略图 → RAW Shell 扩展 → 全图解码),
+/// 再等比缩到 1024 内、按 EXIF 方向摆正、存 jpeg。
 ///
 /// **不计算 dHash** —— dHash 是全图感知哈希,中档已算过,预览档复用即可。
 pub fn build_preview(id: i64, src: &Path) -> Result<()> {
-    let (img, from_thumb) = match crate::exif::read_jpeg_embedded_thumb(src)
-        .and_then(|b| image::load_from_memory(&b).ok())
-        .filter(|t| t.width() >= 128 || t.height() >= 128)
-    {
-        Some(t) => (t, true),
-        None => {
-            if crate::scan::is_raw(src) {
-                match decode_via_shell_sized(src, PREVIEW_SIZE) {
-                    Some(t) => (t, true),
-                    None => (image::open(src)?, false),
-                }
-            } else {
-                (image::open(src)?, false)
-            }
-        }
-    };
+    let (img, from_thumb) = load_for_preview(src, PREVIEW_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("预览解码失败: {}", src.display()))?;
     let flat = if from_thumb {
         img
     } else {
@@ -934,6 +934,28 @@ mod tests {
         // 预览落在 previews 目录(对应原版预览档缓存)。
         assert!(preview_path(id).exists());
         assert!(preview_path(id).to_string_lossy().contains("previews"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `build_preview` 现在统一走 `load_for_preview`,这里锁住该入口的取值约定:
+    /// 常规格式 → 需要调用方自己摆正(`from_thumb=false`);
+    /// 四条路线全失败 → `None`(预览窗显示"加载失败",而不是 panic)。
+    #[test]
+    fn load_for_preview_routes() {
+        let dir = std::env::temp_dir().join(format!("rk-lfp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("a.png");
+        image::RgbImage::from_pixel(300, 200, image::Rgb([10, 20, 30]))
+            .save(&src)
+            .unwrap();
+        let (img, from_thumb) = load_for_preview(&src, PREVIEW_SIZE).expect("常规格式应能解码");
+        assert_eq!(img.width(), 300);
+        // 常规路线出的是未摆正的图 → 由 build_preview 按 EXIF 旋正
+        assert!(!from_thumb, "常规解码应标记需摆正");
+        // 不存在/无法解码的文件:视频/内嵌/RAW/常规四条路线全落空 → None
+        assert!(load_for_preview(&dir.join("nope.png"), PREVIEW_SIZE).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -100,28 +100,6 @@ pub fn read_meta(p: &std::path::Path) -> Meta {
     m
 }
 
-/// 读取拍摄时间（DateTimeOriginal，回退 DateTime）-> ISO "2023-12-31T13:52:06"。
-///
-/// 便捷单字段读取;批量扫描请用 `read_meta`(一次解析取全部字段)。
-#[allow(dead_code)]
-pub fn read_taken(p: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(p).ok()?;
-    let mut buf = std::io::BufReader::new(file);
-    let exif = exif::Reader::new().read_from_container(&mut buf).ok()?;
-    let f = exif
-        .get_field(exif::Tag::DateTimeOriginal, exif::In::PRIMARY)
-        .or_else(|| exif.get_field(exif::Tag::DateTime, exif::In::PRIMARY))?;
-    let first = match &f.value {
-        exif::Value::Ascii(v) => v.first()?.as_slice().to_vec(),
-        _ => return None,
-    };
-    let dt = exif::DateTime::from_ascii(&first).ok()?;
-    Some(format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
-        dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second
-    ))
-}
-
 /// 读取 Orientation（1..=8）；缺省返回 1。
 pub fn read_orientation(p: &std::path::Path) -> u32 {
     let file = match std::fs::File::open(p) {
@@ -136,46 +114,6 @@ pub fn read_orientation(p: &std::path::Path) -> u32 {
     match exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
         Some(f) => f.value.get_uint(0).filter(|v| (1..=8).contains(v)).unwrap_or(1),
         None => 1,
-    }
-}
-
-/// 读取相机型号(Make + Model 合并;都没有返回 None)。
-///
-/// 便捷单字段读取;批量扫描请用 `read_meta`。
-#[allow(dead_code)]
-pub fn read_cam(p: &std::path::Path) -> Option<String> {
-    let file = std::fs::File::open(p).ok()?;
-    let mut buf = std::io::BufReader::new(file);
-    let exif = exif::Reader::new().read_from_container(&mut buf).ok()?;
-    let get = |tag: exif::Tag| -> Option<String> {
-        let f = exif.get_field(tag, exif::In::PRIMARY)?;
-        match &f.value {
-            exif::Value::Ascii(v) => {
-                let s: Vec<u8> = v.first()?.as_slice().to_vec();
-                Some(String::from_utf8_lossy(&s).trim().to_string())
-            }
-            _ => None,
-        }
-    };
-    let make = get(exif::Tag::Make);
-    let model = get(exif::Tag::Model);
-    let joined = match (make, model) {
-        (Some(a), Some(b)) if !a.is_empty() && !b.is_empty() => {
-            // Model 常已含 Make 前缀(如 "Canon Canon EOS"),去重
-            if b.starts_with(&a) {
-                b
-            } else {
-                format!("{a} {b}")
-            }
-        }
-        (Some(a), _) if !a.is_empty() => a,
-        (_, Some(b)) if !b.is_empty() => b,
-        _ => return None,
-    };
-    if joined.is_empty() {
-        None
-    } else {
-        Some(joined)
     }
 }
 
