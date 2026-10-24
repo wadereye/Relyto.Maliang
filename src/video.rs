@@ -19,10 +19,134 @@
 //!   **我方等效**:Shell 关联程序打开(`win::shell_open`)—— 库内视频渲染管线
 //!   体量过大,不在本轮实现(诚实声明)。
 //! - **moviestart/movieend** = 编辑串里的 hex64 值(按 64 位十六进制解析),
-//!   播放时作时间过滤裁剪,**不修改原视频像素**。单位按微秒处理
-//!   (导出时除以 1000 归一)。我方未实现 trim UI,暂不落库。
+//!   播放时作时间过滤裁剪,**不修改原视频像素**。
+//!
+//!   ## 单位(已确认)
+//!
+//!   两个值是 **100 纳秒计数**(10 MHz,即 DirectShow 的 `REFERENCE_TIME`),
+//!   **10 000 000 = 1 秒**。两处换算相互印证:
+//!   - 原版 trim UI 文本用 `值 / 10 000 000` 得到秒数,拼成 `"起秒/止秒"` 显示;
+//!   - 原版把值交给播放器前同样做 `/ 10 000 000.0`。
+//!
+//!   序列化形态:`moviestart=%I64x` / `movieend=%I64x`(16 进制,读回用 `sscanf("%I64x")`,
+//!   读写都不做缩放)。视频导出路径另有一个 `值 / 1000`(100 ns → µs)用于时间码运算。
+//!
+//!   我方 trim UI 用**秒**为单位(内部仍按 100 ns 计数存取)。
 
 use std::path::Path;
+
+/// 每秒钟对应的 100 纳秒计数。
+pub const MOVIE_TICKS_PER_SEC: i64 = 10_000_000;
+
+/// 视频裁剪区间(单位 = 100 纳秒,见 [`MOVIE_TICKS_PER_SEC`])。
+///
+/// 对应原版编辑串里的 `moviestart` / `movieend` 一对。
+/// 原版的语义是**时间过滤**:播放与导出只取 `[start, end]` 这一段,
+/// 不改动原文件像素。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MovieTrim {
+    /// 裁剪起点(100 ns 计数)。
+    pub start: i64,
+    /// 裁剪终点(100 ns 计数)。
+    pub end: i64,
+}
+
+impl MovieTrim {
+    /// 用秒构造(内部转成 100 ns 计数)。
+    pub fn from_secs(start: f64, end: f64) -> MovieTrim {
+        MovieTrim {
+            start: (start * MOVIE_TICKS_PER_SEC as f64).round() as i64,
+            end: (end * MOVIE_TICKS_PER_SEC as f64).round() as i64,
+        }
+    }
+
+    /// 起点(秒)。
+    pub fn start_secs(&self) -> f64 {
+        self.start as f64 / MOVIE_TICKS_PER_SEC as f64
+    }
+
+    /// 终点(秒)。
+    pub fn end_secs(&self) -> f64 {
+        self.end as f64 / MOVIE_TICKS_PER_SEC as f64
+    }
+
+    /// 时长(秒)。终点不大于起点时返回 0。
+    pub fn duration_secs(&self) -> f64 {
+        (self.end - self.start).max(0) as f64 / MOVIE_TICKS_PER_SEC as f64
+    }
+
+    /// 是否空区间(未裁剪)。
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.start
+    }
+
+    /// 把起点/终点限制在 `[0, total]` 内,并保证 `start <= end`。
+    pub fn clamped_to(&self, total_secs: f64) -> MovieTrim {
+        let total = (total_secs * MOVIE_TICKS_PER_SEC as f64).round() as i64;
+        let s = self.start.clamp(0, total.max(0));
+        let e = self.end.clamp(0, total.max(0));
+        MovieTrim {
+            start: s.min(e),
+            end: e.max(s),
+        }
+    }
+
+    /// 序列化成原版编辑串片段:`moviestart=%I64x;movieend=%I64x;`(16 进制小写)。
+    pub fn serialize(&self) -> String {
+        format!(
+            "moviestart={:x};movieend={:x};",
+            self.start as u64, self.end as u64
+        )
+    }
+
+    /// 从效果项参数里取区间(参数缺失或非法时返回 `None`)。
+    ///
+    /// 参数名 `start` / `end`,值是 16 进制 100 ns 计数。
+    pub fn from_params(params: &std::collections::BTreeMap<String, String>) -> Option<MovieTrim> {
+        let s = u64::from_str_radix(params.get("start")?.trim(), 16).ok()?;
+        let e = u64::from_str_radix(params.get("end")?.trim(), 16).ok()?;
+        Some(MovieTrim {
+            start: s as i64,
+            end: e as i64,
+        })
+    }
+
+    /// 转成效果项参数(与 [`MovieTrim::from_params`] 互逆)。
+    pub fn to_params(&self) -> std::collections::BTreeMap<String, String> {
+        let mut m = std::collections::BTreeMap::new();
+        m.insert("start".into(), format!("{:x}", self.start as u64));
+        m.insert("end".into(), format!("{:x}", self.end as u64));
+        m
+    }
+
+    /// 从原版编辑串里解析(找不到对应键时返回 `None`)。
+    ///
+    /// 只认 `moviestart=` / `movieend=` 前缀,值是 16 进制 64 位整数。
+    pub fn parse(filters: &str) -> Option<MovieTrim> {
+        let mut start = None;
+        let mut end = None;
+        for item in filters.split(';') {
+            let item = item.trim();
+            if let Some(v) = item.strip_prefix("moviestart=") {
+                start = u64::from_str_radix(v.trim(), 16).ok();
+            } else if let Some(v) = item.strip_prefix("movieend=") {
+                end = u64::from_str_radix(v.trim(), 16).ok();
+            }
+        }
+        match (start, end) {
+            (Some(s), Some(e)) => Some(MovieTrim {
+                start: s as i64,
+                end: e as i64,
+            }),
+            _ => None,
+        }
+    }
+
+    /// UI 用的 `"起秒 / 止秒"` 文本(一位小数),与原版 trim 面板同形。
+    pub fn label(&self) -> String {
+        format!("{:.1} / {:.1}", self.start_secs(), self.end_secs())
+    }
+}
 
 /// 视频扩展名全集(见模块文档)。
 /// 顺序按池内出现顺序;`mov` 在池尾(QuickTime 分组)。
@@ -80,5 +204,62 @@ mod tests {
         // 原版 `ty`(TiVo)与 `mmv`(MicroMV)这类冷门格式也要认
         assert!(is_video(Path::new("tivo.ty")));
         assert!(is_video(Path::new("sony.mmv")));
+    }
+
+    // ===== moviestart/movieend 对应的 trim 数据模型 =====
+
+    #[test]
+    fn movie_ticks_per_second_is_ten_million() {
+        // 单位:100 纳秒计数,10 000 000 = 1 秒。
+        assert_eq!(MOVIE_TICKS_PER_SEC, 10_000_000);
+    }
+
+    #[test]
+    fn trim_roundtrips_through_serialize() {
+        let t = MovieTrim::from_secs(3.5, 12.25);
+        let s = t.serialize();
+        // 3.5 s = 35 000 000 = 0x2160ec0;12.25 s = 122 500 000 = 0x74d33a0
+        assert_eq!(s, "moviestart=2160ec0;movieend=74d33a0;");
+        let back = MovieTrim::parse(&s).expect("应能解析");
+        assert_eq!(back, t);
+    }
+
+    #[test]
+    fn trim_parse_tolerates_other_filter_items() {
+        // 30 s = 300 000 000 = 0x11e1a300;60 s = 600 000 000 = 0x23c34600
+        let filters = "bw;moviestart=11e1a300;movieend=23c34600;sepia;";
+        let t = MovieTrim::parse(filters).expect("应能解析");
+        assert_eq!(t.start_secs(), 30.0);
+        assert_eq!(t.end_secs(), 60.0);
+        assert!((t.duration_secs() - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trim_parse_returns_none_without_both_keys() {
+        assert!(MovieTrim::parse("moviestart=1e;").is_none());
+        assert!(MovieTrim::parse("bw;sepia;").is_none());
+    }
+
+    #[test]
+    fn trim_clamps_to_total_and_orders_ends() {
+        let t = MovieTrim::from_secs(-2.0, 999.0).clamped_to(10.0);
+        assert_eq!(t.start, 0);
+        assert_eq!(t.end_secs(), 10.0);
+        // 反序的区间也应被理顺
+        let rev = MovieTrim::from_secs(8.0, 2.0).clamped_to(10.0);
+        assert_eq!(rev.start_secs(), 2.0);
+        assert_eq!(rev.end_secs(), 8.0);
+    }
+
+    #[test]
+    fn trim_empty_when_end_not_after_start() {
+        assert!(MovieTrim::default().is_empty());
+        assert!(MovieTrim::from_secs(5.0, 5.0).is_empty());
+        assert!(!MovieTrim::from_secs(5.0, 6.0).is_empty());
+    }
+
+    #[test]
+    fn trim_label_is_seconds_with_one_decimal() {
+        assert_eq!(MovieTrim::from_secs(3.5, 12.25).label(), "3.5 / 12.2");
     }
 }

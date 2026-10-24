@@ -164,6 +164,14 @@ pub struct App {
     fx_sharpen_amount: f32,
     /// 自主设计调色(暖调/冷调/暗角/褪色)的共通强度(0~100)。
     fx_tone_amount: f32,
+    /// 视频裁剪草稿:起点(秒)。
+    fx_trim_start: f64,
+    /// 视频裁剪草稿:终点(秒)。
+    fx_trim_end: f64,
+    /// 视频裁剪草稿:视频总时长(秒,0 = 不限制)。
+    fx_trim_total: f64,
+    /// 视频裁剪草稿所属照片 id(换照片时才重载)。
+    fx_trim_id: Option<i64>,
     /// P1-14:字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
     pool_probe_id: i64,
     /// P1-13:从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
@@ -507,6 +515,10 @@ impl App {
             fx_grain_amount: 0.15,
             fx_sharpen_amount: 60.0,
             fx_tone_amount: 50.0,
+            fx_trim_start: 0.0,
+            fx_trim_end: 0.0,
+            fx_trim_total: 0.0,
+            fx_trim_id: None,
             pool_probe_id: 0,
             show_import_devices: false,
             import_devices: Vec::new(),
@@ -1404,6 +1416,8 @@ impl App {
         ui.separator();
         self.fx_oneclick_ui(ui, id);
         ui.separator();
+        self.fx_trim_ui(ui, id);
+        ui.separator();
         ui.horizontal(|ui| {
             let can_undo = self.fx_undo.get(&id).map(|s| s.can_undo()).unwrap_or(false);
             let can_redo = self.fx_undo.get(&id).map(|s| s.can_redo()).unwrap_or(false);
@@ -1775,9 +1789,101 @@ impl App {
         });
     }
 
+    /// 视频裁剪面板(trim UI)。
+    ///
+    /// 单位说明:原版 `moviestart` / `movieend` 是 **100 纳秒计数**
+    /// (10 000 000 = 1 秒);面板上用秒显示,落库时换算回 100 ns。
+    /// 裁剪是**时间过滤**语义 —— 播放/导出只取这一段,不改原文件像素。
+    fn fx_trim_ui(&mut self, ui: &mut egui::Ui, id: i64) {
+        // 只有视频才显示(换照片时重载草稿)。
+        let is_movie = self
+            .rows
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| crate::video::is_video(std::path::Path::new(&r.path)))
+            .unwrap_or(false);
+        if !is_movie {
+            return;
+        }
+        if self.fx_trim_id != Some(id) {
+            self.fx_trim_id = Some(id);
+            let stored = self.fx_stack_for(id).serialize();
+            match crate::video::MovieTrim::parse(&stored) {
+                Some(t) => {
+                    self.fx_trim_start = t.start_secs();
+                    self.fx_trim_end = t.end_secs();
+                }
+                None => {
+                    // 没有裁剪记录:终点先记 0,等用户按"读视频时长"填。
+                    self.fx_trim_start = 0.0;
+                    self.fx_trim_end = 0.0;
+                }
+            }
+        }
+        ui.heading("视频裁剪");
+        ui.small("起点 / 终点(秒)。原版单位为 100 纳秒,此处按秒操作。");
+        let mut changed = false;
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut self.fx_trim_start)
+                    .range(0.0..=f64::MAX)
+                    .speed(0.1)
+                    .prefix("起点 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut self.fx_trim_end)
+                    .range(0.0..=f64::MAX)
+                    .speed(0.1)
+                    .prefix("终点 "),
+            )
+            .changed();
+        changed |= ui
+            .add(
+                egui::DragValue::new(&mut self.fx_trim_total)
+                    .range(0.0..=f64::MAX)
+                    .speed(0.5)
+                    .prefix("总时长(0=不限) "),
+            )
+            .changed();
+        let _ = changed;
+        let raw = crate::video::MovieTrim::from_secs(self.fx_trim_start, self.fx_trim_end);
+        // 填了总时长就按它钳位(并顺手把反序区间理顺)。
+        let t = if self.fx_trim_total > 0.0 {
+            raw.clamped_to(self.fx_trim_total)
+        } else {
+            raw
+        };
+        ui.small(format!(
+            "区间 {} 秒({})",
+            format!("{:.1}", t.duration_secs()),
+            t.label()
+        ));
+        ui.small(format!("落库片段:{}", t.serialize()));
+        ui.horizontal(|ui| {
+            if ui.button("应用裁剪").clicked() {
+                if t.is_empty() {
+                    self.fx_msg = "终点需大于起点".into();
+                    return;
+                }
+                self.fx_commit_effect(
+                    id,
+                    "视频裁剪",
+                    crate::effects::Effect::oneclick("movie", t.to_params()),
+                );
+                self.fx_msg = "已应用裁剪".into();
+            }
+            if ui.button("清除裁剪").clicked() {
+                self.fx_remove_effect(id, "视频裁剪", "movie");
+                self.fx_trim_start = 0.0;
+                self.fx_trim_end = 0.0;
+            }
+        });
+    }
+
     /// 把一个效果项写进目标照片的效果栈并记入撤销栈。
-    fn fx_commit_effect(&mut self, id: i64, label: &str, eff: crate::effects::Effect) {
-        let before = self.fx_stack_for(id);
+    fn fx_commit_effect(&mut self, id: i64, label: &str, eff: crate::effects::Effect) {        let before = self.fx_stack_for(id);
         let mut after = before.clone();
         after.push(eff);
         if let Err(e) = self.store.set_filters(id, &after.serialize()) {

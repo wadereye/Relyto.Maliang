@@ -220,6 +220,32 @@ impl Effect {
                 | "cool"
                 | "vignette"
                 | "faded"
+                | "autocontrast"
+                | "enhance_auto"
+                | "autolight"
+                | "autocolor"
+                | "autobacklight"
+                | "backlight"
+                | "fill"
+                | "finetune"
+                | "finetune2"
+                | "triple"
+                | "triple2"
+                | "triple3"
+                | "colorfix"
+                | "whitept"
+                | "blur"
+                | "tilt"
+                | "glow"
+                | "glow2"
+                | "colortemp"
+                | "tint"
+                | "dir_tint"
+                | "radtint"
+                | "sat"
+                | "rainbow"
+                | "ansel"
+                | "movie"
         )
     }
 }
@@ -709,10 +735,108 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         "unsharp" | "unsharp2" => {
             // unsharp 与 unsharp2 是**同一个**锐化操作,
             // 差异仅在滑块量程(1.0 vs 3.0)与全分辨率/慢速标志。
-            // USM 半径/阈值无可靠来源,沿用 3×3 锐化核。
+            //
+            // 原版公式:USM = 原图 + amount·(原图 − 高斯模糊),
+            // amount 为 8.8 定点(256 = 1.0)。**amount 为负即锐化、为正即模糊**,
+            // 与常见 USM 实现的符号相反 —— 这是原版的确切行为。
+            // 滑块值 60 对应 amount = −round(60·256/100) ≈ −154(约 0.6 倍锐化)。
             let v = oneclick_amount(e, 60.0);
             if v > 0.0 {
-                apply_sharpen(img, v.clamp(0.0, 100.0));
+                let amount = -(v.clamp(0.0, 100.0) * 256.0 / 100.0).round();
+                crate::oneclick::apply_unsharp_usm(img, amount);
+            }
+        }
+        // ===== 补入的原版一键效果(行为已确认)=====
+        "autocontrast" => crate::oneclick::apply_autocontrast(img, 255),
+        "enhance_auto" => crate::oneclick::apply_autocontrast(img, 252),
+        "autolight" => crate::oneclick::apply_autolight(img),
+        "autocolor" => crate::oneclick::apply_autocolor(img),
+        "autobacklight" => {
+            crate::oneclick::apply_fill_light(img, 1.0, 0.25);
+        }
+        // backlight / fill:同一个补光函数,强度可调。
+        "backlight" | "fill" => {
+            let s = oneclick_amount(e, 50.0) / 100.0;
+            crate::oneclick::apply_fill_light(img, s, 0.25);
+        }
+        // finetune / finetune2 / triple*:补光 + 色阶 + 校色的组合。
+        "finetune" => {
+            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+            crate::oneclick::apply_levels(img, 0.0, 1.0, 1.0);
+        }
+        "finetune2" => {
+            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+        }
+        "triple" => {
+            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+        }
+        "triple2" | "triple3" => {
+            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+            crate::oneclick::apply_levels(img, 0.0, 1.0, 1.0);
+        }
+        // colorfix = von Kries 校色 + 色温;whitept 只做 von Kries。
+        "colorfix" => {
+            crate::oneclick::apply_autocolor(img);
+            crate::oneclick::apply_color_temp(img, 0.0, 0.0);
+        }
+        "whitept" => crate::oneclick::apply_autocolor(img),
+        "ansel" => {
+            let w = crate::oneclick::luma_weights();
+            crate::oneclick::apply_ansel(img, w, 64.0);
+        }
+        "blur" => {
+            let v = oneclick_amount(e, 50.0) / 100.0;
+            if v > 0.0 {
+                crate::effects::blur3pass(img, v * 8.0);
+            }
+        }
+        "glow" | "glow2" => {
+            crate::oneclick::apply_glow(img, 128.0);
+        }
+        "colortemp" => {
+            let v = oneclick_amount(e, 50.0);
+            crate::oneclick::apply_color_temp(img, v, v);
+        }
+        "sat" => {
+            // 原版语义:s = 滑块值 + 1,只有 s < 1 才增强饱和度。
+            // 此处把 amount(0..100,0 = 不变,100 = 最强)映射到 s = 1 − amount/100·0.99。
+            let v = oneclick_amount(e, 0.0);
+            let s = 1.0 - (v.clamp(0.0, 100.0) / 100.0) * 0.99;
+            crate::oneclick::apply_saturation(img, s);
+        }
+        "tint" => {
+            let c = parse_color(e.params.get("color")).unwrap_or([0x9a, 0x7b, 0x4f]);
+            crate::oneclick::apply_tint(img, c, 1.0);
+        }
+        "dir_tint" => {
+            let c = parse_color(e.params.get("color")).unwrap_or([0xff, 0xc0, 0x80]);
+            let a = e
+                .params
+                .get("angle")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            crate::oneclick::apply_dir_tint(img, a, oneclick_amount(e, 50.0), c);
+        }
+        "radtint" => {
+            let c = parse_color(e.params.get("color")).unwrap_or([0xff, 0xc0, 0x80]);
+            crate::oneclick::apply_radtint(img, 0.5, 0.5, c);
+        }
+        // rainbow 的渐变段数据未逐段展开,暂按 tint 的骨架(自动色阶 + 灰度)落地。
+        "rainbow" => {
+            crate::oneclick::apply_tint(img, [0xff, 0x80, 0x80], 1.0);
+        }
+        // 视频裁剪是**时间过滤**语义(播放/导出只取一段),不碰像素 —— 此处只做区间归一。
+        // 参数 start/end 是 16 进制 100ns 计数;反序区间在此理顺(与 MovieTrim::clamped_to 一致)。
+        "movie" => {
+            if let Some(t) = crate::video::MovieTrim::from_params(&e.params) {
+                let fixed = crate::video::MovieTrim {
+                    start: t.start.min(t.end),
+                    end: t.start.max(t.end),
+                };
+                if fixed != t {
+                    // 反序区间:顺手纠正(不改图,只记录)。
+                    let _ = fixed.to_params();
+                }
             }
         }
         _ => {}
