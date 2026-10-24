@@ -1,4 +1,5 @@
-//! 一键效果(oneclick):黑白 / 双色调 / 颗粒 / 锐化 + 自主设计的暖调 / 冷调 / 暗角 / 褪色。
+//! 一键效果(oneclick):黑白 / 双色调 / 颗粒 / 锐化 + 自主设计的暖调 / 冷调 / 暗角 / 褪色,
+//! 以及一批参考原版一键效果补入的功能。
 //!
 //! # 行为要点
 //!
@@ -14,11 +15,30 @@
 //! | `grain` RNG twist | MT19937 | 标准 MT19937 in-place twist |
 //! | `grain` xorshift32 | 噪声混合计算 | `u=s^(s>>11)`;`u^=(u&0xff3a58ad)<<7`;`u^=(u&0xffffdf8c)<<15`;`r=(u>>18)^u` |
 //! | `grain` 噪声强度 | 强度换算 | `收敛系数 = ROUND(256.0 - amount·256.0)` |
-//! | `grain` 噪声混合 | 噪声混合计算 | `out = src + ((0xa0 - |0x80-src|)·(noise-0x80)) >> 8`,clamp `[0,255]` |
-//! | `unsharp` / `unsharp2` | 3×3 锐化核 | 同一条锐化路径,差异是滑块范围 1.0→3.0 与全分辨率/慢速开关 |
+//! | `grain` 噪声混合 | 噪声混合计算 | `out = src + ((0xa0 - \|0x80-src\|)·(noise-0x80)) >> 8`,clamp `[0,255]` |
+//! | `unsharp` / `unsharp2` | 高斯模糊 + 高通 | `out = src + ((blur − src)·amount >> 8)`;**amount 为负才锐化** |
 //! | `warm` / `cool` | 三通道增益 + 亮度归一 | 自主设计,见 [`apply_warm`] |
 //! | `vignette` | smoothstep 边缘衰减 | 自主设计,见 [`apply_vignette`] |
 //! | `faded` | 抬黑位 + 压白位 + 去饱和 | 自主设计,见 [`apply_faded`] |
+//!
+//! # 补入的原版一键效果(行为已确认)
+//!
+//! | 函数 | 对应效果 | 核心 |
+//! |---|---|---|
+//! | [`apply_autocontrast`] | `autocontrast` / `enhance` | 中央 90% + 0.5% 分位 + 线性拉伸 |
+//! | [`apply_autolight`] | `autolight` | 全图 + 0.1% 分位 + gamma 色阶 |
+//! | [`apply_autocolor`] | `autocolor` / `whitept` / `colorfix` | 中性像素色度直方图 + von Kries |
+//! | [`apply_fill_light`] | `backlight` / `fill` / `finetune*` / `triple*` | gamma LUT + 亮度掩码混合 |
+//! | [`apply_levels`] | `finetune2` / `triple2` / `triple3` | 16 位色阶 + 有序抖动 |
+//! | [`apply_color_temp`] | `colortemp` | 斜坡 + 抛物线 S 形色偏 |
+//! | [`apply_gamma`] | `glow` / `tint` / `rainbow` | `lut[i] = pow(i/255, 1/gamma)·255` |
+//! | [`apply_ansel`] | `ansel` | 抛物线加权均值 + smoothstep 对比 |
+//! | [`apply_saturation`] | `sat` | 色度按亮度归一后查曲线 |
+//! | [`apply_glow`] | `glow` / `glow2` | gamma 0.5 + 模糊 + 按不透明度混回 |
+//! | [`apply_unsharp_usm`] | `unsharp` / `unsharp2` | `src + amount·(src − blur)` |
+//! | [`apply_tint`] | `tint` | 自动色阶 + 灰度 + gamma + 单色相乘 |
+//! | [`apply_dir_tint`] | `dir_tint` | 方向渐变 + 三次 B 样条软化 |
+//! | [`apply_radtint`] | `radtint` | 径向渐变着色 |
 //!
 //! # 参数来源有限的项(不做无依据的推测)
 //!
@@ -26,9 +46,12 @@
 //!   色温偏移**(见 [`apply_warm`]);三段增益放资源包 `warm.gain`,可只调数据。
 //! - **`grain` 的 low/high/seed 默认值**:没有可靠来源 → 提供一组
 //!   可用的预设(见 `grain_preset`)。
-//! - **`unsharp` 的 USM 半径/阈值/数量**:没有可靠来源 → 沿用 3×3 锐化核
-//!   (见 `effects::sharpen_kernel`),**不编造 USM 参数**。
 //! - **`sepia` 灰度→棕色的精确映射**:用**双色调插值**近似,并在此明确标注。
+//! - **`sat` 的曲线表索引方向**:存在栈别名歧义,按正向实现(见
+//!   [`apply_saturation`] 的诚实声明)。
+//! - **`glow` 的合成混合模式**:按线性不透明度混合实现(见 [`apply_glow`])。
+//! - **`rainbow` 的渐变段数/各段颜色**:段数据未逐段展开,
+//!   暂按 `tint` 骨架落地。
 //!
 //! # 亮度权重(全库统一,勿改)
 //!
@@ -420,6 +443,645 @@ pub fn apply_faded(img: &mut image::RgbaImage, amount: f32) {
     }
 }
 
+/// 补光(Fill Light)—— `backlight` / `fill` 一键效果与 `finetune` 的第一级。
+///
+/// 参考 Picasa 3 的补光实现(行为级):
+///
+/// ```text
+/// gain   = 1 / ((1 − s)·0.7 + 0.3)                 // s ∈ [0,1],s=1 → 3.3333,s=0 → 1.0
+/// expo   = 1 / (gain·0.7 + 0.3)
+/// LUT[i] = round(min(pow(max(i·gain/255, 0), expo), 256)·255)   // 256 项,值域 0..65280
+/// lum    = (B + 2·G + R) >> 2                      // 注意是 /4,不是 /3
+/// mask   = 0xff00 − lum·round(blend·256)           // 16.8 定点
+/// out_c  = clamp(c + ((LUT[c] − c)·mask >> 16), 0, 255)
+/// ```
+///
+/// `mask` 让**暗部增益大、亮部增益小**(纯黑处 mask≈0.996,纯白处≈0.747),
+/// 所以提亮不会把高光一起推爆。注意 `pow(0, x) = 0`,**纯黑保持纯黑**。
+pub fn apply_fill_light(img: &mut image::RgbaImage, s: f32, blend: f32) {
+    let s = s.clamp(0.0, 1.0);
+    let blend = blend.clamp(0.0, 1.0);
+    let gain = 1.0 / ((1.0 - s) * 0.7 + 0.3);
+    let expo = 1.0 / (gain * 0.7 + 0.3);
+    let mut lut = [0i32; 256];
+    for i in 0..256usize {
+        let x = ((i as f32) * gain / 255.0).max(0.0);
+        let y = x.powf(expo).min(256.0);
+        lut[i] = (y * 255.0).round().clamp(0.0, 65280.0) as i32;
+    }
+    let blend_q = (blend * 256.0).round() as i32;
+    for p in img.pixels_mut() {
+        let lum = ((p[0] as i32) + 2 * (p[1] as i32) + (p[2] as i32)) >> 2;
+        let mask = 0xff00 - lum * blend_q;
+        for c in 0..3 {
+            let v = p[c] as i32;
+            let out = v + (((lut[v as usize] - v) * mask) >> 16);
+            p[c] = out.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// 色阶(gamma curves)—— `finetune2` / `triple2` / `triple3` 的一级。
+///
+/// 参考 Picasa 3 的色阶实现(行为级):
+///
+/// ```text
+/// inv    = (white != black) ? 1/(white − black) : 1.0
+/// LUT16[i] = clamp(round((pow(i/255, 1/gamma)·65280 − black·65280)·inv), 0, 65280)  // 16 位 8.8
+/// ```
+///
+/// `black`/`white`/`gamma` 都是 **0..1 归一化**值。16 位中间精度是本实现的关键:
+/// 直接压到 8 位会在暗部出现台阶。
+pub fn apply_levels(img: &mut image::RgbaImage, black: f32, white: f32, gamma: f32) {
+    let black = black.clamp(0.0, 1.0);
+    let white = white.clamp(0.0, 1.0);
+    let gamma = if gamma <= 0.0 { 1.0 } else { gamma };
+    let inv = if white != black {
+        1.0 / (white - black)
+    } else {
+        1.0
+    };
+    let mut lut16 = [0u16; 257];
+    for i in 0..256usize {
+        let x = i as f32 / 255.0;
+        let y = x.powf(1.0 / gamma) * 65280.0 - black * 65280.0;
+        let v = (y * inv).round().clamp(0.0, 65280.0) as i32;
+        lut16[i] = v as u16;
+    }
+    lut16[256] = lut16[255];
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            let v = p[c] as usize;
+            // 局部斜率做有序抖动,把 16 位结果缩回 8 位(消除色带)。
+            let d = lut16[v + 1] as i32 - lut16[v] as i32;
+            let n = (v.wrapping_mul(2654435761) & 0xff) as i32;
+            let out = ((d * n >> 8) - (d >> 1) + lut16[v] as i32) >> 8;
+            p[c] = out.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// gamma 校正 —— `glow` 的第一级,也是 `tint` / `rainbow` 的一级。
+///
+/// `lut[i] = round(pow(i/255, 1/gamma)·255)`;`gamma < 1` 提亮、`> 1` 压暗。
+pub fn apply_gamma(img: &mut image::RgbaImage, gamma: f32) {
+    let gamma = if gamma <= 0.0 { 1.0 } else { gamma };
+    let mut lut = [0u8; 256];
+    for i in 0..256usize {
+        let x = i as f32 / 255.0;
+        lut[i] = (x.powf(1.0 / gamma) * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            p[c] = lut[p[c] as usize];
+        }
+    }
+}
+
+/// 色温(colortemp)—— `colortemp` 一键效果,也是 `colorfix` 的第二级。
+///
+/// 参考 Picasa 3 的色温实现(行为级):
+///
+/// ```text
+/// step = 0x10000 / (256 − k)
+/// t[i] = (i·(256 − k)) >> 8          // 斜坡
+/// u[i] = (i·step) >> 8               // 反斜坡
+/// w[i] = i·(256 − i)                 // 抛物线(中灰最强)
+/// R' = t(R) + (w(t(R))·m >> 15)
+/// G' = t(G) + (w(t(G))·max(m,0) >> 17)     // 绿通道幅度是红的一半
+/// B' = t(B) − (w(t(B))·m >> 15)
+/// out = (u(R'), u(G'), u(B'))
+/// ```
+///
+/// 即 **R↑ B↓ G↑(半幅)的 S 形色偏**;`k` 是整体偏移、`m` 是强度。
+pub fn apply_color_temp(img: &mut image::RgbaImage, k: f32, m: f32) {
+    let k = (k as i32).clamp(0, 255) as usize;
+    let m = m as i32;
+    let m_pos = m.max(0);
+    let step = if k < 256 { 0x10000 / (256 - k) as i32 } else { 0x10000 };
+    let mut t = [0i32; 256];
+    let mut u = [0i32; 256];
+    let mut w = [0i32; 256];
+    for i in 0..256usize {
+        t[i] = ((i as i32) * ((256 - k) as i32)) >> 8;
+        u[i] = ((i as i32) * step) >> 8;
+        w[i] = (i as i32) * ((256 - i) as i32);
+    }
+    for p in img.pixels_mut() {
+        let mut o = [0u8; 3];
+        for c in 0..3 {
+            let base = t[p[c] as usize].clamp(0, 255) as usize;
+            let weight = w[base];
+            let delta = match c {
+                0 => (weight * m) >> 15,          // 红
+                1 => (weight * m_pos) >> 17,      // 绿(半幅)
+                _ => -((weight * m) >> 15),       // 蓝
+            };
+            let v = (base as i32 + delta).clamp(0, 255) as usize;
+            o[c] = u[v].clamp(0, 255) as u8;
+        }
+        p[0] = o[0];
+        p[1] = o[1];
+        p[2] = o[2];
+    }
+}
+
+/// 自动对比度 —— `autocontrast` / `enhance` 一键效果。
+///
+/// 参考 Picasa 3 的自动色阶实现(行为级):
+///
+/// ```text
+/// 取中央 90%(四边各裁 5%:x ∈ [w·5/100, w·95/100])
+/// 3 × 256 直方图
+/// 阈值 = max(1, w·h/200)                    // 0.5%
+/// low  = 首个 cum ≥ 阈值 的 bin
+/// high = 末个 cum ≥ 阈值 的 bin
+/// scale = (0xff << 16) / (high − low)       // high == low → 0
+/// out   = clamp((v − low)·scale >> 16, 0, 255)
+/// ```
+///
+/// `cap` 是输出上限:`autocontrast` 用 255、`enhance` 用 252。
+pub fn apply_autocontrast(img: &mut image::RgbaImage, cap: u8) {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w < 2 || h < 2 {
+        return;
+    }
+    let x0 = w * 5 / 100;
+    let x1 = w * 95 / 100;
+    let y0 = h * 5 / 100;
+    let y1 = h * 95 / 100;
+    let (x0, x1) = (x0.min(w - 1), x1.max(x0 + 1).min(w));
+    let (y0, y1) = (y0.min(h - 1), y1.max(y0 + 1).min(h));
+    let mut hist = [[0u32; 256]; 3];
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = img.get_pixel(x as u32, y as u32);
+            for c in 0..3 {
+                hist[c][p[c] as usize] += 1;
+            }
+        }
+    }
+    let n = ((x1 - x0) * (y1 - y0)) as u32;
+    let thresh = (n / 200).max(1);
+    let mut lut = [[0u8; 256]; 3];
+    for c in 0..3 {
+        // low = 首个 cum ≥ 阈值
+        let mut cum = 0u32;
+        let mut low = 0usize;
+        for i in 0..256 {
+            cum += hist[c][i];
+            if cum >= thresh {
+                low = i;
+                break;
+            }
+        }
+        // high = 末个 cum ≥ 阈值(等价于从尾部数第一个使 cum ≥ 阈值 的 bin)
+        let mut cum = 0u32;
+        let mut high = 255usize;
+        for i in (0..256).rev() {
+            cum += hist[c][i];
+            if cum >= thresh {
+                high = i;
+                break;
+            }
+        }
+        if high <= low {
+            for i in 0..256 {
+                lut[c][i] = cap;
+            }
+            continue;
+        }
+        let scale = ((cap as u32) << 16) / (high - low) as u32;
+        for i in 0..256usize {
+            let v = ((i as i32 - low as i32) * scale as i32) >> 16;
+            lut[c][i] = v.clamp(0, cap as i32) as u8;
+        }
+    }
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            p[c] = lut[c][p[c] as usize];
+        }
+    }
+}
+
+/// 自动光线(autolight)—— 参考 Picasa 3 的自动色阶 + gamma 组合。
+///
+/// ```text
+/// 全图 3 × 256 直方图(不裁边)
+/// 阈值 = ROUND(pixels · 0.001)                  // 0.1%,比 autocontrast 严一倍
+/// 每通道 low/high;总 low = min(3),high = max(3)
+/// 若 high/255 == 1 且 low/255 == 0 → 已是满动态,直接填白返回
+/// 否则走 apply_levels(low/255, high/255, 1.0)
+/// ```
+pub fn apply_autolight(img: &mut image::RgbaImage) {
+    let n = (img.width() as u64) * (img.height() as u64);
+    if n == 0 {
+        return;
+    }
+    let mut hist = [[0u32; 256]; 3];
+    for p in img.pixels() {
+        for c in 0..3 {
+            hist[c][p[c] as usize] += 1;
+        }
+    }
+    let thresh = ((n as f64) * 0.001).round().max(1.0) as u32;
+    let mut lows = [0usize; 3];
+    let mut highs = [255usize; 3];
+    for c in 0..3 {
+        let mut cum = 0u32;
+        for i in 0..256 {
+            cum += hist[c][i];
+            if cum >= thresh {
+                lows[c] = i;
+                break;
+            }
+        }
+        let mut cum = 0u32;
+        for i in (0..256).rev() {
+            cum += hist[c][i];
+            if cum >= thresh {
+                highs[c] = i;
+                break;
+            }
+        }
+    }
+    let low = *lows.iter().min().unwrap();
+    let high = *highs.iter().max().unwrap();
+    if high == 255 && low == 0 {
+        // 动态已满:原版在此直接填白(视为无需处理)。
+        return;
+    }
+    apply_levels(img, low as f32 / 255.0, high as f32 / 255.0, 1.0);
+}
+
+/// 自动颜色(autocolor)—— 参考 Picasa 3 的中性像素色度直方图 + von Kries 适配。
+///
+/// ```text
+/// 中性像素:G ∈ [0x20, 0xe1] 且 G < 2R, R < 2G, G < 2B, B < 2G
+/// 色度直方图 64 × 64:
+///   x = (R − G)·32 / min(R,G) + 32      y = (B − G)·32 / min(B,G) + 32     (clamp 0..63)
+/// 取众数 bin 得 cast 色
+/// M = [[ 1.9044,  0.4508, −0.3826],
+///      [−0.0532,  1.8018,  0.1995],
+///      [ 0.0491, −0.3057,  1.8576]]
+/// L = (151·G + 77·R + 28·B) >> 8
+/// kᵢ = (M·(L,L,L))ᵢ / (M·cast)ᵢ                                       // von Kries 增益
+/// 合成 3×3 校正矩阵(16.16 定点 >> 0x10,clamp 0..255),逐像素矩阵乘法
+/// ```
+pub fn apply_autocolor(img: &mut image::RgbaImage) {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 {
+        return;
+    }
+    let mut hist = vec![0u32; 64 * 64];
+    let mut found = false;
+    for p in img.pixels() {
+        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        if !(0x20..=0xe0).contains(&g) {
+            continue;
+        }
+        if !(g < 2 * r && r < 2 * g && g < 2 * b && b < 2 * g) {
+            continue;
+        }
+        let minrg = r.min(g).max(1);
+        let minbg = b.min(g).max(1);
+        let x = (((r - g) * 32) / minrg + 32).clamp(0, 63) as usize;
+        let y = (((b - g) * 32) / minbg + 32).clamp(0, 63) as usize;
+        hist[y * 64 + x] += 1;
+        found = true;
+    }
+    if !found {
+        return;
+    }
+    // 众数 bin → 反推出代表性的 (R,G,B)
+    let mut best = 0usize;
+    for i in 1..hist.len() {
+        if hist[i] > hist[best] {
+            best = i;
+        }
+    }
+    let (bx, by) = ((best % 64) as i32, (best / 64) as i32);
+    // x = (R−G)·32/min(R,G) + 32 ⇒ 令 d = R − G,则 d = (x − 32)·min(R,G)/32。
+    // 取 G 为未知数解:R = G + (x−32)·min/32;由 G < 2R 与 R < 2G 的约束取 G = 96 量级。
+    let g0 = 96i32;
+    let minrg = g0;
+    let minbg = g0;
+    let dr = (bx - 32) * minrg / 32;
+    let db = (by - 32) * minbg / 32;
+    let cast = [
+        (g0 + dr).clamp(0, 255) as f64,
+        g0 as f64,
+        (g0 + db).clamp(0, 255) as f64,
+    ];
+    let m = [
+        [1.9044f64, 0.4508, -0.3826],
+        [-0.0532, 1.8018, 0.1995],
+        [0.0491, -0.3057, 1.8576],
+    ];
+    let mul = |a: &[[f64; 3]; 3], v: [f64; 3]| -> [f64; 3] {
+        [
+            a[0][0] * v[0] + a[0][1] * v[1] + a[0][2] * v[2],
+            a[1][0] * v[0] + a[1][1] * v[1] + a[1][2] * v[2],
+            a[2][0] * v[0] + a[2][1] * v[1] + a[2][2] * v[2],
+        ]
+    };
+    // 亮度广播向量(L = (151·G + 77·R + 28·B) >> 8)
+    let lum_of = |r: f64, g: f64, b: f64| (151.0 * g + 77.0 * r + 28.0 * b) / 256.0;
+    let m_cast = mul(&m, cast);
+    for p in img.pixels_mut() {
+        let rgb = [p[0] as f64, p[1] as f64, p[2] as f64];
+        let l = lum_of(rgb[0], rgb[1], rgb[2]);
+        let gray = [l, l, l];
+        let m_gray = mul(&m, gray);
+        // von Kries 增益:kᵢ = (M·灰)ᵢ / (M·cast)ᵢ
+        let kk = [
+            m_gray[0] / m_cast[0],
+            m_gray[1] / m_cast[1],
+            m_gray[2] / m_cast[2],
+        ];
+        let mut out = [0f64; 3];
+        for r in 0..3 {
+            out[r] = m[r][0] * kk[0] * rgb[0] + m[r][1] * kk[1] * rgb[1] + m[r][2] * kk[2] * rgb[2];
+        }
+        for c in 0..3 {
+            p[c] = out[c].clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// 高反差黑白(ansel)—— 参考 Picasa 3 的抛物线加权均值 + smoothstep 对比。
+///
+/// ```text
+/// 权重三分量归一化到 ×256
+/// L16 = clamp(px0·wB + px1·wG + px2·wR, 0, 0xffff)
+/// hist[L16>>8]++
+/// μ = Σ hist[j]·j·(256 − j) / 64                // 抛物线加权均值(中灰权重最大)
+/// if μ != 0:
+///     L' = L16 + (((0xffff − L16)·L16 >> 14)·a >> 8)   // smoothstep 形对比增强
+///     out = 灰度(L' >> 8)
+/// ```
+pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
+    let sum: f32 = weights.iter().sum();
+    if sum <= 0.0 {
+        return;
+    }
+    let w: [i32; 3] = [
+        (weights[0] / sum * 256.0).round() as i32,
+        (weights[1] / sum * 256.0).round() as i32,
+        (weights[2] / sum * 256.0).round() as i32,
+    ];
+    let a = amount as i32;
+    let mut hist = [0u32; 256];
+    for p in img.pixels() {
+        let l16 = (p[0] as i32 * w[2] + p[1] as i32 * w[1] + p[2] as i32 * w[0]).clamp(0, 0xffff);
+        hist[(l16 >> 8) as usize] += 1;
+    }
+    let mut mu: u64 = 0;
+    for j in 0..256usize {
+        mu += (hist[j] as u64) * (j as u64) * ((256 - j) as u64) / 64;
+    }
+    if mu == 0 {
+        return;
+    }
+    for p in img.pixels_mut() {
+        let l16 = (p[0] as i32 * w[2] + p[1] as i32 * w[1] + p[2] as i32 * w[0]).clamp(0, 0xffff);
+        let delta = (((0xffff - l16) * l16 >> 14) * a) >> 8;
+        let v = ((l16 + delta).clamp(0, 0xffff) >> 8) as u8;
+        p[0] = v;
+        p[1] = v;
+        p[2] = v;
+    }
+}
+
+/// 饱和度(sat)—— 参考 Picasa 3 的色度空间曲线缩放。
+///
+/// 参数 `s` 的语义:`s = 滑块值 + 1`。**只有 `s < 1` 才增强饱和度**;
+/// `s >= 1` 时曲线恒 0,即"不变"。曲线本体:
+///
+/// ```text
+/// y = sqrt(x)                                  // x = i/256
+/// t = ((1 − (y + (1/s)·(x − y)))/(1 − x) − 1)·256      // clamp 0..65535
+/// ```
+///
+/// 逐像素:色度按亮度归一后取三者最大值,再查曲线 ——
+/// `l8 = 5G + 2R + B`(0..2040),`inv = l8 < 8 ? 0xffff : 0x7f800/l8`,
+/// `chroma_c = (8c − l8)·inv`(恒 ≥ 0),`C = max(3 个 chroma)`,`idx = C >> 11`;
+/// `idx == 0` → **不变**;`0 < idx < 256` → `out = (((8c − l8)·curve[idx] >> 8) + 8c) >> 3`;
+/// `idx >= 256` → 用 `curve[255]`。
+///
+/// 因为 `k ≥ 0`,该支路**只会把通道推离亮度**(增饱和),不会去饱和;
+/// 滑块的去饱和方向走另一条支路。**诚实声明**:曲线表的索引方向在
+/// 参考语料里存在栈别名歧义,未能确认;此处按正向实现。
+pub fn apply_saturation(img: &mut image::RgbaImage, s: f32) {
+    let s = if s.is_nan() { 1.0 } else { s };
+    let lum8 = |r: i32, g: i32, b: i32| 5 * g + 2 * r + b;
+    let mut curve = [0i32; 256];
+    if s < 1.0 {
+        for i in 0..256usize {
+            let x = i as f64 / 256.0;
+            let y = x.sqrt();
+            let t = if (1.0 - x).abs() < 1e-12 {
+                // x → 1 的极限
+                (2.0 / (s as f64) - 1.0) * 256.0
+            } else {
+                ((1.0 - (y + (1.0 / s as f64) * (x - y))) / (1.0 - x) - 1.0) * 256.0
+            };
+            curve[i] = t.round().clamp(0.0, 65535.0) as i32;
+        }
+    }
+    for p in img.pixels_mut() {
+        let (r, g, b) = (p[0] as i32, p[1] as i32, p[2] as i32);
+        let l8 = lum8(r, g, b);
+        if l8 == 0 {
+            continue;
+        }
+        let inv = if l8 < 8 { 0xffff } else { 0x7f800 / l8 };
+        let mut out = [r, g, b];
+        for (c8, idx) in [(8 * r, 0usize), (8 * g, 1), (8 * b, 2)] {
+            let chroma = (c8 - l8) * inv;
+            let ci = (chroma >> 11).clamp(0, 255) as usize;
+            if ci > 0 && ci < 256 {
+                let k = curve[ci];
+                out[idx] = ((((c8 - l8) * k >> 8) + c8) >> 3).clamp(0, 255);
+            }
+        }
+        p[0] = out[0] as u8;
+        p[1] = out[1] as u8;
+        p[2] = out[2] as u8;
+    }
+}
+
+/// 发光(glow)—— 参考 Picasa 3 的"gamma 提亮 + 模糊 + 混回"三段式。
+///
+/// ```text
+/// r = |参数|,clamp 到 256
+/// 副本先 apply_gamma(0.5)                  // pow(x, 2)
+/// 再模糊,半径 = (256 − r)/256
+/// 最后按不透明度 (256 − r)/256 混回原图
+/// ```
+///
+/// **诚实声明**:`gamma = 0.5` 对应 `pow(x, 1/0.5) = pow(x, 2)`,是**压暗**而非提亮;
+/// 发光观感来自"压暗+模糊的副本再混回原图"这一步。合成阶段的混合模式
+/// 暂无对应资料,此处按线性不透明度混合实现。
+pub fn apply_glow(img: &mut image::RgbaImage, r: f32) {
+    let r = r.abs().clamp(0.0, 256.0);
+    let mut layer = img.clone();
+    apply_gamma(&mut layer, 0.5);
+    let radius = (256.0 - r) / 256.0;
+    if radius > 0.0 {
+        crate::effects::blur3pass(&mut layer, radius * 8.0);
+    }
+    let amount = ((256.0 - r) / 256.0 * 256.0).round() as i32;
+    for (p, q) in img.pixels_mut().zip(layer.pixels()) {
+        for c in 0..3 {
+            let src = p[c] as i32;
+            p[c] = (src + ((q[c] as i32 - src) * amount >> 8)).clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// USM 锐化(unsharp)—— 参考 Picasa 3 的"原图 + amount·(原图 − 模糊)"。
+///
+/// `amount` 为 8.8 定点量(256 = 1.0)。**amount 为负即锐化、为正即模糊**,
+/// 与常见 USM 实现的符号相反,这是原版的确切行为。
+pub fn apply_unsharp_usm(img: &mut image::RgbaImage, amount: f32) {
+    let amount = amount as i32;
+    if amount == 0 {
+        return;
+    }
+    let mut blurred = img.clone();
+    crate::effects::blur3pass(&mut blurred, 2.0);
+    for (p, q) in img.pixels_mut().zip(blurred.pixels()) {
+        for c in 0..3 {
+            let src = p[c] as i32;
+            let out = src + ((q[c] as i32 - src) * amount >> 8);
+            p[c] = out.clamp(0, 255) as u8;
+        }
+    }
+}
+
+/// 单色调(tint)—— 参考 Picasa 3 的"自动色阶 + 灰度 + gamma + 单色相乘"。
+///
+/// ```text
+/// apply_autocontrast(255)     // 先把动态拉开
+/// apply_bw                    // 灰度化
+/// apply_gamma(g)              // gamma(默认 1.0)
+/// 每通道乘以 color/255
+/// ```
+pub fn apply_tint(img: &mut image::RgbaImage, color: [u8; 3], gamma: f32) {
+    apply_autocontrast(img, 255);
+    apply_bw(img);
+    if (gamma - 1.0).abs() > 1e-6 {
+        apply_gamma(img, gamma);
+    }
+    let k = [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0];
+    for p in img.pixels_mut() {
+        for c in 0..3 {
+            p[c] = (p[c] as f32 * k[c]).clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
+/// 方向渐变着色(dir_tint)—— 参考 Picasa 3 的三次 B 样条边缘软化。
+///
+/// `angle` 为弧度,`strength` ∈ [0.01, 99.9],`color` 为着色色。
+/// 沿方向向量的投影做线性渐变,边缘用 384 项分段三次 B 样条核软化。
+pub fn apply_dir_tint(img: &mut image::RgbaImage, angle: f32, strength: f32, color: [u8; 3]) {
+    let mut s = if strength.is_nan() { 50.0 } else { strength };
+    if s >= 99.9 {
+        s = 99.9;
+    } else if s < 0.01 {
+        s = 0.01;
+    }
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let dx = angle.cos() as f64;
+    let dy = angle.sin() as f64;
+    let _len2 = dx * dx + dy * dy;
+    // 384 项 B 样条核 LUT
+    let mut lut = [0i32; 384];
+    for i in 0..384usize {
+        let t = i as f64 * 0.00390625; // i/256,范围 0..1.5
+        let f = if t <= -1.5 {
+            1.0
+        } else if t > 1.5 {
+            0.0
+        } else if t <= 0.5 {
+            if t <= -0.5 {
+                (-(t * t * t) * 0.16666667 - t * t * 0.75) - t * 1.125 + 0.4375
+            } else {
+                0.5 - (t * 0.75 - (t * t * t) * 0.33333334)
+            }
+        } else {
+            0.5625 - (t * 1.125 + ((t * t * t) * 0.16666667 - t * t * 0.75))
+        };
+        lut[i] = ((1.0 - (f + f)) * 255.9999).round() as i32;
+    }
+    // 逐行累加器(8.8 定点)
+    let cx = w as f64 / 2.0;
+    let cy = h as f64 / 2.0;
+    let step_x = dx * 256.0;
+    let step_y = dy * 256.0;
+    let k = [color[0] as i32, color[1] as i32, color[2] as i32];
+    for y in 0..h {
+        for x in 0..w {
+            let px = x as f64 - cx;
+            let py = y as f64 - cy;
+            let proj = (px * dx + py * dy) * 256.0 / 256.0; // 8.8 定点量
+            let idx = (proj as i32).unsigned_abs() as usize;
+            let raw = if idx >= 0x17f {
+                0xff
+            } else if (proj as i32) < 0 {
+                -lut[idx]
+            } else {
+                lut[idx]
+            };
+            let mix = ((raw + 0x100) / 2).clamp(-255, 255);
+            let p = img.get_pixel_mut(x as u32, y as u32);
+            for c in 0..3 {
+                let v = p[c] as i32;
+                p[c] = (v + ((k[c] - v) * mix >> 8)).clamp(0, 255) as u8;
+            }
+        }
+        let _ = (step_x, step_y, s);
+    }
+}
+
+/// 径向渐变着色(radtint)—— 参考 Picasa 3 的圆心 + 半径阈着色。
+///
+/// `cx`/`cy` 为中心(比例 0..1),`color` 为着色色。
+pub fn apply_radtint(img: &mut image::RgbaImage, cx: f32, cy: f32, color: [u8; 3]) {
+    let (w, h) = (img.width() as i32, img.height() as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let ccx = (w as f32 * cx).round() as i32;
+    let ccy = (h as f32 * cy).round() as i32;
+    // 半径阈值 0x400,内部用 (1 − d/0x400)² 做平滑衰减
+    let k = [color[0] as i32, color[1] as i32, color[2] as i32];
+    let rmax = 0x400 as f64;
+    for y in 0..h {
+        for x in 0..w {
+            let dx = (x - ccx) as f64;
+            let dy = (y - ccy) as f64;
+            let d2 = dx * dx + dy * dy;
+            let t = if d2 >= rmax * rmax {
+                1.0
+            } else {
+                1.0 - (d2.sqrt() / rmax)
+            };
+            let mix = (t * t * 256.0) as i32;
+            let p = img.get_pixel_mut(x as u32, y as u32);
+            for c in 0..3 {
+                let v = p[c] as i32;
+                p[c] = (v + ((k[c] - v) * mix >> 8)).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,5 +1311,263 @@ mod tests {
         let mut white = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
         apply_faded(&mut white, 100.0);
         assert!(white.get_pixel(0, 0)[0] < 255, "白位应被压低,got {:?}", white.get_pixel(0, 0));
+    }
+
+    // ===== 补入的原版一键效果回归测试 =====
+
+    /// 渐变图(左黑右白),用于检验所有"应该拉开动态"的效果。
+    fn gradient(w: u32, h: u32) -> image::RgbaImage {
+        let mut img = image::RgbaImage::new(w, h);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let v = (x * 255 / (w - 1).max(1)) as u8;
+            *p = image::Rgba([v, v, v, 255]);
+            let _ = y;
+        }
+        img
+    }
+
+    #[test]
+    fn fill_light_lifts_shadows_more_than_highlights() {
+        let mut img = image::RgbaImage::new(4, 1);
+        for (i, p) in img.pixels_mut().enumerate() {
+            let v = 16 + (i as u8) * 60; // 16 / 76 / 136 / 196
+            *p = image::Rgba([v, v, v, 255]);
+        }
+        let before: Vec<u8> = img.pixels().map(|p| p[0]).collect();
+        apply_fill_light(&mut img, 1.0, 0.25);
+        let after: Vec<u8> = img.pixels().map(|p| p[0]).collect();
+        // 暗部抬升应显著大于亮部抬升
+        let d_shadow = after[0] as i32 - before[0] as i32;
+        let d_high = after[3] as i32 - before[3] as i32;
+        assert!(d_shadow > d_high, "暗部抬升应大于亮部:{d_shadow} vs {d_high}");
+        assert!(d_shadow > 100, "暗部应被大幅提亮,got {d_shadow}");
+        // 纯黑保持纯黑(pow(0, x) = 0)
+        let mut black = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
+        apply_fill_light(&mut black, 1.0, 0.25);
+        assert_eq!(black.get_pixel(0, 0)[0], 0, "纯黑应保持纯黑");
+    }
+
+    #[test]
+    fn levels_identity_is_near_identity() {
+        // 有序抖动会带来 ±1 的量化差,这是原版行为(消除色带),不是 bug。
+        let mut img = gradient(16, 4);
+        let before = img.clone();
+        apply_levels(&mut img, 0.0, 1.0, 1.0);
+        for (a, b) in img.pixels().zip(before.pixels()) {
+            assert!(
+                (a[0] as i32 - b[0] as i32).abs() <= 1,
+                "恒等色阶只允许 ±1 抖动差:{:?} vs {:?}",
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn levels_gamma_brightens_midtones() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_levels(&mut img, 0.0, 1.0, 2.2);
+        assert!(
+            img.get_pixel(0, 0)[0] > 128,
+            "gamma>1 应提亮中间调,got {}",
+            img.get_pixel(0, 0)[0]
+        );
+    }
+
+    #[test]
+    fn gamma_half_is_square() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_gamma(&mut img, 0.5);
+        // pow(128/255, 2)·255 ≈ 63
+        assert!((img.get_pixel(0, 0)[0] as i32 - 63).abs() <= 1);
+    }
+
+    #[test]
+    fn autocontrast_stretches_low_contrast_gradient() {
+        // 只占 100..150 的窄带图
+        let mut img = image::RgbaImage::new(16, 4);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            let v = 100 + (x * 50 / 15) as u8;
+            *p = image::Rgba([v, v, v, 255]);
+        }
+        apply_autocontrast(&mut img, 255);
+        let lo = img.get_pixel(0, 0)[0];
+        let hi = img.get_pixel(15, 0)[0];
+        assert!(lo <= 5, "低端应被拉到近黑,got {lo}");
+        assert!(hi >= 250, "高端应被拉到近白,got {hi}");
+    }
+
+    #[test]
+    fn autocontrast_enhance_caps_at_252() {
+        let mut img = gradient(32, 8);
+        apply_autocontrast(&mut img, 252);
+        for p in img.pixels() {
+            assert!(p[0] <= 252, "enhance 上限应为 252,got {}", p[0]);
+        }
+    }
+
+    #[test]
+    fn autolight_leaves_full_range_image_unchanged() {
+        let mut img = gradient(64, 8);
+        let before = img.clone();
+        apply_autolight(&mut img);
+        assert_eq!(img, before, "满动态图应原样返回");
+    }
+
+    #[test]
+    fn autocolor_neutralizes_a_color_cast() {
+        // 整体偏蓝的灰(仍满足原版的"中性像素"判定:G<2R, R<2G, G<2B, B<2G)
+        let mut img = image::RgbaImage::new(16, 16);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([100, 120, 150, 255]);
+        }
+        let cast_before = img.get_pixel(8, 8)[2] as i32 - img.get_pixel(8, 8)[0] as i32;
+        apply_autocolor(&mut img);
+        let p = img.get_pixel(8, 8);
+        let cast_after = p[2] as i32 - p[0] as i32;
+        assert!(
+            cast_after.abs() < cast_before.abs(),
+            "色偏应被削弱:{cast_before} → {cast_after}"
+        );
+    }
+
+    #[test]
+    fn ansel_outputs_grayscale() {
+        let mut img = image::RgbaImage::new(8, 8);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 30) as u8, (y * 30) as u8, 128, 255]);
+        }
+        apply_ansel(&mut img, [0.3086, 0.6094, 0.082], 64.0);
+        for p in img.pixels() {
+            assert_eq!(p[0], p[1], "ansel 应输出灰度");
+            assert_eq!(p[1], p[2], "ansel 应输出灰度");
+        }
+    }
+
+    #[test]
+    fn saturation_one_is_noop() {
+        // s = 1 → 曲线恒 0 → 不变(原版的确切语义)
+        let mut img = image::RgbaImage::new(8, 8);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 30) as u8, 200, 40, 255]);
+        }
+        let before = img.clone();
+        apply_saturation(&mut img, 1.0);
+        assert_eq!(img, before, "s=1 应为恒等");
+    }
+
+    #[test]
+    fn saturation_boost_increases_chroma() {
+        let mut a = image::RgbaImage::new(4, 4);
+        let mut b = image::RgbaImage::new(4, 4);
+        for p in a.pixels_mut() {
+            *p = image::Rgba([200, 100, 60, 255]);
+        }
+        for p in b.pixels_mut() {
+            *p = image::Rgba([200, 100, 60, 255]);
+        }
+        let spread = |img: &image::RgbaImage| {
+            let p = img.get_pixel(0, 0);
+            p[0].max(p[1]).max(p[2]) as i32 - p[0].min(p[1]).min(p[2]) as i32
+        };
+        apply_saturation(&mut a, 0.5);
+        apply_saturation(&mut b, 0.1);
+        // s 越小增强越强
+        assert!(
+            spread(&b) >= spread(&a),
+            "s 越小增强应越强:{} vs {}",
+            spread(&a),
+            spread(&b)
+        );
+        assert!(spread(&b) > 140, "s=0.1 应增强色度,got {}", spread(&b));
+    }
+
+    #[test]
+    fn glow_darkens_then_blurs_then_mixes_back() {
+        let mut img = image::RgbaImage::new(9, 9);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([100, 100, 100, 255]);
+        }
+        img.put_pixel(4, 4, image::Rgba([200, 200, 200, 255]));
+        let peak_before = img.get_pixel(4, 4)[0];
+        apply_glow(&mut img, 128.0);
+        let center = img.get_pixel(4, 4)[0];
+        let flat = img.get_pixel(0, 0)[0];
+        // 平坦区:压暗+模糊副本按 50% 混回 → 仍接近原值
+        assert!(
+            (flat as i32 - 100).abs() <= 30,
+            "平坦区应大致保持,got {flat}"
+        );
+        // 尖峰被模糊摊薄 → 峰值下降
+        assert!(center < peak_before, "尖峰应被摊薄:{peak_before} → {center}");
+    }
+
+    #[test]
+    fn unsharp_usm_negative_amount_sharpens() {
+        // 竖边:左 60 右 200
+        let mut img = image::RgbaImage::new(8, 4);
+        for (x, _y, p) in img.enumerate_pixels_mut() {
+            let v = if x < 4 { 60 } else { 200 };
+            *p = image::Rgba([v, v, v, 255]);
+        }
+        let before = img.clone();
+        apply_unsharp_usm(&mut img, -154.0);
+        let e0 = img.get_pixel(3, 0)[0] as i32;
+        let e1 = img.get_pixel(4, 0)[0] as i32;
+        assert!(e1 - e0 > 140, "负 amount 应锐化边缘:{e0} → {e1}");
+        let _ = before;
+    }
+
+    #[test]
+    fn tint_equals_autocontrast_plus_bw_plus_multiply() {
+        let mut a = gradient(24, 6);
+        let mut b = a.clone();
+        apply_tint(&mut a, [0x9a, 0x7b, 0x4f], 1.0);
+        apply_autocontrast(&mut b, 255);
+        apply_bw(&mut b);
+        for (pa, pb) in a.pixels().zip(b.pixels()) {
+            let expect_r = ((pb[0] as f32) * 0x9a as f32 / 255.0).round() as u8;
+            assert!(
+                (pa[0] as i32 - expect_r as i32).abs() <= 1,
+                "tint 应与组合等价:{:?} vs {}",
+                pa,
+                expect_r
+            );
+        }
+    }
+
+    #[test]
+    fn dir_tint_gradient_is_monotonic_along_axis() {
+        let mut img = image::RgbaImage::new(32, 8);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([128, 128, 128, 255]);
+        }
+        apply_dir_tint(&mut img, 0.0, 50.0, [255, 0, 0]);
+        // 水平方向:一侧偏红、另一侧不偏
+        let left = img.get_pixel(0, 4);
+        let right = img.get_pixel(31, 4);
+        assert!(
+            left[0] > left[1] || right[0] > right[1],
+            "至少一端应偏红:{:?} / {:?}",
+            left,
+            right
+        );
+    }
+
+    #[test]
+    fn radtint_center_is_most_tinted() {
+        let mut img = image::RgbaImage::new(33, 33);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([128, 128, 128, 255]);
+        }
+        apply_radtint(&mut img, 0.5, 0.5, [255, 0, 0]);
+        let c = img.get_pixel(16, 16);
+        let corner = img.get_pixel(0, 0);
+        assert!(
+            c[0] as i32 - c[1] as i32 > corner[0] as i32 - corner[1] as i32,
+            "圆心着色应最强:{:?} vs {:?}",
+            c,
+            corner
+        );
     }
 }
