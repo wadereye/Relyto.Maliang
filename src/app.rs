@@ -164,6 +164,10 @@ pub struct App {
     fx_sharpen_amount: f32,
     /// 自主设计调色(暖调/冷调/暗角/褪色)的共通强度(0~100)。
     fx_tone_amount: f32,
+    /// 风格配方草稿(见 `crate::recipes` 的名字表)。
+    fx_recipe: Option<String>,
+    /// 风格配方强度(0~100)。
+    fx_recipe_amount: f32,
     /// 视频裁剪草稿:起点(秒)。
     fx_trim_start: f64,
     /// 视频裁剪草稿:终点(秒)。
@@ -515,6 +519,8 @@ impl App {
             fx_grain_amount: 0.15,
             fx_sharpen_amount: 60.0,
             fx_tone_amount: 50.0,
+            fx_recipe: None,
+            fx_recipe_amount: 100.0,
             fx_trim_start: 0.0,
             fx_trim_end: 0.0,
             fx_trim_total: 0.0,
@@ -1785,6 +1791,57 @@ impl App {
                     self.fx_remove_effect(id, "一键效果", n);
                 }
                 self.fx_oneclick = None;
+            }
+        });
+
+        // ===== 风格配方:一个名字对应一串固定顺序的操作 =====
+        ui.separator();
+        ui.label("风格配方(整组效果,强度控制与原图的混合比例)");
+        ui.horizontal_wrapped(|ui| {
+            for key in crate::recipes::RECIPES {
+                let on = self.fx_recipe.as_deref() == Some(*key);
+                if ui.selectable_label(on, crate::recipes::label(key)).clicked() {
+                    if on {
+                        self.fx_recipe = None;
+                    } else {
+                        self.fx_recipe = Some((*key).to_string());
+                        self.fx_recipe_amount = crate::recipes::default_amount(key);
+                    }
+                    self.fx_applied_sig = None;
+                }
+            }
+        });
+        if self.fx_recipe.is_some() {
+            let text = format!(
+                "{} 强度",
+                crate::recipes::label(self.fx_recipe.as_deref().unwrap_or(""))
+            );
+            if ui
+                .add(egui::Slider::new(&mut self.fx_recipe_amount, 0.0..=100.0).text(text))
+                .changed()
+            {
+                self.fx_applied_sig = None;
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("应用风格配方").clicked() {
+                let Some(name) = self.fx_recipe.clone() else {
+                    self.fx_msg = "先选一个风格配方".into();
+                    return;
+                };
+                let mut params = std::collections::BTreeMap::new();
+                params.insert("amount".into(), format!("{:.4}", self.fx_recipe_amount));
+                self.fx_commit_effect(
+                    id,
+                    "风格配方",
+                    crate::effects::Effect::oneclick(&name, params),
+                );
+            }
+            if ui.button("移除风格配方").clicked() {
+                for n in crate::recipes::RECIPES {
+                    self.fx_remove_effect(id, "风格配方", n);
+                }
+                self.fx_recipe = None;
             }
         });
     }

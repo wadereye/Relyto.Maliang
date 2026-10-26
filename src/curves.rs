@@ -302,13 +302,16 @@ pub fn exposure_points(stops: f32) -> Vec<Point> {
 
 /// 把 LUT 应用到图像(逐像素查表)。
 ///
-/// 查找表由 apply 时现算,像素按码值查表。
+/// 查找表按**通道分别**建:`lut[i] = (R'(i), G'(i), B'(i))`,
+/// 其中 `R'(i)` 是红色通道输入 `i` 时的输出。因此查表时
+/// **每个通道用自己的码值索引**,只取自己那一列 ——
+/// 不能三通道共用同一个索引,否则纯主曲线的预设会把彩色图整成灰度。
 pub fn apply_lut(img: &mut image::RgbaImage, lut: &[[u8; 3]; 256]) {
     for p in img.pixels_mut() {
-        let c = lut[p[0] as usize];
-        p[0] = c[0];
-        p[1] = c[1];
-        p[2] = c[2];
+        let (r, g, b) = (p[0] as usize, p[1] as usize, p[2] as usize);
+        p[0] = lut[r][0];
+        p[1] = lut[g][1];
+        p[2] = lut[b][2];
     }
 }
 
@@ -552,7 +555,18 @@ mod tests {
         apply_lut(&mut img, &lut);
         let p = img.get_pixel(0, 0);
         assert_eq!(p[0], 245, "10 反相 → 245");
+        assert_eq!(p[1], 235, "20 反相 → 235");
+        assert_eq!(p[2], 225, "30 反相 → 225");
         assert_eq!(p[3], 128, "alpha 不应被改");
+    }
+
+    #[test]
+    fn master_only_curve_keeps_saturation() {
+        // 只有主曲线的预设只是逐通道重映射,不应把彩色图变灰
+        let mut img = image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 120, 40, 255]));
+        apply_curves(&mut img, &presets::soft_glow(50.0));
+        let p = img.get_pixel(0, 0);
+        assert!(p[0] > p[1] && p[1] > p[2], "色彩层次被抹平:{:?}", [p[0], p[1], p[2]]);
     }
 
     #[test]
