@@ -1529,7 +1529,8 @@ mod tests {
 /// 手动生成观感样张:设置 `MALIANG_SRC`(源图)与 `MALIANG_OUT`(输出目录)
 /// 后执行 `cargo test --offline -- --ignored dump_recipe_samples`。
 ///
-/// 只用于人工比对配方观感,不参与常规测试。
+/// 逐个配方写出单图,并拼一张总览图 `_sheet.png`(便于一次性比对)。
+/// 只用于人工比对观感,不参与常规测试。
 #[cfg(test)]
 #[test]
 #[ignore = "手动生成样张"]
@@ -1541,10 +1542,25 @@ fn dump_recipe_samples() {
     let base = image::open(&src).expect("源图打开失败");
     let base = base.thumbnail(480, 480).to_rgba8();
     std::fs::create_dir_all(&out).ok();
-    for name in RECIPES {
+    base.save(format!("{out}/_source.png")).ok();
+
+    // 先逐配方出单图,再按 6 列拼总览
+    const CELL: u32 = 170;
+    const COLS: u32 = 6;
+    let rows = (RECIPES.len() as u32).div_ceil(COLS);
+    let mut sheet =
+        RgbaImage::from_pixel(COLS * CELL, rows * CELL, Rgba([24, 20, 16, 255]));
+    for (i, name) in RECIPES.iter().enumerate() {
         let mut img = base.clone();
         apply(&mut img, name, 100.0);
         img.save(format!("{out}/{name}.png")).ok();
+        // 等比缩进格子,居中摆放
+        let t = image::imageops::thumbnail(&img, CELL - 8, CELL - 8);
+        let ox = (i as u32 % COLS) * CELL + (CELL - t.width()) / 2;
+        let oy = (i as u32 / COLS) * CELL + (CELL - t.height()) / 2;
+        for (x, y, p) in t.enumerate_pixels() {
+            sheet.put_pixel(ox + x, oy + y, *p);
+        }
     }
-    base.save(format!("{out}/_source.png")).ok();
+    sheet.save(format!("{out}/_sheet.png")).ok();
 }
