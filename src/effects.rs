@@ -249,6 +249,13 @@ impl Effect {
                 | "rainbow"
                 | "ansel"
                 | "movie"
+                | "gamma"
+                | "linblur"
+                | "radblur"
+                | "radsat"
+                | "dir_brite"
+                | "dir_sat"
+                | "dir_sharp"
         )
     }
 }
@@ -824,9 +831,71 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let c = parse_color(e.params.get("color")).unwrap_or([0xff, 0xc0, 0x80]);
             crate::oneclick::apply_radtint(img, 0.5, 0.5, c);
         }
-        // rainbow 的渐变段数据未逐段展开,暂按 tint 的骨架(自动色阶 + 灰度)落地。
+        // 伽马校正:参考的 Level 滑杆量程 2.0、偏移 1.0,
+        // 即实际指数 = 1 + 滑块值;这里把 amount 映射到 1 + 0.9 的最大偏移。
+        "gamma" => {
+            let v = oneclick_amount(e, 0.0) / 100.0;
+            crate::oneclick::apply_gamma(img, 1.0 + v * 0.9);
+        }
+        // 线性模糊:方向由 `angle` 给出,跨度随强度增长。
+        "linblur" => {
+            let a = e
+                .params
+                .get("angle")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            let v = oneclick_amount(e, 40.0);
+            let long = img.width().max(img.height()) as f32;
+            crate::recipes::linear_blur(img, a, v / 100.0 * long * 0.06);
+        }
+        // 焦点柔化:圆心保持清晰,越靠边越糊。
+        "radblur" => {
+            let v = oneclick_amount(e, 50.0) / 100.0;
+            crate::recipes::soft_focus(img, 0.5, 0.5, 0.30, 0.75, v);
+        }
+        // 焦点去色:圆心保留色彩,外围转灰度。
+        "radsat" => {
+            let v = oneclick_amount(e, 50.0) / 100.0;
+            // 强度越大,保留色彩的圆越小、过渡越缓
+            let inner = 0.45 - 0.25 * v;
+            let outer = inner + 0.10 + 0.25 * (1.0 - v);
+            crate::recipes::focal_bw(img, 0.5, 0.5, inner, outer);
+        }
+        // 三个方向性调整:左→右 / 上→下两轴线性渐变。
+        "dir_brite" | "dir_sat" | "dir_sharp" => {
+            let kind = match e.name.to_ascii_lowercase().as_str() {
+                "dir_sat" => crate::recipes::DirKind::Saturation,
+                "dir_sharp" => crate::recipes::DirKind::Sharpen,
+                _ => crate::recipes::DirKind::Brightness,
+            };
+            let lr = e
+                .params
+                .get("lr")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.6);
+            let tb = e
+                .params
+                .get("tb")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0);
+            let v = oneclick_amount(e, 50.0) / 100.0;
+            crate::recipes::directional_adjust(img, lr, tb, v, kind);
+        }
+        // 彩虹:先去饱和,再按亮度走完整一圈色相。
+        //
+        // 参考的滑杆量程 256、缺省 0,语义是色相起点(0~255 对应 0°~360°),
+        // 这里把 amount 映射到同一起点偏移。
         "rainbow" => {
-            crate::oneclick::apply_tint(img, [0xff, 0x80, 0x80], 1.0);
+            crate::effects::apply_color_matrix(img, 0.0, 0.0, -100.0);
+            let off = oneclick_amount(e, 0.0) / 100.0 * 255.0;
+            // 拆成 6 段、每段 60°,这样相邻站点之间走最短弧不会绕回去
+            let mut stops = Vec::with_capacity(7);
+            for i in 0..7 {
+                let pos = i as f32 * 255.0 / 6.0;
+                let h = (off + i as f32 * 60.0) % 360.0;
+                stops.push((pos, (h, 100.0, 100.0)));
+            }
+            crate::recipes::hsv_gradient_map(img, &stops, 0.0);
         }
         // 视频裁剪是**时间过滤**语义(播放/导出只取一段),不碰像素 —— 此处只做区间归一。
         // 参数 start/end 是 16 进制 100ns 计数;反序区间在此理顺(与 MovieTrim::clamped_to 一致)。
