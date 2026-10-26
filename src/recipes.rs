@@ -29,7 +29,7 @@
 //!
 //! 全模块按 **RGBA8** 处理,混合模式在 `0..=255` 域上定义(见 [`Blend`])。
 
-use image::{imageops::FilterType, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 
 // ---------------------------------------------------------------------------
 // 混合
@@ -550,30 +550,46 @@ pub fn edge_detect_b(img: &mut RgbaImage, detail: f32) {
     }
 }
 
-/// 径向模糊(变焦模糊):以 (`cx`,`cy`) 为中心按等比缩放采样并平均。
+/// 径向模糊(变焦模糊):以 (`cx`,`cy`) 为中心把画面按递增倍率叠若干层再取均值。
 ///
 /// ```text
-/// N    = min(30, amount + 5)               // 采样层数
-/// s_k  = 1 + k·(1/N − 1)                   // 第 k 层相对原图的缩放
-/// out  = mean( orig(c + (p − c)·s_k) )
+/// N       = min(30, amount + 5)                  // 叠加层数
+/// step    = floor(W · amount / 200)              // 最外层的放大像素数
+/// d_k     = step · k / N            (k = 1..N)   // 第 k 层在宽、高上各外扩 d_k 像素
+/// x_scale = 1 / (1 + d_k / W)
+/// y_scale = 1 / (1 + d_k / H)
+/// out     = mean( orig(c + (p − c) · (x_scale, y_scale)) )
 /// ```
 ///
-/// `amount` 越大层数越多、最外圈缩得越小,拖影越长。
+/// 三处容易写错的细节:
+///
+/// - 外扩量是**宽、高各加 d 像素**,不是等比缩放。倍率分别是 `(W+d)/W`
+///   与 `(H+d)/H`,所以非正方形画面会有轻微各向异性。
+/// - 层从 `d = step/N` 起,**没有 d = 0 的清晰底图**,因此任何强度下中心也会被带动。
+/// - 每层权重相同(等权平均),没有按层衰减。
 pub fn radial_blur(img: &mut RgbaImage, cx: f32, cy: f32, amount: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return;
     }
-    let n = ((amount.max(0.0) as i32) + 5).min(30).max(2);
+    let amount = amount.clamp(0.0, 100.0);
+    let n = (((amount as i32) + 5).clamp(2, 30)) as usize;
+    // 最外层外扩像素数按宽度算,取整后再分层。
+    let step = (w as f32 * amount / 200.0).floor();
+    if step < 1.0 {
+        return;
+    }
     let src = img.clone();
     let (iw, ih) = (w as i32, h as i32);
     for y in 0..ih {
         for x in 0..iw {
             let mut acc = [0f32; 3];
-            for k in 0..n {
-                let s = 1.0 + (k as f32) * (1.0 / n as f32 - 1.0);
-                let sx = (cx + ((x as f32 + 0.5) - cx) * s).round() as i32;
-                let sy = (cy + ((y as f32 + 0.5) - cy) * s).round() as i32;
+            for k in 1..=n {
+                let d = step * k as f32 / n as f32;
+                let xs = 1.0 / (1.0 + d / w as f32);
+                let ys = 1.0 / (1.0 + d / h as f32);
+                let sx = (cx + ((x as f32 + 0.5) - cx) * xs).round() as i32;
+                let sy = (cy + ((y as f32 + 0.5) - cy) * ys).round() as i32;
                 let p = src.get_pixel(
                     sx.clamp(0, iw - 1) as u32,
                     sy.clamp(0, ih - 1) as u32,
@@ -754,19 +770,25 @@ pub fn focal_bw(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32) {
     composite_masked(img, &gray, &m, Blend::Normal, 1.0);
 }
 
-/// 方块化:先按 `block` 降采样再按最近邻放大回原尺寸。
+/// 方块化:先缩到 `1/block`,再按**最近邻**放大回原尺寸。
 ///
-/// 降采样用三角滤波(取块内均值),放大用最近邻(保持硬块边界)——
-/// 两步合起来等价于"每块一个颜色"。
+/// 缩小时走双线性(参考配方里的 `ResizeImageOperation` 默认开平滑),
+/// 放大时显式关平滑 —— 只有关掉才得到硬块边界。两步合起来,
+/// 每块的颜色取的是**块中心那个采样点**,不是块内均值。
+
 pub fn pixelate(img: &mut RgbaImage, block: f32) {
-    let b = block.round().max(2.0) as u32;
     let (w, h) = img.dimensions();
-    if w <= b || h <= b {
+    if w < 2 || h < 2 {
         return;
     }
-    let (sw, sh) = (w / b, h / b);
-    let small = image::imageops::resize(img, sw.max(1), sh.max(1), FilterType::Triangle);
-    *img = image::imageops::resize(&small, w, h, FilterType::Nearest);
+    let b = block.round().max(2.0);
+    let sw = ((w as f32 / b).round() as u32).max(1);
+    let sh = ((h as f32 / b).round() as u32).max(1);
+    if sw >= w && sh >= h {
+        return;
+    }
+    let small = resize(img, sw, sh);
+    *img = resize_nearest(&small, w, h);
 }
 
 /// 调色板量化(色阶压缩)。
@@ -1020,6 +1042,15 @@ pub fn round_corners(img: &mut RgbaImage, radius: f32, fill: [u8; 3]) {
 ///
 /// `distance` / `blur` 与边框厚度同口径(1024 宽参考像素),
 /// `angle` 为投影方向(度,0 = 向右,90 = 向下)。
+///
+/// # 剪影从哪来
+///
+/// 参考实现的投影参数只有「阴影色 / 背景色 / 不透明度 / 距离 / 角度 /
+/// 横向与纵向模糊半径 / 强度 / 质量档」,**没有任何"用哪个通道做遮罩"的开关**。
+/// 也就是说剪影固定取**画面的不透明区域**(对本项目这种整幅不透明的照片
+/// 就是整块画布矩形),不取亮度、也不取绿通道。所以纯黑照片与纯白照片
+/// 打出来的阴影形状必须完全一样 —— 这是下面 `drop_shadow_shape_ignores_color`
+/// 那条测试要守的约束。
 #[allow(clippy::too_many_arguments)]
 pub fn drop_shadow(
     img: &RgbaImage,
@@ -1147,7 +1178,38 @@ pub fn crop_center(img: &RgbaImage, cw: u32, ch: u32) -> RgbaImage {
     image::imageops::crop_imm(img, x0, y0, cw, ch).to_image()
 }
 
-/// 双线性缩放到指定尺寸(仅用于配方内部小幅调整,不做高质量降采样)。
+/// 最近邻缩放,取样口径与 [`resize`] 一致(`(dst + 0.5)·scale − 0.5`)。
+///
+/// 不用 `image::imageops::resize` 的最近邻:它按 `dst · src/dst` 直接取整,
+/// 与大图比例不整除时块宽会一顿一顿地跳。按像素中心对齐才能得到等宽块。
+pub fn resize_nearest(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let nw = nw.max(1);
+    let nh = nh.max(1);
+    if w == 0 || h == 0 {
+        return RgbaImage::new(nw, nh);
+    }
+    let sx = w as f32 / nw as f32;
+    let sy = h as f32 / nh as f32;
+    RgbaImage::from_fn(nw, nh, |x, y| {
+        let fx = ((x as f32 + 0.5) * sx - 0.5).round();
+        let fy = ((y as f32 + 0.5) * sy - 0.5).round();
+        let ix = (fx.max(0.0) as u32).min(w - 1);
+        let iy = (fy.max(0.0) as u32).min(h - 1);
+        *img.get_pixel(ix, iy)
+    })
+}
+
+/// 双线性缩放到指定尺寸。
+///
+/// 几何是**像素中心对齐**:目标像素 `x` 对应源坐标 `(x + 0.5)·W/nw − 0.5`,
+/// 两个方向各自有独立的比例,不做等比钳制。这与参考实现的取样点完全一致
+/// (`src = (dst + 0.5) · scale + t`,`t` 使像素中心落在源像素中心)。
+///
+/// 参考实现里缩放有两条路:默认开平滑时走 2×2 双线性(8 位定点分数,
+/// `a + ((b − a)·f >> 8)`);显式关平滑(`smoothing="false"`)时退化成
+/// **最近邻**——方块化的放大那一步就是这么关掉的。这里只提供双线性版本,
+/// 需要最近邻时用 [`resize_nearest`](取样口径与这里一致)。
 pub fn resize(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     let nw = nw.max(1);
@@ -2090,5 +2152,154 @@ mod focus_op_tests {
         let k0 = before.get_pixel(2, 2)[0] as i32;
         let k1 = img.get_pixel(2, 2)[0] as i32;
         assert!((k0 - k1).abs() > 30, "角落未被柔化: {k0} → {k1}");
+    }
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::*;
+
+    /// 径向模糊:放大层从 step/N 起、到 step 为止,层数 min(30, amount+5)。
+    ///
+    /// 用中心外的一个亮点看拖影:强度越大,亮点被拉成的径向拖尾越长;
+    /// 同时因为取样点是**最近邻**,拖尾上的像素值不会凭空变亮或翻转。
+    #[test]
+    fn radial_blur_streak_grows_with_amount() {
+        let mut base = RgbaImage::from_pixel(64, 24, Rgba([0, 0, 0, 255]));
+        base.put_pixel(40, 12, Rgba([255, 255, 255, 255]));
+
+        // 亮点被等权平均摊到 N 层上,单个像素的亮度只有 ~255/N;
+        // 所以按"有没有贡献"来数,而不是按亮不亮。
+        let lit = |im: &RgbaImage| -> Vec<u32> {
+            (0..64u32)
+                .filter(|&x| im.get_pixel(x, 12)[0] > 0)
+                .collect()
+        };
+
+        let mut weak = base.clone();
+        radial_blur(&mut weak, 32.0, 12.0, 20.0);
+        let mut strong = base.clone();
+        radial_blur(&mut strong, 32.0, 12.0, 80.0);
+
+        let (lw, ls) = (lit(&weak), lit(&strong));
+        assert!(
+            ls.len() > lw.len(),
+            "强度更大应拉出更长的拖尾: weak={lw:?} strong={ls:?}"
+        );
+        // 叠加层是被**放大**后铺回画布的,所以拖尾朝远离中心的方向延伸
+        assert!(
+            *ls.last().unwrap() > *lw.last().unwrap(),
+            "强度更大时拖尾应向外延伸得更远: weak={lw:?} strong={ls:?}"
+        );
+        // 拖尾只能落在中心与该像素之间 —— 出现中心另一侧的亮点就是缩放方向写反了
+        for x in 0..32u32 {
+            assert!(
+                strong.get_pixel(x, 12)[0] < 20,
+                "x={x} 出现镜像亮化,缩放系数方向写反了"
+            );
+        }
+    }
+
+    #[test]
+    fn radial_blur_zero_amount_is_noop() {
+        let base = RgbaImage::from_fn(16, 16, |x, y| Rgba([x as u8 * 8, y as u8 * 8, 90, 255]));
+        let mut img = base.clone();
+        radial_blur(&mut img, 8.0, 8.0, 0.0);
+        assert_eq!(img.into_raw(), base.into_raw());
+    }
+
+    /// 方块化:每块取块中心的采样点,不是块内均值。
+    ///
+    /// 用**奇数**块宽(3)时块中心正好落在某个源像素上,可以精确断言;
+    /// 偶数块宽的中心落在两个像素之间,必然是个混合值。
+    #[test]
+    fn pixelate_samples_block_centre() {
+        let mut img = RgbaImage::from_pixel(9, 9, Rgba([0, 0, 0, 255]));
+        // 每块中心:3×3 块的 9 个中心在 (1,1) (4,1) (7,1) …
+        let marks: Vec<(u32, u32, u8)> = vec![
+            (1, 1, 30),
+            (4, 1, 60),
+            (7, 1, 90),
+            (1, 4, 120),
+            (4, 4, 150),
+            (7, 4, 180),
+            (1, 7, 210),
+            (4, 7, 240),
+            (7, 7, 255),
+        ];
+        for &(x, y, v) in &marks {
+            img.put_pixel(x, y, Rgba([v, v, v, 255]));
+        }
+        pixelate(&mut img, 3.0);
+        for &(x, y, v) in &marks {
+            for (dx, dy) in [(0u32, 0u32), (1, 0), (0, 1), (2, 2)] {
+                let got = img.get_pixel((x / 3) * 3 + dx, (y / 3) * 3 + dy)[0] as i32;
+                assert!(
+                    (got - v as i32).abs() <= 2,
+                    "块中心 ({x},{y}) 应取到 {v},但块内 ({dx},{dy}) 得到 {got}"
+                );
+            }
+        }
+    }
+
+    /// 双线性缩放:像素中心对齐。1:1 缩放必须原样返回。
+    #[test]
+    fn resize_identity_preserves_pixels() {
+        let src = RgbaImage::from_fn(9, 7, |x, y| {
+            Rgba([(x * 20) as u8, (y * 30) as u8, 77, 200])
+        });
+        let out = resize(&src, 9, 7);
+        assert_eq!(out.into_raw(), src.clone().into_raw());
+    }
+
+    /// 2 倍放大:新像素落在源像素中心之间,应等于左右两个源像素的中值。
+    #[test]
+    fn resize_double_uses_pixel_centres() {
+        let src = RgbaImage::from_pixel(2, 1, Rgba([0, 0, 0, 255]));
+        let mut src = src;
+        src.put_pixel(1, 0, Rgba([200, 200, 200, 255]));
+        let out = resize(&src, 4, 1);
+        // 目标 x=0 → 源 −0.25 → 夹到 0;x=3 → 源 2.25 → 夹到 1
+        assert_eq!(out.get_pixel(0, 0)[0], 0);
+        assert_eq!(out.get_pixel(3, 0)[0], 200);
+        // 中间两个:源 0.25 与 0.75 → 50 与 150
+        let m0 = out.get_pixel(1, 0)[0] as i32;
+        let m1 = out.get_pixel(2, 0)[0] as i32;
+        assert!((m0 - 50).abs() <= 2, "第二个像素应为 50,实得 {m0}");
+        assert!((m1 - 150).abs() <= 2, "第三个像素应为 150,实得 {m1}");
+    }
+
+    /// 投影的剪影只取不透明区域,与画面颜色无关。
+    #[test]
+    fn drop_shadow_shape_ignores_color() {
+        const BG: [u8; 3] = [226, 226, 226];
+        let black = RgbaImage::from_pixel(48, 32, Rgba([0, 0, 0, 255]));
+        let white = RgbaImage::from_pixel(48, 32, Rgba([255, 255, 255, 255]));
+        let a = drop_shadow(&black, BG, [0, 0, 0], 0.5, 8.0, 90.0, 10.0);
+        let b = drop_shadow(&white, BG, [0, 0, 0], 0.5, 8.0, 90.0, 10.0);
+        let (nw, nh) = a.dimensions();
+        assert_eq!(a.dimensions(), b.dimensions());
+
+        // 照片本体贴在画布中央,外圈才是背景 + 阴影;只比外圈。
+        let pad = (nw - 48) / 2;
+        let mut shadowed = 0;
+        for y in 0..nh {
+            for x in 0..nw {
+                let in_photo = x >= pad && x < pad + 48 && y >= pad && y < pad + 32;
+                if in_photo {
+                    continue;
+                }
+                let pa = a.get_pixel(x, y);
+                let pb = b.get_pixel(x, y);
+                assert_eq!(
+                    pa, pb,
+                    "({x},{y}) 的阴影随画面颜色变化了,说明混进了亮度通道"
+                );
+                if *pa != Rgba([BG[0], BG[1], BG[2], 255]) {
+                    shadowed += 1;
+                }
+            }
+        }
+        assert!(shadowed > 0, "照片外圈没有画出任何阴影,测试证明不了东西");
     }
 }
