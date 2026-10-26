@@ -286,7 +286,7 @@ impl Mt19937 {
 pub fn apply_grain(img: &mut image::RgbaImage, params: &GrainParams) {
     let mut rng = Mt19937::new(params.seed);
     let amount = params.amount.clamp(0.0, 1.0);
-    let i_var3 = (256.0 - amount * 256.0).round() as i32;
+    let keep = (256.0 - amount * 256.0).round() as i32;
 
     // 第一段:生成噪声图(与原版同构 —— 先整图生成,再逐像素混合)。
     // `grayscale=true` 时三通道共用同一噪声值(原版 `channelOptions=7` + `grayscale`)。
@@ -294,7 +294,7 @@ pub fn apply_grain(img: &mut image::RgbaImage, params: &GrainParams) {
     let mut noise: Vec<u8> = Vec::with_capacity(px);
     for _ in 0..px {
         let r = rng.next_u8() as i32;
-        let n = r + (((0x7f - r) * i_var3) >> 8);
+        let n = r + (((0x7f - r) * keep) >> 8);
         noise.push(n.clamp(0, 255) as u8);
     }
 
@@ -552,12 +552,12 @@ pub fn apply_gamma(img: &mut image::RgbaImage, gamma: f32) {
 /// u[i] = (i·step) >> 8               // 反斜坡(u∘t ≈ 恒等,截断误差 ≤ ±2)
 /// w[i] = i·(256 − i)                 // 抛物线(中灰最强)
 /// R' = t(R) + (w(t(R))·m >> 15)
-/// G' = t(G) + (w(t(G))·max(m,0) >> 17)     // 绿通道幅度是红的一半,且只取非负 m
+/// G' = t(G) + (w(t(G))·max(m,0) >> 17)     // 绿通道幅度是红蓝的 1/4,且只取非负 m
 /// B' = t(B) − (w(t(B))·m >> 15)
 /// out = (u(R'), u(G'), u(B'))
 /// ```
 ///
-/// 即 **R↑ B↓ G↑(半幅)的 S 形色偏**。`m > 0` 暖、`m < 0` 冷;
+/// 即 **R↑ B↓ G↑(1/4 幅)的 S 形色偏**。`m > 0` 暖、`m < 0` 冷;
 /// `k` 在 m ≠ 0 时起作用:放大冷暖偏移并把抛物线锚点向高光挪
 /// (k < 0 会让斜坡 LUT 字节回绕,所以原版把该轴设计成单极 0..1)。
 /// k = 0 时退化为单轴 —— 这正是 colorfix / finetune 的色温级
