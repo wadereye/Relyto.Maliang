@@ -206,8 +206,11 @@ impl Effect {
 
     /// 该项是否为一键效果(原版 oneclick)。
     ///
-    /// 前 6 个是与原版同名的一键效果;后 4 个是本项目自主设计的调色。
+    /// 除逐项列出的名字外,`crate::recipes` 里的成组配方同样按一键效果对待。
     pub fn is_oneclick(&self) -> bool {
+        if crate::recipes::is_recipe(&self.name) {
+            return true;
+        }
         matches!(
             self.name.to_ascii_lowercase().as_str(),
             "bw"
@@ -839,7 +842,24 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 }
             }
         }
-        _ => {}
+        _ => {
+            // 成组配方(见 `crate::recipes`):一个名字对应一串固定顺序的操作,
+            // 强度由 `amount`(0~100)统一控制 —— 与"淡出"滑杆语义等价;
+            // 可选 `blend` 参数指定结果与原图的混合模式。
+            if crate::recipes::is_recipe(&e.name) {
+                let def = crate::recipes::default_amount(&e.name);
+                let amt = oneclick_amount(e, def);
+                match e.params.get("blend") {
+                    Some(s) => crate::recipes::apply_with(
+                        img,
+                        &e.name,
+                        amt,
+                        crate::recipes::Blend::parse(s),
+                    ),
+                    None => crate::recipes::apply(img, &e.name, amt),
+                };
+            }
+        }
     }
 }
 

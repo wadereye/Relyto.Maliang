@@ -12,6 +12,7 @@ mod net;
 mod oneclick;
 mod picasa;
 mod pool;
+mod recipes;
 mod save;
 mod scan;
 mod scroll;
