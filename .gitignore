@@ -11,3 +11,8 @@
 Thumbs.db
 .DS_Store
 .wtest
+
+# 本地约束/笔记,永不入库
+.workbuddy/
+COMPLIANCE.md
+tools/
