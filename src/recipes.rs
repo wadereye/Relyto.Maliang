@@ -57,6 +57,10 @@ pub enum Blend {
     Darken,
     /// 取亮。
     Lighten,
+    /// 以顶层为条件的强对比:顶层暗时走 multiply,亮时走 screen。
+    HardLight,
+    /// 柔光:顶层 0.5 附近近似不变,两端缓推,不产生硬边。
+    SoftLight,
 }
 
 impl Blend {
@@ -77,6 +81,33 @@ impl Blend {
             Blend::Subtract => base - top,
             Blend::Darken => base.min(top),
             Blend::Lighten => base.max(top),
+            Blend::HardLight => {
+                // 顶层决定用 multiply 还是 screen:
+                //   顶层 ≤ 127 → 2·顶层·底层/255
+                //   顶层 == 255 且底层 == 255 → 255(避免上式在端点溢出)
+                //   其余      → 2·(32512 − (255−底层)(255−顶层))/255
+                if top <= 127.0 {
+                    2.0 * top * base / 255.0
+                } else if top >= 255.0 && base >= 255.0 {
+                    255.0
+                } else {
+                    let n = 32512.0 - (255.0 - base) * (255.0 - top);
+                    2.0 * n / 255.0
+                }
+            }
+            Blend::SoftLight => {
+                // 顶层先取偶数(去掉最低位,等效于量化到 2 的步长),
+                // 再按底层暗/亮分两段:
+                //   底层 < 128 → (顶层+128)·底层/255
+                //   否则       → (65025 − (382−顶层)(255−底层))/255
+                // 两段在底层 = 128 处连续。
+                let t = (top as i32 & 0xfe) as f32;
+                if base < 128.0 {
+                    (t + 128.0) * base / 255.0
+                } else {
+                    (65025.0 - (382.0 - t) * (255.0 - base)) / 255.0
+                }
+            }
         }
     }
 
@@ -90,6 +121,8 @@ impl Blend {
             "subtract" => Blend::Subtract,
             "darken" => Blend::Darken,
             "lighten" => Blend::Lighten,
+            "hardlight" => Blend::HardLight,
+            "softlight" => Blend::SoftLight,
             _ => Blend::Normal,
         }
     }
@@ -557,6 +590,170 @@ pub fn radial_blur(img: &mut RgbaImage, cx: f32, cy: f32, amount: f32) {
     }
 }
 
+/// 线性(方向)模糊:沿给定角度做多次等比采样后取均值。
+///
+/// `angle` 以度为单位,0 = 水平向右;`length` 是采样跨度(像素)。
+/// 层数随跨度增加但封顶,避免大跨度时过度拖慢。
+pub fn linear_blur(img: &mut RgbaImage, angle: f32, length: f32) {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 || length <= 0.0 {
+        return;
+    }
+    let n = ((length as i32) / 2 + 3).clamp(3, 24);
+    let rad = angle.to_radians();
+    let (dx, dy) = (rad.cos(), rad.sin());
+    let src = img.clone();
+    let (iw, ih) = (w as i32, h as i32);
+    for y in 0..ih {
+        for x in 0..iw {
+            let mut acc = [0f32; 3];
+            for k in 0..n {
+                // 以 0 为中心对称铺开:−length/2 … +length/2
+                let t = (k as f32 / (n - 1) as f32 - 0.5) * length;
+                let sx = (x as f32 + dx * t).round() as i32;
+                let sy = (y as f32 + dy * t).round() as i32;
+                let p = src.get_pixel(
+                    sx.clamp(0, iw - 1) as u32,
+                    sy.clamp(0, ih - 1) as u32,
+                );
+                for c in 0..3 {
+                    acc[c] += p[c] as f32;
+                }
+            }
+            let dp = img.get_pixel_mut(x as u32, y as u32);
+            for c in 0..3 {
+                dp[c] = (acc[c] / n as f32).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+}
+
+/// 方向性调整的种类。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DirKind {
+    /// 亮度:整体按权重缩放。
+    Brightness,
+    /// 饱和度:向亮度收敛的比例按权重变化。
+    Saturation,
+    /// 锐度:权重高于 1 的一侧加强锐化。
+    Sharpen,
+}
+
+/// 方向性调整:沿左右/上下做一个线性渐变,越靠一侧效果越强。
+///
+/// `lr` / `tb` 取值 −1~1,正数表示"右侧 / 下侧更强"。
+/// `strength` 是 0~1 的总体强度。两轴同时给值时按线性叠加
+/// (右上角最强、左下角最弱),与参考的「Left to Right + Top to Bottom」两滑杆一致。
+pub fn directional_adjust(img: &mut RgbaImage, lr: f32, tb: f32, strength: f32, kind: DirKind) {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 || strength <= 0.0 {
+        return;
+    }
+    let s = strength.clamp(0.0, 1.0);
+    // 锐化需要一份模糊底图作参照
+    let base = if kind == DirKind::Sharpen {
+        let mut b = img.clone();
+        box_blur(&mut b, 2.0, 2.0);
+        Some(b)
+    } else {
+        None
+    };
+    let wf = w as f32;
+    let hf = h as f32;
+    for y in 0..h {
+        let uy = (2.0 * (y as f32 + 0.5) / hf - 1.0).clamp(-1.0, 1.0);
+        for x in 0..w {
+            let ux = (2.0 * (x as f32 + 0.5) / wf - 1.0).clamp(-1.0, 1.0);
+            let m = 1.0 + s * (lr * ux + tb * uy);
+            let dp = img.get_pixel_mut(x, y);
+            match kind {
+                DirKind::Brightness => {
+                    // 用加减平移而不是乘:暗部也要跟着变,否则深色照片上几乎看不出渐变
+                    let delta = (m - 1.0) * 127.5;
+                    for c in 0..3 {
+                        dp[c] = (dp[c] as f32 + delta).clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+                DirKind::Saturation => {
+                    let g = luma8(&Rgba([dp[0], dp[1], dp[2], 255]));
+                    for c in 0..3 {
+                        let v = g + (dp[c] as f32 - g) * m;
+                        dp[c] = v.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+                DirKind::Sharpen => {
+                    let bp = base.as_ref().unwrap().get_pixel(x, y);
+                    let k = (m - 1.0).max(0.0);
+                    for c in 0..3 {
+                        let orig = dp[c] as f32;
+                        let v = orig + (orig - bp[c] as f32) * k * 2.0;
+                        dp[c] = v.clamp(0.0, 255.0).round() as u8;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 焦点柔化:圆心附近保持清晰,越往外叠得越多。
+///
+/// `inner` 是"仍然清晰"的半径(占短边比例),`outer` 是模糊到满强度的半径。
+/// 参考的「Soft Focus」用一只定位点指定圆心,这里按同一语义用归一化坐标。
+pub fn soft_focus(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32, amount: f32) {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 || amount <= 0.0 {
+        return;
+    }
+    let short = w.min(h) as f32;
+    let r_in = (inner * short).max(1.0);
+    let r_out = (outer * short).max(r_in + 1.0);
+    let m = circular_mask(
+        w,
+        h,
+        cx * w as f32,
+        cy * h as f32,
+        r_in,
+        r_out,
+        0.0,
+        1.0,
+    );
+    let mut blurred = img.clone();
+    box_blur(&mut blurred, short * 0.02, short * 0.02);
+    composite_masked(img, &blurred, &m, Blend::Normal, amount.clamp(0.0, 1.0));
+}
+
+/// 焦点去色:圆内保留色彩,圆外转成灰度。
+///
+/// `inner` / `outer` 与 [`soft_focus`] 同义;`outer − inner` 越小过渡越硬,
+/// 对应参考里那条「Sharpness」滑杆。
+pub fn focal_bw(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32) {
+    let (w, h) = img.dimensions();
+    if w == 0 || h == 0 {
+        return;
+    }
+    let short = w.min(h) as f32;
+    let r_in = (inner * short).max(1.0);
+    let r_out = (outer * short).max(r_in + 1.0);
+    let m = circular_mask(
+        w,
+        h,
+        cx * w as f32,
+        cy * h as f32,
+        r_in,
+        r_out,
+        0.0,
+        1.0,
+    );
+    let mut gray = img.clone();
+    for p in gray.pixels_mut() {
+        let g = luma8(p).round().clamp(0.0, 255.0) as u8;
+        p[0] = g;
+        p[1] = g;
+        p[2] = g;
+    }
+    composite_masked(img, &gray, &m, Blend::Normal, 1.0);
+}
+
 /// 方块化:先按 `block` 降采样再按最近邻放大回原尺寸。
 ///
 /// 降采样用三角滤波(取块内均值),放大用最近邻(保持硬块边界)——
@@ -950,6 +1147,39 @@ pub fn crop_center(img: &RgbaImage, cw: u32, ch: u32) -> RgbaImage {
     image::imageops::crop_imm(img, x0, y0, cw, ch).to_image()
 }
 
+/// 双线性缩放到指定尺寸(仅用于配方内部小幅调整,不做高质量降采样)。
+pub fn resize(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
+    let (w, h) = img.dimensions();
+    let nw = nw.max(1);
+    let nh = nh.max(1);
+    if w == 0 || h == 0 {
+        return RgbaImage::new(nw, nh);
+    }
+    let sx = w as f32 / nw as f32;
+    let sy = h as f32 / nh as f32;
+    RgbaImage::from_fn(nw, nh, |x, y| {
+        let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (w - 1) as f32);
+        let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (h - 1) as f32);
+        let x0 = fx.floor() as u32;
+        let y0 = fy.floor() as u32;
+        let x1 = (x0 + 1).min(w - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let tx = fx - x0 as f32;
+        let ty = fy - y0 as f32;
+        let p00 = img.get_pixel(x0, y0);
+        let p10 = img.get_pixel(x1, y0);
+        let p01 = img.get_pixel(x0, y1);
+        let p11 = img.get_pixel(x1, y1);
+        let mut out = [0u8; 4];
+        for c in 0..4 {
+            let top = p00[c] as f32 * (1.0 - tx) + p10[c] as f32 * tx;
+            let bot = p01[c] as f32 * (1.0 - tx) + p11[c] as f32 * tx;
+            out[c] = (top * (1.0 - ty) + bot * ty).round().clamp(0.0, 255.0) as u8;
+        }
+        Rgba(out)
+    })
+}
+
 /// 单色红外:保留绿通道主导的亮度,再叠一层柔化提亮。
 ///
 /// ```text
@@ -1008,6 +1238,8 @@ pub const RECIPES: &[&str] = &[
     "bloom",
     "sketch",
     "cross_process",
+    "cinemascope",
+    "sixties",
 ];
 
 /// 该名字是否是本模块的配方。
@@ -1044,6 +1276,8 @@ pub fn label(name: &str) -> &'static str {
         "bloom" => "柔光",
         "sketch" => "铅笔素描",
         "cross_process" => "交叉冲印",
+        "cinemascope" => "宽银幕",
+        "sixties" => "六十年代",
         _ => "效果",
     }
 }
@@ -1211,11 +1445,14 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
             crate::oneclick::apply_tint(&mut layer, [255, 0, 0], 1.0);
             composite(img, &layer, Blend::Normal, a);
         }
-        // 夜视仪:自动色阶 → 黑绿映射 → 光晕 → 亮部噪声 → 提对比
+        // 夜视仪:自动色阶 → 黑绿映射 → 内光晕 → 亮部噪声
+        //
+        // 光晕半径按画面长边的 0.233 倍取(参考配方的 `35·0.02·max/3`),
+        // 强度 1.5 让增益到顶,所以边缘是纯黑压暗而不是半透明覆盖。
         "night_vision" => {
             auto_fix(img);
             gradient_map(img, &[[0, 0, 0], [0x57, 0xcc, 0x29]]);
-            glow_edge(img, [0, 0, 0], long * 0.06, 0.6, 1.0);
+            glow_edge(img, [0, 0, 0], long * 0.2333, 1.5, 1.0);
             apply_noise_layer(img, 30, 0, 180, false, Blend::Lighten, 0.2);
         }
         // 马赛克:方块化
@@ -1297,6 +1534,35 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
             let (w2, h2) = img.dimensions();
             let layer = RgbaImage::from_pixel(w2, h2, Rgba([0xfc, 0xff, 0x00, 255]));
             composite(img, &layer, Blend::Multiply, 0.2);
+        }
+        // 宽银幕:裁成 1.7:1 → 纵向压到 95% → 自动色阶 + 降饱和 +
+        // 三通道错位曲线 + 细颗粒 → 上下各加 15% 黑边。
+        //
+        // 裁切高度取 `min(round(宽/1.7), 原高)`,所以竖幅照片不会被拉扁,
+        // 只是保持原高后按宽度算出的比例封顶。
+        "cinemascope" => {
+            let cw = w;
+            let ch = ((w as f32 / 1.7).round() as u32).clamp(1, h);
+            let mut out_img = crop_center(img, cw, ch);
+            let nh = ((ch as f32 * 0.95).round() as u32).max(1);
+            out_img = resize(&out_img, cw, nh);
+            auto_fix(&mut out_img);
+            crate::effects::apply_color_matrix(&mut out_img, 0.0, 0.0, -25.0);
+            let c = crate::curves::presets::widescreen();
+            crate::curves::apply_curves(&mut out_img, &c);
+            apply_noise_layer(&mut out_img, 0, 225, 245, true, Blend::Multiply, 1.0);
+            let bar = (ch as f32 * 0.15).round();
+            *img = border_asym(&out_img, [0, 0, 0], 0.0, 0.0, bar, bar);
+            return true;
+        }
+        // 六十年代:自动色阶 + 暖调错位曲线 + 细颗粒正片叠底 + 白色圆角。
+        // 圆角半径 = 短边/14,外框色缺省为白。
+        "sixties" => {
+            auto_fix(img);
+            let c = crate::curves::presets::retro();
+            crate::curves::apply_curves(img, &c);
+            apply_noise_layer(img, 5, 235, 255, true, Blend::Multiply, 0.6);
+            round_corners(img, short / 14.0, [255, 255, 255]);
         }
         _ => return false,
     }
@@ -1563,4 +1829,266 @@ fn dump_recipe_samples() {
         }
     }
     sheet.save(format!("{out}/_sheet.png")).ok();
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    fn ch(mode: Blend, base: f32, top: f32) -> f32 {
+        mode.ch(base, top)
+    }
+
+    #[test]
+    fn hardlight_dark_top_multiplies() {
+        // 顶层为黑 → 结果恒为黑;顶层为中性 127 → 约等于底层的一半
+        assert!(ch(Blend::HardLight, 200.0, 0.0).abs() < 0.01);
+        let half = ch(Blend::HardLight, 200.0, 127.0);
+        assert!((half - 2.0 * 127.0 * 200.0 / 255.0).abs() < 0.01, "got {half}");
+    }
+
+    #[test]
+    fn hardlight_bright_top_screens() {
+        // 顶层为白、底层为黑 → 白(强对比的另一端)
+        assert!((ch(Blend::HardLight, 0.0, 255.0) - 255.0).abs() < 0.6);
+        // 顶层白 + 底层白 → 精确 255(单独处理,避免公式在端点溢出)
+        assert_eq!(ch(Blend::HardLight, 255.0, 255.0), 255.0);
+    }
+
+    #[test]
+    fn hardlight_is_continuous_where_expected() {
+        // 底层为白时,两段在顶层 127/128 处应当接近(不该跳变)
+        let a = ch(Blend::HardLight, 255.0, 127.0);
+        let b = ch(Blend::HardLight, 255.0, 128.0);
+        assert!((a - b).abs() < 3.0, "127→{a} 128→{b}");
+    }
+
+    #[test]
+    fn softlight_mid_top_is_near_identity() {
+        // 顶层取中灰时应当基本不改变底层
+        for base in [20.0f32, 100.0, 180.0, 240.0] {
+            let out = ch(Blend::SoftLight, base, 128.0);
+            assert!((out - base).abs() < 4.0, "base={base} out={out}");
+        }
+    }
+
+    #[test]
+    fn softlight_matches_two_segment_formula() {
+        // 底层暗: (顶层偶数化 + 128)·底层/255
+        let got = ch(Blend::SoftLight, 100.0, 200.0);
+        assert!((got - (200.0 + 128.0) * 100.0 / 255.0).abs() < 0.01);
+        // 底层亮: (65025 − (382 − 顶层)(255 − 底层))/255
+        let got = ch(Blend::SoftLight, 200.0, 100.0);
+        let want = (65025.0 - (382.0 - 100.0) * (255.0 - 200.0)) / 255.0;
+        assert!((got - want).abs() < 0.01);
+    }
+
+    #[test]
+    fn blend_parse_knows_new_modes() {
+        assert_eq!(Blend::parse("hardlight"), Blend::HardLight);
+        assert_eq!(Blend::parse("SOFTLIGHT"), Blend::SoftLight);
+    }
+}
+
+#[cfg(test)]
+mod canvas_recipe_tests {
+    use super::*;
+
+    fn sample(w: u32, h: u32) -> RgbaImage {
+        RgbaImage::from_fn(w, h, |x, y| {
+            Rgba([
+                (x * 255 / w.max(1)) as u8,
+                (y * 255 / h.max(1)) as u8,
+                128,
+                255,
+            ])
+        })
+    }
+
+    #[test]
+    fn cinemascope_letterboxes_to_wide_frame() {
+        let src = sample(340, 300);
+        let mut img = src.clone();
+        assert!(apply(&mut img, "cinemascope", 100.0));
+        // 宽度不变,高度 = 裁切高 × (0.95 + 2×0.15)
+        assert_eq!(img.width(), 340);
+        let ch = ((340.0f32 / 1.7).round() as u32).min(300);
+        let want = ((ch as f32 * 0.95).round() as u32) + 2 * ((ch as f32 * 0.15).round() as u32);
+        assert_eq!(img.height(), want, "ch={ch}");
+        // 上下首行必须是纯黑边
+        for x in [0, 170, 339] {
+            assert_eq!(*img.get_pixel(x, 0), Rgba([0, 0, 0, 255]));
+            assert_eq!(*img.get_pixel(x, img.height() - 1), Rgba([0, 0, 0, 255]));
+        }
+        // 中部仍是有内容的
+        let mid = img.get_pixel(170, img.height() / 2);
+        assert!(mid[0] > 0 || mid[1] > 0);
+    }
+
+    #[test]
+    fn cinemascope_leaves_tall_image_height_alone() {
+        // 竖幅:宽/1.7 小于原高,裁切后应当比原图矮;宽度保持不变
+        let mut img = sample(200, 400);
+        assert!(apply(&mut img, "cinemascope", 100.0));
+        assert_eq!(img.width(), 200);
+        assert!(img.height() < 400);
+    }
+
+    #[test]
+    fn sixties_keeps_size_and_rounds_corners() {
+        let mut img = sample(140, 140);
+        let before = *img.get_pixel(0, 0);
+        assert!(apply(&mut img, "sixties", 100.0));
+        assert_eq!(img.dimensions(), (140, 140));
+        // 圆角外应被白色填掉
+        let corner = *img.get_pixel(0, 0);
+        assert_ne!(corner, before, "角落未被处理");
+        assert_eq!(corner[0], 255);
+        assert_eq!(corner[1], 255);
+        assert_eq!(corner[2], 255);
+    }
+
+    #[test]
+    fn resize_keeps_gradient_direction() {
+        let src = RgbaImage::from_fn(8, 4, |x, _| {
+            let v = (x * 255 / 7) as u8;
+            Rgba([v, v, v, 255])
+        });
+        let out = resize(&src, 16, 2);
+        assert_eq!(out.dimensions(), (16, 2));
+        // 左端近黑、右端近白
+        assert!(out.get_pixel(0, 0)[0] < 20);
+        assert!(out.get_pixel(15, 0)[0] > 235);
+    }
+}
+
+#[cfg(test)]
+mod focus_op_tests {
+    use super::*;
+
+    /// 手动导出各"焦点/方向"类算子的观感样张:
+    /// 设 `MALIANG_SRC` / `MALIANG_OUT` 后跑
+    /// `cargo test --offline -- --ignored dump_focus_samples`。
+    #[test]
+    #[ignore = "手动生成样张"]
+    fn dump_focus_samples() {
+        let Ok(src) = std::env::var("MALIANG_SRC") else {
+            return;
+        };
+        let out = std::env::var("MALIANG_OUT").unwrap_or_else(|_| ".".into());
+        let base = image::open(&src).expect("源图打开失败");
+        let base = base.thumbnail(420, 420).to_rgba8();
+        std::fs::create_dir_all(&out).ok();
+
+        let mut a = base.clone();
+        linear_blur(&mut a, 20.0, 24.0);
+        a.save(format!("{out}/op_linear_blur.png")).ok();
+
+        let mut b = base.clone();
+        soft_focus(&mut b, 0.5, 0.5, 0.30, 0.75, 1.0);
+        b.save(format!("{out}/op_soft_focus.png")).ok();
+
+        let mut c = base.clone();
+        focal_bw(&mut c, 0.5, 0.5, 0.30, 0.40);
+        c.save(format!("{out}/op_focal_bw.png")).ok();
+
+        let mut d = base.clone();
+        directional_adjust(&mut d, 0.8, 0.0, 1.0, DirKind::Brightness);
+        d.save(format!("{out}/op_dir_brightness.png")).ok();
+
+        let mut e = base.clone();
+        directional_adjust(&mut e, -0.8, 0.0, 1.0, DirKind::Saturation);
+        e.save(format!("{out}/op_dir_saturation.png")).ok();
+
+        let mut f = base.clone();
+        directional_adjust(&mut f, 0.8, 0.0, 1.0, DirKind::Sharpen);
+        f.save(format!("{out}/op_dir_sharpen.png")).ok();
+    }
+
+    fn flat(w: u32, h: u32, c: [u8; 4]) -> RgbaImage {
+        RgbaImage::from_pixel(w, h, Rgba(c))
+    }
+
+    #[test]
+    fn linear_blur_leaves_flat_image_alone() {
+        let mut img = flat(16, 16, [90, 120, 150, 255]);
+        let before = img.clone();
+        linear_blur(&mut img, 30.0, 10.0);
+        assert_eq!(img.into_raw(), before.into_raw());
+    }
+
+    #[test]
+    fn linear_blur_smears_vertical_edge_horizontally() {
+        // 左半黑、右半白,水平模糊后边界两侧不再是非黑即白
+        let mut img = RgbaImage::from_fn(32, 8, |x, _| {
+            let v = if x < 16 { 0 } else { 255 };
+            Rgba([v, v, v, 255])
+        });
+        linear_blur(&mut img, 0.0, 12.0);
+        let left = img.get_pixel(13, 4)[0];
+        let right = img.get_pixel(18, 4)[0];
+        assert!(left > 0, "边界左侧未被带动: {left}");
+        assert!(right < 255, "边界右侧未被带动: {right}");
+    }
+
+    #[test]
+    fn directional_brightness_darkens_left_and_brightens_right() {
+        let mut img = flat(40, 20, [128, 128, 128, 255]);
+        directional_adjust(&mut img, 0.8, 0.0, 1.0, DirKind::Brightness);
+        let l = img.get_pixel(2, 10)[0];
+        let r = img.get_pixel(37, 10)[0];
+        assert!(l < 110, "左侧应变暗: {l}");
+        assert!(r > 145, "右侧应变亮: {r}");
+    }
+
+    #[test]
+    fn directional_saturation_keeps_gray_gray() {
+        // 中性灰没有饱和度可调 → 任何方向性去色都不该改变它
+        let mut img = flat(20, 20, [128, 128, 128, 255]);
+        directional_adjust(&mut img, -1.0, 0.0, 1.0, DirKind::Saturation);
+        for p in img.pixels() {
+            assert!((p[0] as i32 - 128).abs() <= 1);
+        }
+    }
+
+    #[test]
+    fn focal_bw_keeps_center_color_and_grays_corner() {
+        // 左半红、右半蓝:圆心在中央,角落应被去色
+        let mut img = RgbaImage::from_fn(60, 60, |x, _| {
+            if x < 30 {
+                Rgba([200, 40, 40, 255])
+            } else {
+                Rgba([40, 40, 200, 255])
+            }
+        });
+        focal_bw(&mut img, 0.5, 0.5, 0.15, 0.45);
+        let corner = img.get_pixel(0, 0);
+        assert_eq!(corner[0], corner[1], "角落未去色: {:?}", corner);
+        assert_eq!(corner[1], corner[2]);
+        let center = img.get_pixel(29, 30);
+        assert!(center[0] > center[2], "中心应保留色彩: {:?}", center);
+    }
+
+    #[test]
+    fn soft_focus_keeps_center_and_smudges_edge() {
+        // 棋盘格:中心应当几乎不变,边缘被平均掉
+        let mut img = RgbaImage::from_fn(80, 80, |x, y| {
+            let v = if (x / 4 + y / 4) % 2 == 0 { 0 } else { 255 };
+            Rgba([v, v, v, 255])
+        });
+        let before = img.clone();
+        soft_focus(&mut img, 0.5, 0.5, 0.20, 0.75, 1.0);
+        let c0 = before.get_pixel(40, 40);
+        let c1 = img.get_pixel(40, 40);
+        assert!(
+            (c0[0] as i32 - c1[0] as i32).abs() <= 2,
+            "中心被误伤: {} → {}",
+            c0[0],
+            c1[0]
+        );
+        // 角上应明显偏离原来的纯黑/纯白
+        let k0 = before.get_pixel(2, 2)[0] as i32;
+        let k1 = img.get_pixel(2, 2)[0] as i32;
+        assert!((k0 - k1).abs() > 30, "角落未被柔化: {k0} → {k1}");
+    }
 }
