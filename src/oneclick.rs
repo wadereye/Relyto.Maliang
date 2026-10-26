@@ -538,25 +538,33 @@ pub fn apply_gamma(img: &mut image::RgbaImage, gamma: f32) {
     }
 }
 
-/// 色温(colortemp)—— `colortemp` 一键效果,也是 `colorfix` 的第二级。
+/// 色温(colortemp)—— 双轴:`temp` 冷暖轴 + `white` 白场偏移轴。
 ///
-/// 参考 Picasa 3 的色温实现(行为级):
+/// 参考 Picasa 3 的色温实现(行为级)。两轴滑块到参数的换算是两次
+/// 浮点乘法(双精度常数),滑杆量程沿用原版设置:
 ///
 /// ```text
+/// m = int(temp · 256)      // Cool to Warm:量程 1.0、偏移 0.5 → temp ∈ [−0.5, +0.5]
+/// k = int(white · 128)     // White Shift:量程 1.0、无偏移   → white ∈ [0, 1]
+///
 /// step = 0x10000 / (256 − k)
 /// t[i] = (i·(256 − k)) >> 8          // 斜坡
-/// u[i] = (i·step) >> 8               // 反斜坡
+/// u[i] = (i·step) >> 8               // 反斜坡(u∘t ≈ 恒等,截断误差 ≤ ±2)
 /// w[i] = i·(256 − i)                 // 抛物线(中灰最强)
 /// R' = t(R) + (w(t(R))·m >> 15)
-/// G' = t(G) + (w(t(G))·max(m,0) >> 17)     // 绿通道幅度是红的一半
+/// G' = t(G) + (w(t(G))·max(m,0) >> 17)     // 绿通道幅度是红的一半,且只取非负 m
 /// B' = t(B) − (w(t(B))·m >> 15)
 /// out = (u(R'), u(G'), u(B'))
 /// ```
 ///
-/// 即 **R↑ B↓ G↑(半幅)的 S 形色偏**;`k` 是整体偏移、`m` 是强度。
-pub fn apply_color_temp(img: &mut image::RgbaImage, k: f32, m: f32) {
-    let k = (k as i32).clamp(0, 255) as usize;
-    let m = m as i32;
+/// 即 **R↑ B↓ G↑(半幅)的 S 形色偏**。`m > 0` 暖、`m < 0` 冷;
+/// `k` 在 m ≠ 0 时起作用:放大冷暖偏移并把抛物线锚点向高光挪
+/// (k < 0 会让斜坡 LUT 字节回绕,所以原版把该轴设计成单极 0..1)。
+/// k = 0 时退化为单轴 —— 这正是 colorfix / finetune 的色温级
+/// (它们只传冷暖轴、k 恒为 0)。
+pub fn apply_color_temp(img: &mut image::RgbaImage, temp: f32, white: f32) {
+    let m = (temp * 256.0) as i32;
+    let k = (((white.clamp(0.0, 1.0) * 128.0) as i32).clamp(0, 255)) as usize;
     let m_pos = m.max(0);
     let step = if k < 256 { 0x10000 / (256 - k) as i32 } else { 0x10000 };
     let mut t = [0i32; 256];
@@ -1569,5 +1577,65 @@ mod tests {
             c,
             corner
         );
+    }
+
+    // ===== 色温双轴映射(temp → m = temp·256,white → k = white·128)=====
+
+    /// 中灰 + 暖端:Δ_R = w(128)·m>>15 = 16384·128>>15 = 64。
+    #[test]
+    fn colortemp_warm_half_raises_red_lowers_blue() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_color_temp(&mut img, 0.5, 0.0);
+        let p = img.get_pixel(0, 0);
+        assert_eq!(p[0], 128 + 64, "暖端中灰 R 应 +64");
+        assert_eq!(p[2], 128 - 64, "暖端中灰 B 应 −64");
+        // 绿通道 >>17:16384·128>>17 = 16(红蓝的 1/4 幅,压绿是为了少动亮度)
+        assert_eq!(p[1], 128 + 16, "暖端中灰 G 应 +16");
+    }
+
+    #[test]
+    fn colortemp_cool_is_mirror_of_warm() {
+        let mut warm = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_color_temp(&mut warm, 0.5, 0.0);
+        let mut cool = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_color_temp(&mut cool, -0.5, 0.0);
+        for c in [0usize, 2] {
+            // 冷暖互为镜像:R/B 关于 128 对称(绿轴只取非负 m,不参与)
+            assert_eq!(
+                2 * 128,
+                warm.get_pixel(0, 0)[c] as i32 + cool.get_pixel(0, 0)[c] as i32,
+                "通道 {c} 冷暖应关于 128 对称"
+            );
+        }
+    }
+
+    /// m = 0 时 u∘t ≈ 恒等(斜坡截断误差 ≤ ±2);白场轴单独不产生色偏。
+    #[test]
+    fn colortemp_white_shift_alone_is_near_identity() {
+        for white in [0.0f32, 0.5, 1.0] {
+            for x in [0u8, 64, 128, 200, 255] {
+                let mut img =
+                    image::RgbaImage::from_pixel(1, 1, image::Rgba([x, x, x, 255]));
+                apply_color_temp(&mut img, 0.0, white);
+                let p = img.get_pixel(0, 0);
+                assert!(
+                    (p[0] as i32 - x as i32).abs() <= 2,
+                    "temp=0 white={white} 时 {x} 应近似不变,得 {}",
+                    p[0]
+                );
+            }
+        }
+    }
+
+    /// 白场轴放大冷暖偏移:white=1(k=128)比 white=0 的偏移更大。
+    #[test]
+    fn colortemp_white_shift_amplifies_warm_shift() {
+        let mut a = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_color_temp(&mut a, 0.25, 0.0);
+        let mut b = image::RgbaImage::from_pixel(2, 2, image::Rgba([128, 128, 128, 255]));
+        apply_color_temp(&mut b, 0.25, 1.0);
+        let da = a.get_pixel(0, 0)[0] as i32 - 128;
+        let db = b.get_pixel(0, 0)[0] as i32 - 128;
+        assert!(db > da, "白场轴应放大暖偏移:{db} 应 > {da}");
     }
 }

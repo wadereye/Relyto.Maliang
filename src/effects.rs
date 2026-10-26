@@ -788,8 +788,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         "colorfix" => {
             crate::oneclick::apply_autocolor(img);
             crate::oneclick::apply_color_temp(img, 0.0, 0.0);
-        }
-        "whitept" => crate::oneclick::apply_autocolor(img),
+        }        "whitept" => crate::oneclick::apply_autocolor(img),
         "ansel" => {
             let w = crate::oneclick::luma_weights();
             crate::oneclick::apply_ansel(img, w, 64.0);
@@ -804,8 +803,15 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             crate::oneclick::apply_glow(img, 128.0);
         }
         "colortemp" => {
-            let v = oneclick_amount(e, 50.0);
-            crate::oneclick::apply_color_temp(img, v, v);
+            // 原版双轴:temp = Cool to Warm(−0.5..0.5)、white = White Shift(0..1)。
+            // 兼容旧数据:只存了 amount(0..100)时按 50 = 中性折算到冷暖轴。
+            let parse = |key: &str| e.params.get(key).and_then(|v| v.parse::<f32>().ok());
+            let temp = match parse("temp") {
+                Some(t) => t,
+                None => (oneclick_amount(e, 50.0) - 50.0) / 100.0,
+            };
+            let white = parse("white").unwrap_or(0.0);
+            crate::oneclick::apply_color_temp(img, temp, white);
         }
         "sat" => {
             // 原版语义:s = 滑块值 + 1,只有 s < 1 才增强饱和度。
