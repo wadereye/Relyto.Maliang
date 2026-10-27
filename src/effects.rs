@@ -130,6 +130,76 @@ pub struct Effect {
     pub params: BTreeMap<String, String>,
 }
 
+/// 已知的一键效果名 **`apply_effect` 中有分派分支**的那一批。
+///
+/// ⚠️ 每新增一个分派分支都必须同步这里 —— 测试
+/// `every_known_effect_touches_pixels` 会在两者漂移时失败,用来防止再度出现
+/// 「名字能被识别、但没有落地实现」的静默空操作(历史上 `tilt` /
+/// `shadow` 就是这么漏掉的)。
+pub const PIXEL_EFFECTS: &[&str] = &[
+    "bw",
+    "sepia",
+    "grain",
+    "grain2",
+    "unsharp",
+    "unsharp2",
+    "warm",
+    "cool",
+    "vignette",
+    "faded",
+    "autocontrast",
+    "enhance_auto",
+    "autolight",
+    "autocolor",
+    "autobacklight",
+    "backlight",
+    "fill",
+    "finetune",
+    "finetune2",
+    "triple",
+    "triple2",
+    "triple3",
+    "colorfix",
+    "whitept",
+    "blur",
+    "tilt",
+    "glow",
+    "glow2",
+    "colortemp",
+    "tint",
+    "dir_tint",
+    "radtint",
+    "sat",
+    "rainbow",
+    "ansel",
+    "movie",
+    "gamma",
+    "invert",
+    "linblur",
+    "radblur",
+    "radsat",
+    "dir_brite",
+    "dir_sat",
+    "dir_sharp",
+    "shadow",
+];
+
+/// `tilt`(Straighten)滑杆满量程对应的角度。
+///
+/// 参考只公开了这根滑杆的量程(range 2.0 / offset 1.0),到角度的换算系数
+/// 暂无对应资料 —— 这里取 ±15° 作为"够用且不会一下子转过头"的取值。
+const TILT_MAX_DEG: f32 = 15.0;
+
+/// 登记在案、**刻意不改像素**的效果名。
+///
+/// 这些名字有自己的语义(例如 `movie` 只做时间区间裁剪),在渲染管线里
+/// 落到别处生效,故不算 bug;清单之外的名字若不动像素,测试会报错。
+#[cfg(test)]
+const DOCUMENTED_NOOPS: &[&str] = &[
+    // 视频裁剪是**时间过滤**语义,参数交给 `crate::video::MovieTrim` 处理。
+    "movie",
+];
+
 impl Effect {
     /// 新建一个"增强"效果项(原版顶层滤镜名 `enhance`,
     /// 见效果参数校验)。
@@ -204,60 +274,16 @@ impl Effect {
         }
     }
 
-    /// 该项是否为一键效果(原版 oneclick)。
-    ///
-    /// 除逐项列出的名字外,`crate::recipes` 里的成组配方同样按一键效果对待。
-    pub fn is_oneclick(&self) -> bool {
-        if crate::recipes::is_recipe(&self.name) {
-            return true;
-        }
-        matches!(
-            self.name.to_ascii_lowercase().as_str(),
-            "bw"
-                | "sepia"
-                | "grain"
-                | "grain2"
-                | "unsharp"
-                | "unsharp2"
-                | "warm"
-                | "cool"
-                | "vignette"
-                | "faded"
-                | "autocontrast"
-                | "enhance_auto"
-                | "autolight"
-                | "autocolor"
-                | "autobacklight"
-                | "backlight"
-                | "fill"
-                | "finetune"
-                | "finetune2"
-                | "triple"
-                | "triple2"
-                | "triple3"
-                | "colorfix"
-                | "whitept"
-                | "blur"
-                | "tilt"
-                | "glow"
-                | "glow2"
-                | "colortemp"
-                | "tint"
-                | "dir_tint"
-                | "radtint"
-                | "sat"
-                | "rainbow"
-                | "ansel"
-                | "movie"
-                | "gamma"
-                | "linblur"
-                | "radblur"
-                | "radsat"
-                | "dir_brite"
-                | "dir_sat"
-                | "dir_sharp"
-        )
+/// 该项是否为一键效果(原版 oneclick)。
+///
+/// 除逐项列出的名字外,`crate::recipes` 里的成组配方同样按一键效果对待。
+pub fn is_oneclick(&self) -> bool {
+    if crate::recipes::is_recipe(&self.name) {
+        return true;
     }
+    let name = self.name.to_ascii_lowercase();
+    PIXEL_EFFECTS.iter().any(|k| *k == name)
+}
 }
 
 /// 曲线控制点序列化:`x,y;x,y`(原版用 `{x,y}` 数组,此处为紧凑等价形)。
@@ -535,23 +561,39 @@ pub fn apply(img: &mut image::RgbaImage, adj: &Adjust) {
 
 /// 3×3 色彩矩阵(对比度 / 亮度 / 饱和度)。
 ///
-/// 原版数学形态(3×3 色彩矩阵):3×3 矩阵 + 平移量。
-/// 亮度/对比度/饱和度三项按**同一矩阵 + 平移**表达。
+/// 原版数学形态(3×3 色彩矩阵):3×3 矩阵 + 平移量,见参考的
+/// `SimpleColorMatrix`(矩阵右乘序列 `M × Sat × ContrastBright × Hue`)。
+/// 亮度/对比度/饱和度三项按**同一矩阵 + 平移**表达,顺序与参考一致。
+///
+/// - **对比度**(参考合并式 `out = g·in + 127.5·(1−g)`,等价于以
+///   **中灰 127.5 为轴**的线性缩放):`k = 1 + contrast/100`,`out = k·(v − 127.5) + 127.5`。
+///   由此中灰**保持不动**,`contrast = −100` 时整图折叠到中灰。
+///   ⚠️ 早期版本在这里多计了一次 `+(1−k)·128` 平移,导致 +100 把中灰压成纯黑、
+///   −100 把整图推成纯白;现有回归锁见 `contrast_keeps_midgray_and_folds_to_midgray`。
+/// - **饱和度**:参考是**非对称**的 `s' = 1 + (sat > 0 ? 3·sat : sat) / 100`
+///   (正方向 3 倍增益),亮度权重取全库统一的 `(0.3086, 0.6094, 0.082)` ——
+///   **不是** Rec.709 的 `(0.2126, 0.7152, 0.0722)`,否则与 `bw` / `tint` 口径不一致。
+/// - **亮度**:平移量 `brightness/100 × 127.5`(维持既有 UI 量程,未改)。
+///
+/// **诚实声明**:参考对比度走的是一张 101 项非线性增益表 `T(x)`(`g = 1 + T(x)`,
+/// `T(0)=0`、`T(50)=1.0`、`T(100)=10.0`),表值暂无对应资料 —— 此处保留**线性** `k`。
+/// 因此正对比度滑块的手感比参考更温和,这是已知的简化,不是漏实现。
 pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
-    let k = 1.0 + contrast / 100.0; // 对比度:以 128 为中心的线性缩放
-    let off = (1.0 - k) * 128.0;
+    let k = 1.0 + contrast / 100.0; // 对比度:以中灰 127.5 为轴的线性缩放
     let boff = brightness / 100.0 * 127.5; // 亮度:平移量
-    let s = 1.0 + saturation / 100.0;
+    // 饱和度:非对称增益 + 全库统一亮度权重
+    let s = 1.0 + (if saturation > 0.0 { 3.0 * saturation } else { saturation }) / 100.0;
+    let [wr, wg, wb] = crate::oneclick::luma_weights();
     for p in img.pixels_mut() {
         let r = p[0] as f32;
         let g = p[1] as f32;
         let b = p[2] as f32;
-        // 对比度(围绕中灰 128)
-        let (r, g, b) = ((r - 128.0) * k + 128.0 + off, (g - 128.0) * k + 128.0 + off, (b - 128.0) * k + 128.0 + off);
+        // 对比度(围绕中灰 127.5,不再叠加重复平移)
+        let (r, g, b) = ((r - 127.5) * k + 127.5, (g - 127.5) * k + 127.5, (b - 127.5) * k + 127.5);
         // 亮度平移
         let (r, g, b) = (r + boff, g + boff, b + boff);
-        // 饱和度(Rec.709 亮度加权)
-        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        // 饱和度(全库统一亮度加权)
+        let luma = wr * r + wg * g + wb * b;
         let (r, g, b) = (
             luma + (r - luma) * s,
             luma + (g - luma) * s,
@@ -563,14 +605,21 @@ pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast:
     }
 }
 
-/// 曝光(线性 2^stops)。原版 `ExposureImageOperation` + 参数 `exposure`。
+/// 曝光:走**曝光曲线**(样条)路径,与 `curves` 里的曝光点表共用一套实现。
+///
+/// 原版曝光是**色调曲线级的三条 DSP 整形**,不是线性乘法:先把 `stops` 拆成
+/// 整数档 `N` 与小数权重 `w`,把曝光点表写进 Master 槽后按自然三次样条求值,
+/// 迭代 `N+1` 次并在末两步按 `w` 线性混合。点表取自内置资源包:
+/// `exposure.pos` / `exposure.neg`。
+///
+/// ⚠️ 过去这里另有一份线性 `2^stops` 实现,导致库内有两套曝光口径、
+/// `curves::exposure_points` 在 Adjust 路径上不可达 —— 现已合并成本函数。
 pub fn apply_exposure(img: &mut image::RgbaImage, stops: f32) {
-    let f = 2f32.powf(stops.clamp(-3.0, 3.0));
-    for p in img.pixels_mut() {
-        p[0] = (p[0] as f32 * f).clamp(0.0, 255.0) as u8;
-        p[1] = (p[1] as f32 * f).clamp(0.0, 255.0) as u8;
-        p[2] = (p[2] as f32 * f).clamp(0.0, 255.0) as u8;
-    }
+    let c = crate::curves::Curves {
+        exposure: stops.clamp(-3.0, 3.0),
+        ..Default::default()
+    };
+    crate::curves::apply_curves(img, &c);
 }
 
 /// 暗部(blacks):正值抬亮暗部、负值压暗暗部。
@@ -625,6 +674,11 @@ pub fn apply_sharpen(img: &mut image::RgbaImage, value: f32) {
 }
 
 /// 三次 box blur(高斯近似)—— 对齐原版 `sigma=r*3` + 三段 box 的结构。
+///
+/// **口径说明**:这只服务调整面板的 `Adjust.blur` 滑杆(参数语义是
+/// 「sigma 系数 + 三段宽度系数」,来自我方资源包);效果算子 `blur` 已改走
+/// 参考的阶梯量化 + 盒式模糊路径(见 `apply_effect` 与 `recipes::blur_ladder`),
+/// 两条路径不要再互相污染。
 pub fn blur3pass(img: &mut image::RgbaImage, radius: f32) {
     let radii = blur_box_radii(radius);
     for r in radii {
@@ -687,6 +741,54 @@ fn box_blur_v(img: &mut image::RgbaImage, r: i32) {
 pub fn apply_stack(img: &mut image::RgbaImage, st: &FilterStack) {
     for it in &st.items {
         apply_effect(img, it);
+    }
+}
+
+/// 读取组合效果的一个滑杆值:参数是**滑杆原值**(0..1),
+/// 按参考的 `<range>` / `<offset>` 折算成物理量 `raw·range − offset`。
+///
+/// 参考里带 `<offset>` 的滑杆,`offset` 恰好是 `range` 的一半(如 range 2.0 /
+/// offset 1.0),说明带偏移的滑杆是**双向**的、原值 0.5 即中位。
+fn combo_val(e: &Effect, key: &str, raw_default: f32, range: f32, offset: f32) -> f32 {
+    let raw = e
+        .params
+        .get(key)
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(raw_default);
+    raw * range - offset
+}
+
+/// 高光 / 阴影响应值 → 色阶的白点 / 黑点。
+///
+/// **诚实声明**:参考只公开了这两根滑杆的存在与量程(0.48),到黑白点的
+/// 折算系数暂无对应资料。此处按标准色阶语义线性折算
+/// (高光下调白点、阴影上抬黑点),方向确定、系数属我方重构。
+fn highlights_shadows(e: &Effect) -> (f32, f32) {
+    let h = combo_val(e, "highlights", 0.0, 0.48, 0.0);
+    let s = combo_val(e, "shadows", 0.0, 0.48, 0.0);
+    ((1.0 - h).clamp(0.0, 1.0), s.clamp(0.0, 1.0))
+}
+
+/// `finetune` / `finetune2`:补光 → 高光 / 阴影 → 色温。
+///
+/// 两者的差别只在**色温轴的宽度**:参考 finetune 是 range 1.0 / offset 0.5
+/// (−0.5..0.5),finetune2 是 range 2.0 / offset 1.0(−1..1)。
+fn tuning_combo(img: &mut image::RgbaImage, e: &Effect, wide_axis: bool) {
+    let fl = combo_val(e, "fill", 0.0, 1.0, 0.0);
+    if fl > 0.0 {
+        crate::oneclick::apply_fill_light(img, fl, 0.25);
+    }
+    let (white, black) = highlights_shadows(e);
+    if white < 1.0 || black > 0.0 {
+        crate::oneclick::apply_levels(img, black, white, 1.0);
+    }
+    let temp = if wide_axis {
+        combo_val(e, "temp", 0.5, 2.0, 1.0)
+    } else {
+        combo_val(e, "temp", 0.5, 1.0, 0.5)
+    };
+    if temp != 0.0 {
+        crate::oneclick::apply_color_temp(img, temp, 0.0);
     }
 }
 
@@ -769,36 +871,123 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let s = oneclick_amount(e, 50.0) / 100.0;
             crate::oneclick::apply_fill_light(img, s, 0.25);
         }
-        // finetune / finetune2 / triple*:补光 + 色阶 + 校色的组合。
-        "finetune" => {
-            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
-            crate::oneclick::apply_levels(img, 0.0, 1.0, 1.0);
-        }
-        "finetune2" => {
-            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+        // ===== 组合效果:滑杆清单取自参考产品自带的滤镜描述,各接自己的滑杆 =====
+        //
+        // | id | 参考滑杆(依次为 id=0/1/2/3) | 我方接线 |
+        // |---|---|---|
+        // | `triple` | 亮度(range 2.0 / offset 1.0)、对比度(1.0 / 0.5)、补光 | 色彩矩阵(亮度+对比度)→ 补光 |
+        // | `triple2` | 补光、黑点、白点(默认 1.0) | 补光 → 色阶(黑白点) |
+        // | `triple3` | 补光、高光(0.48)、阴影(0.48) | 补光 → 色阶(高光/阴影折算) |
+        // | `finetune` | 补光、高光、阴影、色温(1.0 / 0.5) | 补光 → 高光/阴影 → 色温 |
+        // | `finetune2` | 同上,色温轴宽一倍(2.0 / 1.0) | 同上(色温折算不同) |
+        // | `colorfix` | 白场吸管 + 色温(1.0 / 0.5) | von Kries 校色 → 色温 |
+        //
+        // **诚实声明**:参考只公开了「有哪些滑杆」与其量程/偏移,
+        // 高光 / 阴影 两根滑杆到色阶的折算系数暂无对应资料 ——
+        // 这里按「负=压、正=提」的方向线性折算到白点 / 黑点,属我方重构。
+        "finetune" | "finetune2" => {
+            tuning_combo(img, e, e.name.eq_ignore_ascii_case("finetune2"));
         }
         "triple" => {
-            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
+            let b = combo_val(e, "brightness", 0.5, 2.0, 1.0) * 100.0;
+            let c = combo_val(e, "contrast", 0.5, 1.0, 0.5) * 100.0;
+            if b != 0.0 || c != 0.0 {
+                apply_color_matrix(img, b, c, 0.0);
+            }
+            let fl = combo_val(e, "fill", 0.0, 1.0, 0.0);
+            if fl > 0.0 {
+                crate::oneclick::apply_fill_light(img, fl, 0.25);
+            }
         }
-        "triple2" | "triple3" => {
-            crate::oneclick::apply_fill_light(img, 0.5, 0.25);
-            crate::oneclick::apply_levels(img, 0.0, 1.0, 1.0);
+        "triple2" => {
+            let fl = combo_val(e, "fill", 0.0, 1.0, 0.0);
+            if fl > 0.0 {
+                crate::oneclick::apply_fill_light(img, fl, 0.25);
+            }
+            // 黑点 / 白点:白点的参考默认值就是 1.0(见 XML 的 `<default>`)
+            let black = combo_val(e, "black", 0.0, 1.0, 0.0);
+            let white = combo_val(e, "white", 1.0, 1.0, 0.0);
+            if black > 0.0 || white < 1.0 {
+                crate::oneclick::apply_levels(img, black, white, 1.0);
+            }
+        }
+        "triple3" => {
+            let fl = combo_val(e, "fill", 0.0, 1.0, 0.0);
+            if fl > 0.0 {
+                crate::oneclick::apply_fill_light(img, fl, 0.25);
+            }
+            let (white, black) = highlights_shadows(e);
+            if white < 1.0 || black > 0.0 {
+                crate::oneclick::apply_levels(img, black, white, 1.0);
+            }
         }
         // colorfix = von Kries 校色 + 色温;whitept 只做 von Kries。
         "colorfix" => {
             crate::oneclick::apply_autocolor(img);
-            crate::oneclick::apply_color_temp(img, 0.0, 0.0);
-        }        "whitept" => crate::oneclick::apply_autocolor(img),
+            let temp = combo_val(e, "temp", 0.5, 1.0, 0.5);
+            if temp != 0.0 {
+                crate::oneclick::apply_color_temp(img, temp, 0.0);
+            }
+        }
+        // 倾斜校正(Straighten):参考是一根双向滑杆(range 2.0 / offset 1.0),
+        // 即 raw 0..1 → −1..1,中位不旋转。
+        //
+        // **诚实声明**:滑杆到角度的换算系数暂无对应资料,此处按 ±15° 满量程
+        // 线性折算;调用方也可以用 `angle` 参数直接给度数来绕过折算。
+        "tilt" => {
+            let deg = match e.params.get("angle").and_then(|v| v.parse::<f32>().ok()) {
+                Some(d) => d,
+                None => {
+                    (oneclick_amount(e, 50.0).clamp(0.0, 100.0) / 100.0 * 2.0 - 1.0)
+                        * TILT_MAX_DEG
+                }
+            };
+            if deg != 0.0 {
+                let rotated = crate::recipes::rotate(img, deg, false, [0, 0, 0]);
+                *img = rotated;
+            }
+        }
+        // 阴影 / 高光:参考三根滑杆 Radius / Shadow % / Highlight %。
+        // 只给通用强度滑杆 `amount` 时,按"两端同幅度"处理。
+        "shadow" => {
+            let radius = e
+                .params
+                .get("radius")
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(25.0);
+            let pct = |key: &str| e.params.get(key).and_then(|v| v.parse::<f32>().ok());
+            let (sh, hi) = match (pct("shadow"), pct("highlight")) {
+                (Some(s), Some(h)) => (s, h),
+                _ => {
+                    let v = oneclick_amount(e, 0.0).clamp(0.0, 100.0) / 100.0;
+                    (v, v)
+                }
+            };
+            crate::recipes::shadow_highlight(img, radius, sh, hi);
+        }
+        // 反相(Invert Colors):参考就是一条 Master 曲线 `[(0,255), (255,0)]`
+        // (见 `<effect>` 的曲线调整节点),数据已在资源包。
+        "invert" => {
+            crate::curves::apply_curves(img, &crate::curves::presets::invert());
+        }
+        "whitept" => crate::oneclick::apply_autocolor(img),
         "ansel" => {
             let w = crate::oneclick::luma_weights();
             crate::oneclick::apply_ansel(img, w, 64.0);
         }
         "blur" => {
             let v = oneclick_amount(e, 50.0) / 100.0;
-            if v > 0.0 {
-                crate::effects::blur3pass(img, v * 8.0);
+            // 参考口径:滑杆量经阶梯量化(档位 {2.065, 3.0625, 4.13, 5.13}),
+            // 再走与 recipes 同一条盒式模糊(内部含半图钳制)—— 库内两条
+            // 模糊口径在效果算子这条路上已合并。
+            let r = crate::recipes::blur_ladder(v * 8.0);
+            if r > 0.0 {
+                crate::recipes::box_blur(img, r, r);
             }
         }
+        // glow / glow2:参考的光晕算子内部参数无对应资料,
+        // 我方固定走 gamma 0.5 + 模糊 + 混回的中性光晕,不读 amount、
+        // 阈值写死 128 —— 知情维持,调参留待有资料后再对齐。
         "glow" | "glow2" => {
             crate::oneclick::apply_glow(img, 128.0);
         }
@@ -1126,6 +1315,157 @@ mod tests {
         assert_eq!(st2, after);
     }
 
+    // ===== 审计 3.1 缺陷回归锁(B1 / B2 / B3 / B8 / B9)=====
+    // 以下 5 条在修复前必须**失败**,用来固定缺陷结论本身,而不只是固定实现。
+
+    /// B1:对比度不能在平移量上重复计入一次偏移。
+    ///
+    /// 标准式是 `out = (v − pivot)·k + pivot`:中灰**保持中灰**,负对比度收敛到中灰。
+    /// 旧实现多算了一次 `+(1−k)·128`,于是 +100 档把中灰压成纯黑、−100 档把整图推成纯白。
+    #[test]
+    fn contrast_keeps_midgray_and_folds_to_midgray() {
+        let run = |v: u8, c: f32| {
+            let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([v, v, v, 255]));
+            apply_color_matrix(&mut img, 0.0, c, 0.0);
+            img.get_pixel(0, 0)[0]
+        };
+        assert_eq!(run(128, 100.0), 128, "正满档:中灰必须仍是中灰");
+        assert_eq!(run(128, -100.0), 127, "负满档:应折叠到中灰 127.5 而非纯白");
+        assert!(
+            run(200, 100.0) > run(200, 0.0),
+            "正对比度应把亮部继续推亮:"
+        );
+    }
+
+    /// B2:色彩矩阵的饱和度必须走全库统一的亮度权重(0.3086/0.6094/0.082),
+    /// 不能用 Rec.709 的 (0.2126/0.7152/0.0722)。取 `sat = −100`(退化为灰度)时
+    /// 输出就是该位的亮度值 —— 纯红应为 **78**,而不是 Rec.709 的 54。
+    #[test]
+    fn saturation_uses_library_luma_weights() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        apply_color_matrix(&mut img, 0.0, 0.0, -100.0);
+        let v = img.get_pixel(0, 0)[0];
+        assert!((v as i32 - 78).abs() <= 1, "纯红应映射到 78,实得 {v}");
+    }
+
+    /// B3:饱和度必须是**非对称**的 —— 正方向按 3 倍增益走。
+    ///
+    /// 参考的确切规则:`s' = 1 + (sat > 0 ? 3·sat : sat) / 100`。
+    /// 于是 `sat = +100` → `s' = 4`(不是线性式的 2);负方向仍是线性。
+    #[test]
+    fn positive_saturation_gain_is_tripled() {
+        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([140, 120, 130, 255]));
+        apply_color_matrix(&mut img, 0.0, 0.0, 100.0);
+        let p = img.get_pixel(0, 0);
+        assert!((p[0] as i32 - 178).abs() <= 2, "s'=4 时 R 应约 178,实得 {p:?}");
+        assert!((p[1] as i32 - 98).abs() <= 2, "s'=4 时 G 应约 98,实得 {p:?}");
+    }
+
+    /// B8:调整面板的曝光必须走**曝光曲线**(样条)路径,而不是线性 `2^stops`。
+    ///
+    /// 参考的曝光点表:`pos (0,17)(47,81)(129,186)(221,255)`、
+    /// `neg (13,0)(116,74)(208,156)(255,221)`。输入 100 经曲线约为
+    /// **+1 档 → 149**(−1 档 → 63),而线性乘法会给出 200 / 50。
+    #[test]
+    fn exposure_runs_through_the_curve_spline() {
+        let run = |e: f32| {
+            let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([100, 100, 100, 255]));
+            apply(&mut img, &Adjust {
+                exposure: e,
+                ..Default::default()
+            });
+            img.get_pixel(0, 0)[0] as i32
+        };
+        let up = run(1.0);
+        assert!(up > 130 && up < 170, "+1 档应走样条约 149,实得 {up}");
+        let down = run(-1.0);
+        assert!(down > 50 && down < 80, "-1 档应走样条约 63,实得 {down}");
+    }
+
+    /// B9:5 个组合效果不能塌成同一件事 —— 各自的滑杆必须只影响自己。
+    ///
+    /// 参考的滑杆清单(取自官方 `<filter>` 描述):
+    /// `triple` = 亮度 / 对比度 / 补光;`triple2` = 补光 / 黑点 / 白点;
+    /// `triple3` = 补光 / 高光 / 阴影;`finetune` = 补光 / 高光 / 阴影 / 色温;
+    /// `finetune2` = 同上但色温轴宽一倍;`colorfix` = 白场校色 + 色温。
+    ///
+    /// 参数一律按**滑杆原值**(0..1)传入,再按参考的 `<range>` / `<offset>`
+    /// 折算成物理量 —— 例如 finetune 的色温轴 range=1.0/offset=0.5,
+    /// 滑杆 0..1 映射到 −0.5..0.5;finetune2 是 range=2.0/offset=1.0,映射到 −2..2。
+    #[test]
+    fn combo_effects_are_individually_wired() {
+        // 注意:`temp` 传的是**滑杆原值**(0..1),0.5 即中位(中性);
+        // finetune / finetune2 / colorfix 按各自的 range / offset 折算。
+        // 构造效果项:`param` 为空时用参考的零档默认。
+        fn mk(name: &str, params: &[(&str, &str)]) -> Effect {
+            let mut m = BTreeMap::new();
+            for (k, v) in params {
+                m.insert(k.to_string(), v.to_string());
+            }
+            Effect {
+                name: name.into(),
+                params: m,
+            }
+        }
+        let run = |name: &str, params: &[(&str, &str)]| {
+            let mut img = image::RgbaImage::from_pixel(24, 24, image::Rgba([40, 90, 160, 255]));
+            apply_effect(&mut img, &mk(name, params));
+            img.into_raw()
+        };
+
+        // 各自的滑杆必须只影响自己(给自己的滑杆 → 结果改变)
+        assert_ne!(
+            run("triple", &[("brightness", "40")]),
+            run("triple", &[]),
+            "triple 应响应自己的 brightness 滑杆"
+        );
+        assert_ne!(
+            run("triple", &[("contrast", "40")]),
+            run("triple", &[]),
+            "triple 应响应自己的 contrast 滑杆"
+        );
+        assert_ne!(
+            run("triple2", &[("black", "0.3")]),
+            run("triple2", &[]),
+            "triple2 应响应自己的 black(黑点)滑杆"
+        );
+        assert_ne!(
+            run("triple3", &[("highlights", "0.2")]),
+            run("triple3", &[]),
+            "triple3 应响应自己的 highlights 滑杆"
+        );
+        assert_ne!(
+            run("finetune", &[("temp", "1.0")]),
+            run("finetune", &[]),
+            "finetune 应响应自己的 temp 滑杆"
+        );
+        assert_ne!(
+            run("colorfix", &[("temp", "1.0")]),
+            run("colorfix", &[]),
+            "colorfix 应响应自己的 temp 滑杆"
+        );
+
+        // 别人的滑杆不能串到自己身上
+        assert_eq!(
+            run("triple2", &[("brightness", "40")]),
+            run("triple2", &[]),
+            "triple2 没有 brightness 滑杆,不该读取它"
+        );
+
+        // finetune 与 finetune2 的色温轴宽度不同(1.0 / 2.0),同一原始滑杆值结果不同
+        assert_ne!(
+            run("finetune", &[("temp", "1.0")]),
+            run("finetune2", &[("temp", "1.0")]),
+            "finetune2 的色温轴比 finetune 宽一倍,不应得到同一色温"
+        );
+
+        // zerostate:不给参数时,5 个照明/微调类效果都应是恒等(参考 zerostate 语义)
+        let identity = image::RgbaImage::from_pixel(24, 24, image::Rgba([40, 90, 160, 255])).into_raw();
+        for name in ["triple", "triple2", "triple3", "finetune", "finetune2"] {
+            assert_eq!(run(name, &[]), identity, "{name} 的零档应是恒等");
+        }
+    }
+
     #[test]
     fn brightness_increases_pixel_values() {
         let mut img = image::RgbaImage::from_pixel(4, 4, image::Rgba([100, 100, 100, 255]));
@@ -1150,16 +1490,25 @@ mod tests {
         assert_eq!(p[1], p[2]);
     }
 
+    /// B8(续):曝光必须**随档位单调**,且迭代结果始终落在 0..255 内。
+    ///
+    /// 负向点表末端是 (255,221) —— 即使 −3 档也不会把 250 压到纯黑,这是
+    /// 曝光曲线本身的行为(负档只是整条曲线的 mild 压缩),不是钳位遗漏。
     #[test]
-    fn exposure_doubles_then_clamps() {
-        let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([100, 50, 20, 255]));
-        apply(&mut img, &Adjust {
-            exposure: 1.0,
-            ..Default::default()
-        });
-        let p = img.get_pixel(0, 0);
-        assert_eq!(p[0], 200);
-        assert_eq!(p[1], 100);
+    fn exposure_extremes_stay_monotonic_and_in_range() {
+        let run = |e: f32| {
+            let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([250, 250, 250, 255]));
+            apply(&mut img, &Adjust {
+                exposure: e,
+                ..Default::default()
+            });
+            img.get_pixel(0, 0)[0]
+        };
+        assert_eq!(run(0.0), 250, "0 档应恒等");
+        assert!(run(1.0) > 250, "+1 档应更亮");
+        assert_eq!(run(3.0), 255, "+3 档应钳到 255");
+        let (d1, d3) = (run(-1.0), run(-3.0));
+        assert!(d3 < d1 && d1 < 250, "负档应单调压暗:{d3} < {d1} < 250");
     }
 
     #[test]
@@ -1333,10 +1682,12 @@ mod tests {
         // 饱和度 -100 → 灰度(R==G==B)
         assert_eq!(px[0], px[1], "饱和度 -100 应变灰");
         assert_eq!(px[1], px[2]);
-        // 灰度值 = 提亮后三通道的 luma(0.2126R+0.7152G+0.0722B),
-        // 必须比"未提亮的原 luma"更高(亮度 +50 起作用)。
-        let orig_luma = 0.2126 * 200.0 + 0.7152 * 80.0 + 0.0722 * 60.0;
-        let bright_luma = 0.2126 * 263.75 + 0.7152 * 143.75 + 0.0722 * 123.75;
+        // 灰度值 = 提亮后三通道的 luma —— 必须用**本项目统一权重**
+        // (0.3086/0.6094/0.082),不是 Rec.709:早前这里写死 Rec.709,
+        // 等于把当时色彩矩阵用错权重的缺陷固化成了断言。
+        let w = crate::oneclick::luma_weights();
+        let orig_luma = w[0] * 200.0 + w[1] * 80.0 + w[2] * 60.0;
+        let bright_luma = w[0] * 263.75 + w[1] * 143.75 + w[2] * 123.75;
         assert!(
             px[0] as f32 > orig_luma,
             "提亮后灰度应高于原 luma {orig_luma}, got {}",
@@ -1362,5 +1713,192 @@ mod tests {
         assert!(s.starts_with("enhance="), "应含项名: {s}");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 第 2 项-a:`tilt`(Straighten)不能再是静默空操作。
+    ///
+    /// 参考的 `<filter id="tilt">` 只有一根双向滑杆(range 2.0 / offset 1.0),
+    /// 所以转动的角度必须随滑块变化,而不是恒为 0。
+    #[test]
+    fn tilt_straightens_the_image() {
+        let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 255]));
+        for y in 6..10 {
+            for x in 2..14 {
+                img.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+        let before = img.clone();
+        apply_effect(
+            &mut img,
+            &Effect {
+                name: "tilt".into(),
+                params: [("amount".to_string(), "100".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        assert_ne!(
+            img.as_raw(),
+            before.as_raw(),
+            "tilt 没有改动任何像素 —— 仍是静默空操作"
+        );
+        // 水平白条转过之后,左右两端白像素所在的行号应当错开。
+        let row_of = |img: &image::RgbaImage, x: u32| -> Option<u32> {
+            (0..img.height()).find(|y| img.get_pixel(x, *y)[0] > 128)
+        };
+        assert_eq!(
+            (row_of(&before, 3), row_of(&before, 12)),
+            (Some(6), Some(6)),
+            "基准:白条是水平的"
+        );
+        assert_ne!(
+            (row_of(&img, 3), row_of(&img, 12)),
+            (Some(6), Some(6)),
+            "倾斜后两端行号应不再相同"
+        );
+    }
+
+    /// 第 2 项-b:`shadow`(Shadow & Highlight)必须真正提亮暗部 / 压回亮部。
+    #[test]
+    fn shadow_highlight_lifts_darks_and_recovers_highlights() {
+        // 暗底 + 中央一块亮方,使局部均值与像素值产生落差。
+        let base = || {
+            let mut img = image::RgbaImage::from_pixel(24, 24, image::Rgba([10, 10, 10, 255]));
+            for y in 8..16 {
+                for x in 8..16 {
+                    img.put_pixel(x, y, image::Rgba([240, 240, 240, 255]));
+                }
+            }
+            img
+        };
+        let run = |shadow: &str, highlight: &str| {
+            let mut img = base();
+            apply_effect(
+                &mut img,
+                &Effect {
+                    name: "shadow".into(),
+                    params: [
+                        ("shadow".to_string(), shadow.to_string()),
+                        ("highlight".to_string(), highlight.to_string()),
+                        ("radius".to_string(), "3.0".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
+            );
+            img
+        };
+        // 紧挨亮块外侧的暗像素:局部均值高于自身,应被提亮
+        let dark_probe = |img: &image::RgbaImage| img.get_pixel(7, 12)[0];
+        // 亮块**边缘内侧**的像素:邻域里混进暗像素,局部均值低于自身,
+        // 开启高光压制时应回落。取平坦区内部(如 12,12)是恒等的 ——
+        // 局部均值等于自身,这是该算法的应有行为。
+        let bright_probe = |img: &image::RgbaImage| img.get_pixel(15, 12)[0];
+
+        assert_eq!(dark_probe(&run("0.0", "0.0")), 10, "两项都是 0 时应恒等");
+        let lifted = dark_probe(&run("1.0", "0.0"));
+        assert!(lifted > 10, "暗部应被提亮,实得 {lifted}");
+        let pressed = bright_probe(&run("0.0", "1.0"));
+        assert!(pressed < 240, "亮部应被压回,实得 {pressed}");
+    }
+
+    /// 第 2 项-c:回归锁 —— `PIXEL_EFFECTS` 里除显式登记的名字外,
+    /// 每一个都必须真的影响像素。
+    #[test]
+    fn every_known_effect_touches_pixels() {
+        let sample = || {
+            let mut img = image::RgbaImage::new(32, 32);
+            for y in 0..32 {
+                for x in 0..32 {
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([(x * 8) as u8, (y * 8) as u8, ((x + y) * 4) as u8, 255]),
+                    );
+                }
+            }
+            img
+        };
+        // 给足所有已知参数键,避免某个效果只是因为取不到自己的键才没变化。
+        let strong = || -> std::collections::BTreeMap<String, String> {
+            [
+                ("amount", "100"),
+                ("angle", "35"),
+                ("color", "ff8040"),
+                ("mix", "100"),
+                ("seed", "1"),
+                ("channeloptions", "7"),
+                ("grayscale", "false"),
+                ("lr", "0.9"),
+                ("tb", "0.9"),
+                ("brightness", "0.85"),
+                ("contrast", "0.9"),
+                ("fill", "0.8"),
+                ("black", "0.3"),
+                ("white", "0.7"),
+                ("temp", "0.9"),
+                ("highlights", "0.4"),
+                ("shadows", "0.4"),
+                ("highlight", "ffeedd"),
+                ("shadow", "000000"),
+                ("radius", "3.0"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+        };
+        let mut silent: Vec<&str> = Vec::new();
+        for name in PIXEL_EFFECTS {
+            if DOCUMENTED_NOOPS.contains(name) {
+                continue;
+            }
+            let mut img = sample();
+            let before = img.as_raw().clone();
+            apply_effect(
+                &mut img,
+                &Effect {
+                    name: (*name).to_string(),
+                    params: strong(),
+                },
+            );
+            if img.as_raw() == &before {
+                silent.push(name);
+            }
+        }
+        assert!(
+            silent.is_empty(),
+            "这些效果名能被识别却不改像素(静默空操作):{silent:?}"
+        );
+    }
+
+    /// 第 4 项-a:`Invert` —— 参考是 Master 曲线 `[(0,255), (255,0)]`,
+    /// 曲线数据已在 `crate::curves::presets::invert()`,只差这条接线。
+    #[test]
+    fn invert_effect_negates_the_image() {
+        let run = |pix: image::Rgba<u8>| {
+            let mut img = image::RgbaImage::from_pixel(2, 2, pix);
+            apply_effect(
+                &mut img,
+                &Effect {
+                    name: "invert".into(),
+                    params: Default::default(),
+                },
+            );
+            *img.get_pixel(0, 0)
+        };
+        let white = run(image::Rgba([255, 255, 255, 255]));
+        assert_eq!(white[0], 0, "纯白应反相成纯黑,实得 {}", white[0]);
+        let mid = run(image::Rgba([64, 128, 200, 255]));
+        assert!(
+            (mid[1] as i32 - 127).abs() <= 4,
+            "中灰反相后仍在中灰附近,实得 {}",
+            mid[1]
+        );
+        assert!(
+            mid[0] > 180 && mid[2] < 80,
+            "反相应翻转明暗倾向:R={} B={}",
+            mid[0],
+            mid[2]
+        );
     }
 }

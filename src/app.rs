@@ -1684,6 +1684,8 @@ impl App {
                 ("冷调", "cool"),
                 ("暗角", "vignette"),
                 ("褪色", "faded"),
+                ("扶正", "tilt"),
+                ("暗部/高光", "shadow"),
             ] {
                 let on = self.fx_oneclick.as_deref() == Some(key);
                 if ui.selectable_label(on, label).clicked() {
@@ -1726,6 +1728,10 @@ impl App {
             Some("cool") => Some("冷调强度"),
             Some("vignette") => Some("暗角强度"),
             Some("faded") => Some("褪色强度"),
+            // 扶正:0~100 折算到 ±15°,50 = 不旋转。
+            Some("tilt") => Some("扶正角度"),
+            // 暗部/高光:一根滑杆同时驱动两端。
+            Some("shadow") => Some("修复强度"),
             _ => None,
         } {
             if ui
@@ -1774,7 +1780,7 @@ impl App {
                 // 自主设计调色:只有一个 amount 参数。
                 if matches!(
                     name.as_str(),
-                    "warm" | "cool" | "vignette" | "faded"
+                    "warm" | "cool" | "vignette" | "faded" | "tilt" | "shadow"
                 ) {
                     params.insert("amount".into(), format!("{:.4}", self.fx_tone_amount));
                 }
@@ -1787,6 +1793,7 @@ impl App {
             if ui.button("移除一键效果").clicked() {
                 for n in [
                     "bw", "sepia", "grain", "unsharp", "warm", "cool", "vignette", "faded",
+                    "tilt", "shadow",
                 ] {
                     self.fx_remove_effect(id, "一键效果", n);
                 }
