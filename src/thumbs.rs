@@ -40,10 +40,14 @@ impl Tier {
         }
     }
 
-    /// 该档的缓存子目录名(对应原版的三张表)。
+    /// 该档的缓存子目录名(对应原版的多档缓存表)。
+    ///
+    /// ⚠️ Small 与 Normal **不能**共用目录:两者尺寸不同(96/256),
+    /// 同名文件会互相覆盖 —— 切一次小档就把中档缓存冲掉。
+    /// Normal 沿用历史的 `"thumbs"` 目录以保住既有缓存。
     pub fn dir_name(self) -> &'static str {
         match self {
-            Tier::Small => "thumbs",
+            Tier::Small => "smallthumbs",
             Tier::Normal => "thumbs",
             Tier::Big => "bigthumbs",
             Tier::Preview => "previews",
@@ -958,5 +962,25 @@ mod tests {
         assert!(load_for_preview(&dir.join("nope.png"), PREVIEW_SIZE).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 各档位的缓存路径必须两两不同 —— 否则相邻档位互相覆盖,
+    /// 表现为"切小档后大档缓存失踪"。
+    #[test]
+    fn tier_paths_are_pairwise_distinct() {
+        for (a, b) in [
+            (Tier::Small, Tier::Normal),
+            (Tier::Normal, Tier::Big),
+            (Tier::Big, Tier::Preview),
+            (Tier::Small, Tier::Big),
+            (Tier::Small, Tier::Preview),
+            (Tier::Normal, Tier::Preview),
+        ] {
+            assert_ne!(
+                tier_path(a, 42),
+                tier_path(b, 42),
+                "{a:?} 与 {b:?} 的缓存路径不能相同"
+            );
+        }
     }
 }

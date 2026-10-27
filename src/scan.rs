@@ -316,7 +316,9 @@ pub fn scan_dir_ctrl(
             })
             .filter_map(|e| e.ok())
             .filter(|e| e.file_type().is_file())
-            .filter(|e| is_image(e.path()))
+            // 视频同样收录(`photos.kind` 记为 MOVIE),否则 `crate::video`
+            // 的 21 个扩展名与缩略图抽帧链路都不可达。
+            .filter(|e| is_indexable(e.path()))
             .map(|e| e.path().to_path_buf());
         for p in it {
             visit_counter += 1;
@@ -419,10 +421,21 @@ struct Cancelled;
 
 /// 读取一条记录(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
 fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
-    let meta = crate::exif::read_meta(p);
+    // 视频不解析 EXIF、也不起 COM 抽帧:容器里没有 Orientation / 机身信息,
+    // bulk 扫描时逐个拉 Shell 缩略图更是拖垮整次扫描。尺寸留空,
+    // 显示时由 `crate::thumbs` 的抽帧路径按需补齐。
+    let is_vid = crate::video::is_video(p);
+    let meta = if is_vid {
+        crate::exif::Meta {
+            orientation: 1,
+            ..Default::default()
+        }
+    } else {
+        crate::exif::read_meta(p)
+    };
     // 尺寸:优先 EXIF;缺失时用解码器读头(RAW 解不了,改用 Shell 缩略图尺寸)。
     let (mut w, mut h) = (meta.width, meta.height);
-    if w.is_none() || h.is_none() {
+    if !is_vid && (w.is_none() || h.is_none()) {
         let dims = image_dimensions(p).or_else(|| shell_dimensions(p));
         w = w.or(dims.map(|d| d.0));
         h = h.or(dims.map(|d| d.1));
@@ -442,7 +455,7 @@ fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
         lat: meta.gps.map(|g| g.0),
         lon: meta.gps.map(|g| g.1),
         cam: meta.cam,
-        kind: if crate::video::is_video(p) {
+        kind: if is_vid {
             crate::video::kind::MOVIE
         } else {
             crate::video::kind::PHOTO
@@ -492,7 +505,7 @@ pub fn index_file_ctrl(
             return Ok(false);
         }
     }
-    if !is_image(path) {
+    if !is_indexable(path) {
         return Ok(false);
     }
     // 排除规则:路径上任一级目录命中排除名则跳过。
@@ -716,6 +729,37 @@ mod tests {
         let txt = dir.join("b.txt");
         std::fs::write(&txt, b"x").unwrap();
         assert!(!index_file(&store, &txt).unwrap(), "非图像不应索引");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 视频必须真的能入库 —— 目录扫描与单文件入库两条路径都要放行视频。
+    ///
+    /// 收录判定按扩展名分流(与参考一致),不解码文件本身,所以这里用一个
+    /// 只有文件头的占位 .mp4 就够了。
+    #[test]
+    fn video_files_are_indexed() {
+        let dir = std::env::temp_dir().join(format!("rk-scanvideo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
+            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .unwrap();
+        std::fs::write(dir.join("a.jpg"), &buf).unwrap();
+        std::fs::write(dir.join("clip.mp4"), b"\0\0\0\x18ftypmp42").unwrap();
+
+        // 目录扫描:视频与图片应一并收录
+        let store = Store::open_mem().unwrap();
+        let s = scan_dir(&store, &[dir.clone()]).unwrap();
+        assert_eq!(s.indexed, 2, "视频应与图片一样被收录,实得 {}", s.indexed);
+
+        // 事件驱动的单文件入库
+        let store2 = Store::open_mem().unwrap();
+        assert!(
+            index_file(&store2, &dir.join("clip.mp4")).unwrap(),
+            "视频应能通过单文件入库路径进入索引"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

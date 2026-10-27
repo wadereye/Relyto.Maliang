@@ -1,4 +1,5 @@
-//! 模型功能(OCR/人脸/CLIP)。默认关闭;`cargo build --features ai` 启用。
+//! 模型功能(OCR/人脸/CLIP)。**默认启用**(`default = ["ai"]`);
+//! `cargo build --no-default-features` 可关闭。
 //! 运行时模型文件放 `%APPDATA%\Relyto\Maliang\models\`,缺失时全部功能优雅不可用。
 
 use ort::environment::Environment;

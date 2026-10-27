@@ -23,23 +23,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use walkdir::WalkDir;
 
-const IMG_EXTS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
 
-fn is_image(p: &Path) -> bool {
-    p.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| IMG_EXTS.contains(&e.to_ascii_lowercase().as_str()))
-        .unwrap_or(false)
-}
-
-/// 目录快照:排序后的 (路径, mtime_ms, size) 列表,只含图像文件。
+/// 目录快照:排序后的 (路径, mtime_ms, size) 列表,只含**可索引**的媒体文件
+/// (图片 + RAW + 视频 —— 判定统一走 `crate::scan::is_indexable`,
+/// 避免此处与事件路径收录范围不一致)。
 /// 首轮调用建立基线(不触发扫描)。降级轮询路径使用。
 pub fn snapshot(root: &Path) -> Vec<(String, i64, u64)> {
     let mut v: Vec<(String, i64, u64)> = WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| is_image(e.path()))
+        .filter(|e| crate::scan::is_indexable(e.path()))
         .filter_map(|e| {
             let md = e.metadata().ok()?;
             let mtime = md

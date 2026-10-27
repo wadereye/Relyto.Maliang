@@ -35,7 +35,7 @@
 //! | [`apply_ansel`] | `ansel` | 抛物线加权均值 + smoothstep 对比 |
 //! | [`apply_saturation`] | `sat` | 色度按亮度归一后查曲线 |
 //! | [`apply_glow`] | `glow` / `glow2` | gamma 0.5 + 模糊 + 按不透明度混回 |
-//! | [`apply_unsharp_usm`] | `unsharp` / `unsharp2` | `src + amount·(src − blur)` |
+//! | [`apply_unsharp_usm`] | `unsharp` / `unsharp2` | `src + amount·(blur − src)`(amount 为负即锐化) |
 //! | [`apply_tint`] | `tint` | 自动色阶 + 灰度 + gamma + 单色相乘 |
 //! | [`apply_dir_tint`] | `dir_tint` | 方向渐变 + 三次 B 样条软化 |
 //! | [`apply_radtint`] | `radtint` | 径向渐变着色 |
@@ -289,10 +289,15 @@ pub fn apply_grain(img: &mut image::RgbaImage, params: &GrainParams) {
     let keep = (256.0 - amount * 256.0).round() as i32;
 
     // 第一段:生成噪声图(与原版同构 —— 先整图生成,再逐像素混合)。
-    // `grayscale=true` 时三通道共用同一噪声值(原版 `channelOptions=7` + `grayscale`)。
+    //
+    // `grayscale` 是参考里的独立开关:
+    // - `true`  → 整像素只抽**一个**值,三个被选中的通道共用;
+    // - `false` → 每个通道各自抽一个值,得到**彩色**噪点。
+    // ⚠️ 早前只有一条共用数组,`true` / `false` 行为完全相同。
     let px = (img.width() * img.height()) as usize;
-    let mut noise: Vec<u8> = Vec::with_capacity(px);
-    for _ in 0..px {
+    let per_pixel = if params.grayscale { 1 } else { 3 };
+    let mut noise: Vec<u8> = Vec::with_capacity(px * per_pixel);
+    for _ in 0..px * per_pixel {
         let r = rng.next_u8() as i32;
         let n = r + (((0x7f - r) * keep) >> 8);
         noise.push(n.clamp(0, 255) as u8);
@@ -301,12 +306,13 @@ pub fn apply_grain(img: &mut image::RgbaImage, params: &GrainParams) {
     // 第二段:混合到像素。
     let mut ni = 0usize;
     for p in img.pixels_mut() {
-        let n = noise[ni] as i32;
-        ni += 1;
+        let chan_off = ni;
+        ni += per_pixel;
         for c in 0..3 {
             if params.channel_options & (1 << c) == 0 {
                 continue;
             }
+            let n = noise[chan_off + if params.grayscale { 0 } else { c }] as i32;
             let src = p[c] as i32;
             let d = 0x80 - src;
             let abs_d = d.abs();
@@ -716,7 +722,7 @@ pub fn apply_autolight(img: &mut image::RgbaImage) {
     let low = *lows.iter().min().unwrap();
     let high = *highs.iter().max().unwrap();
     if high == 255 && low == 0 {
-        // 动态已满:原版在此直接填白(视为无需处理)。
+        // 动态范围已满:像素保持不动,直接返回(原版此分支的行为无对应资料)。
         return;
     }
     apply_levels(img, low as f32 / 255.0, high as f32 / 255.0, 1.0);
@@ -839,10 +845,15 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
         (weights[2] / sum * 256.0).round() as i32,
     ];
     let a = amount as i32;
+    // ⚠️ 早前的写法是 `p[0]·w[2] + p[1]·w[1] + p[2]·w[0]` —— 把参考语料里
+    // **BGRA 下标**直接套到了 RGBA 缓冲上,红蓝权重互换,红偏向的灰度一律算反。
+    // 权重与缓冲同为 RGBA 语义,必须按下标 0/1/2 对应 R/G/B。
+    let luma16 = |p: &image::Rgba<u8>| {
+        (p[0] as i32 * w[0] + p[1] as i32 * w[1] + p[2] as i32 * w[2]).clamp(0, 0xffff)
+    };
     let mut hist = [0u32; 256];
     for p in img.pixels() {
-        let l16 = (p[0] as i32 * w[2] + p[1] as i32 * w[1] + p[2] as i32 * w[0]).clamp(0, 0xffff);
-        hist[(l16 >> 8) as usize] += 1;
+        hist[(luma16(p) >> 8) as usize] += 1;
     }
     let mut mu: u64 = 0;
     for j in 0..256usize {
@@ -852,7 +863,7 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
         return;
     }
     for p in img.pixels_mut() {
-        let l16 = (p[0] as i32 * w[2] + p[1] as i32 * w[1] + p[2] as i32 * w[0]).clamp(0, 0xffff);
+        let l16 = luma16(p);
         let delta = (((0xffff - l16) * l16 >> 14) * a) >> 8;
         let v = ((l16 + delta).clamp(0, 0xffff) >> 8) as u8;
         p[0] = v;
@@ -873,9 +884,12 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
 ///
 /// 逐像素:色度按亮度归一后取三者最大值,再查曲线 ——
 /// `l8 = 5G + 2R + B`(0..2040),`inv = l8 < 8 ? 0xffff : 0x7f800/l8`,
-/// `chroma_c = (8c − l8)·inv`(恒 ≥ 0),`C = max(3 个 chroma)`,`idx = C >> 11`;
-/// `idx == 0` → **不变**;`0 < idx < 256` → `out = (((8c − l8)·curve[idx] >> 8) + 8c) >> 3`;
-/// `idx >= 256` → 用 `curve[255]`。
+/// `chroma_c = (8c − l8)·inv`,`C = max(3 个 chroma)`,`idx = clamp(C >> 11, 0, 255)`;
+/// `idx == 0` → **不变**;`idx > 0` → `out_c = (((8c − l8)·curve[idx] >> 8) + 8c) >> 3`
+/// (**三个通道都用同一个 `curve[idx]`**)。
+///
+/// 注:单通道色度可以为负(低于该亮度基准的通道);取三者最大值后再截断,
+/// 因此负色度自然落到 `idx == 0` 的不变支路。
 ///
 /// 因为 `k ≥ 0`,该支路**只会把通道推离亮度**(增饱和),不会去饱和;
 /// 滑块的去饱和方向走另一条支路。**诚实声明**:曲线表的索引方向在
@@ -904,18 +918,17 @@ pub fn apply_saturation(img: &mut image::RgbaImage, s: f32) {
             continue;
         }
         let inv = if l8 < 8 { 0xffff } else { 0x7f800 / l8 };
-        let mut out = [r, g, b];
-        for (c8, idx) in [(8 * r, 0usize), (8 * g, 1), (8 * b, 2)] {
-            let chroma = (c8 - l8) * inv;
-            let ci = (chroma >> 11).clamp(0, 255) as usize;
-            if ci > 0 && ci < 256 {
-                let k = curve[ci];
-                out[idx] = ((((c8 - l8) * k >> 8) + c8) >> 3).clamp(0, 255);
+        let c8 = [8 * r, 8 * g, 8 * b];
+        // 参考口径:索引取**三个色度的最大值**,三通道共用同一个表项。
+        // ⚠️ 早前按逐通道各自的色度索引,与上述口径不符。
+        let chroma = c8.map(|c| (c - l8) * inv);
+        let ci = (chroma.into_iter().max().unwrap() >> 11).clamp(0, 255) as usize;
+        if ci > 0 {
+            let k = curve[ci];
+            for (idx, c) in c8.iter().enumerate() {
+                p[idx] = ((((c - l8) * k >> 8) + c) >> 3).clamp(0, 255) as u8;
             }
         }
-        p[0] = out[0] as u8;
-        p[1] = out[1] as u8;
-        p[2] = out[2] as u8;
     }
 }
 
@@ -948,7 +961,7 @@ pub fn apply_glow(img: &mut image::RgbaImage, r: f32) {
     }
 }
 
-/// USM 锐化(unsharp)—— 参考 Picasa 3 的"原图 + amount·(原图 − 模糊)"。
+/// USM 锐化(unsharp)—— `src + amount·(blur − src)`。
 ///
 /// `amount` 为 8.8 定点量(256 = 1.0)。**amount 为负即锐化、为正即模糊**,
 /// 与常见 USM 实现的符号相反,这是原版的确切行为。
@@ -1027,21 +1040,30 @@ pub fn apply_dir_tint(img: &mut image::RgbaImage, angle: f32, strength: f32, col
         };
         lut[i] = ((1.0 - (f + f)) * 255.9999).round() as i32;
     }
-    // 逐行累加器(8.8 定点)
+    // 软化宽度:`strength` 是滑杆原值(0..100),按百分比折算成长边的像素数。
+    //
+    // **诚实声明**:参考把 `strength` 传给 B 样条软化环节,
+    // 但「百分比 → 像素」这一步的基准边长暂无对应资料 ——
+    // 这里按**长边**取基准(方向向量是单位向量,投影以像素为单位)。
     let cx = w as f64 / 2.0;
     let cy = h as f64 / 2.0;
-    let step_x = dx * 256.0;
-    let step_y = dy * 256.0;
+    let soft = (s as f64 / 100.0) * (w.max(h) as f64).max(1.0);
+    // 逐行 / 逐列的 8.8 定点累加器:投影量为 `px·dx + py·dy`,此处 ×256 收进定点。
+    let step_x = (dx * 256.0).round() as i64;
+    let step_y = (dy * 256.0).round() as i64;
+    // 每行起点取 x = 0 处的投影:`(0 − cx)·dx + (y − cy)·dy`,随 y 逐步累加 dy。
+    let mut row = ((-cx) * dx * 256.0 + (-cy) * dy * 256.0).round() as i64;
     let k = [color[0] as i32, color[1] as i32, color[2] as i32];
     for y in 0..h {
+        let mut proj = row;
+        row += step_y;
         for x in 0..w {
-            let px = x as f64 - cx;
-            let py = y as f64 - cy;
-            let proj = (px * dx + py * dy) * 256.0 / 256.0; // 8.8 定点量
-            let idx = (proj as i32).unsigned_abs() as usize;
+            let idx8 = (proj as f64 / soft) as i64; // 8.8 定点 → 软化宽度归一化
+            proj += step_x;
+            let idx = idx8.unsigned_abs() as usize;
             let raw = if idx >= 0x17f {
                 0xff
-            } else if (proj as i32) < 0 {
+            } else if idx8 < 0 {
                 -lut[idx]
             } else {
                 lut[idx]
@@ -1053,7 +1075,6 @@ pub fn apply_dir_tint(img: &mut image::RgbaImage, angle: f32, strength: f32, col
                 p[c] = (v + ((k[c] - v) * mix >> 8)).clamp(0, 255) as u8;
             }
         }
-        let _ = (step_x, step_y, s);
     }
 }
 
@@ -1637,5 +1658,106 @@ mod tests {
         let da = a.get_pixel(0, 0)[0] as i32 - 128;
         let db = b.get_pixel(0, 0)[0] as i32 - 128;
         assert!(db > da, "白场轴应放大暖偏移:{db} 应 > {da}");
+    }
+
+    // ===== 审计 3.1 缺陷回归锁(B4 / B5 / B6 / B7)=====
+    // 这 4 条在修复前必须**失败**,用来固定缺陷结论本身,不只是固定实现。
+
+    /// B4:`ansel` 的亮度权重必须按缓冲的 R/G/B 顺序落到红绿蓝上。
+    ///
+    /// 参考的确切权重是 `(0.3086, 0.6094, 0.082)` —— 红色对亮度的贡献约为蓝色的
+    /// 3.8 倍,因此**纯红必须比纯蓝亮**。权重按参考语料的 BGRA 下标套到 RGBA
+    /// 缓冲上时(红用 w[2]、蓝用 w[0])会整体反过来,这里锁定正确方向。
+    #[test]
+    fn ansel_luma_weights_follow_rgb_order() {
+        let w = luma_weights();
+        let mut red = image::RgbaImage::from_pixel(8, 8, image::Rgba([255, 0, 0, 255]));
+        let mut blue = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 0, 255, 255]));
+        apply_ansel(&mut red, w, 64.0);
+        apply_ansel(&mut blue, w, 64.0);
+        let (r, b) = (red.get_pixel(0, 0)[0], blue.get_pixel(0, 0)[0]);
+        assert!(
+            r as i32 - b as i32 > 40,
+            "纯红应显著亮于纯蓝,实得 R={r} B={b}"
+        );
+    }
+
+    /// B5:`dir_tint` 的 `strength` 必须真正参与计算。
+    ///
+    /// 参考把 strength 解释为**软化(羽化)宽度**:值越大边缘过渡越宽,
+    /// 画面远端(投影坐标远在过渡宽度之外)的着色就越弱。
+    /// 旧实现把该参数丢弃了 —— 10 与 90 得到逐字节相同的图。
+    #[test]
+    fn dir_tint_strength_widens_the_feather() {
+        let run = |s: f32| {
+            let mut img = image::RgbaImage::from_pixel(65, 65, image::Rgba([128, 128, 128, 255]));
+            apply_dir_tint(&mut img, 0.0, s, [255, 0, 0]);
+            // 取方向轴(dx=1)的远端探测点:px = 64 − 32.5 = 31.5
+            img.get_pixel(64, 32)[1]
+        };
+        let (narrow, wide) = (run(10.0), run(90.0));
+        assert_ne!(narrow, wide, "strength 不应被丢弃:{narrow} == {wide}");
+        assert!(
+            wide > narrow,
+            "strength 越大远端着色应越弱(G 越高),实得 10→{narrow} 90→{wide}"
+        );
+    }
+
+    /// B5(续):投影的**原点必须在画面中心**。
+    ///
+    /// 方向色块沿方向轴的两侧反号,因此中心处 B 样条核取半值 →
+    /// G 通道应落在「半着色」的 128·(1 − 128/256) ≈ 64 附近。
+    /// 逐行累加器漏掉 `(0 − cx)·dx` 起点时,中心会被推到接近满着色。
+    #[test]
+    fn dir_tint_center_is_half_tinted() {
+        let mut img = image::RgbaImage::from_pixel(65, 65, image::Rgba([128, 128, 128, 255]));
+        apply_dir_tint(&mut img, 0.0, 50.0, [255, 0, 0]);
+        let g = img.get_pixel(32, 32)[1] as i32;
+        assert!((g - 64).abs() <= 6, "画面中心应是半着色,G 应约 64,实得 {g}");
+    }
+
+    /// B6:`GrainParams::grayscale == false` 必须给出**逐通道独立**的噪声。
+    ///
+    /// 参考的 `grayscale` 是独立开关:`true` 三通道共用同一个噪声值,
+    /// `false` 各通道各自抽样。旧实现只有一份噪声,`true` / `false` 行为完全相同。
+    #[test]
+    fn grain_false_grayscale_samples_each_channel() {
+        let run = |g: bool| {
+            let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255]));
+            apply_grain(
+                &mut img,
+                &GrainParams {
+                    amount: 0.5,
+                    seed: 5,
+                    channel_options: 7,
+                    grayscale: g,
+                },
+            );
+            img
+        };
+        // grayscale=true:输入是中性灰 → 三通道必须逐像素相等(共用同一噪声值)
+        for p in run(true).pixels() {
+            assert_eq!(p[0], p[1], "灰度噪声应三通道共用同一值");
+            assert_eq!(p[1], p[2], "灰度噪声应三通道共用同一值");
+        }
+        // grayscale=false:至少要有像素的三通道不一致
+        let independent = run(false).pixels().any(|p| p[0] != p[1] || p[1] != p[2]);
+        assert!(independent, "grayscale=false 应逐通道各自抽样");
+    }
+
+    /// B7:`sat` 的曲线索引应是**三通道色度的最大值**,不是逐通道各自索引。
+    ///
+    /// 像素 (60,0,200) 上:R 的色度索引只有 126,B 的色度索引已饱和到 255。
+    /// 按参考「`C = max(3 个 chroma)`」的口径,R 也应查 `curve[255]`,
+    /// 结果约 **149**;若按逐通道索引 R 只会得到约 134。
+    #[test]
+    fn saturation_indexes_curve_by_max_chroma() {
+        let mut img = image::RgbaImage::from_pixel(1, 1, image::Rgba([60, 0, 200, 255]));
+        apply_saturation(&mut img, 0.1);
+        let r = img.get_pixel(0, 0)[0] as i32;
+        assert!(
+            (r - 149).abs() <= 2,
+            "应以最大色度索引曲线,R 应约 149,实得 {r}"
+        );
     }
 }
