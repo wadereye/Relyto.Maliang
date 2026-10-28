@@ -1473,7 +1473,18 @@ impl App {
         if !st.is_empty() {
             ui.small("本张已应用:");
             for it in &st.items {
-                let tag = if it.is_oneclick() { "一键" } else { "调整" };
+                // 参考里有但没做的项(如需笔刷交互)要显式标出,别让用户以为已生效
+                let tag = match crate::effects::support_of(&it.name) {
+                    crate::effects::Support::ReferenceOnly => "暂不支持",
+                    crate::effects::Support::Unknown => "未知名",
+                    crate::effects::Support::Pixel => {
+                        if it.is_oneclick() {
+                            "一键"
+                        } else {
+                            "调整"
+                        }
+                    }
+                };
                 ui.small(format!("  · {} [{}]", it.name, tag));
             }
         }
