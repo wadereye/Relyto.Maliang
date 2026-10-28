@@ -17,8 +17,13 @@
 //!
 //! # 约定与限制
 //!
-//! - **白平衡属于 EXIF 元数据**,不是效果栈条目(见 `crate::exif`)。
-//! - 亮度/对比度联动开关只**存储**该标志,不实现联动算法(暂无可靠来源)。
+//! - **白平衡不从 EXIF 读取**:`crate::exif` 的元数据里没有这一项;
+//!   色调上的冷暖调整走独立的 `colortemp` 效果项(见 [`apply_color_temp`]
+//!   的转发)。此前这里写着「白平衡属于 EXIF 元数据(见 `crate::exif`)」,
+//!   是指向一个并不存在的字段,已更正。
+//! - 参考有个「亮度/对比度联动」开关(`ContrastAndBrightnessLinked`),
+//!   我方既没有这个参数、也没有可靠来源还原它的算法 ——
+//!   此前文档写成「只存储该标志」并不属实,这里更正为**未实现**。
 //! - 序列化格式用 `name=value;`;**多参数项**用 `name=k1=v1,k2=v2`
 //!   (参数打包方式属我方约定)。
 //!
@@ -148,7 +153,10 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "vignette",
     "faded",
     "autocontrast",
+    "enhance",
     "enhance_auto",
+    "curves",
+    "contrast",
     "autolight",
     "autocolor",
     "autobacklight",
@@ -199,6 +207,125 @@ const DOCUMENTED_NOOPS: &[&str] = &[
     // 视频裁剪是**时间过滤**语义,参数交给 `crate::video::MovieTrim` 处理。
     "movie",
 ];
+
+/// 参考产品随发行包自带的滤镜清单(取自其滤镜描述文件,共 84 项)。
+///
+/// 用途只有一个:把「参考有而我方没有」变成可断言的事实,
+/// 避免下一轮再靠人工数一遍。具体分档见 [`support_of`]。
+#[cfg(test)]
+pub const REFERENCE_IDS: &[&str] = &[
+    // 「编辑历史」类:不是像素滤镜,是历史记录里的条目类型
+    "save", "crop64", "crop", "redeye", "retouch", "picnik", "rot",
+    // 常规调整 / 工具 / 一键效果
+    "debug", "triple", "triple2", "triple3", "finetune", "finetune2", "colorfix",
+    "autobacklight", "autolight", "autocolor", "bw", "enhance", "warm", "grain",
+    "grain2", "sepia", "unsharp", "unsharp2", "autocontrast", "tilt", "rainbow",
+    "radblur", "radsat", "linblur", "ansel", "tint", "dir_tint", "radtint", "glow",
+    "glow2", "sat", "colortemp", "shadow", "blur", "contrast", "gamma", "backlight",
+    "fill", "whitept", "dir_sat", "dir_brite", "dir_sharp", "focalpixelate", "Boost",
+    "Border", "Cinemascope", "Comicize", "CrossProcess", "DropShadow",
+    "PicnikFocalPixelate", "FocalZoom", "PicnikGrain", "HDR", "HeatMap", "Holga",
+    "Invert", "IR", "LocalContrast", "Lomo", "Matte", "MuseumMatte", "Neon",
+    "NightVision", "Orton", "PencilSketch", "Pixelate", "Polaroid", "QuantizePalette",
+    "ReanimatedEyeColor", "RoundedEdges", "Sixties", "Soften", "PicnikTint", "TwoTone",
+    "Vignette", "moviestart", "movieend",
+];
+
+/// 参考里有、但我方**明确不做**的效果名。
+///
+/// 不做的理由统一写在下表;这些名字必须同时满足两点(测试已锁):
+/// 既不在像素效果表里,也不是可执行的配方 —— 否则就是「认得名字却不改像素」
+/// 的半吊子状态。
+pub const REFERENCE_ONLY: &[&str] = &[
+    // 需要**笔刷 / 选区**交互才能有意义,UI 成本远高于算法本身
+    "redeye",
+    "retouch",
+    "ReanimatedEyeColor",
+    // 依赖已于早前关停的外部在线服务
+    "picnik",
+    // 属于「编辑历史」的条目类型,不是可回放的像素滤镜
+    "save",
+    "crop64",
+    "crop",
+    "rot",
+    // 视频的起止端点在我方不是独立效果,而是 `movie` 效果的两个参数
+    // (`start` / `end`,见 `crate::video::MovieTrim`)。
+    "moviestart",
+    "movieend",
+    // 参考内部的调试项
+    "debug",
+];
+
+/// 参考滤镜名 → 我方**配方名**的对应表。
+///
+/// 参考的内部 id 有两种写法:不带下划线的大驼峰(`CrossProcess`)与全小写
+/// (`focalpixelate`),而我方配方一律用小写下划线。这张表把两者的对应关系
+/// 显式写出来 —— 此前只能凭注释里的一句话去猜,现在是可断言的事实
+/// (见 `recipe_aliases_point_at_real_recipes`)。
+pub const RECIPE_ALIASES: &[(&str, &str)] = &[
+    ("boost", "punch"),
+    ("border", "frame"),
+    ("dropshadow", "float_shadow"),
+    ("focalpixelate", "focal_pixelate"),
+    ("picnikfocalpixelate", "focal_pixelate"),
+    ("focalzoom", "zoom_blur"),
+    ("picnikgrain", "film_grain"),
+    ("heatmap", "heat_map"),
+    ("holga", "toy_camera"),
+    ("ir", "infrared"),
+    ("localcontrast", "local_contrast"),
+    ("matte", "edge_glow"),
+    ("museummatte", "matte_frame"),
+    ("nightvision", "night_vision"),
+    ("pencilsketch", "sketch"),
+    ("polaroid", "instant_film"),
+    ("quantizepalette", "posterize"),
+    ("roundededges", "rounded_corners"),
+    ("picniktint", "color_wash"),
+    ("twotone", "duotone"),
+    ("soften", "bloom"),
+    ("comicize", "comic"),
+    ("crossprocess", "cross_process"),
+    // 注:参考的 `Vignette` 由配方 `vignette_glow` 承载;`vignette` 这个
+    // 名字保留给我方自主设计的平滑暗角(效果表里的独立一项),不在此抢占。
+];
+
+/// 一个参考滤镜名对应的我方配方名(大小写不敏感);无对应则返回 `None`。
+pub fn recipe_for(name: &str) -> Option<&'static str> {
+    let low = name.to_ascii_lowercase();
+    RECIPE_ALIASES
+        .iter()
+        .find(|(k, _)| *k == low)
+        .map(|(_, v)| *v)
+}
+
+/// 一个效果名在我方的落地状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
+    Pixel,
+    /// 参考有、我方明确不做;理由见 [`REFERENCE_ONLY`]。
+    ReferenceOnly,
+    /// 既不在参考清单里我方也不认得 —— 通常是拼错或来路不明的名字。
+    Unknown,
+}
+
+/// 判断一个效果名的落地状态,供 UI 标注与自检使用。
+///
+/// UI 用它把效果栈里的「暂不支持」项标出来,而不是让用户以为已经生效。
+pub fn support_of(name: &str) -> Support {
+    let low = name.to_ascii_lowercase();
+    if PIXEL_EFFECTS.contains(&low.as_str())
+        || crate::recipes::is_recipe(&low)
+        || recipe_for(&low).is_some()
+    {
+        return Support::Pixel;
+    }
+    if REFERENCE_ONLY.iter().any(|k| k.to_ascii_lowercase() == low) {
+        return Support::ReferenceOnly;
+    }
+    Support::Unknown
+}
 
 impl Effect {
     /// 新建一个"增强"效果项(原版顶层滤镜名 `enhance`,
@@ -871,6 +998,15 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let s = oneclick_amount(e, 50.0) / 100.0;
             crate::oneclick::apply_fill_light(img, s, 0.25);
         }
+        // ===== 参考清单里的独立单滑杆项 =====
+        //
+        // `contrast`(Contrast):只有一根**双向**对比度滑杆(range 1.0 / offset 0.5),
+        // 原值 0.5 是中位(恒等);折算后 −0.5..0.5 线性映射到色彩矩阵的
+        // 对比度档次(−100..100)。
+        "contrast" => {
+            let v = combo_val(e, "contrast", 0.5, 1.0, 0.5) * 200.0;
+            crate::effects::apply_color_matrix(img, 0.0, v, 0.0);
+        }
         // ===== 组合效果:滑杆清单取自参考产品自带的滤镜描述,各接自己的滑杆 =====
         //
         // | id | 参考滑杆(依次为 id=0/1/2/3) | 我方接线 |
@@ -1110,17 +1246,20 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             // 成组配方(见 `crate::recipes`):一个名字对应一串固定顺序的操作,
             // 强度由 `amount`(0~100)统一控制 —— 与"淡出"滑杆语义等价;
             // 可选 `blend` 参数指定结果与原图的混合模式。
-            if crate::recipes::is_recipe(&e.name) {
-                let def = crate::recipes::default_amount(&e.name);
+            // 先认参考滤镜名(如 `CrossProcess`),再认我方配方名。
+            let resolved = recipe_for(&e.name);
+            let target = resolved.unwrap_or(&e.name);
+            if crate::recipes::is_recipe(target) {
+                let def = crate::recipes::default_amount(target);
                 let amt = oneclick_amount(e, def);
                 match e.params.get("blend") {
                     Some(s) => crate::recipes::apply_with(
                         img,
-                        &e.name,
+                        target,
                         amt,
                         crate::recipes::Blend::parse(s),
                     ),
-                    None => crate::recipes::apply(img, &e.name, amt),
+                    None => crate::recipes::apply(img, target, amt),
                 };
             }
         }
@@ -1842,6 +1981,12 @@ mod tests {
                 ("highlight", "ffeedd"),
                 ("shadow", "000000"),
                 ("radius", "3.0"),
+                // curves 有自己的参数空间,缺了它退化成恒等 —— 会给这条回归锁误判
+                ("master", "0,0;255,255"),
+                ("red", "0,20;255,235"),
+                ("green", "0,10;255,200"),
+                ("blue", "0,40;255,215"),
+                ("exposure", "1.0"),
             ]
             .into_iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1899,6 +2044,226 @@ mod tests {
             "反相应翻转明暗倾向:R={} B={}",
             mid[0],
             mid[2]
+        );
+    }
+
+    /// 第 9 项-b:`contrast` 是参考滤镜清单里的独立一项(只有一根双向对比度滑杆),
+    /// 此前完全没有实现 —— 补上并按参考滑杆口径接线。
+    #[test]
+    fn reference_contrast_is_wired_to_the_matrix_contrast() {
+        let base = || {
+            let mut img = image::RgbaImage::new(16, 16);
+            for y in 0..16 {
+                for x in 0..16 {
+                    img.put_pixel(x, y, image::Rgba([60 + (x * 8) as u8, 60, 60, 255]));
+                }
+            }
+            img
+        };
+        let run = |raw: &str| {
+            let mut img = base();
+            let mut params = BTreeMap::new();
+            params.insert("contrast".to_string(), raw.to_string());
+            apply_effect(
+                &mut img,
+                &Effect {
+                    name: "contrast".into(),
+                    params,
+                },
+            );
+            img
+        };
+        // 参考滑杆 range 1.0 / offset 0.5 ⇒ 原值 0.5 是中位(恒等)
+        let mid = run("0.5");
+        let base_bytes = base().into_raw();
+        assert_eq!(mid.as_raw(), &base_bytes, "滑杆居中时应恒等");
+        let up = run("1.0");
+        let down = run("0.0");
+        assert_ne!(up.as_raw(), &base_bytes, "正向应拉开对比");
+        assert_ne!(down.as_raw(), &base_bytes, "负向应压平对比");
+        // 拉开对比后,原本最暗与最亮的两点差值应变大
+        let spread = |img: &image::RgbaImage| -> i32 {
+            let lo = img.get_pixel(0, 0)[0] as i32;
+            let hi = img.get_pixel(15, 0)[0] as i32;
+            hi - lo
+        };
+        assert!(spread(&up) > spread(&base()), "正向应放大明暗差");
+        assert!(spread(&down) < spread(&base()), "负向应收窄明暗差");
+    }
+
+    /// 与 [`crate::recipes`] 那条同类的强约束:`apply_effect` 里**有分派分支**
+    /// 的名字,必须至少能被 [`support_of`] 认出来。
+    ///
+    /// 别名表不能是「指到一个不存在的地方」,而且**两个名字必须得到同一张图** ——
+    /// 否则就是挂了个牌子但实际没接上。
+    #[test]
+    fn recipe_aliases_point_at_real_recipes() {
+        let sample = || {
+            let mut img = image::RgbaImage::new(24, 24);
+            for y in 0..24 {
+                for x in 0..24 {
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([(x * 10) as u8, (y * 10) as u8, ((x + y) * 5) as u8, 255]),
+                    );
+                }
+            }
+            img
+        };
+        for (from, to) in crate::effects::RECIPE_ALIASES {
+            assert!(
+                crate::recipes::is_recipe(to),
+                "别名 {from} 指向的配方 {to} 不存在"
+            );
+            // 别名不能抢占已有的效果名:`apply_effect` 的显式分支优先于兜底,
+            // 一旦重名,参考名会落到另一种算法上,而这正是 `vignette` 的情况。
+            assert!(
+                !crate::effects::PIXEL_EFFECTS.contains(from)
+                    && !crate::recipes::is_recipe(from),
+                "别名 {from} 与已有效果同名,会抢走既有分派"
+            );
+            let mut a = sample();
+            let mut b = sample();
+            // 同强度两条路径应逐像素一致
+            let ran_a = crate::recipes::apply(&mut a, from, 100.0);
+            let ran_b = crate::recipes::apply(&mut b, to, 100.0);
+            // 参考名不进 recipes 的分派(那边只认我方配方名),走 effects 的别名解析
+            assert!(!ran_a, "{from} 应由 effects 侧别名解析,不该在 recipes 里被直接认下");
+            assert!(ran_b, "{to} 应是可执行配方");
+            let mut c = sample();
+            apply_effect(
+                &mut c,
+                &Effect {
+                    name: (*from).into(),
+                    params: [("amount".to_string(), "100".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+            );
+            assert_eq!(
+                c.as_raw(),
+                b.as_raw(),
+                "别名 {from} 与配方 {to} 的结果应完全一致"
+            );
+        }
+    }
+
+    /// 历史教训:先是 `tilt` / `shadow` 有名字无实现,接着 `orton` /
+    /// `vignette_glow` 有分派没登记,再到本轮 `enhance` 有分支却不在效果表里 ——
+    /// 三件事是同一个病。分支清单直接从源码解析,杜绝手工清单漂移。
+    fn apply_effect_arms() -> Vec<String> {
+        let src = include_str!("effects.rs");
+        let start = src.find("pub fn apply_effect").expect("apply_effect 应存在");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("apply_effect 应以顶层 } 结束");
+        let body = &body[..end];
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            let Some(pos) = t.find("=>") else {
+                continue;
+            };
+            // 行首到 `=>` 之间应全是 `"名字" | ` 的写法;
+            // 名字可能不止一个(`"a" | "b" =>`)—— 逐个收进来。
+            let head = t[..pos].trim();
+            if !head.starts_with('"') || head.is_empty() {
+                continue;
+            }
+            let ok: Vec<&str> = head.split('|').map(|x| x.trim()).collect();
+            if ok.iter().any(|x| !(x.starts_with('"') && x.ends_with('"') && x.len() > 2)) {
+                continue;
+            }
+            for x in ok {
+                arms.push(x[1..x.len() - 1].to_string());
+            }
+        }
+        arms.sort();
+        arms.dedup();
+        arms
+    }
+
+    #[test]
+    fn dispatch_arms_are_all_classified() {
+        let arms = apply_effect_arms();
+        assert!(!arms.is_empty(), "没能解析出任何分支,判据失效");
+        for name in &arms {
+            assert_ne!(
+                crate::effects::support_of(name),
+                crate::effects::Support::Unknown,
+                "apply_effect 认得 {name},但它既不在效果表也不是配方 —— 半吊子状态"
+            );
+        }
+        // 反向:效果表里每个名字都必须真被处理(不然就是死登记)
+        for name in crate::effects::PIXEL_EFFECTS {
+            let is_noop = crate::effects::DOCUMENTED_NOOPS.contains(name);
+            assert!(
+                arms.iter().any(|a| a == name) || is_noop,
+                "效果表里的 {name} 没有任何分派分支"
+            );
+        }
+    }
+
+    /// 第 9 项-a:参考滤镜清单(84 项)的落地状态必须**可机读**而不是靠记性。
+    ///
+    /// 关键是把「知道但不做」(需要笔刷交互 / 外部服务已关停 / 属于编辑历史项)
+    /// 与「压根没见过」区分开 —— 后者通常是拼错的效果名,应当能被揪出来。
+    #[test]
+    fn reference_filter_ids_are_all_classified() {
+        for id in crate::effects::REFERENCE_IDS {
+            let got = crate::effects::support_of(id);
+            assert_ne!(
+                got,
+                crate::effects::Support::Unknown,
+                "参考滤镜 {id} 既无实现也没登记为「暂不支持」"
+            );
+        }
+    }
+
+    /// 「暂不支持」的名字必须真的没有像素实现 ——
+    /// 否则就是上一轮 `tilt` / `shadow` 那种「半吊子」:认得名字却不改像素。
+    #[test]
+    fn reference_only_ids_have_no_pixel_implementation() {
+        for id in crate::effects::REFERENCE_ONLY {
+            let low = id.to_ascii_lowercase();
+            assert!(
+                !crate::effects::PIXEL_EFFECTS.contains(&low.as_str()),
+                "{id} 登记为暂不支持,却出现在像素效果表里"
+            );
+            assert!(
+                !crate::recipes::is_recipe(&low),
+                "{id} 登记为暂不支持,却是可执行的配方"
+            );
+            assert_ne!(
+                crate::effects::support_of(id),
+                crate::effects::Support::Unknown,
+                "{id} 应在 REFERENCE_IDS 里"
+            );
+        }
+    }
+
+    /// 分类必须对外可用:UI 据此给效果栈标注「暂不支持」,而不是静默无效果。
+    #[test]
+    fn support_classification_distinguishes_the_three_states() {
+        assert_eq!(
+            crate::effects::support_of("bw"),
+            crate::effects::Support::Pixel,
+            "bw 应有像素实现"
+        );
+        assert_eq!(
+            crate::effects::support_of("orton"),
+            crate::effects::Support::Pixel,
+            "orton 是配方,应有像素实现"
+        );
+        assert_eq!(
+            crate::effects::support_of("retouch"),
+            crate::effects::Support::ReferenceOnly,
+            "retouch 需要笔刷交互,应登记为暂不支持"
+        );
+        assert_eq!(
+            crate::effects::support_of("not_a_real_effect"),
+            crate::effects::Support::Unknown,
+            "没见过的名字应是 Unknown"
         );
     }
 }

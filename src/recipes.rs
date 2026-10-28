@@ -550,6 +550,30 @@ pub fn local_contrast(img: &mut RgbaImage, radius: f32, strength: f32) {
     }
 }
 
+/// 局部对比度 —— **参考的两支嵌套形式**(滑杆口径就是参考的 `c`)。
+///
+/// 参考的 LocalContrast 不是单公式,而是两支嵌套依次复合:
+///
+/// ```text
+/// blur = Blur(orig, radius)                    // 先记下 orig 与 blur 两张图
+/// 支一 subtract:(blur − orig)·c  复合回 ⇒ blur + (orig − blur)·c
+/// 支二 add     :(orig − blur)·c  复合回 ⇒ blur + 2c·(orig − blur)
+/// ```
+///
+/// 与 [`local_contrast`] 的 USM 形式 `orig + s·(orig − blur)` 属同一族,
+/// 换算关系 **`s = 2c − 1`**(回归锁 `local_contrast_strength_maps_to_reference_contrast`)。
+/// 两个推论:`c = 0.5` 严格还原原图;`c = 0` 得到纯模糊图。
+///
+/// 参考滑杆量程:`radius` 1.3~40(缺省 15)、`c` 1~3(缺省 1.5)。
+///
+/// **诚实声明**:嵌套语义按「子级结果以该 BlendMode 复合进父画布」解读,
+/// 各支作用的中间画布顺序取自官方滤镜描述的书写次序;
+/// 若复合方向另有讲究,结果会差一个常数倍,目前无样本可校验。
+pub fn local_contrast_ref(img: &mut RgbaImage, radius: f32, contrast: f32) {
+    // 直接换算成 USM 的强度再走同一条实现,避免两处公式写歪。
+    local_contrast(img, radius, 2.0 * contrast - 1.0);
+}
+
 /// 阴影 / 高光(Shadow & Highlight)。
 ///
 /// 参考的三根滑杆:Radius(`range 1.0` + `log 250.0`)、Shadow %、Highlight %(均 `range 1.0`);
@@ -1415,6 +1439,9 @@ pub const RECIPES: &[&str] = &[
     "duotone",
     "comic",
     "bloom",
+    "orton",
+    "vignette_glow",
+    "lomo",
     "sketch",
     "cross_process",
     "cinemascope",
@@ -1453,6 +1480,9 @@ pub fn label(name: &str) -> &'static str {
         "duotone" => "双色调",
         "comic" => "漫画",
         "bloom" => "柔光",
+        "orton" => "奥顿柔焦",
+        "vignette_glow" => "黑色暗角",
+        "lomo" => "暗角柔化",
         "sketch" => "铅笔素描",
         "cross_process" => "交叉冲印",
         "cinemascope" => "宽银幕",
@@ -1538,9 +1568,9 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         "film_grain" => {
             apply_noise_layer(img, 1, 229, 255, true, Blend::Multiply, 1.0);
         }
-        // 强动态:大半径局部对比,观感接近 HDR
+        // 强动态:参考的 HDR 就是同一个局部对比算子,滑杆缺省 radius=20、contrast=3
         "hdr" => {
-            local_contrast(img, 20.0, 3.0);
+            local_contrast_ref(img, 20.0, 3.0);
         }
         // 热成像:先去饱和,再按亮度走蓝→绿→红色阶
         "heat_map" => {
@@ -1581,7 +1611,7 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         }
         // 局部对比:中小半径、温和强度
         "local_contrast" => {
-            local_contrast(img, 15.0, 1.5);
+            local_contrast_ref(img, 15.0, 1.5);
         }
         // 鲜艳暗角:边缘压暗 + 边缘模糊 + 提饱和对比
         "toy_vivid" => {
@@ -1689,6 +1719,29 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
             let mut layer = img.clone();
             box_blur(&mut layer, 20.0, 20.0);
             composite(img, &layer, Blend::Normal, 0.8);
+        }
+        // 托伊相机款(Lomo):参考滤镜描述里是三步依次作用 —
+        //   ① 黑色**内发光**:半径 = 35·0.02·长边/2 = 0.35·长边,强度 1.1;
+        //   ② **圆形渐变遮罩**下的 Blur(20):内径 = 长边/4,
+        //      外径 = 长边/2·(2 − blur/100),参考滑杆缺省 50 → 0.75·长边;
+        //   ③ 色彩矩阵:饱和 +20 / 对比 +35 / 亮度 +5。
+        // 遮罩是「内实外虚」,所以只有中心被模糊,四角保持清晰。
+        "lomo" => {
+            glow_edge(img, [0, 0, 0], long * 0.35, 1.1, 1.0);
+            let m = circular_mask(
+                w,
+                h,
+                w as f32 / 2.0,
+                h as f32 / 2.0,
+                long * 0.25,
+                long * 0.75,
+                1.0,
+                0.0,
+            );
+            let mut layer = img.clone();
+            box_blur(&mut layer, 20.0, 20.0);
+            composite_masked(img, &layer, &m, Blend::Normal, 1.0);
+            crate::effects::apply_color_matrix(img, 5.0, 35.0, 20.0);
         }
         // 奥顿柔焦(Orton-ish):参考是**嵌套操作** ——
         // `Blur(bloom)` 以 **Overlay** 混合回原图 → 再叠一条亮度曲线
@@ -1886,6 +1939,48 @@ mod tests {
         assert_ne!(*img.get_pixel(0, 0), before, "圆角外的像素未被填充");
         let center = img.get_pixel(32, 32);
         assert_eq!(center[3], 255, "中心像素被误伤");
+    }
+
+    /// 参考的 LocalContrast 不是单公式,而是**两支嵌套**依次作用:
+    ///
+    /// ```text
+    /// blur = Blur(orig, r)
+    /// 支一(subtract):(blur − orig)·c   →  以 subtract 复合回:bg = blur + (orig−blur)·c
+    /// 支二(add)      :(orig − blur)·c   →  以 add      复合回:bg + (orig−blur)·c
+    /// 合计           :blur + 2c·(orig − blur)
+    /// ```
+    ///
+    /// 于是与常见的 USM 形式 `orig + s·(orig−blur)` 是**同一族**,换算关系
+    /// `s = 2c − 1`。两条推论被下面的断言锁死:
+    /// `c = 0.5` 必须严格还原原图;`s = 2c − 1` 必须逐字节等价。
+    #[test]
+    fn local_contrast_reference_is_identity_at_half() {
+        let mut img = sample(24, 24);
+        let before = img.clone();
+        local_contrast_ref(&mut img, 8.0, 0.5);
+        assert_eq!(
+            img.as_raw(),
+            before.as_raw(),
+            "c=0.5 时应严格还原原图(blur + 1·detail = orig)"
+        );
+    }
+
+    #[test]
+    fn local_contrast_strength_maps_to_reference_contrast() {
+        for c in [0.5f32, 1.0, 1.5, 3.0] {
+            let mut a = sample(24, 24);
+            let mut b = sample(24, 24);
+            local_contrast(&mut a, 8.0, 2.0 * c - 1.0);
+            local_contrast_ref(&mut b, 8.0, c);
+            for (pa, pb) in a.pixels().zip(b.pixels()) {
+                for ch in 0..3 {
+                    assert!(
+                        (pa[ch] as i32 - pb[ch] as i32).abs() <= 1,
+                        "c={c} 时两种参数口径应等价,实得 {pa:?} vs {pb:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2651,5 +2746,124 @@ mod sampler_tests {
         for p in img.pixels() {
             assert_eq!(p[0], 128, "均色图模糊应保持均色,实得 {}", p[0]);
         }
+    }
+
+    /// 登记表的两向一致性 —— 防止出现「`apply` 认得、`is_recipe` 不认」的不可达配方。
+    ///
+    /// 分支清单直接从本文件源码里解析,不另抄一份常量表,避免以后两处漂移。
+    fn dispatch_arms() -> Vec<String> {
+        let src = include_str!("recipes.rs");
+        let start = src
+            .find("pub fn apply_with")
+            .expect("apply_with 应存在");
+        let body = &src[start..];
+        let end = body.find("\n}\n").expect("apply_with 应以顶层 } 结束");
+        let body = &body[..end];
+        let mut arms: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix('"') {
+                if let Some((name, tail)) = rest.split_once('"') {
+                    if tail.trim_start().starts_with("=>") && !name.is_empty() {
+                        arms.push(name.to_string());
+                    }
+                }
+            }
+        }
+        arms.sort();
+        arms.dedup();
+        arms
+    }
+
+    #[test]
+    fn registered_recipes_match_the_apply_dispatch() {
+        let arms = dispatch_arms();
+        assert!(!arms.is_empty(), "没能从源码解析出任何分支,判据失效");
+
+        // 方向一:`apply` 认得的名字必须全部登记,否则 UI 与 is_oneclick 都不可达。
+        let unregistered: Vec<&String> = arms
+            .iter()
+            .filter(|n| !crate::recipes::is_recipe(n))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "这些配方有分派分支却没登记,外部不可达:{unregistered:?}"
+        );
+
+        // 方向二:登记表里每个名字都必须真能跑,且有独立的中文名。
+        for name in crate::recipes::RECIPES {
+            let mut img = image::RgbaImage::from_pixel(8, 8, image::Rgba([120, 120, 120, 255]));
+            assert!(
+                crate::recipes::apply(&mut img, name, 100.0),
+                "登记了却没有对应分支:{name}"
+            );
+            assert_ne!(
+                crate::recipes::label(name),
+                "效果",
+                "配方 {name} 缺独立中文名"
+            );
+        }
+    }
+
+    /// `Lomo`(托伊相机款抖动暗角)在 84 项参考滤镜里没有对应实现 —— 补齐。
+    ///
+    /// 参考链(取自官方滤镜描述,三步依次作用):
+    ///  1. 黑色**内发光**:半径 = 35·0.02·长边/2 = 0.35·长边,强度 1.1
+    ///  2. 圆形渐变遮罩下的 **Blur(20)**:遮罩内径 = 长边/4,外径 = 长边/2·(2 − blur/100)
+    ///  3. 色彩矩阵:饱和 +20 / 对比 +35 / 亮度 +5
+    ///
+    /// 断言只锁这三件事的**可观测后果**,不锁内部写法。
+    #[test]
+    fn lomo_blurs_the_center_and_darkens_the_corners() {
+        // 高频条纹:中心被 Blur(20) 抚平」后,相邻列的差异应显著变小。
+        let stripes = || {
+            let mut img = image::RgbaImage::new(64, 64);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let v = if x % 2 == 0 { 200 } else { 60 };
+                    img.put_pixel(x, y, image::Rgba([v, v, v, 255]));
+                }
+            }
+            img
+        };
+        let contrast_at_center = |img: &image::RgbaImage| -> i32 {
+            let mut sum = 0i32;
+            for x in 28..36u32 {
+                let d = img.get_pixel(x, 32)[0] as i32 - img.get_pixel(x + 1, 32)[0] as i32;
+                sum += d.abs();
+            }
+            sum
+        };
+
+        let base = stripes();
+        let before = contrast_at_center(&base);
+        assert!(before > 500, "基准应满足高频,实得 {before}");
+
+        let mut img = base.clone();
+        assert!(
+            crate::recipes::apply(&mut img, "lomo", 100.0),
+            "lomo 应是已知配方"
+        );
+        let after = contrast_at_center(&img);
+        assert!(
+            after < before / 2,
+            "中心应被模糊抹平:前 {before} → 后 {after}"
+        );
+
+        // 四角应被黑色内发光压暗
+        let corner_before = base.get_pixel(0, 0)[0];
+        let corner_after = img.get_pixel(0, 0)[0];
+        assert!(
+            corner_after < corner_before,
+            "四角应被压暗:前 {corner_before} → 后 {corner_after}"
+        );
+
+        // 第三步:中心区域应有饱和/对比提升的痕迹 —— 平坦区上取不到,
+        // 改为验证整体不是只有暗角(即中心亮度没有单向下坠到 0)
+        assert!(
+            img.get_pixel(32, 32)[0] > 8,
+            "中心不应被压成纯黑,实得 {}",
+            img.get_pixel(32, 32)[0]
+        );
     }
 }
