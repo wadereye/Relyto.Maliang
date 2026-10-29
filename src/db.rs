@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS photos (
 );
 CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_utc);
 CREATE INDEX IF NOT EXISTS idx_photos_parent ON photos(parent);
-CREATE INDEX IF NOT EXISTS idx_photos_cam_id ON photos(cam_id);
+-- 注意:建在迁移列(如 cam_id)上的索引不能写在这里 —— 旧库表已存在,
+-- CREATE TABLE IF NOT EXISTS 跳过、索引先于 ALTER 执行会直接失败。
+-- 这类索引一律放 `from_conn` 的迁移段(ALTER 之后)。
 -- P1-14 字符串池。按列隔离(pool 名 = <表>_<列>),
 -- id = 池内去重数组下标,**append-only、无引用计数**,回收靠 vacuum() 重建
 -- (整池序列化 + 字符串入池只对现存行入池)。
@@ -163,7 +165,11 @@ CREATE TABLE IF NOT EXISTS thumb_tiers (
 impl Store {
     pub fn open() -> Result<Store> {
         let path = data_dir().join("index.db");
-        let conn = Connection::open(&path)?;
+        Self::from_conn(Connection::open(&path)?)
+    }
+
+    /// 对既有连接执行建表 + 旧库迁移(测试可注入模拟旧库)。
+    pub fn from_conn(conn: Connection) -> Result<Store> {
         conn.execute_batch(SCHEMA)?;
         // 旧库迁移:按需补列(列已存在时静默)
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN dhash INTEGER;");
@@ -207,9 +213,7 @@ impl Store {
     /// 内存库(测试专用,避免污染真实 index.db)。
     #[cfg(test)]
     pub fn open_mem() -> Result<Store> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Store(Mutex::new(conn)))
+        Self::from_conn(Connection::open_in_memory()?)
     }
 
     pub fn upsert_watched(&self, p: &Path) -> Result<()> {
@@ -1300,6 +1304,56 @@ mod tests {
     fn intern_batch_empty_is_noop() {
         let store = Store::open_mem().unwrap();
         assert!(store.intern_batch(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn open_migrates_legacy_db_without_cam_id_column() {
+        // 模拟早期版本的 index.db:photos 表已存在但只有老列
+        // (没有 cam_id / filters / kind 等后续迁移列)。
+        // SCHEMA 不得引用任何迁移列,否则建索引先于 ALTER 失败,
+        // 程序启动即 panic(真实事故:2026-10-29 debug 版启动崩溃)。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE photos(
+                 id INTEGER PRIMARY KEY,
+                 path TEXT UNIQUE NOT NULL,
+                 parent TEXT NOT NULL,
+                 mtime INTEGER NOT NULL,
+                 size INTEGER NOT NULL,
+                 taken_utc TEXT,
+                 cam TEXT,
+                 rot INTEGER NOT NULL DEFAULT 0,
+                 thumb_ok INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO photos(path,parent,mtime,size,cam)
+                 VALUES('/p/a.jpg','/p',0,0,'Nikon D850');",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        let c = store.0.lock().unwrap();
+        // 迁移列已补齐,池索引已建立
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name='idx_photos_cam_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "cam_id 索引应在迁移后建立");
+        // 旧行的相机型号已被 backfill_cam_pool 迁入字符串池(cam 置空)
+        let cid: Option<i64> = c
+            .query_row("SELECT cam_id FROM photos WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert!(cid.is_some(), "旧行相机型号应已入池");
+        let val: String = c
+            .query_row(
+                "SELECT value FROM string_pool WHERE pool='photos_cam' AND value_id=?1",
+                rusqlite::params![cid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(val, "Nikon D850");
     }
 
     #[test]
