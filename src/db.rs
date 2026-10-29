@@ -235,6 +235,22 @@ impl Store {
         Ok(())
     }
 
+    /// 首启登记默认扫描范围(壳目录)并落标记;重复调用为空操作。
+    ///
+    /// 对应参考件首启行为:只登记「我的文档 / 图片 / 桌面」一次,
+    /// 之后监听列表完全由用户在文件夹管理器自管。
+    /// 返回是否本次执行了登记(调用方据此决定是否发起首扫)。
+    pub fn ensure_first_run_scope(&self) -> bool {
+        if self.get_setting("scan_initialized").is_some() {
+            return false;
+        }
+        for r in default_roots() {
+            let _ = self.upsert_watched(&r);
+        }
+        let _ = self.set_setting("scan_initialized", "1");
+        true
+    }
+
     /// 监听文件夹及其照片数(含子文件夹;文件夹管理器列表面板)。
     pub fn watched_stats(&self) -> Vec<(String, usize)> {
         let conn = self.0.lock().unwrap();
@@ -1072,78 +1088,43 @@ fn like_escape(s: &str) -> String {
 
 /// 扫描根目录候选(按盘符枚举)。
 ///
-/// 卷类型分流:`GetLogicalDriveStrings` + `GetDriveTypeA` 分流。
-/// 关键差异:**网络盘(DRIVE_REMOTE)不扫描** —— 原版明确不扫,我方原先 C:\~Z:\ 全枚举
-/// 会把映射的网络盘也拖进来,造成"扫描整个图库"长时间卡死。
+/// 默认扫描范围:用户壳目录(我的文档 / 图片 / 桌面)。
+///
+/// 对应参考件首启口径 —— 安装文案原文
+/// "Only search My Documents, My Pictures, and the Desktop":
+/// 首启只登记这三个壳目录并扫描一次;扩大范围由用户在文件夹管理器手动添加。
+/// **绝不返回盘根** —— 盘根会把系统 / 应用数据目录整卷拖进库(真实事故)。
 pub fn default_roots() -> Vec<PathBuf> {
-    if cfg!(windows) {
-        let mut v = Vec::new();
-        for c in b'C'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", c as char));
-            if !std::fs::metadata(&root).map(|m| m.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            match crate::win::drive_type(&root) {
-                // 已知卷类型:按原版策略决定收不收(网络盘/光驱直接排除)。
-                Some(t) => {
-                    if !t.scannable() {
-                        continue;
-                    }
-                    v.push(root);
-                }
-                // 取不到卷类型(非 Windows 等):退回"目录存在即可"。
-                None => v.push(root),
-            }
-        }
-        v
-    } else {
-        let mut v = Vec::new();
-        if let Some(h) = dirs::home_dir() {
-            v.push(h.join("Pictures"));
-            v.push(h);
-        }
-        if !v[0].exists() {
-            v.remove(0);
-        }
-        v
-    }
-}
-
-/// 列出所有可扫描的卷(含盘符),供 UI 展示"扫描整个图库"会覆盖哪些卷。
-/// 与 `default_roots` 同源,但不做目录存在性检查(用于说明文案)。
-pub fn scannable_volumes() -> Vec<(String, bool)> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-    let mut v = Vec::new();
-    for c in b'C'..=b'Z' {
-        let root = format!("{}:\\", c as char);
-        let p = PathBuf::from(&root);
-        if !std::fs::metadata(&p).map(|m| m.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let (kind, scannable) = match crate::win::drive_type(&p) {
-            Some(crate::win::DriveType::Fixed) => ("固定盘", true),
-            Some(crate::win::DriveType::Removable) => ("可移动", true),
-            Some(crate::win::DriveType::RamDisk) => ("内存盘", true),
-            Some(crate::win::DriveType::Remote) => ("网络盘", false),
-            Some(crate::win::DriveType::CdRom) => ("光驱", false),
-            Some(crate::win::DriveType::NoRootDir) => ("无根目录", false),
-            _ => ("未知", false),
-        };
-        // 顺带标出文件系统名(NTFS / exFAT / FAT32 …):
-        // 用户据此判断这个卷是不是自己想扫的那个(比如插上的相机卡)。
-        let fs = crate::win::volume_filesystem(&p)
-            .map(|s| format!(", {s}"))
-            .unwrap_or_default();
-        v.push((format!("{root} ({kind}{fs})"), scannable));
-    }
-    v
+    crate::win::known_dirs()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 参考件口径:默认扫描范围是壳目录(我的文档/图片/桌面),
+    /// 绝不返回盘根 —— 盘根会把系统/应用数据目录整卷拖进库(真实事故)。
+    #[test]
+    fn default_roots_are_shell_dirs_never_drive_roots() {
+        for p in default_roots() {
+            assert!(p.exists(), "默认根不存在:{p:?}");
+            assert!(
+                p.parent().is_some(),
+                "默认根不允许是盘根/卷根:{p:?}"
+            );
+        }
+    }
+
+    /// 参考件首启行为:默认范围只登记一次,之后由用户在文件夹管理器自管。
+    #[test]
+    fn first_run_scope_seeds_once() {
+        let store = Store::open_mem().unwrap();
+        assert!(store.watched_stats().is_empty());
+        assert!(store.ensure_first_run_scope());
+        assert!(!store.watched_stats().is_empty());
+        // 第二次调用是空操作(已初始化)。
+        assert!(!store.ensure_first_run_scope());
+    }
 
     /// P0 修复固化:新库 photos 表必须带 star 列
     /// (scan.rs INSERT / timeline.rs SELECT·UPDATE 都依赖它;旧库靠 ALTER 迁移补)。

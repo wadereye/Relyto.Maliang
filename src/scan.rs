@@ -54,8 +54,17 @@ pub fn is_raw(p: &Path) -> bool {
 
 /// 扫描排除规则(目录名匹配,大小写不敏感)。
 ///
-/// 默认项对齐原版:
-/// `windows / winnt / temp / Program Files / Originals`。
+/// 参考件的默认排除列表只有 4 项(初始化函数依次入集):
+/// `thumbs / RECYCLER / Originals / .picasaoriginals`。
+/// 它不踩系统目录的真正原因是**默认扫描范围极窄**(只登记
+/// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
+/// 而非靠排除规则拦截。
+///
+/// 我方默认表是参考件口径的**刻意超集**:除回收站(旧名 RECYCLER,
+/// 现代系统为 $RECYCLE.BIN,内含 $I*.jpg 删除记录,不是图片)与
+/// Originals 外,另加系统 / 应用数据目录作纵深防御 —— 万一用户
+/// 手动把宽范围加进监听,也能挡住最常见的数据垃圾。
+/// 另有点开头的隐藏目录一律排除(见 `excludes_dir`)。
 /// 用户自定义项来自 `settings` 表的 `exclude_dirs`(每行一个目录名)。
 #[derive(Debug, Clone)]
 pub struct Exclusions {
@@ -66,20 +75,22 @@ impl Default for Exclusions {
     fn default() -> Self {
         Exclusions {
             names: vec![
-                "windows".into(),
-                "winnt".into(),
-                "temp".into(),
-                "Program Files".into(),
-                "Program Files (x86)".into(),
+                // —— 参考件默认 4 项(原样口径;RECYCLER 为旧版回收站目录名) ——
+                "thumbs".into(),
+                "RECYCLER".into(),
                 "Originals".into(),
-                // Windows 系统目录:回收站(内含 $I*.jpg 删除记录,不是图片)、
-                // 还原点、恢复分区、系统升级临时目录。
+                ".picasaoriginals".into(),
+                // —— 我方扩充:现代系统对应物与常见数据垃圾(纵深防御) ——
                 "$RECYCLE.BIN".into(),
                 "System Volume Information".into(),
                 "Recovery".into(),
                 "$WINDOWS.~BT".into(),
                 "$WINDOWS.~WS".into(),
-                // 应用数据与包管理缓存(海量小图标/构建产物,不属于照片)。
+                "windows".into(),
+                "winnt".into(),
+                "temp".into(),
+                "Program Files".into(),
+                "Program Files (x86)".into(),
                 "AppData".into(),
                 "node_modules".into(),
                 "npm-cache".into(),
