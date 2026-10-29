@@ -187,6 +187,54 @@ pub fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
+/// 取用户壳目录(我的文档 / 图片 / 桌面),按存在性过滤。
+///
+/// 对应参考件首启默认扫描范围 —— 安装文案原文:
+/// "Only search My Documents, My Pictures, and the Desktop"。
+/// 参考件首启只登记这三个壳目录,绝不扫盘根;扩大范围由用户手动添加。
+pub fn known_dirs() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, KNOWN_FOLDER_FLAG,
+            SHGetKnownFolderPath,
+        };
+        let mut v = Vec::new();
+        for fid in [&FOLDERID_Documents, &FOLDERID_Pictures, &FOLDERID_Desktop] {
+            // SAFETY: rfid 指向静态常量 GUID;htoken 传 NULL 表示当前用户。
+            if let Ok(pw) =
+                unsafe { SHGetKnownFolderPath(fid, KNOWN_FOLDER_FLAG(0), HANDLE(std::ptr::null_mut())) }
+            {
+                let s = unsafe { pw.to_string() }.unwrap_or_default();
+                unsafe { CoTaskMemFree(Some(pw.as_ptr() as _)) };
+                if !s.is_empty() {
+                    let p = std::path::PathBuf::from(s);
+                    if p.is_dir() {
+                        v.push(p);
+                    }
+                }
+            }
+        }
+        v
+    }
+    #[cfg(not(windows))]
+    {
+        let mut v = Vec::new();
+        if let Some(h) = dirs::home_dir() {
+            for n in ["Documents", "Pictures", "Desktop"] {
+                let p = h.join(n);
+                if p.is_dir() {
+                    v.push(p);
+                }
+            }
+        }
+        v
+    }
+}
+
+
 /// 用系统关联程序打开文件。
 ///
 /// P2-17 视频播放的**等效替代**:原版在库内用 DirectShow filter graph

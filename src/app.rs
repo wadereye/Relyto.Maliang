@@ -626,6 +626,14 @@ impl App {
         // 正常完成/取消都会出队;本项目改用持久化队列,
         // 进程中途退出后仍可在下次启动时继续。
         let pending = self.store.pending_scans();
+        // 参考件首启口径:首次运行只登记壳目录(我的文档/图片/桌面)
+        // 并扫描一次,之后监听列表由用户在文件夹管理器自管。
+        if self.store.ensure_first_run_scope() && pending.is_empty() {
+            let roots = crate::db::default_roots();
+            if !roots.is_empty() {
+                self.start_scan_roots(roots, "常用目录");
+            }
+        }
         if !pending.is_empty() {
             let roots: Vec<PathBuf> = pending.iter().map(|(r, _)| PathBuf::from(r)).collect();
             let scope = if pending.len() == 1 {
@@ -678,12 +686,18 @@ impl App {
         }
     }
 
+    /// 重扫当前全部监听目录。
+    ///
+    /// 参考件没有「扫全盘」概念:范围只经文件夹管理器扩大,
+    /// 这里提供对已登记范围的一键重扫入口(不新增范围)。
     fn start_scan_full(&mut self) {
-        let roots = crate::db::default_roots();
-        for r in &roots {
-            let _ = self.store.upsert_watched(r);
-        }
-        self.start_scan_roots(roots, "整个图库");
+        let roots: Vec<PathBuf> = self
+            .store
+            .watched_stats()
+            .into_iter()
+            .map(|(p, _)| PathBuf::from(p))
+            .collect();
+        self.start_scan_roots(roots, "全部监听目录");
     }
 
     /// 启动扫描后台线程;scope 仅用于状态文案。
@@ -3005,7 +3019,7 @@ impl eframe::App for App {
                     }
                     let scanning = self.scan_busy.load(Ordering::Relaxed);
                     if ui
-                        .add_enabled(!scanning, egui::Button::new("扫描整个图库…"))
+                        .add_enabled(!scanning, egui::Button::new("重新扫描监听目录…"))
                         .clicked()
                     {
                         self.start_scan_full();
@@ -3014,31 +3028,12 @@ impl eframe::App for App {
                     if scanning {
                         ui.spinner();
                     }
-                    // 说明"扫描整个图库"覆盖哪些卷 + 哪些卷被排除
-                    // (卷类型分流:网络盘/光驱不扫)。
-                    {
-                        let mut yes: Vec<String> = Vec::new();
-                        let mut no: Vec<String> = Vec::new();
-                        for (label, ok) in crate::db::scannable_volumes() {
-                            if ok {
-                                yes.push(label);
-                            } else {
-                                no.push(label);
-                            }
-                        }
-                        let joined = |v: &[String]| {
-                            v.iter()
-                                .map(|s| s.as_str())
-                                .collect::<Vec<_>>()
-                                .join("、")
-                        };
-                        if !yes.is_empty() {
-                            ui.small(format!("将扫描:{}", joined(&yes)));
-                        }
-                        if !no.is_empty() {
-                            ui.small(format!("已跳过(网络盘/光驱等):{}", joined(&no)));
-                        }
-                    }
+                    // 参考件没有「扫全盘」概念:范围只经文件夹管理器扩大,
+                    // 这里只重扫已登记的监听目录,不新增范围。
+                    ui.small(format!(
+                        "监听 {} 个目录;扩大范围请用「添加文件夹到图库」",
+                        self.watched.len()
+                    ));
                     ui.separator();
                     ui.menu_button("导入(I)", |ui| {
                         // P1-13:从设备导入(设备选择窗口)。
