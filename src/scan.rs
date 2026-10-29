@@ -70,7 +70,19 @@ impl Default for Exclusions {
                 "winnt".into(),
                 "temp".into(),
                 "Program Files".into(),
+                "Program Files (x86)".into(),
                 "Originals".into(),
+                // Windows 系统目录:回收站(内含 $I*.jpg 删除记录,不是图片)、
+                // 还原点、恢复分区、系统升级临时目录。
+                "$RECYCLE.BIN".into(),
+                "System Volume Information".into(),
+                "Recovery".into(),
+                "$WINDOWS.~BT".into(),
+                "$WINDOWS.~WS".into(),
+                // 应用数据与包管理缓存(海量小图标/构建产物,不属于照片)。
+                "AppData".into(),
+                "node_modules".into(),
+                "npm-cache".into(),
             ],
         }
     }
@@ -92,7 +104,13 @@ impl Exclusions {
     }
 
     /// 该目录名是否应被排除。
+    ///
+    /// 除显式名单外,**点开头的隐藏目录**(.git / .config / .workbuddy 等)
+    /// 一律排除 —— 工具与版本库的内部数据不属于照片集。
     pub fn excludes_dir(&self, name: &str) -> bool {
+        if name.starts_with('.') {
+            return true;
+        }
         self.names.iter().any(|n| n.eq_ignore_ascii_case(name))
     }
 
@@ -631,6 +649,27 @@ mod tests {
         assert!(e.excludes_dir("Originals"));
         assert!(!e.excludes_dir("Pictures"));
         assert!(!e.excludes_dir("Photos"));
+    }
+
+    #[test]
+    fn default_exclusions_skip_system_and_cache_dirs() {
+        // 真实事故:回收站元数据文件($I*.jpg)不是图片,解码永远失败,
+        // 缩略图 worker 对失败不记账,每轮取到同一批 → 进度永久卡死。
+        // 应用数据/缓存目录同理,不该进照片索引。
+        let e = Exclusions::default();
+        assert!(e.excludes_dir("$RECYCLE.BIN"), "回收站必须排除");
+        assert!(e.excludes_dir("System Volume Information"));
+        assert!(e.excludes_dir("AppData"));
+        assert!(e.excludes_dir("Program Files (x86)"));
+        assert!(e.excludes_dir("node_modules"));
+        assert!(e.excludes_dir("npm-cache"));
+        assert!(e.excludes_dir("Recovery"));
+        assert!(e.excludes_dir("$WINDOWS.~BT"));
+        // 点开头的隐藏目录(.git / .config / .workbuddy 等)一律排除
+        assert!(e.excludes_dir(".git"));
+        assert!(e.excludes_dir(".workbuddy"));
+        assert!(e.excludes_dir(".config"));
+        assert!(!e.excludes_dir("SeaDriveRoot"));
     }
 
     #[test]

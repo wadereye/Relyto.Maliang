@@ -79,6 +79,18 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // 按当前排除规则清洗已入库的行(回收站/应用数据等历史遗留)。
+        "--purge-excluded" => {
+            match db::Store::open() {
+                Ok(store) => {
+                    let excl = scan::Exclusions::from_store(&store);
+                    let n = store.purge_excluded(&excl);
+                    println!("已清除 {n} 行;生效排除项:{}", excl.names().join(", "));
+                }
+                Err(e) => eprintln!("打开索引库失败:{e}"),
+            }
+            true
+        }
         _ => false,
     }
 }
