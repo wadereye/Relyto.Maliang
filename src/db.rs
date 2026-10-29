@@ -190,6 +190,11 @@ impl Store {
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;");
         // P1-14:相机型号池化列 + 池表。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN cam_id INTEGER;");
+        // 缩略图生成失败计数(防 worker 对坏文件无限重试,真实事故见
+        // thumbs.rs::backfill_tier 注释):失败满 3 次不再进回填队列。
+        let _ = conn.execute_batch(
+            "ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;",
+        );
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_cam_id ON photos(cam_id);
              CREATE TABLE IF NOT EXISTS string_pool (
@@ -939,7 +944,10 @@ impl Store {
         // Normal 档(1)沿用 photos.thumb_ok 作为权威标记,其余走 thumb_tiers 表。
         let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if tier == 1 {
             (
-                "SELECT id, path FROM photos WHERE thumb_ok=0 LIMIT ?1",
+                // thumb_fail 达阈值的行不再返回:生成失败的文件(如回收站
+                // 元数据、损坏图)重试也不会成功,必须放行队列,否则 worker
+                // 每轮取回同一批,整体进度永久卡死(真实事故)。
+                "SELECT id, path FROM photos WHERE thumb_ok=0 AND thumb_fail<3 LIMIT ?1",
                 vec![Box::new(limit as i64)],
             )
         } else {
@@ -961,6 +969,64 @@ impl Store {
         .ok()
         .map(|it| it.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
+    }
+
+    /// 缩略图生成失败记账:失败计数 +1。
+    ///
+    /// 计数达 3 的行会被 `missing_tier` 跳过(防坏文件无限重试)。
+    /// 文件本身变化(mtime 更新)由扫描器重置 `thumb_ok` 走正常重试路径。
+    pub fn mark_thumb_fail(&self, id: i64) {
+        let _ = self.0.lock().unwrap().execute(
+            "UPDATE photos SET thumb_fail=thumb_fail+1 WHERE id=?1",
+            rusqlite::params![id],
+        );
+    }
+
+    /// 按排除规则清洗已入库的行(一次性维护,配 `--purge-excluded`)。
+    ///
+    /// 历史版本排除规则较窄,回收站/应用数据目录的文件可能已经入库;
+    /// 这些行既出不了缩略图(多数解码失败),也占着浏览网格。
+    /// 按 `parent` 目录逐组件匹配排除名,命中即整目录删除
+    /// (关联表走外键级联)。返回删除的照片行数。
+    pub fn purge_excluded(&self, excl: &crate::scan::Exclusions) -> usize {
+        // 取出全部目录,按组件判断(目录数远小于照片数)。
+        let dirs: Vec<String> = {
+            let conn = self.0.lock().unwrap();
+            let mut st = match conn.prepare("SELECT DISTINCT parent FROM photos") {
+                Ok(s) => s,
+                Err(_) => return 0,
+            };
+            st.query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        };
+        let bad: Vec<String> = dirs
+            .into_iter()
+            .filter(|p| {
+                Path::new(p)
+                    .components()
+                    .filter_map(|c| match c {
+                        std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                        _ => None,
+                    })
+                    .any(|seg| excl.excludes_dir(&seg))
+            })
+            .collect();
+        if bad.is_empty() {
+            return 0;
+        }
+        let conn = self.0.lock().unwrap();
+        let mut n = 0usize;
+        for d in &bad {
+            if let Ok(cnt) = conn.execute(
+                "DELETE FROM photos WHERE parent=?1",
+                rusqlite::params![d],
+            ) {
+                n += cnt;
+            }
+        }
+        n
     }
 
     /// 该档已生成的照片数(状态栏展示)。
@@ -1304,6 +1370,73 @@ mod tests {
     fn intern_batch_empty_is_noop() {
         let store = Store::open_mem().unwrap();
         assert!(store.intern_batch(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn purge_excluded_removes_system_dir_rows() {
+        // 历史版本把回收站/应用数据扫进了索引(--purge-excluded 清洗)。
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.0.lock().unwrap();
+            for (id, parent) in [
+                (1, r"D:\4.Photos\2026 旅行"),
+                (2, r"D:\$RECYCLE.BIN\S-1-5-21"),
+                (3, r"C:\Users\me\AppData\Local\Temp\cache"),
+                (4, r"C:\proj\.git\hooks"),
+            ] {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
+                    rusqlite::params![id, format!("{parent}/a.jpg"), parent],
+                )
+                .unwrap();
+            }
+        }
+        let n = store.purge_excluded(&crate::scan::Exclusions::default());
+        assert_eq!(n, 3, "回收站/AppData/.git 三行应被清除");
+        let left: Vec<i64> = {
+            let c = store.0.lock().unwrap();
+            let mut st = c.prepare("SELECT id FROM photos ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(left, vec![1], "正常照片目录必须保留");
+    }
+
+    #[test]
+    fn missing_tier_skips_repeatedly_failed_photos() {
+        // 缩略图生成失败要记账:失败满 3 次不再进回填队列。
+        // 否则一批坏文件(如回收站元数据)会让 worker 永远空转(真实事故)。
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.0.lock().unwrap();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'/x/a.jpg','/x',0,0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,thumb_fail) VALUES(2,'/x/b.jpg','/x',0,0,3)",
+                [],
+            )
+            .unwrap();
+        }
+        let ids: Vec<i64> = store
+            .missing_tier(1, 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![1], "连续失败 3 次的照片不应再进回填队列");
+        // 记账接口:每次失败计数 +1
+        store.mark_thumb_fail(1);
+        let f: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT thumb_fail FROM photos WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(f, 1);
     }
 
     #[test]

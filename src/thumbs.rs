@@ -345,14 +345,17 @@ pub fn backfill_tier(store: &crate::db::Store, tier: Tier, limit: usize) -> Resu
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let ok: Vec<(i64, u64)> = rows
+    let (ok, failed): (Vec<(i64, u64)>, Vec<i64>) = rows
         .par_iter()
-        .filter_map(|(id, path)| {
-            generate_tier(tier, *id, Path::new(path))
-                .ok()
-                .map(|h| (*id, h))
-        })
-        .collect();
+        .partition_map(|(id, path)| match generate_tier(tier, *id, Path::new(path)) {
+            Ok(h) => rayon::iter::Either::Left((*id, h)),
+            // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
+            // worker 永远空转在开头(真实事故:回收站 $I*.jpg 元数据)。
+            Err(_) => rayon::iter::Either::Right(*id),
+        });
+    for id in &failed {
+        store.mark_thumb_fail(*id);
+    }
     if ok.is_empty() {
         return Ok(Vec::new());
     }
@@ -748,6 +751,39 @@ mod tests {
         assert_eq!(cached.height(), THUMB_SIZE);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 生成失败要记账:同一张反复失败达阈值后,不再进入回填队列。
+    /// 否则一批坏文件(如回收站元数据)会让 worker 永远空转(真实事故)。
+    #[test]
+    fn backfill_marks_repeated_failures_then_skips() {
+        let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
+        let photo_id = unique_id();
+        {
+            let conn = store.0.lock().unwrap();
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'/x',0,0)",
+                rusqlite::params![photo_id, "/nonexistent/rk-fail/bad.jpg"],
+            )
+            .unwrap();
+        }
+        // 每轮:取到这张 → 生成失败 → 记账。三轮后 thumb_fail 达 3。
+        for round in 1..=3 {
+            let ids = backfill_tier(&store, Tier::Normal, 10).unwrap();
+            assert!(ids.is_empty(), "第 {round} 轮不应有成功产出");
+        }
+        let f: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(f, 3, "三次失败应各记一笔");
+        // 之后 missing_tier 不再返回它,worker 得以推进到后续照片。
+        assert!(
+            store.missing_tier(1, 10).is_empty(),
+            "失败满阈值后应被队列跳过"
+        );
     }
 
     /// P0-1:后台 worker 会把 `thumb_ok=0` 的照片补上缩略图,并回报 id。
