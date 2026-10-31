@@ -13,6 +13,8 @@ enum ViewKind {
     Timeline,
     Folder,
     Duplicates,
+    /// 相簿(参考件 Album:照片的命名集合,不动文件)。
+    Albums,
     #[allow(dead_code)]
     Faces,
     Tags,
@@ -198,6 +200,69 @@ pub struct App {
     show_ocr_boxes: bool,
     /// 预览叠框缓存(照片 id, 归一化框 + 标签)。
     preview_boxes: Option<(i64, Vec<((f32, f32, f32, f32), String)>)>,
+    // —— 预览缩放/平移(参考件 View and Edit 单图视图:滚轮缩放、拖拽平移、
+    // 双击切换适应窗口/100% 像素)——
+    /// 缩放系数:1.0 = 适应窗口;上限 8 倍。
+    preview_zoom: f32,
+    /// 平移偏移(屏幕像素,相对图区中心)。
+    preview_pan: egui::Vec2,
+    /// 裁剪模式开关(拖拽画裁剪框;开启时平移手势让位)。
+    crop_mode: bool,
+    /// 放大超过预览档(1024px)分辨率时按需解码的全图缓存(照片 id, RGBA)。
+    /// 内存上限约 40MP,超出则停在预览档(状态栏提示)。
+    preview_full: Option<(i64, image::RgbaImage)>,
+    /// 全图解码在途照片 id。
+    zoom_pending: Option<i64>,
+    // —— 裁剪工具(参考件编辑视图的 Crop;比例预设取自其 AspectRatioList)——
+    /// 裁剪框草稿(显示图像的归一化坐标 0..1;[x0, y0, x1, y1],用前归一)。
+    crop_rect: Option<[f32; 4]>,
+    /// 裁剪比例锁定(像素比 w / h;None = 自由)。
+    crop_ratio: Option<(f32, f32)>,
+    /// 裁剪拖拽锚点(屏幕坐标;None = 未在拖拽)。
+    crop_drag: Option<egui::Pos2>,
+    /// 自定义比例(设置项「custom_crop_ratios」,name|w|h 分号分隔)。
+    custom_ratios: Vec<(String, f32, f32)>,
+    /// 自定义比例录入框(宽 / 高 / 名称)。
+    crop_cw: String,
+    crop_ch: String,
+    crop_cname: String,
+    // —— 幻灯片放映(参考件 View > Slideshow;间隔常量名 SlideshowEffectTime、
+    // 循环开关 LoopSlideshow)——
+    /// 放映中(全屏接管主区)。
+    slideshow: bool,
+    /// 上次自动切换时刻。
+    slide_last: std::time::Instant,
+    /// 暂停(空格切换)。
+    slide_pause: bool,
+    /// 每张停留秒数(参考件 SlideshowEffectTime;默认值暂无对应资料,取 3 秒)。
+    slide_interval: f32,
+    /// 循环放映(设置项 slideshow_loop,默认开)。
+    slide_loop: bool,
+    // —— 标题(Caption,参考件)——
+    /// 预览窗标题编辑缓冲(照片 id, 文本)。
+    caption_edit: Option<(i64, String)>,
+    /// 缩略图下方显示标题(参考件 Thumbnail captions;设置项 thumb_captions)。
+    thumb_captions: bool,
+    // —— 相簿(参考件 Album)——
+    /// 当前查看的相簿。
+    sel_album: Option<i64>,
+    /// 新建相簿输入框。
+    album_input: String,
+    // —— 属性 / 选项窗口(imageproperties.fen / options.fen 等价物)——
+    show_props: bool,
+    show_options: bool,
+    /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
+    options_tab: usize,
+    /// 文件夹视图树形形态(参考件 Simplified Tree View;设置项 folder_tree)。
+    folder_tree: bool,
+    /// 壁纸设置结果通道(后台解码 + 落盘 + SystemParametersInfoW)。
+    wallpaper_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// 放大态专用纹理(全图 + 效果栈合成;键 = 照片 id + 栈签名,平移/缩放复用)。
+    zoom_tex: Option<(i64, String, egui::TextureHandle)>,
+    /// 缩放/平移状态归属的照片 id(换照片时自动复位)。
+    zoom_active_for: Option<i64>,
+    /// 全图解码结果通道(Option = 解码失败或超过内存上限);防重复派发的在途照片 id。
+    zoom_rx: Option<mpsc::Receiver<(i64, Option<image::RgbaImage>)>>,
     #[cfg(feature = "ai")]
     face_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
     #[cfg(feature = "ai")]
@@ -477,6 +542,23 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, store: Arc<Store>) -> Self {
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
         load_cjk_font(&cc.egui_ctx);
+        // 自定义裁剪比例 / 缩略图说明开关在 move store 之前读取。
+        let custom_ratios = Self::load_custom_ratios(&store);
+        let thumb_captions = store
+            .get_setting("thumb_captions")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        let folder_tree = store
+            .get_setting("folder_tree")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+        // P3-ui:邮件默认尺寸从设置读(选项 > 电子邮件;参考件默认 1024)。
+        let email_size = crate::share::ShareSize::from_px(
+            store
+                .get_setting("email_size_px")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1024),
+        );
         let app = Self {
             store,
             rows: Vec::new(),
@@ -507,9 +589,9 @@ impl App {
             fx_msg: String::new(),
             export_with_effects: false,
             email_win: false,
-            email_size: crate::share::ShareSize::Large,
+            email_size,
             cd_win: false,
-            cd_size: crate::share::ShareSize::Small,
+            cd_size: crate::share::ShareSize::Px800,
             share_rx: None,
             preview_base: None,
             fx_applied_sig: None,
@@ -574,6 +656,35 @@ impl App {
             show_face_boxes: true,
             show_ocr_boxes: true,
             preview_boxes: None,
+            preview_zoom: 1.0,
+            preview_pan: egui::Vec2::ZERO,
+            crop_mode: false,
+            preview_full: None,
+            zoom_rx: None,
+            zoom_pending: None,
+            crop_rect: None,
+            crop_ratio: None,
+            crop_drag: None,
+            custom_ratios,
+            crop_cw: String::new(),
+            crop_ch: String::new(),
+            crop_cname: String::new(),
+            slideshow: false,
+            slide_last: std::time::Instant::now(),
+            slide_pause: false,
+            slide_interval: 3.0,
+            slide_loop: true,
+            caption_edit: None,
+            thumb_captions,
+            sel_album: None,
+            album_input: String::new(),
+            show_props: false,
+            show_options: false,
+            options_tab: 0,
+            folder_tree,
+            wallpaper_rx: None,
+            zoom_tex: None,
+            zoom_active_for: None,
             #[cfg(feature = "ai")]
             face_rx: None,
             #[cfg(feature = "ai")]
@@ -975,6 +1086,10 @@ impl App {
                 .iter()
                 .flat_map(|(_, ids)| ids.iter().copied())
                 .collect(),
+            ViewKind::Albums => self
+                .sel_album
+                .map(|a| self.store.album_photo_ids(a))
+                .unwrap_or_default(),
             #[cfg(feature = "ai")]
             ViewKind::Faces => {
                 // 一张照片可能有多个人脸框,去重后再作为选择/导出范围
@@ -2007,6 +2122,498 @@ impl App {
         self.fx_applied_sig = None;
     }
 
+    /// 90° 直角旋转(参考件的「Rotate Clockwise / Counterclockwise」)。
+    ///
+    /// 效果栈的同名项会被替换,所以先把既有 `rot` 的 quarter 累加再提交 ——
+    /// 连点两次顺时针 = 180°,四次回到原位(quarter 归零时直接移除该项)。
+    fn preview_rotate(&mut self, id: i64, quarter_delta: u32) {
+        let cur = self
+            .fx_preview_stack(id)
+            .items
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("rot"))
+            .and_then(|e| e.params.get("quarter").and_then(|v| v.parse::<u32>().ok()))
+            .unwrap_or(0);
+        let q = (cur + quarter_delta) % 4;
+        if q == 0 {
+            self.fx_remove_effect(id, "旋转复位", "rot");
+            self.fx_msg = "已复位旋转".into();
+        } else {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("quarter".into(), q.to_string());
+            self.fx_commit_effect(
+                id,
+                if quarter_delta % 2 == 1 {
+                    "旋转90°"
+                } else {
+                    "旋转180°"
+                },
+                crate::effects::Effect {
+                    name: "rot".into(),
+                    params,
+                },
+            );
+        }
+    }
+
+    /// 读取自定义裁剪比例(设置项「custom_crop_ratios」,格式 name|w|h 分号分隔)。
+    /// 对应参考件 Add Custom Aspect Ratio 对话框的持久化。
+    fn load_custom_ratios(store: &Store) -> Vec<(String, f32, f32)> {
+        let Some(s) = store.get_setting("custom_crop_ratios") else {
+            return Vec::new();
+        };
+        s.split(';')
+            .filter_map(|e| {
+                let mut it = e.split('|');
+                let name = it.next()?.to_string();
+                let w = it.next()?.parse::<f32>().ok()?;
+                let h = it.next()?.parse::<f32>().ok()?;
+                Some((name, w, h))
+            })
+            .collect()
+    }
+
+    /// 把自定义比例写回设置项。
+    fn save_custom_ratios(&self) {
+        let s: Vec<String> = self
+            .custom_ratios
+            .iter()
+            .map(|(n, w, h)| format!("{n}|{w}|{h}"))
+            .collect();
+        let _ = self.store.set_setting("custom_crop_ratios", &s.join(";"));
+    }
+
+    /// 进入幻灯片放映(参考件 View > Slideshow:当前视图逐张全屏放映)。
+    /// 间隔 / 循环来自设置项(选项对话框可改)。
+    fn start_slideshow(&mut self) {
+        if self.view_ids().is_empty() {
+            self.fx_msg = "当前视图没有照片".into();
+            return;
+        }
+        self.slide_interval = self
+            .store
+            .get_setting("slideshow_interval")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3.0);
+        self.slide_loop = self
+            .store
+            .get_setting("slideshow_loop")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        if self.preview.is_none() {
+            if let Some(first) = self.view_ids().first() {
+                self.preview = Some(*first);
+                self.preview_tex = None;
+            }
+        }
+        self.slideshow = true;
+        self.slide_pause = false;
+        self.slide_last = std::time::Instant::now();
+    }
+
+    /// 设为桌面壁纸:后台解码原图 → EXIF 摆正 → 存临时 JPEG → SystemParametersInfoW。
+    fn set_wallpaper_for(&mut self, idx: usize) {
+        if self.wallpaper_rx.is_some() {
+            self.status = "上一个壁纸设置还在进行中…".into();
+            return;
+        }
+        let path = PathBuf::from(&self.rows[idx].path);
+        self.status = format!("正在设为桌面壁纸:{}…", path.display());
+        let (tx, rx) = mpsc::channel();
+        self.wallpaper_rx = Some(rx);
+        std::thread::spawn(move || {
+            let res = (|| -> Result<String, String> {
+                let img = image::open(&path).map_err(|e| e.to_string())?;
+                let img = crate::thumbs::apply_exif_rotation(
+                    img,
+                    crate::exif::read_orientation(Path::new(&path)),
+                );
+                let dst = std::env::temp_dir().join("maliang_wallpaper.jpg");
+                // image 0.25 的 JPEG 编码器要可 seek 的目标,先编进内存缓冲。
+                let rgb = img.to_rgb8();
+                let mut buf = std::io::Cursor::new(Vec::new());
+                let mut enc =
+                    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 92);
+                enc.encode(
+                    rgb.as_raw(),
+                    rgb.width(),
+                    rgb.height(),
+                    image::ExtendedColorType::Rgb8,
+                )
+                .map_err(|e| e.to_string())?;
+                std::fs::write(&dst, buf.into_inner()).map_err(|e| e.to_string())?;
+                if crate::win::set_wallpaper(&dst) {
+                    Ok("已设为桌面壁纸".into())
+                } else {
+                    Err("SystemParametersInfoW 调用失败".into())
+                }
+            })();
+            let _ = tx.send(res);
+        });
+    }
+
+    /// 属性窗口(参考件 imageproperties 窗:文件名 / 位置 / 大小+日期 /
+    /// Property-Value 列表 / 上一张-下一张)。
+    fn props_ui(&mut self, ctx: &egui::Context) {
+        let id = match self.preview {
+            Some(id) => id,
+            // 没开预览时取第一个选中的照片。
+            None => match self.sel.iter().next() {
+                Some(&id) => id,
+                None => {
+                    self.show_props = false;
+                    return;
+                }
+            },
+        };
+        let Some(&idx) = self.id_row.get(&id) else {
+            self.show_props = false;
+            return;
+        };
+        // 先取齐数据再进窗口(避免闭包里借用 self.rows 冲突)。
+        let (path, taken, cam, caption, star, kind) = {
+            let r = &self.rows[idx];
+            (
+                r.path.clone(),
+                r.taken.clone(),
+                r.cam.clone(),
+                r.caption.clone(),
+                r.star != 0,
+                r.kind,
+            )
+        };
+        let dims = (self.rows[idx].width, self.rows[idx].height);
+        let (lat, lon) = (self.rows[idx].lat, self.rows[idx].lon);
+        let fx_count = self.fx_preview_stack(id).items.len();
+        let total = self.view_ids().len();
+        let pos = self
+            .preview
+            .and_then(|p| self.view_ids().iter().position(|&x| x == p))
+            .map(|i| i + 1)
+            .unwrap_or(1);
+        let mut props_open = self.show_props;
+        egui::Window::new("属性")
+            .open(&mut props_open)
+            .default_width(460.0)
+            .show(ctx, |ui| {
+                let name = Path::new(&path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.clone());
+                ui.strong(&name);
+                ui.label(
+                    Path::new(&path)
+                        .parent()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                // 大小 + 修改日期(参考件 Size 行)。
+                if let Ok(md) = std::fs::metadata(&path) {
+                    let kb = md.len() as f64 / 1024.0;
+                    let size_s = if kb >= 1024.0 {
+                        format!("{:.1} MB", kb / 1024.0)
+                    } else {
+                        format!("{kb:.0} KB")
+                    };
+                    let mtime = md
+                        .modified()
+                        .ok()
+                        .and_then(|t| {
+                            chrono::DateTime::<chrono::Local>::from(t)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                                .into()
+                        })
+                        .unwrap_or_default();
+                    ui.label(format!("{size_s}    修改:{mtime}"));
+                }
+                ui.separator();
+                // Property / Value 两列清单(参考件 list 控件)。
+                egui::Grid::new("props-grid").num_columns(2).show(ui, |ui| {
+                    ui.label("类型");
+                    ui.label(if kind == crate::video::kind::MOVIE {
+                        "视频".into()
+                    } else {
+                        Path::new(&path)
+                            .extension()
+                            .map(|e| format!("图片({})", e.to_string_lossy().to_uppercase()))
+                            .unwrap_or_else(|| "图片".into())
+                    });
+                    ui.end_row();
+                    ui.label("像素");
+                    ui.label(match (dims.0, dims.1) {
+                        (Some(w), Some(h)) => format!("{w} × {h}"),
+                        _ => "—".into(),
+                    });
+                    ui.end_row();
+                    ui.label("拍摄时间");
+                    ui.label(taken.unwrap_or_default().replace('T', " "));
+                    ui.end_row();
+                    ui.label("相机");
+                    ui.label(if cam.is_empty() { "—".into() } else { cam });
+                    ui.end_row();
+                    ui.label("GPS");
+                    ui.label(match (lat, lon) {
+                        (Some(a), Some(b)) => format!("{a:.5}, {b:.5}"),
+                        _ => "—".into(),
+                    });
+                    ui.end_row();
+                    ui.label("星标");
+                    ui.label(if star { "★ 已加星" } else { "☆ 未加星" });
+                    ui.end_row();
+                    ui.label("标题");
+                    ui.label(if caption.is_empty() { "—".into() } else { caption });
+                    ui.end_row();
+                    ui.label("效果项");
+                    ui.label(format!("{fx_count} 项"));
+                    ui.end_row();
+                });
+                ui.separator();
+                // 上一张 / 下一张(参考件 nav 行:"x of x files")。
+                ui.horizontal(|ui| {
+                    if ui.button("◀ 上一张").clicked() {
+                        self.step_preview(-1);
+                    }
+                    ui.label(format!("{pos} / {total} 张"));
+                    if ui.button("下一张 ▶").clicked() {
+                        self.step_preview(1);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("关闭").clicked() {
+                        self.show_props = false;
+                    }
+                    if ui.button("在资源管理器中显示").clicked() {
+                        show_in_explorer(&path);
+                    }
+                });
+            });
+            // 标题栏 X(props_open=false)或关闭按钮都会关掉窗口。
+            self.show_props = props_open && self.show_props;
+    }
+
+    /// 选项窗口(参考件 options 窗:General / E-Mail / Slideshow 等页签;
+    /// 本项目为全本地,Network / Web Albums / Name Tags 页签不适用,不设)。
+    fn options_ui(&mut self, ctx: &egui::Context) {
+        let mut opts_open = self.show_options;
+        egui::Window::new("选项")
+            .open(&mut opts_open)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (i, name) in ["常规", "电子邮件", "幻灯片"].iter().enumerate() {
+                        if ui.selectable_label(self.options_tab == i, *name).clicked() {
+                            self.options_tab = i;
+                        }
+                    }
+                });
+                ui.separator();
+                match self.options_tab {
+                    0 => {
+                        // 常规(参考件 General:本项目取本地适用项)。
+                        if ui
+                            .checkbox(&mut self.export_with_effects, "导出时套用已保存的效果")
+                            .changed()
+                        {
+                            self.fx_msg = if self.export_with_effects {
+                                "导出将带上已保存的效果".into()
+                            } else {
+                                "导出 = 原图副本".into()
+                            };
+                        }
+                        if ui
+                            .checkbox(&mut self.thumb_captions, "缩略图下方显示标题")
+                            .changed()
+                        {
+                            let _ = self.store.set_setting(
+                                "thumb_captions",
+                                if self.thumb_captions { "1" } else { "0" },
+                            );
+                        }
+                        if ui
+                            .checkbox(&mut self.dup_near, "重复照片检测包含近似重复")
+                            .changed()
+                        {
+                            self.rebuild();
+                        }
+                        ui.separator();
+                        ui.small("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。");
+                        ui.small("索引备份 / 压缩在「工具 > 图库维护」里。");
+                    }
+                    1 => {
+                        // 电子邮件(参考件 E-Mail:8 档尺寸列表,默认 1024)。
+                        ui.label("邮件附件默认尺寸(发送窗口仍可临时改):");
+                        let cur_px = self.email_size.px();
+                        for s in crate::share::ShareSize::ALL {
+                            if ui
+                                .selectable_label(cur_px == s.px(), s.label())
+                                .clicked()
+                            {
+                                self.email_size = s;
+                                let _ = self
+                                    .store
+                                    .set_setting("email_size_px", &s.px().to_string());
+                            }
+                        }
+                    }
+                    _ => {
+                        // 幻灯片(参考件 Slideshow:LoopSlideshow;间隔常量
+                        // SlideshowEffectTime 的数值暂无对应资料,默认 3 秒)。
+                        let mut itv = self
+                            .store
+                            .get_setting("slideshow_interval")
+                            .and_then(|v| v.parse::<f32>().ok())
+                            .unwrap_or(3.0);
+                        if ui
+                            .add(egui::Slider::new(&mut itv, 1.0..=10.0).text("每张停留(秒)"))
+                            .changed()
+                        {
+                            let _ = self.store.set_setting("slideshow_interval", &format!("{itv:.1}"));
+                        }
+                        let mut lp = self
+                            .store
+                            .get_setting("slideshow_loop")
+                            .map(|v| v != "0")
+                            .unwrap_or(true);
+                        if ui.checkbox(&mut lp, "循环放映").changed() {
+                            let _ =
+                                self.store.set_setting("slideshow_loop", if lp { "1" } else { "0" });
+                        }
+                    }
+                }
+            });
+            self.show_options = opts_open && self.show_options;
+    }
+
+    /// 幻灯片全屏渲染(接管整帧;空格暂停、Esc 退出、点击前进)。
+    fn slideshow_ui(&mut self, ctx: &egui::Context) {
+        let ids = self.view_ids();
+        if ids.is_empty() {
+            self.slideshow = false;
+            return;
+        }
+        let interval = self.slide_interval.max(0.5) as f64;
+        if !self.slide_pause {
+            let elapsed = self.slide_last.elapsed().as_secs_f64();
+            if elapsed >= interval {
+                // 不循环时放到尾张即退出(参考件 LoopSlideshow)。
+                let last = *ids.last().unwrap();
+                if !self.slide_loop && self.preview == Some(last) {
+                    self.slideshow = false;
+                    return;
+                }
+                self.step_preview(1);
+                self.slide_last = std::time::Instant::now();
+            }
+            ctx.request_repaint_after(
+                std::time::Duration::from_secs_f64((interval - elapsed).max(0.05)),
+            );
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    self.slideshow = false;
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::Space)) {
+                    self.slide_pause = !self.slide_pause;
+                    self.slide_last = std::time::Instant::now();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
+                    self.step_preview(-1);
+                    self.slide_last = std::time::Instant::now();
+                }
+                if ui.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
+                    self.step_preview(1);
+                    self.slide_last = std::time::Instant::now();
+                }
+                let tex = self.preview_tex(ctx);
+                let avail = ui.available_size();
+                let (rect, resp) = ui
+                    .allocate_exact_size(avail - egui::vec2(0.0, 34.0), egui::Sense::click());
+                if let Some(t) = tex {
+                    let [tw, th] = t.size();
+                    let fit = (rect.width() / tw.max(1) as f32)
+                        .min(rect.height() / th.max(1) as f32)
+                        .min(1.0);
+                    let size = egui::vec2(tw as f32 * fit, th as f32 * fit);
+                    let img = egui::Rect::from_center_size(rect.center(), size);
+                    ui.painter_at(rect).image(
+                        t.id(),
+                        img,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
+                // 点击前进(参考件放映的翻页交互)。
+                if resp.clicked() {
+                    self.step_preview(1);
+                    self.slide_last = std::time::Instant::now();
+                }
+                // 底部信息行:标题 + 序号 + 暂停提示。
+                let n = ids.len();
+                let pos = self
+                    .preview
+                    .and_then(|p| ids.iter().position(|&x| x == p))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let mut line = format!("{} / {}    空格 暂停 · Esc 退出", pos, n);
+                if self.slide_pause {
+                    line = format!("[已暂停]  {line}");
+                }
+                let cap = self
+                    .preview
+                    .map(|id| self.store.get_caption(id))
+                    .unwrap_or_default();
+                ui.horizontal(|ui| {
+                    if !cap.is_empty() {
+                        ui.label(
+                            egui::RichText::new(&cap)
+                                .color(egui::Color32::WHITE)
+                                .size(15.0),
+                        );
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(line)
+                                .color(egui::Color32::GRAY)
+                                .size(12.0),
+                        );
+                    });
+                });
+            });
+    }
+
+    /// 应用裁剪(把归一化矩形写进效果链;对应参考件 Crop 工具的 Apply)。
+    fn commit_crop(&mut self, id: i64) {
+        let Some([ax, ay, bx, by]) = self.crop_rect.take() else {
+            return;
+        };
+        let (x0, x1) = (ax.min(bx), ax.max(bx));
+        let (y0, y1) = (ay.min(by), ay.max(by));
+        let (w, h) = (x1 - x0, y1 - y0);
+        if w < 0.02 || h < 0.02 {
+            self.fx_msg = "裁剪区域太小".into();
+            return;
+        }
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("x".into(), format!("{x0:.4}"));
+        params.insert("y".into(), format!("{y0:.4}"));
+        params.insert("w".into(), format!("{w:.4}"));
+        params.insert("h".into(), format!("{h:.4}"));
+        self.crop_mode = false;
+        self.crop_drag = None;
+        self.fx_commit_effect(
+            id,
+            "裁剪",
+            crate::effects::Effect {
+                name: "crop".into(),
+                params,
+            },
+        );
+    }
+
     /// P1-9:派发滚动事件(键盘翻页 / 跳到顶底)。
     ///
     /// 按事件名派发给对应的滚动处理;未匹配的事件直接忽略。
@@ -2294,8 +2901,21 @@ impl App {
         if let Some(&row) = self.id_row.get(&next_id) {
             self.preview = Some(next_id);
             self.preview_tex = None;
+            self.preview_reset_zoom();
             debug_assert!(row < self.rows.len());
         }
+    }
+
+    /// 预览缩放/平移复位(换照片、关闭预览时调用;参考件换图回到适应窗口)。
+    fn preview_reset_zoom(&mut self) {
+        self.preview_zoom = 1.0;
+        self.preview_pan = egui::Vec2::ZERO;
+        self.crop_mode = false;
+        // 全图缓存内存可观(几十 MB),换图即释放;在途解码结果按 id 校验丢弃。
+        self.preview_full = None;
+        self.zoom_tex = None;
+        self.zoom_rx = None;
+        self.zoom_pending = None;
     }
 
     /// 照片网格(按缩略图档位决定列数与格子大小;选中项加蓝框)。
@@ -2365,6 +2985,59 @@ impl App {
         }
         if ui.button("在资源管理器中显示").clicked() {
             show_in_explorer(&self.rows[idx].path);
+            ui.close();
+        }
+        // 加入相簿(参考件 Add to Album;相簿不移动文件;已加入的打勾,点击移除)。
+        ui.menu_button("加入相簿…", |ui| {
+            let albums = self.store.albums();
+            if albums.is_empty() {
+                ui.label("(还没有相簿:视图 > 相簿 里新建)");
+            }
+            let member: Vec<i64> = self
+                .store
+                .albums_of_photo(self.rows[idx].id)
+                .into_iter()
+                .map(|(a, _)| a)
+                .collect();
+            for (aid, name, _) in albums {
+                let in_album = member.contains(&aid);
+                let label = if in_album {
+                    format!("✓ 「{name}」(点击移出)")
+                } else {
+                    format!("「{name}」")
+                };
+                if ui.button(label).clicked() {
+                    if in_album {
+                        let _ = self.store.album_remove_photo(aid, self.rows[idx].id);
+                        self.fx_msg = format!("已移出相簿「{name}」");
+                    } else {
+                        let _ = self.store.album_add_photo(aid, self.rows[idx].id);
+                        self.fx_msg = format!("已加入相簿「{name}」");
+                    }
+                    ui.close();
+                }
+            }
+        });
+        if self.view == ViewKind::Albums {
+            if let Some(a) = self.sel_album {
+                if ui.button("从相簿移除").clicked() {
+                    let _ = self.store.album_remove_photo(a, self.rows[idx].id);
+                    ui.close();
+                }
+            }
+        }
+        ui.separator();
+        // 用编辑器打开(参考件 Open File(s) in an Editor)。
+        if ui.button("用编辑器打开").clicked() {
+            let p = PathBuf::from(&self.rows[idx].path);
+            if !crate::win::shell_edit(&p) {
+                self.status = format!("无法打开(未关联编辑器):{}", p.display());
+            }
+            ui.close();
+        }
+        // 设为桌面壁纸(参考件 Set as Desktop)。
+        if ui.button("设为桌面壁纸").clicked() {
+            self.set_wallpaper_for(idx);
             ui.close();
         }
         ui.separator();
@@ -2475,6 +3148,21 @@ impl App {
             if v.small_button(if star0 { "★" } else { "☆" }).clicked() {
                 star_clicked = true;
             }
+            // 缩略图说明(参考件 Thumbnail captions 视图开关)。
+            if self.thumb_captions {
+                let cap = self.rows[idx].caption.trim();
+                if !cap.is_empty() {
+                    let s: String = {
+                        let mut c = cap.chars();
+                        if cap.chars().count() > 36 {
+                            format!("{}…", c.by_ref().take(36).collect::<String>())
+                        } else {
+                            c.collect()
+                        }
+                    };
+                    v.label(egui::RichText::new(s).small());
+                }
+            }
         });
         if star_clicked {
             let new = if star0 { 0 } else { 1 };
@@ -2546,6 +3234,31 @@ impl App {
             }
         }
         self.preview_tex.as_ref().map(|(_, t)| t.clone())
+    }
+
+    /// 放大态纹理:全图缓存 + 当前效果栈合成,按(照片 id, 栈签名)缓存。
+    ///
+    /// 只在效果栈变化时重算一次全图合成(大图一次几百毫秒),平移/缩放重绘
+    /// 直接复用缓存纹理;平移缩放的几何与分辨率无关(等比),不需重算。
+    fn zoom_tex_get(&mut self, ctx: &egui::Context, id: i64) -> Option<egui::TextureHandle> {
+        if self.preview_full.as_ref()?.0 != id {
+            return None;
+        }
+        let stack = self.fx_preview_stack(id);
+        let sig = format!("full|{}", stack.serialize());
+        if let Some((kid, ksig, tex)) = &self.zoom_tex {
+            if *kid == id && ksig == &sig {
+                return Some(tex.clone());
+            }
+        }
+        let img = &self.preview_full.as_ref().unwrap().1;
+        let mut rgba = img.clone();
+        crate::effects::apply_stack(&mut rgba, &stack);
+        let size = [rgba.width() as usize, rgba.height() as usize];
+        let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+        let tex = ctx.load_texture(format!("preview-{id}-full"), color, egui::TextureOptions::default());
+        self.zoom_tex = Some((id, sig, tex.clone()));
+        Some(tex)
     }
 
     /// 预览叠框数据(OCR/人脸框图上标注)。按照片 id 缓存。
@@ -2692,6 +3405,11 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // P1-9:每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
         self.thumb_decode_count = 0;
+        // 幻灯片放映:全屏接管整帧,跳过常规面板。
+        if self.slideshow {
+            self.slideshow_ui(ctx);
+            return;
+        }
         // 轮询扫描结果
         if let Some(rx) = &self.scan_rx {
             if let Ok(r) = rx.try_recv() {
@@ -2823,6 +3541,16 @@ impl eframe::App for App {
         }
         if self.share_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        // 壁纸设置结果(后台线程解码原图并落盘临时 JPEG)。
+        if let Some(rx) = &self.wallpaper_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.wallpaper_rx = None;
+                self.status = match res {
+                    Ok(msg) => msg,
+                    Err(e) => format!("设为壁纸失败: {e}"),
+                };
+            }
         }
         // 图库维护(备份/压缩/清理缺失)结果轮询
         if let Some(rx) = &self.maint_rx {
@@ -3013,6 +3741,18 @@ impl eframe::App for App {
             egui::MenuBar::new().ui(ui, |ui| {
                 // —— 文件 ——
                 ui.menu_button("文件(F)", |ui| {
+                    // 属性(参考件 File > Properties,imageproperties 窗)。
+                    if ui
+                        .add_enabled(
+                            self.preview.is_some() || !self.sel.is_empty(),
+                            egui::Button::new("属性…"),
+                        )
+                        .clicked()
+                    {
+                        self.show_props = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("添加文件夹到图库…").clicked() {
                         self.add_folder_to_library();
                         ui.close();
@@ -3165,6 +3905,14 @@ impl eframe::App for App {
                         self.view = ViewKind::Timeline;
                         ui.close();
                     }
+                    // 相簿(参考件 Album 列表)。
+                    if ui
+                        .selectable_label(self.view == ViewKind::Albums, "相簿")
+                        .clicked()
+                    {
+                        self.view = ViewKind::Albums;
+                        ui.close();
+                    }
                     #[cfg(feature = "ai")]
                     if ui
                         .selectable_label(self.view == ViewKind::Faces, "人物")
@@ -3195,6 +3943,41 @@ impl eframe::App for App {
                         self.view = ViewKind::Folder;
                         ui.close();
                     }
+                    ui.separator();
+                    // 幻灯片放映(参考件 View > Slideshow:当前视图逐张全屏)。
+                    if ui.button("幻灯片放映").clicked() {
+                        self.start_slideshow();
+                        ui.close();
+                    }
+                    // 缩略图说明(参考件 Thumbnail captions)。
+                    if ui
+                        .checkbox(&mut self.thumb_captions, "缩略图说明")
+                        .changed()
+                    {
+                        let _ = self.store.set_setting(
+                            "thumb_captions",
+                            if self.thumb_captions { "1" } else { "0" },
+                        );
+                    }
+                    // 文件夹视图形态(参考件 Tree View / Flat Folder View)。
+                    ui.menu_button("文件夹视图", |ui| {
+                        if ui
+                            .selectable_label(!self.folder_tree, "扁平文件夹视图")
+                            .clicked()
+                        {
+                            self.folder_tree = false;
+                            let _ = self.store.set_setting("folder_tree", "0");
+                            ui.close();
+                        }
+                        if ui
+                            .selectable_label(self.folder_tree, "简化树形视图")
+                            .clicked()
+                        {
+                            self.folder_tree = true;
+                            let _ = self.store.set_setting("folder_tree", "1");
+                            ui.close();
+                        }
+                    });
                     ui.separator();
                     ui.menu_button("排序方式", |ui| {
                         if ui
@@ -3245,6 +4028,12 @@ impl eframe::App for App {
                 });
                 // —— 工具 ——
                 ui.menu_button("工具(T)", |ui| {
+                    // 选项(参考件 Tools > Options,分页设置窗)。
+                    if ui.button("选项…").clicked() {
+                        self.show_options = true;
+                        ui.close();
+                    }
+                    ui.separator();
                     #[cfg(feature = "ai")]
                     {
                         if ui
@@ -3394,17 +4183,106 @@ impl eframe::App for App {
             });
         }
 
-        // 左侧面板:文件夹视图 / 人物视图 / 标签视图
-        if self.view == ViewKind::Folder {            egui::SidePanel::left("folders").show(ctx, |ui| {
+        // 左侧面板:文件夹视图 / 相簿视图 / 人物视图 / 标签视图
+        if self.view == ViewKind::Folder {
+            egui::SidePanel::left("folders").show(ctx, |ui| {
                 ui.heading("文件夹");
                 ui.separator();
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for (i, f) in self.folders.clone().iter().enumerate() {
-                        if ui.selectable_label(self.selected_folder == i, f).clicked() {
-                            self.selected_folder = i;
+                    if self.folder_tree {
+                        // 简化树形视图(参考件 Simplified Tree View):
+                        // 按父目录分组,组头为父目录,子项缩进显示末级目录名。
+                        let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+                        for (i, f) in self.folders.iter().enumerate() {
+                            let parent = Path::new(f)
+                                .parent()
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            match groups.iter_mut().find(|(p, _)| *p == parent) {
+                                Some((_, v)) => v.push(i),
+                                None => groups.push((parent, vec![i])),
+                            }
+                        }
+                        for (parent, kids) in groups {
+                            ui.strong(parent);
+                            ui.indent("folder-tree", |ui| {
+                                for i in kids {
+                                    let leaf = Path::new(&self.folders[i])
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| self.folders[i].clone());
+                                    if ui
+                                        .selectable_label(self.selected_folder == i, leaf)
+                                        .clicked()
+                                    {
+                                        self.selected_folder = i;
+                                    }
+                                }
+                            });
+                        }
+                    } else {
+                        // 扁平文件夹视图(参考件 Flat Folder View)。
+                        for (i, f) in self.folders.clone().iter().enumerate() {
+                            if ui.selectable_label(self.selected_folder == i, f).clicked() {
+                                self.selected_folder = i;
+                            }
                         }
                     }
                 });
+            });
+        }
+        // 相簿面板(参考件 Album 列表;相簿是照片 id 的命名集合,不动文件)。
+        if self.view == ViewKind::Albums {
+            egui::SidePanel::left("albums").show(ctx, |ui| {
+                ui.heading("相簿");
+                ui.separator();
+                let albums = self.store.albums();
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.album_input)
+                            .hint_text("新相簿名称"),
+                    );
+                    if ui.button("新建").clicked() && !self.album_input.trim().is_empty() {
+                        match self.store.album_create(self.album_input.trim()) {
+                            Ok(aid) => {
+                                self.sel_album = Some(aid);
+                                self.album_input.clear();
+                            }
+                            Err(e) => self.fx_msg = format!("新建相簿失败: {e}"),
+                        }
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    for (aid, name, n) in albums {
+                        if ui
+                            .selectable_label(self.sel_album == Some(aid), format!("{name} · {n} 张"))
+                            .clicked()
+                        {
+                            self.sel_album = Some(aid);
+                        }
+                    }
+                });
+                if let Some(a) = self.sel_album {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.album_input)
+                                .hint_text("重命名为"),
+                        );
+                        if ui.button("重命名").clicked() && !self.album_input.trim().is_empty() {
+                            if let Err(e) = self.store.album_rename(a, self.album_input.trim()) {
+                                self.fx_msg = format!("重命名失败: {e}");
+                            } else {
+                                self.album_input.clear();
+                            }
+                        }
+                    });
+                    if ui.button("删除当前相簿").clicked() {
+                        let _ = self.store.album_delete(a);
+                        self.sel_album = None;
+                    }
+                }
             });
         }
         if self.view == ViewKind::Tags {
@@ -3901,6 +4779,35 @@ impl eframe::App for App {
                             .collect();
                         self.photo_grid(ui, "folder-grid", &idxs);
                     }
+                    ViewKind::Albums => {
+                        match self.sel_album {
+                            None => {
+                                ui.heading("相簿");
+                                ui.label("在左侧选择或新建一个相簿。相簿是照片的命名集合,不会移动文件。");
+                            }
+                            Some(a) => {
+                                let name = self
+                                    .store
+                                    .albums()
+                                    .into_iter()
+                                    .find(|(aid, _, _)| *aid == a)
+                                    .map(|(_, n, _)| n)
+                                    .unwrap_or_default();
+                                ui.heading(format!("相簿:{name}"));
+                                // 相簿成员按加入顺序显示(链上 pos 序)。
+                                let ids = self.store.album_photo_ids(a);
+                                let idxs: Vec<usize> = ids
+                                    .iter()
+                                    .filter_map(|id| self.id_row.get(id).copied())
+                                    .collect();
+                                if idxs.is_empty() {
+                                    ui.label("(空相簿)用照片右键菜单的「加入相簿」添加。");
+                                } else {
+                                    self.photo_grid(ui, "album-grid", &idxs);
+                                }
+                            }
+                        }
+                    }
                 }
             });
             // P1-9:把本帧的实际滚动偏移 / 视口高 / 内容高记下来,
@@ -3920,7 +4827,7 @@ impl eframe::App for App {
                 egui::Window::new("照片预览")
                     .open(&mut preview_open)
                     .resizable(true)
-                    .default_width(720.0)
+                    .default_size([780.0, 860.0])
                     .show(ctx, |ui| {
                         // 导航行:翻页后本帧直接返回,下一帧按新索引渲染
                         let mut stepped = false;
@@ -3932,6 +4839,14 @@ impl eframe::App for App {
                             if ui.button("下一张 ▶").clicked() {
                                 self.step_preview(1);
                                 stepped = true;
+                            }
+                            ui.separator();
+                            // 90° 直角旋转(参考件编辑视图的两个旋转按钮)。
+                            if ui.button("↺ 逆时针").clicked() {
+                                self.preview_rotate(id, 3);
+                            }
+                            if ui.button("↻ 顺时针").clicked() {
+                                self.preview_rotate(id, 1);
                             }
                             #[cfg(feature = "ai")]
                             {
@@ -3952,17 +4867,320 @@ impl eframe::App for App {
                         if stepped {
                             return;
                         }
+                        // 缩放/平移状态归属检查:换照片自动复位(参考件换图回到适应窗口)。
+                        if self.zoom_active_for != Some(id) {
+                            self.preview_reset_zoom();
+                            self.zoom_active_for = Some(id);
+                        }
+                        // 收取全图解码结果(放大超过预览档分辨率时按需解码)。
+                        if let Some(rx) = &self.zoom_rx {
+                            match rx.try_recv() {
+                                Ok((rid, Some(img))) => {
+                                    if Some(rid) == self.preview {
+                                        self.preview_full = Some((rid, img));
+                                        self.zoom_tex = None; // 触发全图重合成
+                                    }
+                                    self.zoom_rx = None;
+                                    self.zoom_pending = None;
+                                }
+                                Ok((_, None)) => {
+                                    // 解码失败或超过内存上限:停在预览档。
+                                    self.zoom_rx = None;
+                                    self.zoom_pending = None;
+                                    self.fx_msg = "原图过大或解码失败,放大显示停留在预览档清晰度".into();
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {}
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    self.zoom_rx = None;
+                                    self.zoom_pending = None;
+                                }
+                            }
+                        }
                         ui.separator();
                         let tex = self.preview_tex(ctx);
                         if let Some(t) = tex {
                             let [tw, th] = t.size();
-                            let scale = 640.0 / tw.max(th).max(1) as f32;
-                            let size = egui::vec2(tw as f32 * scale, th as f32 * scale);
-                            let resp = ui.image((t.id(), size));
-                            // OCR/人脸框图上标注
+                            let mut to_100 = false;
+                            // 缩放工具行(与参考件一致的手势 + 等价按钮)。
+                            ui.horizontal(|ui| {
+                                if ui.button("−").clicked() {
+                                    self.preview_zoom = (self.preview_zoom / 1.25).max(1.0);
+                                }
+                                if ui.button("100%").clicked() {
+                                    to_100 = true;
+                                }
+                                if ui.button("+").clicked() {
+                                    self.preview_zoom = (self.preview_zoom * 1.25).min(8.0);
+                                }
+                                ui.label(format!("{:.0}%", self.preview_zoom * 100.0));
+                                if ui.button("适应窗口").clicked() {
+                                    self.preview_zoom = 1.0;
+                                    self.preview_pan = egui::Vec2::ZERO;
+                                }
+                                ui.separator();
+                                // 裁剪工具开关(参考件 Crop)。
+                                if ui.selectable_label(self.crop_mode, "裁剪").clicked() {
+                                    self.crop_mode = !self.crop_mode;
+                                    self.crop_rect = None;
+                                    self.crop_drag = None;
+                                }
+                            });
+                            // 裁剪工具行:比例预设(取自参考件 AspectRatioList)+ 应用/取消。
+                            if self.crop_mode {
+                                ui.horizontal(|ui| {
+                                    ui.label("比例:");
+                                    let mut presets: Vec<(String, Option<(f32, f32)>)> = vec![
+                                        ("自由".into(), None),
+                                        ("原比例".into(), Some((tw as f32, th as f32))),
+                                        ("4 : 3(屏幕)".into(), Some((4.0, 3.0))),
+                                        ("3 : 2(打印)".into(), Some((3.0, 2.0))),
+                                        ("16 : 9(电影)".into(), Some((16.0, 9.0))),
+                                        ("16 : 10".into(), Some((16.0, 10.0))),
+                                        ("1 : 1(方形)".into(), Some((1.0, 1.0))),
+                                        ("4 : 6".into(), Some((4.0, 6.0))),
+                                        ("5 : 7".into(), Some((5.0, 7.0))),
+                                        ("8 : 10".into(), Some((8.0, 10.0))),
+                                        ("10 : 15".into(), Some((10.0, 15.0))),
+                                        ("9 : 13".into(), Some((9.0, 13.0))),
+                                    ];
+                                    for (n, w, h) in self.custom_ratios.clone() {
+                                        presets.push((format!("{n}({w:.0}×{h:.0})"), Some((w, h))));
+                                    }
+                                    let cur = match self.crop_ratio {
+                                        None => "自由".to_string(),
+                                        Some((w, h)) => format!("{w:.0} : {h:.0}"),
+                                    };
+                                    egui::ComboBox::from_id_salt("crop_ratio")
+                                        .selected_text(cur)
+                                        .show_ui(ui, |ui| {
+                                            for (label, r) in &presets {
+                                                if ui
+                                                    .selectable_label(
+                                                        self.crop_ratio == *r,
+                                                        label,
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.crop_ratio = *r;
+                                                }
+                                            }
+                                        });
+                                    if let Some((w, h)) = self.crop_ratio {
+                                        if ui.button("⇄ 对调").clicked() {
+                                            self.crop_ratio = Some((h, w));
+                                        }
+                                    }
+                                    if ui.button("应用裁剪").clicked() {
+                                        self.commit_crop(id);
+                                    }
+                                    if ui.button("取消").clicked() {
+                                        self.crop_mode = false;
+                                        self.crop_rect = None;
+                                        self.crop_drag = None;
+                                    }
+                                });
+                                // 自定义比例录入(参考件 Add Custom Aspect Ratio:宽 × 高 + 名称)。
+                                ui.horizontal(|ui| {
+                                    ui.label("自定义比例:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.crop_cw)
+                                            .desired_width(40.0),
+                                    );
+                                    ui.label("×");
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.crop_ch)
+                                            .desired_width(40.0),
+                                    );
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.crop_cname)
+                                            .hint_text("名称")
+                                            .desired_width(90.0),
+                                    );
+                                    if ui.button("保存为预设").clicked() {
+                                        if let (Ok(w), Ok(h)) = (
+                                            self.crop_cw.trim().parse::<f32>(),
+                                            self.crop_ch.trim().parse::<f32>(),
+                                        ) {
+                                            if w > 0.0 && h > 0.0 {
+                                                let name = if self.crop_cname.trim().is_empty() {
+                                                    format!("{w:.0}:{h:.0}")
+                                                } else {
+                                                    self.crop_cname.trim().to_string()
+                                                };
+                                                self.custom_ratios.push((name, w, h));
+                                                self.save_custom_ratios();
+                                                self.crop_cw.clear();
+                                                self.crop_ch.clear();
+                                                self.crop_cname.clear();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            // 图区:滚动缩放 / 拖拽平移 / 双击切换。全图放大时
+                            // 几何以预览档比例计算(等比,几何与分辨率无关)。
+                            let avail = (ui.available_size() - egui::vec2(0.0, 120.0))
+                                .max(egui::vec2(240.0, 160.0));
+                            let (rect, resp) =
+                                ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+                            let painter = ui.painter_at(rect);
+                            let fit_scale = (rect.width() / tw.max(1) as f32)
+                                .min(rect.height() / th.max(1) as f32)
+                                .min(1.0);
+                            if to_100 {
+                                // 100% 像素:屏幕 1px = 图像 1px。
+                                self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(8.0);
+                                self.preview_pan = egui::Vec2::ZERO;
+                            }
+                            const ZOOM_MIN: f32 = 1.0;
+                            const ZOOM_MAX: f32 = 8.0;
+                            // 滚轮缩放(以光标为锚点;参考件单图视图滚轮即缩放)。
+                            if resp.hovered() {
+                                let sd = ui.input(|i| i.raw_scroll_delta.y);
+                                if sd != 0.0 {
+                                    let z0 = self.preview_zoom;
+                                    let z1 = (z0 * f32::exp(sd * 0.0022)).clamp(ZOOM_MIN, ZOOM_MAX);
+                                    if (z1 - z0).abs() > f32::EPSILON {
+                                        let c0 = egui::vec2(
+                                            tw as f32 * fit_scale * z0,
+                                            th as f32 * fit_scale * z0,
+                                        );
+                                        let img0 = egui::Rect::from_center_size(
+                                            rect.center() + self.preview_pan,
+                                            c0,
+                                        );
+                                        if let Some(p) = resp.hover_pos() {
+                                            let uv = egui::vec2(
+                                                ((p.x - img0.min.x) / c0.x).clamp(0.0, 1.0),
+                                                ((p.y - img0.min.y) / c0.y).clamp(0.0, 1.0),
+                                            );
+                                            let c1 = egui::vec2(
+                                                tw as f32 * fit_scale * z1,
+                                                th as f32 * fit_scale * z1,
+                                            );
+                                            // 光标下的图像点保持不动。
+                                            self.preview_pan =
+                                                p - uv * c1 + c1 * 0.5 - rect.center();
+                                        }
+                                        self.preview_zoom = z1;
+                                    }
+                                }
+                            }
+                            // 拖拽平移(裁剪模式让位给框选手势;画框在 img_rect 之后处理)。
+                            if !self.crop_mode && resp.dragged_by(egui::PointerButton::Primary) {
+                                self.preview_pan += resp.drag_delta();
+                            }
+                            // 双击:适应窗口 ↔ 100% 像素。
+                            if resp.double_clicked() {
+                                if self.preview_zoom > 1.01 {
+                                    self.preview_zoom = 1.0;
+                                    self.preview_pan = egui::Vec2::ZERO;
+                                } else {
+                                    self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(ZOOM_MAX);
+                                    self.preview_pan = egui::Vec2::ZERO;
+                                }
+                            }
+                            let base = fit_scale * self.preview_zoom;
+                            let content = egui::vec2(tw as f32 * base, th as f32 * base);
+                            // 平移夹在图像边界内(图像小于图区时居中)。
+                            let max_pan = ((content - rect.size()) * 0.5)
+                                .max(egui::Vec2::ZERO);
+                            self.preview_pan = egui::Vec2::new(
+                                self.preview_pan.x.clamp(-max_pan.x, max_pan.x),
+                                self.preview_pan.y.clamp(-max_pan.y, max_pan.y),
+                            );
+                            let img_rect = egui::Rect::from_center_size(
+                                rect.center() + self.preview_pan,
+                                content,
+                            );
+                            // 裁剪模式:拖拽画裁剪框(比例锁定在像素空间成立)。
+                            if self.crop_mode {
+                                if resp.drag_started() {
+                                    self.crop_drag = resp.interact_pointer_pos();
+                                    self.crop_rect = None;
+                                }
+                                if let Some(start) = self.crop_drag {
+                                    if let Some(p) = resp.interact_pointer_pos() {
+                                        let to_norm = |q: egui::Pos2| {
+                                            let d = q - img_rect.min;
+                                            let s = img_rect.size();
+                                            egui::vec2(
+                                                (d.x / s.x.max(1.0)).clamp(0.0, 1.0),
+                                                (d.y / s.y.max(1.0)).clamp(0.0, 1.0),
+                                            )
+                                        };
+                                        let a = to_norm(start);
+                                        let mut b = to_norm(p);
+                                        if let Some((rw, rh)) = self.crop_ratio {
+                                            // 像素空间 pw/ph = rw/rh
+                                            // → 归一化空间 dw/dh = (rw/rh)·(th/tw)。
+                                            let k = (rw / rh) * (th as f32 / tw as f32);
+                                            let mut dw = (b.y - a.y) * k;
+                                            dw = dw.clamp(-a.x, 1.0 - a.x);
+                                            let dh = (dw / k).clamp(-a.y, 1.0 - a.y);
+                                            dw = dh * k;
+                                            b = egui::vec2(a.x + dw, a.y + dh);
+                                        }
+                                        self.crop_rect = Some([a.x, a.y, b.x, b.y]);
+                                    }
+                                    if !resp.dragged() {
+                                        self.crop_drag = None;
+                                    }
+                                }
+                            }
+                            // 放大超过预览档约 1.35 倍 → 请求全图解码(一次,后台)。
+                            let need_full = self.preview_zoom > 1.35
+                                && self.preview_full.as_ref().map(|(k, _)| *k) != Some(id)
+                                && self.zoom_rx.is_none()
+                                && self.zoom_pending.is_none();
+                            if need_full {
+                                let (tx, rx) = mpsc::channel();
+                                self.zoom_rx = Some(rx);
+                                self.zoom_pending = Some(id);
+                                let path = self.rows[idx].path.clone();
+                                std::thread::spawn(move || {
+                                    // 内存上限:约 40MP(160MB RGBA)。超过则放弃,停在预览档。
+                                    let ok = image::ImageReader::open(&path)
+                                        .ok()
+                                        .and_then(|r| r.with_guessed_format().ok())
+                                        .and_then(|r| r.decode().ok())
+                                        .map(|d| {
+                                            crate::thumbs::apply_exif_rotation(
+                                                d,
+                                                crate::exif::read_orientation(Path::new(&path)),
+                                            )
+                                        })
+                                        .filter(|d| {
+                                            (d.width() as u64) * (d.height() as u64) <= 40_000_000
+                                        })
+                                        .map(|d| d.to_rgba8());
+                                    let _ = tx.send((id, ok));
+                                });
+                                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                            }
+                            // 放大态且全图已就绪 → 用全图纹理(效果栈合成,带缓存)。
+                            let use_full = self.preview_zoom > 1.35
+                                && self.preview_full.as_ref().map(|(k, _)| *k) == Some(id);
+                            let paint = if use_full {
+                                self.zoom_tex_get(ctx, id).or_else(|| Some(t.clone()))
+                            } else {
+                                Some(t.clone())
+                            };
+                            if let Some(pt) = paint {
+                                painter.image(
+                                    pt.id(),
+                                    img_rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                            }
+                            // OCR/人脸框图上标注(坐标相对图像矩形,随缩放平移走)
                             let boxes = self.preview_boxes_for(id);
                             if !boxes.is_empty() {
-                                let r = resp.rect;
+                                let r = img_rect;
                                 let stroke = egui::Stroke::new(
                                     1.5_f32,
                                     egui::Color32::from_rgb(255, 90, 90),
@@ -3977,10 +5195,9 @@ impl eframe::App for App {
                                         r.min.y + d * r.height(),
                                     );
                                     let rect = egui::Rect::from_min_max(p0, p1);
-                                    ui.painter()
-                                        .rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
+                                    painter.rect_stroke(rect, 0.0, stroke, egui::StrokeKind::Inside);
                                     if !label.is_empty() {
-                                        let galley = ui.painter().layout_no_wrap(
+                                        let galley = painter.layout_no_wrap(
                                             label.clone(),
                                             egui::FontId::proportional(11.0),
                                             egui::Color32::WHITE,
@@ -3989,13 +5206,99 @@ impl eframe::App for App {
                                             rect.min,
                                             galley.size() + egui::vec2(4.0, 2.0),
                                         );
-                                        ui.painter()
-                                            .rect_filled(bg, 0.0, egui::Color32::from_black_alpha(170));
-                                        ui.painter().galley(
+                                        painter.rect_filled(
+                                            bg,
+                                            0.0,
+                                            egui::Color32::from_black_alpha(170),
+                                        );
+                                        painter.galley(
                                             bg.min + egui::vec2(2.0, 1.0),
                                             galley,
                                             egui::Color32::WHITE,
                                         );
+                                    }
+                                }
+                            }
+                            // 裁剪遮罩(参考件 Crop 样式:四周压暗 + 白框 + 三分线)。
+                            if self.crop_mode {
+                                let dim = egui::Color32::from_black_alpha(110);
+                                let inner = self.crop_rect.map(|c| {
+                                    let (x0, x1) = (c[0].min(c[2]), c[0].max(c[2]));
+                                    let (y0, y1) = (c[1].min(c[3]), c[1].max(c[3]));
+                                    egui::Rect::from_min_max(
+                                        img_rect.min
+                                            + egui::vec2(
+                                                x0 * img_rect.width(),
+                                                y0 * img_rect.height(),
+                                            ),
+                                        img_rect.min
+                                            + egui::vec2(
+                                                x1 * img_rect.width(),
+                                                y1 * img_rect.height(),
+                                            ),
+                                    )
+                                });
+                                match inner {
+                                    Some(r) => {
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_max(
+                                                img_rect.min,
+                                                egui::pos2(img_rect.max.x, r.top()),
+                                            ),
+                                            0.0,
+                                            dim,
+                                        );
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(img_rect.min.x, r.bottom()),
+                                                img_rect.max,
+                                            ),
+                                            0.0,
+                                            dim,
+                                        );
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(img_rect.min.x, r.top()),
+                                                egui::pos2(r.left(), r.bottom()),
+                                            ),
+                                            0.0,
+                                            dim,
+                                        );
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(r.right(), r.top()),
+                                                egui::pos2(img_rect.max.x, r.bottom()),
+                                            ),
+                                            0.0,
+                                            dim,
+                                        );
+                                        painter.rect_stroke(
+                                            r,
+                                            0.0,
+                                            egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        // 三分构图线。
+                                        let lw = egui::Stroke::new(
+                                            0.75_f32,
+                                            egui::Color32::from_white_alpha(120),
+                                        );
+                                        for i in 1..3 {
+                                            let t = i as f32 / 3.0;
+                                            let x = r.left() + r.width() * t;
+                                            let y = r.top() + r.height() * t;
+                                            painter.line_segment(
+                                                [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
+                                                lw,
+                                            );
+                                            painter.line_segment(
+                                                [egui::pos2(r.left(), y), egui::pos2(r.right(), y)],
+                                                lw,
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        painter.rect_filled(img_rect, 0.0, dim);
                                     }
                                 }
                             }
@@ -4051,6 +5354,29 @@ impl eframe::App for App {
                             ui.label(parts.join(" · "));
                         }
                         ui.label(format!("文件: {path}"));
+                        // 标题(参考件 Caption:单图视图直接编辑,失焦/回车保存)。
+                        if self.caption_edit.as_ref().map(|(k, _)| *k) != Some(id) {
+                            self.caption_edit = Some((id, self.store.get_caption(id)));
+                        }
+                        if let Some((_, cap)) = &mut self.caption_edit {
+                            let resp = ui
+                                .horizontal(|ui| {
+                                    ui.label("标题:");
+                                    ui.add(
+                                        egui::TextEdit::singleline(cap)
+                                            .desired_width(ui.available_width() - 60.0),
+                                    )
+                                })
+                                .inner;
+                            let enter =
+                                ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
+                            if resp.lost_focus() || enter {
+                                if *cap != self.store.get_caption(id) {
+                                    let _ = self.store.set_caption(id, cap);
+                                    self.fx_msg = "标题已保存".into();
+                                }
+                            }
+                        }
                         ui.separator();
                         ui.horizontal(|ui| {
                             ui.label("标签:");
@@ -4101,6 +5427,9 @@ impl eframe::App for App {
                 if !preview_open {
                     self.preview = None;
                     self.preview_tex = None;
+                    // 关闭预览即释放缩放状态与全图缓存(几十 MB 级)。
+                    self.preview_reset_zoom();
+                    self.zoom_active_for = None;
                 }
             }
         }
@@ -4313,6 +5642,15 @@ impl eframe::App for App {
                     ui.small("说明:原版的变更日志只存内存,不可回溯;此处为持久化增强版。");
                 });
             self.show_changes = open;
+        }
+
+        // P3-ui:属性窗口(imageproperties 等价物)。
+        if self.show_props {
+            self.props_ui(ctx);
+        }
+        // P3-ui:选项窗口(options 等价物)。
+        if self.show_options {
+            self.options_ui(ctx);
         }
 
         // P1-11:按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。

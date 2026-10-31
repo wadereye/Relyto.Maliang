@@ -22,39 +22,69 @@ use crate::effects::FilterStack;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// 邮件/光盘尺寸档(与原版 UI 文案一致:1600/1024/800)。
+/// 邮件/光盘尺寸档(参考件 Options > E-Mail 的 8 档列表
+/// `160|320|480|640|800|1024|1200|1600`;默认 1024 像素)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareSize {
-    Large,
-    Medium,
-    Small,
+    Px160,
+    Px320,
+    Px480,
+    Px640,
+    Px800,
+    Px1024,
+    Px1200,
+    Px1600,
 }
 
 impl ShareSize {
-    /// 最长边像素(与原版一致:1600 / 1024 / 800)。
+    /// 最长边像素(参考件尺寸档列表)。
     #[must_use]
     pub fn px(self) -> u32 {
         match self {
-            ShareSize::Large => 1600,
-            ShareSize::Medium => 1024,
-            ShareSize::Small => 800,
+            ShareSize::Px160 => 160,
+            ShareSize::Px320 => 320,
+            ShareSize::Px480 => 480,
+            ShareSize::Px640 => 640,
+            ShareSize::Px800 => 800,
+            ShareSize::Px1024 => 1024,
+            ShareSize::Px1200 => 1200,
+            ShareSize::Px1600 => 1600,
         }
     }
 
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            ShareSize::Large => "大:1600 像素(打印/分享)",
-            ShareSize::Medium => "中:1024 像素(分享)",
-            ShareSize::Small => "小:800 像素(博客/网页)",
+            ShareSize::Px160 => "160 像素(缩略图)",
+            ShareSize::Px320 => "320 像素(网页小图)",
+            ShareSize::Px480 => "480 像素(小图)",
+            ShareSize::Px640 => "640 像素(普通)",
+            ShareSize::Px800 => "800 像素(博客/网页)",
+            ShareSize::Px1024 => "1024 像素(推荐)",
+            ShareSize::Px1200 => "1200 像素(大图)",
+            ShareSize::Px1600 => "1600 像素(打印/分享)",
         }
     }
 
-    pub const ALL: [ShareSize; 3] = [
-        ShareSize::Large,
-        ShareSize::Medium,
-        ShareSize::Small,
+    pub const ALL: [ShareSize; 8] = [
+        ShareSize::Px160,
+        ShareSize::Px320,
+        ShareSize::Px480,
+        ShareSize::Px640,
+        ShareSize::Px800,
+        ShareSize::Px1024,
+        ShareSize::Px1200,
+        ShareSize::Px1600,
     ];
+
+    /// 按像素值取档(选项持久化用;未知值回退 1024 = 参考件默认档)。
+    #[must_use]
+    pub fn from_px(px: u32) -> ShareSize {
+        Self::ALL
+            .into_iter()
+            .find(|s| s.px() == px)
+            .unwrap_or(ShareSize::Px1024)
+    }
 }
 
 /// 原版附件文件名格式 `"%0*d-%s"`:
@@ -84,6 +114,8 @@ pub fn stage_jpegs(
     let mut out = Vec::with_capacity(items.len());
     for (i, (src, stack)) in items.iter().enumerate() {
         let img = image::open(src).with_context(|| format!("解码失败: {}", src.display()))?;
+        // 与预览同一坐标空间:先按 EXIF 方向摆正再套效果栈(含几何类效果)。
+        let img = crate::thumbs::apply_exif_rotation(img, crate::exif::read_orientation(src));
         let mut rgba = img.to_rgba8();
         if !stack.is_empty() {
             crate::effects::apply_stack(&mut rgba, stack);
@@ -361,10 +393,12 @@ mod tests {
 
     #[test]
     fn share_size_px_matches_original_strings() {
-        // 原版 UI 文案:1600(推荐)/1024(中)/800(小)
-        assert_eq!(ShareSize::Large.px(), 1600);
-        assert_eq!(ShareSize::Medium.px(), 1024);
-        assert_eq!(ShareSize::Small.px(), 800);
+        // 原版 Options > E-Mail 尺寸档列表 160|320|480|640|800|1024|1200|1600,
+        // 默认档 1024("Same as multiple (1024 pixels)")。
+        for px in [160, 320, 480, 640, 800, 1024, 1200, 1600] {
+            assert_eq!(ShareSize::from_px(px).px(), px);
+        }
+        assert_eq!(ShareSize::from_px(999), ShareSize::Px1024);
     }
 
     #[test]
@@ -395,7 +429,7 @@ mod tests {
         std::fs::write(&src, &buf).unwrap();
 
         let items = vec![(src.clone(), FilterStack::new())];
-        let files = stage_jpegs(&items, ShareSize::Large.px(), &dir).unwrap();
+        let files = stage_jpegs(&items, ShareSize::Px1600.px(), &dir).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].file_name().unwrap().to_string_lossy().ends_with("-照片 A.jpg"));
         let got = image::open(&files[0]).unwrap();

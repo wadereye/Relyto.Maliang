@@ -195,6 +195,23 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;",
         );
+        // P3-ui:标题(参考件 Caption;幻灯片/属性面板/缩略图说明显示)。
+        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN caption TEXT;");
+        // P3-ui:相簿(参考件 Album;我方相簿是照片 id 的命名集合,不移动文件)。
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS albums (
+                id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                ts INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS album_photos (
+                album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
+                photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+                pos INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(album_id, photo_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_album_photos_album ON album_photos(album_id, pos);",
+        );
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_cam_id ON photos(cam_id);
              CREATE TABLE IF NOT EXISTS string_pool (
@@ -302,6 +319,154 @@ impl Store {
             rusqlite::params![k, v],
         )?;
         Ok(())
+    }
+
+    // ===== P3-ui 标题(Caption)与相簿(Album) =====
+
+    /// 读照片标题(无标题返回空串)。
+    pub fn get_caption(&self, id: i64) -> String {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT caption FROM photos WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// 写照片标题(空串 = 清除)。
+    pub fn set_caption(&self, id: i64, caption: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE photos SET caption=?2 WHERE id=?1",
+            rusqlite::params![id, if caption.is_empty() { None } else { Some(caption) }],
+        )?;
+        Ok(())
+    }
+
+    /// 相簿列表(按创建顺序)。返回 (id, 名称, 照片数)。
+    pub fn albums(&self) -> Vec<(i64, String, usize)> {
+        let conn = self.0.lock().unwrap();
+        let mut st = match conn.prepare(
+            "SELECT a.id, a.name,
+                    (SELECT COUNT(*) FROM album_photos ap WHERE ap.album_id = a.id)
+             FROM albums a ORDER BY a.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as usize))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    }
+
+    /// 新建相簿,返回 id(重名返回既有 id,与参考件「不能重名」一致)。
+    pub fn album_create(&self, name: &str) -> Result<i64> {
+        let conn = self.0.lock().unwrap();
+        if let Ok(id) = conn.query_row(
+            "SELECT id FROM albums WHERE name=?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        ) {
+            return Ok(id);
+        }
+        conn.execute(
+            "INSERT INTO albums(name, ts) VALUES(?1, ?2)",
+            rusqlite::params![name, chrono::Utc::now().timestamp_millis()],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// 相簿重命名。
+    pub fn album_rename(&self, id: i64, name: &str) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "UPDATE albums SET name=?2 WHERE id=?1",
+            rusqlite::params![id, name],
+        )?;
+        Ok(())
+    }
+
+    /// 删除相簿(成员照片不动,ON DELETE CASCADE 清映射)。
+    pub fn album_delete(&self, id: i64) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM albums WHERE id=?1", rusqlite::params![id])?;
+        Ok(())
+    }
+
+    /// 照片加入相簿(已存在则忽略;pos 追加到尾部)。
+    pub fn album_add_photo(&self, album_id: i64, photo_id: i64) -> Result<()> {
+        let conn = self.0.lock().unwrap();
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM album_photos WHERE album_id=?1 AND photo_id=?2",
+                rusqlite::params![album_id, photo_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(1);
+        if exists > 0 {
+            return Ok(());
+        }
+        let pos: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(pos),-1)+1 FROM album_photos WHERE album_id=?1",
+                rusqlite::params![album_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        conn.execute(
+            "INSERT INTO album_photos(album_id, photo_id, pos) VALUES(?1,?2,?3)",
+            rusqlite::params![album_id, photo_id, pos],
+        )?;
+        Ok(())
+    }
+
+    /// 照片移出相簿。
+    pub fn album_remove_photo(&self, album_id: i64, photo_id: i64) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "DELETE FROM album_photos WHERE album_id=?1 AND photo_id=?2",
+            rusqlite::params![album_id, photo_id],
+        )?;
+        Ok(())
+    }
+
+    /// 相簿成员(按 pos 序),返回照片 id 列表。
+    pub fn album_photo_ids(&self, album_id: i64) -> Vec<i64> {
+        let conn = self.0.lock().unwrap();
+        let mut st = match conn.prepare(
+            "SELECT photo_id FROM album_photos WHERE album_id=?1 ORDER BY pos",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([album_id], |r| r.get(0))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// 照片所在的相簿(用于右键菜单勾选状态)。
+    pub fn albums_of_photo(&self, photo_id: i64) -> Vec<(i64, String)> {
+        let conn = self.0.lock().unwrap();
+        let mut st = match conn.prepare(
+            "SELECT a.id, a.name FROM albums a
+             JOIN album_photos ap ON ap.album_id = a.id
+             WHERE ap.photo_id = ?1 ORDER BY a.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([photo_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     }
 
     // ===== P2-15 持久化扫描队列 =====

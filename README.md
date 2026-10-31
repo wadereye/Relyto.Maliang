@@ -1,176 +1,244 @@
-# Relyto.Maliang（马良）
+<div align="right">
 
-> 用 AI 重新诠释 Picasa 的本地照片管理应用。
+English | [简体中文](./README.zh-CN.md)
 
-Maliang（马良）是一个面向桌面端的本地照片管理工具，目标是把经典的
-Picasa 3 的体验现代化：更顺滑的浏览、更智能的组织，以及原生、离线、
-隐私优先的 AI 能力。全部数据保存在你自己的机器上，不上云、不扫描你的
-隐私上传。
+</div>
 
-项目目前处于早期开发阶段（v0.1.0），核心浏览、索引与缩略图链路已可运行。
+# Relyto.Maliang (马良)
 
-## 功能规划
+> A local photo management app that reimagines Picasa with AI.
 
-### 已实现 / 进行中
-- **照片索引与浏览**：扫描本地目录，建立 SQLite 索引，支持时间线 / 文件夹视图。
-- **多级缩略图**：后台常驻 worker，按 Small96 / Normal256 / Big512 / Preview1024
-  四档生成与缓存，界面流畅不卡顿。
-- **时间线视图**：按拍摄日期聚合，参照 Picasa 的视图与排序方式。
-- **文件夹视图**：监控目录变化（事件去抖 + 轮询 + 基线三档门控），自动增量更新索引。
-- **标签 / 星标**：读写经典 `picasa.ini`，与原版 Picasa 互通。
-- **重复检测**：基于 dHash 的感知哈希，找出视觉近似的照片（超出原版能力）。
-- **EXIF 与 GPS**：读取拍摄参数、经纬度，支持 KML 导出。
-- **人脸与相簿**：人脸检测、模板匹配、聚类与命名（随 `ai` 特性默认启用）。
-- **编辑与一键增强**：曲线（自然三次样条）、曝光 / 黑白 / 颗粒等效果；
-  一键增强（oneclick）除黑白、棕褐、颗粒、锐化外，另含自主设计的
-  暖调、冷调、暗角、褪色，以及伽马、线性模糊、焦点柔化、焦点去色、
-  方向性亮度 / 饱和度 / 锐度。效果参数集中在资源包中，便于调校。
-- **风格配方**：28 个成组滤镜（浓郁 / 画框 / 投影 / 中心马赛克 / 变焦拖影 /
-  胶片颗粒 / 强动态 / 热成像 / 玩具相机 / 红外胶片 / 局部对比 / 鲜艳暗角 /
-  边缘提亮 / 装裱卡纸 / 霓虹 / 夜视仪 / 马赛克 / 一次成像 / 海报色阶 / 圆角 /
-  单色洗 / 双色调 / 漫画 / 柔光 / 铅笔素描 / 交叉冲印 / 宽银幕 / 六十年代）。
-  每个配方是一串固定顺序的像素操作，强度统一控制与原图的混合比例；
-  另有一组可复用的基础算子（混合模式、遮罩、盒式模糊、线性模糊、渐变映射、
-  边缘检测、变焦模糊、色阶压缩、边框、投影、旋转、方向性调整等）。
-- **设备导入**：通过 WPD / WIA 接入相机、手机等便携设备（Windows）。
-- **视频支持**：识别常见视频格式，抽取缩略图，调用系统播放器播放。
-- **XMP 镜像**：将编辑与元数据镜像为 XMP，便于与其他工具互通。
-- **导出 / 保存**：带编辑参数烘焙导出，保留原始文件。
+**Why this project exists.** Google Picasa was a truly great photo
+management and editing app — fast, simple, and a joy to use. Sadly, Google
+discontinued it in 2016, leaving a gap that no modern tool has quite filled.
+That's why this project sets out to rewrite Picasa in Rust and release it as
+open source, so the experience we loved can live on.
 
-### AI 能力（默认启用 `ai` 特性）
-- OCR 文字识别
-- 人脸自动归类建议与半自动聚类
-- CLIP 语义搜索（"找有猫的照片"）
+If Maliang is useful to you, please consider giving the repo a
+[⭐ star](https://github.com/wadereye/Relyto.Maliang/stargazers) — and if
+something is missing or broken, open an
+[issue](https://github.com/wadereye/Relyto.Maliang/issues). Feature requests
+are always welcome.
 
-### 有意不做（范围外）
-图片精修编辑链（retouch / picnik）、拼贴 / 海报 / CD 刻录、在线分享
-（Picasa Web / 社交平台 / 邮件 / 打印）、TWAIN 相机扫描、相簿系统云同步、
-Picasa2 迁移。
+Maliang (马良) is a desktop-first local photo management tool that aims to
+modernize the classic Picasa 3 experience: smoother browsing, smarter
+organization, and native, offline, privacy-first AI capabilities. All of your
+data stays on your own machine — nothing is uploaded to the cloud, and your
+private photos are never scanned and sent anywhere.
 
-## 技术栈
-- **语言**：Rust 2021
-- **UI**：[egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui) 0.33（wgpu 渲染）
-- **数据库**：[rusqlite](https://github.com/rusqlite/rusqlite)（bundled SQLite）
-- **系统交互**：`windows` crate（WPD / WIA / COM，Windows 平台）
-- **图像**：`image` 0.25（JPEG / PNG / WebP / TIFF / BMP / GIF）
+The project is in early development (v0.1.0). The core browsing, indexing, and
+thumbnail pipeline are already working.
 
-## 编译方法
+## Feature Roadmap
 
-### 环境要求
-- Windows 10/11（本项目当前仅面向 Windows，依赖 `windows` crate 的设备导入能力）
-- [Rust 工具链](https://www.rust-lang.org/tools/install)（stable，建议较新版本）
-- 构建过程需要从 crates.io 下载依赖，请确保网络可用
+### Implemented / In Progress
+- **Photo indexing & browsing**: scans local directories and builds a SQLite
+  index, with timeline and folder views.
+- **Multi-level thumbnails**: a persistent background worker generates and
+  caches thumbnails at four sizes — Small96 / Normal256 / Big512 /
+  Preview1024 — keeping the UI smooth and responsive.
+- **Timeline view**: grouped by capture date, following Picasa's view and
+  sorting conventions.
+- **Folder view**: watches directory changes (event debouncing + polling +
+  baseline three-tier gating) and incrementally updates the index.
+- **Tags / star ratings**: reads and writes the classic `picasa.ini`,
+  interoperable with the original Picasa.
+- **Duplicate detection**: perceptual hashing based on dHash to find visually
+  similar photos (beyond the original's capabilities).
+- **EXIF & GPS**: reads capture parameters and coordinates, with KML export.
+- **Faces & albums**: face detection, template matching, clustering, and
+  naming (enabled by default via the `ai` feature).
+- **Editing & one-click enhance**: curves (natural cubic spline), exposure /
+  black-and-white / grain effects; the one-click enhance set includes
+  black-and-white, sepia, grain, and sharpen, plus self-designed warm tone,
+  cool tone, vignette, and fade, and gamma, linear blur, focal softening,
+  focal desaturation, and directional brightness / saturation / sharpness.
+  Effect parameters live in an asset pack for easy tuning.
+- **Style recipes**: 28 grouped filter recipes (Fade, Frame, Drop Shadow,
+  Center Mosaic, Zoom Blur, Film Grain, Strong Dynamic, Thermal Imaging, Toy
+  Camera, Infrared Film, Local Contrast, Vignette Glow, Edge Glow, Mat Board,
+  Neon, Night Vision, Pixelate, Instant Photo, Posterize, Rounded Corners,
+  Monochrome Wash, Two-Tone, Comic, Soft Glow, Pencil Sketch, Cross Process,
+  Cinemascope, Sixties). Each recipe is a fixed sequence of pixel operations
+  with a unified strength control that sets the blend ratio against the
+  original image. A set of reusable primitive operators is also provided
+  (blend modes, masks, box blur, linear blur, gradient maps, edge detection,
+  zoom blur, posterization, borders, drop shadow, rotation, directional
+  adjustments, and more).
+- **Device import**: imports from cameras, phones, and other portable devices
+  via WPD / WIA (Windows).
+- **Video support**: recognizes common video formats, extracts thumbnails,
+  and plays them with the system player.
+- **XMP mirroring**: mirrors edits and metadata to XMP for interoperability
+  with other tools.
+- **Export / save**: bakes edit parameters into exports while preserving the
+  original files.
 
-### 标准构建
+### AI Capabilities (the `ai` feature is enabled by default)
+- OCR text recognition
+- Automatic people-grouping suggestions and semi-automatic clustering
+- CLIP semantic search ("find photos with cats")
+
+### Intentionally Out of Scope
+Advanced retouching workflows (retouch / picnik), collage / poster / CD
+burning, online sharing (Picasa Web / social platforms / email / printing),
+TWAIN camera scanning, cloud album sync, and Picasa2 migration.
+
+## Tech Stack
+- **Language**: Rust 2021
+- **UI**: [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui) 0.33 (wgpu rendering)
+- **Database**: [rusqlite](https://github.com/rusqlite/rusqlite) (bundled SQLite)
+- **System integration**: the `windows` crate (WPD / WIA / COM on Windows)
+- **Imaging**: `image` 0.25 (JPEG / PNG / WebP / TIFF / BMP / GIF)
+
+## Building
+
+### Requirements
+- Windows 10/11 (the project currently targets Windows only, relying on the
+  `windows` crate for device import)
+- The [Rust toolchain](https://www.rust-lang.org/tools/install) (stable; a
+  recent version is recommended)
+- Network access is required during the build to fetch dependencies from
+  crates.io
+
+### Standard Build
 ```bash
-# 克隆（如需）
+# Clone (if needed)
 git clone https://github.com/wadereye/Relyto.Maliang
 cd Relyto.Maliang
 
-# 调试构建
+# Debug build
 cargo build
 
-# 发布构建（推荐，开启 LTO 与单 codegen unit）
+# Release build (recommended; enables LTO and a single codegen unit)
 cargo build --release
 
-# 运行
-cargo run            # 或运行 target/release/maliang.exe
+# Run
+cargo run            # or run target/release/maliang.exe
 ```
 
-### 精简构建（不含 AI）
-`ai` 特性会引入 ONNX Runtime 与模型文件（OCR / 人脸 / CLIP），**默认已启用**：
+### Slim Build (without AI)
+The `ai` feature pulls in ONNX Runtime and model files (OCR / faces / CLIP)
+and is **enabled by default**:
 ```bash
-cargo build --release          # 默认 = 含 ai
+cargo build --release          # default = includes ai
 ```
-不想要这份体积与依赖时用：
+If you don't want the extra size and dependencies:
 ```bash
 cargo build --release --no-default-features
 ```
-精简构建下「人物」与「语义搜索」视图会提示未编译，其余功能不受影响。
-启用前请确保已配置 `onnxruntime` 运行环境与对应的模型权重文件。
+In a slim build, the "People" and "Semantic Search" views will indicate that
+they were not compiled in; everything else works as usual. Before enabling the
+feature, make sure the `onnxruntime` runtime and the corresponding model
+weights are in place.
 
-### 常用命令
+### Common Commands
 ```bash
-cargo check          # 仅类型检查（快）
-cargo test           # 运行测试（默认含 AI 模块测试）
-cargo test --no-default-features   # 精简构建的测试
+cargo check          # type checking only (fast)
+cargo test           # run tests (includes AI module tests by default)
+cargo test --no-default-features   # tests for the slim build
 ```
 
-### 构建排错（Windows）
-- 依赖 `windows` crate 与 COM，请使用官方 Rust 安装器提供的原生 MSVC 工具链。
-- 若 C 盘空间紧张导致 `cargo` 临时文件报错，可指定临时目录：
+### Build Troubleshooting (Windows)
+- The project depends on the `windows` crate and COM, so use the native MSVC
+  toolchain provided by the official Rust installer.
+- If the C drive is short on space and `cargo`'s temporary files cause errors,
+  point the temp directory elsewhere:
   ```powershell
   $env:TMP = "D:\tmp-maliang"; $env:TEMP = "D:\tmp-maliang"
   cargo build --release
   ```
-- 首次构建会编译大量依赖，耗时较长，请耐心等待。
+- The first build compiles a large number of dependencies and takes a while —
+  please be patient.
 
-## 目录结构
+## Project Layout
 ```
 Relyto.Maliang/
-├── Cargo.toml          # 包定义与依赖
+├── Cargo.toml          # package definition and dependencies
 ├── Cargo.lock
 ├── assets/
-│   └── presets.dat     # 内置效果参数资源包（编译期内嵌，可用命令行覆盖）
+│   └── presets.dat     # built-in effect parameter pack (embedded at compile time, overridable via CLI)
 ├── src/
-│   ├── main.rs         # 入口（UI 线程提权、打开索引库、启动 eframe）
-│   ├── app.rs          # 主界面（视图 / 排序 / 文件夹管理器）
-│   ├── scan.rs         # 目录扫描与索引
-│   ├── thumbs.rs       # 缩略图生成与缓存
-│   ├── timeline.rs     # 时间线聚合
-│   ├── watch.rs        # 目录变化监控
-│   ├── db.rs           # SQLite 存储层
-│   ├── pool.rs         # 字符串池（列式存储）
-│   ├── effects.rs / curves.rs / oneclick.rs  # 编辑与增强
-│   ├── recipes.rs                            # 成组滤镜配方与基础像素算子
-│   ├── assets.rs / assets_format.rs           # 内置参数资源包的读取与格式
-│   ├── faces.rs / clip.rs / ai.rs            # AI 能力（ai 特性）
-│   ├── device.rs / wpd.rs / win.rs           # 设备导入与系统交互
+│   ├── main.rs         # entry point (UI thread DPI awareness, index store, eframe startup)
+│   ├── app.rs          # main UI (views / sorting / folder manager)
+│   ├── scan.rs         # directory scanning and indexing
+│   ├── thumbs.rs       # thumbnail generation and caching
+│   ├── timeline.rs     # timeline aggregation
+│   ├── watch.rs        # directory change monitoring
+│   ├── db.rs           # SQLite storage layer
+│   ├── pool.rs         # string pools (columnar storage)
+│   ├── effects.rs / curves.rs / oneclick.rs  # editing and enhancement
+│   ├── recipes.rs                            # grouped filter recipes and pixel primitives
+│   ├── assets.rs / assets_format.rs           # reading and format of the built-in parameter pack
+│   ├── faces.rs / clip.rs / ai.rs            # AI capabilities (ai feature)
+│   ├── device.rs / wpd.rs / win.rs           # device import and system integration
 │   ├── video.rs / xmp.rs / export.rs / save.rs
 │   └── ...
-└── target/             # 构建产物（已 gitignore）
+└── target/             # build artifacts (gitignored)
 ```
 
-## 内置效果参数（资源包）
+## Built-in Effect Parameters (Asset Pack)
 
-曲线预设、亮度权重、黑白 / 双色调 / 颗粒的默认参数、模糊形状系数、滚动阻尼
-常量等**可调数值**不写在源码里，而是集中存放于 `assets/presets.dat`——
-一个带 magic 与版本号的小端二进制容器（段名 + f64 数值列表）。这样调整观感
-只需改数据、不必改代码。
+Tunable values — curve presets, luma weights, the default parameters for
+black-and-white / two-tone / grain, blur shape coefficients, scroll damping
+constants, and so on — do not live in the source code. They are centralized in
+`assets/presets.dat`, a little-endian binary container with a magic header and
+version number (section names + f64 value lists). This way, adjusting the look
+only requires changing data, not code.
 
-程序启动时的取值顺序：
+Resolution order at startup:
 
-1. 用户目录下的 `%APPDATA%\Maliang\presets.dat`（若存在且格式正确）——可覆盖；
-2. 编译期内嵌的 `assets/presets.dat`（始终可用，作为兜底）。
+1. `%APPDATA%\Maliang\presets.dat` in the user directory (if present and
+   well-formed) — overridable;
+2. the compile-time-embedded `assets/presets.dat` (always available, as the
+   fallback).
 
-文本与二进制之间可以互转：
+The pack can be converted between text and binary:
 
 ```bash
-# 导出当前生效的资源包为可读文本
+# Export the currently active pack as readable text
 cargo run -- --export-assets my-presets.txt
 
-# 编辑后写回用户目录（下次启动生效）
+# Write an edited pack back to the user directory (takes effect on next launch)
 cargo run -- --import-assets my-presets.txt
 ```
 
-资源包损坏时会自动回退到内嵌副本，不会导致程序无法启动。
+If the pack is corrupted, the app automatically falls back to the embedded
+copy and still starts normally.
 
-## 商标与免责声明
+## Trademark & Disclaimer
 
-Picasa 是 Google LLC 的商标。本项目是一个**独立的开源实现**，与 Google LLC
-没有任何关联，也未获得其授权、赞助或背书。
+Picasa is a trademark of Google LLC. This project is an **independent open
+source implementation** with no affiliation to, and no authorization,
+sponsorship, or endorsement from, Google LLC.
 
-本项目不包含 Picasa 的任何二进制文件、源代码或专有资源文件；对 Picasa 界面与
-交互方式的参照仅用于提供熟悉的使用体验与数据互通（如 `picasa.ini`）。
+Maliang is an independent implementation built from the ground up, without
+using any of Picasa's source code, binaries, or asset files. Similarities in
+interface and interaction design are intended to preserve a familiar
+experience and to support data interoperability with Picasa (such as the
+classic `picasa.ini` file format).
 
-## 第三方声明
+## Third-Party Notices
 
-本项目参考了 OpenAI CLIP（MIT 许可）的 BPE 分词器实现，完整归属声明与许可
-原文见 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
+The project's own code is released under the Apache License 2.0, and the
+project additionally includes or references the following third-party
+content. Full attribution and license texts are collected in
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md); all third-party
+components are used and distributed under their original license terms,
+which the licensing of this project neither replaces nor overrides.
 
-仓库**不分发**任何模型文件或权重；运行时所需的 ONNX 模型与 BPE 合并表由用户
-自行获取后放入本地模型目录。
+- **OpenAI CLIP** (MIT license): the BPE tokenizer implementation in
+  `src/clip.rs` is written with reference to its code;
+- **Cargo dependencies** (egui / eframe / wgpu / image / rusqlite / windows
+  and others): all under MIT, Apache-2.0, or BSD-family licenses, compatible
+  with this project's release license;
+- **Models & weights**: the repository distributes no model or weight files;
+  runtime resources are obtained by the user and placed into the local model
+  directory, and all rights remain with their respective owners.
 
-## 协议
+## License
 
-本项目以 [Apache License 2.0](./LICENSE) 发布。
+The project's own code is released under the [Apache License 2.0](./LICENSE);
+third-party components follow their respective original license terms — see
+[Third-Party Notices](#third-party-notices) and
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).

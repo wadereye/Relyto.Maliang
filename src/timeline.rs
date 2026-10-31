@@ -16,6 +16,8 @@ pub struct PhotoRow {
     pub height: Option<i32>,
     /// 相机型号(EXIF Make/Model 合并,预览信息行)。
     pub cam: String,
+    /// 标题(参考件 Caption;缩略图说明/幻灯片/属性面板显示)。
+    pub caption: String,
     /// GPS 坐标(十进制度;无定位为 None)。
     pub lat: Option<f64>,
     pub lon: Option<f64>,
@@ -33,7 +35,7 @@ pub fn load_all(store: &Store) -> Result<Vec<PhotoRow>> {
     // LEFT JOIN 保证:未池化的历史行(cam 有值、cam_id 为 NULL)仍能显示。
     let mut st = conn.prepare(
         "SELECT p.id, p.path, p.taken_utc, p.star, p.thumb_ok, p.width, p.height,
-                COALESCE(sp.value, p.cam, ''), p.lat, p.lon, p.kind
+                COALESCE(sp.value, p.cam, ''), p.lat, p.lon, p.kind, p.caption
          FROM photos p
          LEFT JOIN string_pool sp ON sp.pool = ?1 AND sp.value_id = p.cam_id
          ORDER BY p.taken_utc DESC, p.path",
@@ -53,6 +55,7 @@ pub fn load_all(store: &Store) -> Result<Vec<PhotoRow>> {
                 lat: r.get(8)?,
                 lon: r.get(9)?,
                 kind: r.get(10)?,
+                caption: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
             })
         })?
         .filter_map(|r| r.ok())
