@@ -1,3 +1,8 @@
+// release 按 GUI 子系统链接:双击启动不再弹黑色控制台框。
+// debug 保留控制台子系统,方便看日志与断点输出。
+// 命令行子命令的输出由 win::attach_parent_console 挂回调用方终端。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 mod assets_format;
@@ -97,6 +102,11 @@ fn handle_cli(args: &[String]) -> bool {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // GUI 子系统下带参数启动,多半是命令行子命令;先把输出挂回父终端再执行,
+    // 否则 println! 的结果无处可去。普通双击(无参数)不受影响。
+    if !args.is_empty() {
+        win::attach_parent_console();
+    }
     if handle_cli(&args) {
         return Ok(());
     }

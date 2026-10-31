@@ -190,6 +190,8 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "dir_sat",
     "dir_sharp",
     "shadow",
+    "rot",
+    "crop",
 ];
 
 /// `tilt`(Straighten)滑杆满量程对应的角度。
@@ -214,7 +216,8 @@ const DOCUMENTED_NOOPS: &[&str] = &[
 /// 避免下一轮再靠人工数一遍。具体分档见 [`support_of`]。
 #[cfg(test)]
 pub const REFERENCE_IDS: &[&str] = &[
-    // 「编辑历史」类:不是像素滤镜,是历史记录里的条目类型
+    // 「编辑历史」类:参考里是历史记录的条目类型;在我方效果链等价于编辑历史,
+    // 其中 crop / rot 已按可执行像素效果落地(见 PIXEL_EFFECTS),其余维持不做。
     "save", "crop64", "crop", "redeye", "retouch", "picnik", "rot",
     // 常规调整 / 工具 / 一键效果
     "debug", "triple", "triple2", "triple3", "finetune", "finetune2", "colorfix",
@@ -243,11 +246,10 @@ pub const REFERENCE_ONLY: &[&str] = &[
     "ReanimatedEyeColor",
     // 依赖已于早前关停的外部在线服务
     "picnik",
-    // 属于「编辑历史」的条目类型,不是可回放的像素滤镜
+    // 属于「编辑历史」的条目类型,且没有独立的像素语义:
+    // save 是写盘动作;crop64 是 crop 的 64 位坐标变体(我方 crop 用 u32 已够)。
     "save",
     "crop64",
-    "crop",
-    "rot",
     // 视频的起止端点在我方不是独立效果,而是 `movie` 效果的两个参数
     // (`start` / `end`,见 `crate::video::MovieTrim`)。
     "moviestart",
@@ -1081,6 +1083,46 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             if deg != 0.0 {
                 let rotated = crate::recipes::rotate(img, deg, false, [0, 0, 0]);
                 *img = rotated;
+            }
+        }
+        // 90° 直角旋转(参考编辑历史条目 rot 的可执行形态;「Rotate Clockwise /
+        // Counterclockwise」菜单与按钮都落到它)。quarter:1 = 顺时针,2 = 180°,
+        // 3 = 逆时针;精确转置,不发生 tilt 那样的画布扩边。
+        "rot" => {
+            let q = e
+                .params
+                .get("quarter")
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(1)
+                % 4;
+            match q {
+                1 => *img = image::imageops::rotate90(img),
+                2 => *img = image::imageops::rotate180(img),
+                3 => *img = image::imageops::rotate270(img),
+                _ => {}
+            }
+        }
+        // 裁剪(参考编辑历史条目 crop 的可执行形态;改画布尺寸,不做像素回混)。
+        // 参数 x / y / w / h 是**显示方向图像的归一化分数**(0..1)——
+        // 与分辨率无关,预览(1024 档)/导出(全分辨率)共用同一组数值;
+        // 裁剪矩形相对"链上此点"的图像,与参考编辑历史按序回放的语义一致。
+        "crop" => {
+            let p = |k: &str, def: f32| {
+                e.params
+                    .get(k)
+                    .and_then(|v| v.parse::<f32>().ok())
+                    .unwrap_or(def)
+            };
+            let fx = p("x", 0.0).clamp(0.0, 1.0);
+            let fy = p("y", 0.0).clamp(0.0, 1.0);
+            let fw = p("w", 1.0).clamp(0.0, 1.0 - fx);
+            let fh = p("h", 1.0).clamp(0.0, 1.0 - fy);
+            let x = (fx * img.width() as f32).round() as u32;
+            let y = (fy * img.height() as f32).round() as u32;
+            let w = (fw * img.width() as f32).round() as u32;
+            let h = (fh * img.height() as f32).round() as u32;
+            if w >= 16 && h >= 16 && (w < img.width() || h < img.height()) {
+                *img = image::imageops::crop(img, x, y, w, h).to_image();
             }
         }
         // 阴影 / 高光:参考三根滑杆 Radius / Shadow % / Highlight %。
@@ -1981,6 +2023,11 @@ mod tests {
                 ("highlight", "ffeedd"),
                 ("shadow", "000000"),
                 ("radius", "3.0"),
+                // crop 的归一化裁剪矩形(对样图裁掉一圈,尺寸变化即算改像素)
+                ("x", "0"),
+                ("y", "0"),
+                ("w", "0.75"),
+                ("h", "0.75"),
                 // curves 有自己的参数空间,缺了它退化成恒等 —— 会给这条回归锁误判
                 ("master", "0,0;255,255"),
                 ("red", "0,20;255,235"),

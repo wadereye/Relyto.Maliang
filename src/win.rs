@@ -1,4 +1,4 @@
-//! Windows 平台能力封装(卷类型分流 / 线程优先级 / Shell 缩略图)。
+//! Windows 平台能力封装(卷类型分流 / 线程优先级 / Shell 缩略图 / 控制台挂载)。
 //!
 //! 对应原版 Picasa 3 的三处参考结论：
 //! - 卷类型分流用 `GetLogicalDriveStringsA` + `GetDriveTypeA` 分流卷类型,
@@ -182,6 +182,67 @@ pub fn set_current_thread_priority(p: Priority) {
     }
 }
 
+/// 把标准输出/错误挂回**父进程的控制台**(GUI 子系统 exe 的命令行子命令专用)。
+///
+/// 背景:release 二进制按 GUI 子系统链接(双击启动不弹黑框),此时标准句柄
+/// 不指向任何终端,`println!` 的输出会消失。从终端启动并携带命令行参数时,
+/// 先调本函数:挂上父进程(终端)的控制台,再把 stdout/stderr 重定向到
+/// `CONOUT$`,子命令的输出就能回到调用方终端。从资源管理器双击、或本来就
+/// 有控制台(debug 构建)时挂载失败,静默跳过,无副作用。
+pub fn attach_parent_console() {
+    #[cfg(windows)]
+    {
+        use windows::core::w;
+        use windows::Win32::Foundation::GENERIC_WRITE;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows::Win32::System::Console::{
+            AttachConsole, GetStdHandle, SetConsoleOutputCP, SetStdHandle, ATTACH_PARENT_PROCESS,
+            STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+        };
+
+        // SAFETY: 只带一个常量参数;失败仅意味着没有可挂的父控制台。
+        if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() {
+            return;
+        }
+        // 挂载成功后把控制台输出代码页切到 UTF-8(65001 = CP_UTF8),
+        // println! 的中文才能在 936 代码页的 conhost 里正常显示。
+        unsafe {
+            let _ = SetConsoleOutputCP(65001);
+        }
+        for slot in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // 已有合法句柄(用户重定向了 > file 或管道)时不覆盖,保留重定向语义;
+            // GUI 子系统普通启动时标准句柄为空,才挂到 CONOUT$ 屏幕缓冲。
+            let cur = unsafe { GetStdHandle(slot) };
+            if let Ok(h) = &cur {
+                if !h.is_invalid() {
+                    continue;
+                }
+            }
+            // SAFETY: CONOUT$ 是系统约定的控制台输出设备名;
+            // SetStdHandle 替换进程级标准句柄,替换后的句柄由进程持有到退出。
+            if let Ok(h) = unsafe {
+                CreateFileW(
+                    w!("CONOUT$"),
+                    GENERIC_WRITE.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    Default::default(),
+                    None,
+                )
+            } {
+                unsafe {
+                    let _ = SetStdHandle(slot, h);
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {}
+}
+
 /// 取系统逻辑 CPU 数(用于扫描线程数上限)。
 pub fn cpu_count() -> usize {
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
@@ -234,6 +295,72 @@ pub fn known_dirs() -> Vec<std::path::PathBuf> {
     }
 }
 
+
+/// 用系统关联的编辑器打开文件(参考件「Open File(s) in an Editor」)。
+///
+/// ShellExecuteW 的 `edit` 动词:文件类型关联了编辑器时用编辑器,
+/// 未关联时退回 `open`(用默认程序打开)。
+pub fn shell_edit(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let wide = to_wide(&path.to_string_lossy().into_owned());
+        // SAFETY: 参数均为合法 NUL 结尾宽字符串;动词为静态常量。
+        let ret = unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("edit"),
+                PCWSTR(wide.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if (ret.0 as isize) > 32 {
+            return true;
+        }
+        // 未关联 edit 动词 → 退回默认程序。
+        shell_open(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// 把图片文件设为桌面壁纸(参考件「Set as Desktop」)。
+///
+/// `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`:路径必须是位图文件
+/// (JPG 现代系统可用);调用方负责先把当前照片渲染成 JPEG 落盘。
+pub fn set_wallpaper(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SystemParametersInfoW, SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
+        };
+
+        let wide = to_wide(&path.to_string_lossy().into_owned());
+        // SAFETY: pvParam 指向 NUL 结尾宽字符串;SPIF 组合是标准写法。
+        unsafe {
+            SystemParametersInfoW(
+                SPI_SETDESKWALLPAPER,
+                0,
+                Some(wide.as_ptr() as *mut core::ffi::c_void),
+                SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
+            )
+        }
+        .is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
 
 /// 用系统关联程序打开文件。
 ///

@@ -116,6 +116,9 @@ fn render_with_stack(
     stack: &crate::effects::FilterStack,
 ) -> anyhow::Result<()> {
     let img = image::open(src)?;
+    // 与预览同一坐标空间:先按 EXIF 方向摆正,效果栈的几何类效果
+    // (旋转/裁剪)才能在导出时落到与预览一致的位置。
+    let img = crate::thumbs::apply_exif_rotation(img, crate::exif::read_orientation(src));
     let mut rgba = img.to_rgba8();
     crate::effects::apply_stack(&mut rgba, stack);
     let out = image::DynamicImage::ImageRgba8(rgba);
