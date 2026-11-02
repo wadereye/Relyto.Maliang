@@ -107,7 +107,8 @@ pub fn volume_label(root: &Path) -> Option<String> {
     }
 }
 
-/// 固定盘的文件系统名(如 "NTFS" / "exFAT")。原版用它排除 FAT/FAT32。
+/// 取盘符根目录的文件系统名(NTFS / FAT32 / exFAT / ReFS …)。
+/// USN/MFT 卷级扫描的前置判定:只有 NTFS 才有 USN journal。
 /// 取不到返回 `None`。
 pub fn volume_filesystem(root: &Path) -> Option<String> {
     #[cfg(windows)]
@@ -115,10 +116,12 @@ pub fn volume_filesystem(root: &Path) -> Option<String> {
         use windows::core::PCWSTR;
         use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
         let root = root.to_string_lossy().into_owned();
+        if !root.ends_with('\\') && !root.ends_with('/') {
+            return None;
+        }
         let wide = to_wide(&root);
         let mut fs_buf = [0u16; 64];
-        // SAFETY: fs_buf 是 NUL 结尾的定长 UTF-16 数组,长度与缓冲区一致;
-        // 其余出参传 None 表示不需要。
+        // SAFETY: wide 是 NUL 结尾的 UTF-16 串;fs_buf 长度与切片一致,其余出参不需要。
         let ok = unsafe {
             GetVolumeInformationW(
                 PCWSTR(wide.as_ptr()),
@@ -398,6 +401,365 @@ pub fn shell_open(path: &Path) -> bool {
     }
 }
 
+/// ShellExecuteExW + runas:提权拉起一个程序,窗口一律 SW_HIDE(不留黑框)。
+///
+/// `wait_ms` = `Some(n)`:最多等 n 毫秒并返回退出码(注册/删除计划任务要用);
+/// `wait_ms` = `None`:发后即忘(索引器子进程,结果靠 `--mft-report` 文件回报)。
+#[cfg(windows)]
+fn shell_execute_elevated(file: &str, params: &str, wait_ms: Option<u32>) -> Result<Option<u32>, String> {
+    use windows::core::{HRESULT, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, HWND};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS, ShellExecuteExW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let file_w = to_wide(file);
+    let params_w = to_wide(params);
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: windows::core::w!("runas"),
+        lpFile: PCWSTR(file_w.as_ptr()),
+        lpParameters: PCWSTR(params_w.as_ptr()),
+        lpDirectory: PCWSTR::null(),
+        // 原来是 SW_SHOWNORMAL:debug 构建是控制台子系统,提权子进程因此会弹一个
+        // 黑色控制台框。SW_HIDE 对 release(GUI 子系统)无副作用,对 debug 就把框藏了。
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    // SAFETY: sei 各指针均为合法 NUL 结尾宽串或空;结构体大小已填。
+    unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| {
+        // 1223 = ERROR_CANCELLED,用户在 UAC 上点了"否"。
+        if e.code() == HRESULT::from_win32(1223) {
+            "管理员授权被取消".to_string()
+        } else {
+            format!("提权启动失败: {e}")
+        }
+    })?;
+    let h = sei.hProcess;
+    if h.is_invalid() {
+        return Ok(None);
+    }
+    let out = match wait_ms {
+        // SAFETY: h 是 ShellExecuteEx 成功时交给我们的进程句柄;等待/取退出码只读它,
+        // 两条分支各 CloseHandle 一次配平。
+        Some(ms) => {
+            let waited = unsafe { WaitForSingleObject(h, ms).0 };
+            let mut exit = 0u32;
+            // WAIT_OBJECT_0 == 0:进程按预期结束。
+            let got = waited == 0 && unsafe { GetExitCodeProcess(h, &mut exit).is_ok() };
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            if !got {
+                return Err(if waited == 0 {
+                    "提权进程退出码读取失败".to_string()
+                } else {
+                    "提权进程超时未结束".to_string()
+                });
+            }
+            Some(exit)
+        }
+        None => {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
+            None
+        }
+    };
+    Ok(out)
+}
+
+/// 用 UAC 提权拉起**自身**子进程(runas 动词),发后即忘。
+///
+/// 每次调用都要过一次 UAC(Windows 不给"记住"runas 同意),现在只服务
+/// 「每次单独授权」这一档;默认档走计划任务 [`mft_task_install`]。
+/// `params` 是完整命令行参数串(如 `--mft-scan --mft-report <文件>`)。
+pub fn launch_elevated(params: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+        shell_execute_elevated(&exe.to_string_lossy(), params, None).map(|_| ())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = params;
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 全盘索引更新器的计划任务名(注册一次,以后静默触发)。
+pub const MFT_TASK_NAME: &str = "RelytoMaliangIndexer";
+/// 计划任务固定执行的参数:不带报告路径(由子进程自己按数据目录推导),
+/// 这样数据目录改了也不用重注册;`--mft-task` 让子进程摘掉自己的控制台。
+pub const MFT_TASK_ARGS: &str = "--mft-scan --mft-task";
+
+/// 隐藏窗口运行命令行工具并等它结束,返回退出码(schtasks 专用,不闪黑框)。
+pub fn run_hidden(program: &str, args: &[&str]) -> Result<i32, String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use std::process::Stdio;
+        // CREATE_NO_WINDOW:子进程不分配控制台。
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let status = std::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("启动 {program} 失败: {e}"))?
+            .wait()
+            .map_err(|e| format!("等待 {program} 结束失败: {e}"))?;
+        Ok(status.code().unwrap_or(-1))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (program, args);
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 当前用户 SID 字符串(计划任务 `<UserId>` 用 SID,比 `域\别名` 无歧义:
+/// 微软账户、Entra 加入的机器上别名都不等于登录名)。
+#[cfg(windows)]
+fn current_user_sid() -> Result<String, String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, HLOCAL};
+    use windows::Win32::Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    // SAFETY: 打开的是本进程令牌,TOKEN_QUERY 只读,句柄由本函数负责关闭。
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|e| format!("打开进程令牌失败: {e}"))?;
+    let mut len = 0u32;
+    // SAFETY: 第一次传空缓冲只问所需长度,是 Win32 约定用法。
+    unsafe {
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+    }
+    let mut buf = vec![0u8; len.max(1) as usize];
+    // SAFETY: buf 长度即上一步问到的长度;输出结构里的 SID 指针指向 buf 内部。
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            len,
+            &mut len,
+        )
+    };
+    if ok.is_err() {
+        // SAFETY: 令牌句柄在两条路径上都要关。
+        unsafe {
+            let _ = CloseHandle(token);
+        }
+        return Err("读取令牌用户失败".to_string());
+    }
+    // SAFETY: GetTokenInformation 成功 ⇒ buf 头部是一个合法 TOKEN_USER。
+    let sid = unsafe { (&*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
+    let mut sid_str = PWSTR::null();
+    // SAFETY: sid 来自上一步的令牌查询;转换出的字符串由 LocalFree 释放。
+    let res = unsafe { ConvertSidToStringSidW(sid, &mut sid_str) };
+    let mut out = String::new();
+    unsafe {
+        if res.is_ok() && !sid_str.is_null() {
+            // 转换结果是 NUL 结尾宽串,自己找终止符(PWSTR 无现成的读取方法)。
+            let mut n = 0usize;
+            while *sid_str.0.add(n) != 0 {
+                n += 1;
+            }
+            out = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str.0, n));
+            let _ = LocalFree(HLOCAL(sid_str.0 as *mut std::ffi::c_void));
+        }
+        let _ = CloseHandle(token);
+    }
+    if out.is_empty() {
+        Err("SID 转换失败".to_string())
+    } else {
+        Ok(out)
+    }
+}
+
+/// `schtasks.exe` 的绝对路径(靠 PATH 找在提权环境里不总可靠)。
+#[cfg(windows)]
+fn schtasks_exe() -> String {
+    std::env::var("SystemRoot")
+        .map(|root| format!(r"{}\System32\schtasks.exe", root))
+        .unwrap_or_else(|_| r"C:\Windows\System32\schtasks.exe".to_string())
+}
+
+fn xml_esc(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// 计划任务定义 XML(UTF-16 编码由调用方落盘时处理)。
+///
+/// `InteractiveToken` + `HighestAvailable`:任务由计划任务服务负责提权,
+/// 所以**非提权的本程序调用 `/Run` 不会再看到 UAC 弹窗** —— 这就是
+/// "授权一次、以后静默"的机制;同时任务是服务拉起的,不挂控制台。
+/// `ExecutionTimeLimit` 兜底,免得子进程挂死后留一个永动任务实例。
+pub fn mft_task_xml(sid: &str, exe: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Relyto.Maliang 全盘文件名索引更新(快速查找数据源,只读 NTFS 卷日志)</Description>
+  </RegistrationInfo>
+  <Triggers />
+  <Principals>
+    <Principal id="Author">
+      <UserId>{sid}</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>HighestAvailable</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{cmd}</Command>
+      <Arguments>{args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#,
+        sid = xml_esc(sid),
+        cmd = xml_esc(&exe.to_string_lossy()),
+        args = xml_esc(MFT_TASK_ARGS),
+    )
+}
+
+/// 一次性提权,把索引更新器注册成「按需启动 + 最高权限」的计划任务。
+/// 这是本功能唯一需要用户点"是"的地方;之后每次启动都静默。
+/// `tmp_dir` 用来落任务定义 XML(schtasks `/XML` 只吃 UTF-16 文件)。
+pub fn mft_task_install(exe: &Path, tmp_dir: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let xml = mft_task_xml(&current_user_sid()?, exe);
+        let def = tmp_dir.join("mft_task.xml");
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+        bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
+        std::fs::write(&def, &bytes).map_err(|e| format!("写任务定义失败: {e}"))?;
+        let params = format!("/Create /F /TN {MFT_TASK_NAME} /XML \"{}\"", def.display());
+        let res = shell_execute_elevated(&schtasks_exe(), &params, Some(90_000));
+        let _ = std::fs::remove_file(&def);
+        match res? {
+            Some(0) => Ok(()),
+            Some(code) => Err(format!("计划任务注册失败(schtasks 退出码 {code})")),
+            None => Err("计划任务注册未返回结果".to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (exe, tmp_dir);
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 计划任务是否已注册(查询不需要管理员)。
+pub fn mft_task_registered() -> bool {
+    #[cfg(windows)]
+    {
+        matches!(run_hidden(&schtasks_exe(), &["/Query", "/TN", MFT_TASK_NAME]), Ok(0))
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// 触发计划任务更新索引:静默(不弹 UAC、不弹窗口),结果由子进程写报告文件。
+pub fn mft_task_run() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        match run_hidden(&schtasks_exe(), &["/Run", "/TN", MFT_TASK_NAME]) {
+            Ok(0) => Ok(()),
+            Ok(code) => Err(format!("计划任务启动失败(schtasks 退出码 {code})")),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 撤销授权 = 删除计划任务(改任务定义要提权,所以这一步仍会弹一次 UAC)。
+pub fn mft_task_uninstall() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let params = format!("/Delete /F /TN {MFT_TASK_NAME}");
+        match shell_execute_elevated(&schtasks_exe(), &params, Some(90_000))? {
+            Some(0) => Ok(()),
+            Some(code) => Err(format!("计划任务删除失败(schtasks 退出码 {code})")),
+            None => Err("计划任务删除未返回结果".to_string()),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 摘掉进程自己的控制台。
+///
+/// 被计划任务拉起时(debug 构建是控制台子系统)系统会给一个新控制台,
+/// 那就是用户看到的黑框;release 是 GUI 子系统、本来没有控制台,调用无副作用。
+pub fn hide_console() {
+    #[cfg(windows)]
+    {
+        // SAFETY: FreeConsole 只解除本进程与控制台的关联,无参数无返回值风险。
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
+}
+
+/// 在资源管理器中定位文件(`explorer /select,"路径"`)。
+pub fn reveal_in_explorer(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let args = format!("/select,\"{}\"", path.display());
+        let file_w = to_wide("explorer.exe");
+        let args_w = to_wide(&args);
+        // SAFETY: 均为合法 NUL 结尾宽串;动词 "open" 为静态常量。
+        let ret = unsafe {
+            ShellExecuteW(
+                None,
+                windows::core::w!("open"),
+                PCWSTR(file_w.as_ptr()),
+                PCWSTR(args_w.as_ptr()),
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        (ret.0 as isize) > 32
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// 通过 Windows Shell 取缩略图(借系统已安装的相机 RAW 解码扩展)。
 ///
 /// 走 Windows Shell 的 COM 路线:`SHCreateItemFromParsingName` →
@@ -550,5 +912,24 @@ mod tests {
     #[test]
     fn cpu_count_is_at_least_one() {
         assert!(cpu_count() >= 1);
+    }
+
+    #[test]
+    fn mft_task_xml_points_at_exe_and_stays_silent_about_privileges() {
+        // 任务定义必须:跑当前 exe + 固定的 --mft-scan --mft-task(不带可变的报告
+        // 路径,否则数据目录一改就永远等不到信号)+ 最高权限 + 交互登录型。
+        let xml = mft_task_xml(
+            "S-1-5-21-1&2",
+            Path::new(r"D:\Some Dir\maliang.exe"),
+        );
+        assert!(xml.contains(r#"<Command>D:\Some Dir\maliang.exe</Command>"#));
+        assert!(xml.contains(&format!("<Arguments>{MFT_TASK_ARGS}</Arguments>")));
+        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
+        // 非提权调用方要靠它免 UAC,前提就是这条:注册成最高权限的按需任务。
+        assert!(xml.contains("<Triggers />"));
+        // 身份里的 & 必须转义,否则整份 XML 解析失败(schtasks 报"格式不正确")。
+        assert!(xml.contains("S-1-5-21-1&amp;2"));
+        assert!(!xml.contains("mft_report"));
     }
 }

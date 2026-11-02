@@ -114,6 +114,16 @@ fn thumb_path(id: i64) -> PathBuf {
     tier_path(Tier::Normal, id)
 }
 
+/// 清掉某张照片在**所有档位**留下的缩略图缓存文件。
+///
+/// 索引行被删除(文件已在外部消失)后缓存就成了无主垃圾,
+/// 且 id 若被复用会显示成别的照片。监听线程删除索引时一并调用。
+pub fn purge_cached(id: i64) {
+    for tier in ALL_TIERS {
+        let _ = std::fs::remove_file(tier_path(tier, id));
+    }
+}
+
 /// 若磁盘缩略图存在则返回路径;否则在哪生成由调用方决定（后台线程）。
 #[allow(dead_code)]
 pub fn existing(id: i64) -> Option<PathBuf> {
@@ -356,6 +366,15 @@ pub fn backfill_tier(store: &crate::db::Store, tier: Tier, limit: usize) -> Resu
     for id in &failed {
         store.mark_thumb_fail(*id);
     }
+    // 删除竞态:生成期间照片可能已被移出图库(监听对账),
+    // 刚落盘的缩略图必须清掉,否则 rowid 复用时会被当成新照片的缓存。
+    let alive: std::collections::HashMap<i64, String> = rows.iter().cloned().collect();
+    let (ok, stale): (Vec<(i64, u64)>, Vec<(i64, u64)>) = ok
+        .into_iter()
+        .partition(|(id, _)| alive.get(id).is_some_and(|p| store.photo_alive(*id, p)));
+    for (id, _) in &stale {
+        purge_cached(*id);
+    }
     if ok.is_empty() {
         return Ok(Vec::new());
     }
@@ -566,7 +585,12 @@ pub fn spawn_preview_worker(store: Arc<crate::db::Store>) -> PreviewWorker {
             }
             let res = build_preview(id, Path::new(&path)).map(|_| true).map_err(|e| e.to_string());
             if res.is_ok() {
-                let _ = store.mark_tier_done(id, Tier::Preview as u8);
+                if store.photo_alive(id, &path) {
+                    let _ = store.mark_tier_done(id, Tier::Preview as u8);
+                } else {
+                    // 删除竞态:生成期间已被移出图库 → 丢弃刚写的缓存。
+                    purge_cached(id);
+                }
             }
             let _ = done_tx.send((id, res));
         }
@@ -629,9 +653,7 @@ mod tests {
     /// 否则既会无限堆积(此前单目录已积累数百个历史文件),
     /// 也让「初始应无缓存」这类断言变成靠运气。
     fn purge_cache(id: i64) {
-        for tier in ALL_TIERS {
-            let _ = std::fs::remove_file(tier_path(tier, id));
-        }
+        purge_cached(id);
     }
 
     /// 测试期缓存清理守卫:`Drop` 时清掉该 id 的缓存文件。
