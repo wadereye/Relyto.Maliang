@@ -16,11 +16,12 @@ walkdir = "2"
 notify-debouncer-full = "0.7"
 chrono = "0.4"
 kamadak-exif = "0.6"
+memchr = "2"
 anyhow = "1"
 dirs = "6"
 rfd = "0.15"
 clap = { version = "4", features = ["derive"] }
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Imapi", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_PortableDevices", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Imapi", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_PortableDevices", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Security", "Win32_Security_Authorization"] }
 
 [features]
 # 默认带上模型能力(OCR/人脸/CLIP):开箱即有 Faces / 语义搜索视图。
@@ -36,3 +37,6 @@ optional = true
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+[build-dependencies]
+winresource = "0.1"

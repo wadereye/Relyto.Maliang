@@ -5,7 +5,43 @@ use std::sync::Mutex;
 
 pub struct Store(pub Mutex<Connection>);
 
-/// 数据目录(索引库 + 模型)。可用 MALIANG_DATA_DIR 覆盖(测试/便携运行)。
+/// 数据目录配置文件名:固定放**默认**目录里,先于任何库打开就能读到
+/// (避免「配置本身存在哪」的自指问题)。环境变量 MALIANG_DATA_DIR 仍最高优先。
+const LOCATION_FILE: &str = "data.location";
+
+/// 默认数据目录(marker 文件所在;env/marker 都不生效时它就是数据目录)。
+fn default_data_dir() -> PathBuf {
+    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("Relyto").join("Maliang")
+}
+
+/// 解析 marker 文本:第一项 = 生效数据目录,第二项 = 待迁移来源(可选)。
+fn parse_location(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
+    let mut data = None;
+    let mut pending = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("data_dir=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                data = Some(PathBuf::from(v));
+            }
+        } else if let Some(v) = line.strip_prefix("pending_from=") {
+            let v = v.trim();
+            if !v.is_empty() {
+                pending = Some(PathBuf::from(v));
+            }
+        }
+    }
+    (data, pending)
+}
+
+fn marker_data_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(default_data_dir().join(LOCATION_FILE)).ok()?;
+    parse_location(&text).0
+}
+
+/// 数据目录(索引库 + 模型)。优先级:MALIANG_DATA_DIR 环境变量 >
+/// 默认目录下的 `data.location` 标记(选项页写入)> 默认目录。
 pub fn data_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("MALIANG_DATA_DIR") {
         if !v.is_empty() {
@@ -14,10 +50,116 @@ pub fn data_dir() -> PathBuf {
             return p;
         }
     }
-    let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    let p = base.join("Relyto").join("Maliang");
+    let p = marker_data_dir()
+        .unwrap_or_else(default_data_dir);
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+/// 选项页:设定数据目录(写 marker;`None` = 恢复默认)。
+/// 记下 `pending_from = 当前数据目录`,下次启动把旧文件复制过去;
+/// 本会话继续用原目录,保证写库不中断。
+pub fn set_data_dir(dir: Option<&Path>) -> std::io::Result<()> {
+    let marker = default_data_dir().join(LOCATION_FILE);
+    let _ = std::fs::create_dir_all(default_data_dir());
+    match dir {
+        Some(d) => {
+            let cur = data_dir();
+            let mut text = format!("data_dir={}\n", d.display());
+            if cur != d {
+                text.push_str(&format!("pending_from={}\n", cur.display()));
+            }
+            std::fs::write(&marker, text)
+        }
+        None => {
+            match std::fs::remove_file(&marker) {
+                Ok(()) => Ok(()),
+                // 没有标记 = 已经是默认,视为成功。
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+/// 启动早期(Store 打开前)执行 pending 迁移:把 `pending_from` 目录里的
+/// 文件按「目标缺失才复制」搬到当前数据目录(逐文件 tmp+rename,失败不动
+/// 已复制部分,下次启动重试),成功后清掉 pending 行。
+/// 环境变量覆盖(测试/便携)时直接跳过,不碰任何目录。
+pub fn migrate_pending_data() {
+    let env_set = std::env::var_os("MALIANG_DATA_DIR")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if env_set {
+        return;
+    }
+    let marker_path = default_data_dir().join(LOCATION_FILE);
+    let Ok(text) = std::fs::read_to_string(&marker_path) else {
+        return;
+    };
+    let (target, pending) = parse_location(&text);
+    let (Some(target), Some(from)) = (target, pending) else {
+        return;
+    };
+    let from = PathBuf::from(from);
+    if from != target {
+        let _ = std::fs::create_dir_all(&target);
+        if copy_missing_recursive(&from, &target) {
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|l| !l.starts_with("pending_from="))
+                .collect();
+            let _ = std::fs::write(&marker_path, kept.join("\n") + "\n");
+        }
+    } else {
+        // 指回自身:清掉 pending 即可。
+        let kept: Vec<&str> = text
+            .lines()
+            .filter(|l| !l.starts_with("pending_from="))
+            .collect();
+        let _ = std::fs::write(&marker_path, kept.join("\n") + "\n");
+    }
+}
+
+/// 递归复制 `src` → `dst`,只复制目标缺失的文件(已有文件一律不覆盖,
+/// 避免「旧默认目录的陈旧副本回写覆盖新目录里更新的数据」)。
+/// 逐文件先写 `.tmp` 再改名;返回是否全部成功。
+/// 跳过:marker 本身、`*.tmp`、mft_report.txt(瞬态文件)。
+fn copy_missing_recursive(src: &Path, dst: &Path) -> bool {
+    let mut ok = true;
+    let Ok(entries) = std::fs::read_dir(src) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s == LOCATION_FILE || name_s == "mft_report.txt" || name_s.ends_with(".tmp") {
+            continue;
+        }
+        let s = entry.path();
+        let d = dst.join(&name);
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if std::fs::create_dir_all(&d).is_err() || !copy_missing_recursive(&s, &d) {
+                    ok = false;
+                }
+            }
+            Ok(_) => {
+                if !d.exists() {
+                    let tmp = d.with_extension("migrating.tmp");
+                    match std::fs::copy(&s, &tmp).and_then(|_| std::fs::rename(&tmp, &d)) {
+                        Ok(()) => {}
+                        Err(_) => {
+                            let _ = std::fs::remove_file(&tmp);
+                            ok = false;
+                        }
+                    }
+                }
+            }
+            Err(_) => ok = false,
+        }
+    }
+    ok
 }
 
 /// 缓存目录(缩略图)。可用 MALIANG_CACHE_DIR 覆盖。
@@ -609,10 +751,48 @@ impl Store {
         }
     }
 
+    /// 删除一批照片行及其**全部**引用行(须在事务内调用)。
+    ///
+    /// SQLite 外键级联默认关闭,只删 photos 会留下孤儿行 ——
+    /// rowid 复用后孤儿会错挂到新照片上,所以引用表必须逐一显式删。
+    /// 同时往变更日志写 `removed`(便于回溯:这些行不是用户手动移除的)。
+    fn delete_photo_rows(tx: &rusqlite::Transaction<'_>, rows: &[(i64, String)]) -> Result<()> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let mut st_tags = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id=?1")?;
+        let mut st_ft = tx.prepare_cached(
+            "DELETE FROM face_templates WHERE face_id IN
+             (SELECT id FROM faces WHERE photo_id=?1)",
+        )?;
+        let mut st_faces = tx.prepare_cached("DELETE FROM faces WHERE photo_id=?1")?;
+        let mut st_clips = tx.prepare_cached("DELETE FROM clips WHERE photo_id=?1")?;
+        let mut st_clips_cn = tx.prepare_cached("DELETE FROM clips_cn WHERE photo_id=?1")?;
+        let mut st_tiers = tx.prepare_cached("DELETE FROM thumb_tiers WHERE photo_id=?1")?;
+        let mut st_album = tx.prepare_cached("DELETE FROM album_photos WHERE photo_id=?1")?;
+        let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
+        let mut st_log = tx.prepare_cached(
+            "INSERT INTO changes(ts,path,action,photo_id) VALUES(?1,?2,'removed',?3)",
+        )?;
+        for (id, path) in rows {
+            st_tags.execute(rusqlite::params![id])?;
+            st_ft.execute(rusqlite::params![id])?;
+            st_faces.execute(rusqlite::params![id])?;
+            st_clips.execute(rusqlite::params![id])?;
+            st_clips_cn.execute(rusqlite::params![id])?;
+            st_tiers.execute(rusqlite::params![id])?;
+            st_album.execute(rusqlite::params![id])?;
+            st_photos.execute(rusqlite::params![id])?;
+            st_log.execute(rusqlite::params![ts, path, id])?;
+        }
+        Ok(())
+    }
+
     /// 清理已缺失文件的索引行,返回被清理的路径(图库维护)。
-    /// 必须连同 faces/face_templates/clips/photo_tags 一起删:SQLite 外键
-    /// 级联默认关闭,只删 photos 会留下孤儿行(rowid 复用后会错挂到新照片)。
-    pub fn mark_missing(&self) -> Result<Vec<String>> {        let conn = self.0.lock().unwrap();
+    /// 引用行的清理见 `delete_photo_rows`。
+    pub fn mark_missing(&self) -> Result<Vec<String>> {
+        let conn = self.0.lock().unwrap();
         let mut st = conn.prepare("SELECT id, path FROM photos")?;
         let all: Vec<(i64, String)> = st
             .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
@@ -627,25 +807,59 @@ impl Store {
             return Ok(Vec::new());
         }
         let tx = conn.unchecked_transaction()?;
-        {
-            let mut st_tags = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id=?1")?;
-            let mut st_ft = tx.prepare_cached(
-                "DELETE FROM face_templates WHERE face_id IN
-                 (SELECT id FROM faces WHERE photo_id=?1)",
-            )?;
-            let mut st_faces = tx.prepare_cached("DELETE FROM faces WHERE photo_id=?1")?;
-            let mut st_clips = tx.prepare_cached("DELETE FROM clips WHERE photo_id=?1")?;
-            let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
-            for (id, _) in &missing {
-                st_tags.execute(rusqlite::params![id])?;
-                st_clips.execute(rusqlite::params![id])?;
-                st_ft.execute(rusqlite::params![id])?;
-                st_faces.execute(rusqlite::params![id])?;
-                st_photos.execute(rusqlite::params![id])?;
-            }
-        }
+        Self::delete_photo_rows(&tx, &missing)?;
         tx.commit()?;
         Ok(missing.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// 精确移除一批**已确认不存在**的路径的索引行,返回实际删除的 (id, 路径)。
+    ///
+    /// 与 `mark_missing` 的区别:只查给定路径(及其子项),不遍历全库 ——
+    /// 供监听线程在收到删除事件时即时对账,不必等用户手动维护。
+    /// 以磁盘为准:路径仍存在时跳过(事件与重命名/回滚之间存在竞态)。
+    ///
+    /// 目录被删时事件只报目录本身(子文件不一定逐个上报),
+    /// 因此还要按路径边界清掉库里的子项。
+    pub fn drop_missing_paths(&self, paths: &[String]) -> Result<Vec<(i64, String)>> {
+        let conn = self.0.lock().unwrap();
+        let mut st = conn.prepare("SELECT id, path FROM photos WHERE path=?1")?;
+        let mut st_sub = conn.prepare(
+            "SELECT id, path FROM photos
+             WHERE instr(path, ?1) = 1
+               AND length(path) > length(?1)
+               AND substr(path, length(?1) + 1, 1) IN ('\\', '/')",
+        )?;
+        let mut rows: Vec<(i64, String)> = Vec::new();
+        for p in paths {
+            if Path::new(p).exists() {
+                continue;
+            }
+            let mut hit = Vec::new();
+            if let Ok(r) = st.query_row([p.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            }) {
+                hit.push(r);
+            }
+            if let Ok(it) = st_sub.query_map([p.as_str()], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            }) {
+                hit.extend(it.flatten());
+            }
+            for r in hit {
+                if !rows.iter().any(|(id, _)| *id == r.0) {
+                    rows.push(r);
+                }
+            }
+        }
+        drop(st);
+        drop(st_sub);
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tx = conn.unchecked_transaction()?;
+        Self::delete_photo_rows(&tx, &rows)?;
+        tx.commit()?;
+        Ok(rows)
     }
 
     // ===== P1-12 变更日志 =====
@@ -1112,11 +1326,29 @@ impl Store {
 
     /// 标记某张照片的某档缩略图已生成。
     pub fn mark_tier_done(&self, photo_id: i64, tier: u8) -> Result<()> {
+        // 只为仍存在的照片记完成:删除(监听对账)与后台缩略图存在竞态,
+        // 孤儿 thumb_tiers 行会在 rowid 复用时错挂到新照片上。
         self.0.lock().unwrap().execute(
-            "INSERT OR IGNORE INTO thumb_tiers(photo_id,tier) VALUES(?1,?2)",
+            "INSERT OR IGNORE INTO thumb_tiers(photo_id,tier)
+             SELECT ?1,?2 WHERE EXISTS(SELECT 1 FROM photos WHERE id=?1)",
             rusqlite::params![photo_id, tier as i64],
         )?;
         Ok(())
+    }
+
+    /// (id, 路径)是否仍是同一条索引行 —— 后台生成(缩略图/预览)与删除对账
+    /// 存在竞态,生成完成后用它判断产物是否已过期。比对路径是为了覆盖
+    /// rowid 被复用给另一张照片的情况。
+    pub fn photo_alive(&self, id: i64, path: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT 1 FROM photos WHERE id=?1 AND path=?2",
+                rusqlite::params![id, path],
+                |_| Ok(()),
+            )
+            .is_ok()
     }
 
     /// 取该档**尚未生成**的照片 id + 路径(供后台 worker 批量补齐)。
@@ -1266,6 +1498,45 @@ pub fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_location_reads_both_lines_and_ignores_junk() {
+        let (d, p) = parse_location("data_dir=D:\\mliang\npending_from=C:\\Users\\x\\AppData\n");
+        assert_eq!(d, Some(PathBuf::from("D:\\mliang")));
+        assert_eq!(
+            p,
+            Some(PathBuf::from("C:\\Users\\x\\AppData"))
+        );
+        let (d, p) = parse_location("data_dir=\n垃圾行\ndata_dir=E:\\only\n");
+        assert_eq!(d, Some(PathBuf::from("E:\\only")), "空行忽略,最后一行生效");
+        assert_eq!(p, None);
+        let (d, p) = parse_location("");
+        assert_eq!((d, p), (None, None));
+    }
+
+    #[test]
+    fn copy_missing_copies_only_absent_files_skips_transients() {
+        let base = std::env::temp_dir().join(format!("rk-migr-{}", std::process::id()));
+        let src = base.join("src");
+        let dst = base.join("dst");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("index.db"), b"AAA").unwrap();
+        std::fs::write(src.join("sub").join("nameindex.bin"), b"BBB").unwrap();
+        std::fs::write(src.join("data.location"), b"data_dir=X").unwrap();
+        std::fs::write(src.join("mft_report.txt"), b"r").unwrap();
+        std::fs::write(src.join("junk.tmp"), b"t").unwrap();
+        // 目标已有同名文件 → 不覆盖。
+        std::fs::write(dst.join("index.db"), b"OLD").unwrap();
+        assert!(copy_missing_recursive(&src, &dst));
+        assert_eq!(std::fs::read(dst.join("index.db")).unwrap(), b"OLD");
+        assert_eq!(std::fs::read(dst.join("sub").join("nameindex.bin")).unwrap(), b"BBB");
+        assert!(!dst.join("data.location").exists(), "marker 不随迁");
+        assert!(!dst.join("mft_report.txt").exists());
+        assert!(!dst.join("junk.tmp").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// 参考件口径:默认扫描范围是壳目录(我的文档/图片/桌面),
     /// 绝不返回盘根 —— 盘根会把系统/应用数据目录整卷拖进库(真实事故)。
@@ -1456,6 +1727,129 @@ mod tests {
         }
         let n_photos: i64 = c.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0)).unwrap();
         assert_eq!(n_photos, 1, "存在的照片必须保留");
+    }
+
+    /// 监听线程的精确对账:只删给定且确实不存在的路径,仍存在的跳过。
+    /// 关联行(含 mark_missing 原先漏掉的缩略图档 / 相册 / 中文 CLIP)一并清,
+    /// 并写入 `removed` 变更日志。
+    #[test]
+    fn drop_missing_paths_only_removes_vanished_ones() {
+        let store = Store::open_mem().unwrap();
+        let dir = std::env::temp_dir();
+        let keep = format!("{}/keep-{}.jpg", dir.display(), std::process::id());
+        let gone = format!("{}/gone-{}.jpg", dir.display(), std::process::id());
+        std::fs::write(&keep, b"x").unwrap();
+        let _ = std::fs::remove_file(&gone);
+        let gone_id;
+        {
+            let c = store.0.lock().unwrap();
+            for p in [&keep, &gone] {
+                c.execute(
+                    "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'/',0,0)",
+                    rusqlite::params![p],
+                )
+                .unwrap();
+            }
+            gone_id = c
+                .query_row(
+                    "SELECT id FROM photos WHERE path=?1",
+                    rusqlite::params![gone],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            c.execute(
+                "INSERT INTO clips_cn(photo_id,dim,vec) VALUES(?1,1,X'00')",
+                rusqlite::params![gone_id],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO thumb_tiers(photo_id,tier) VALUES(?1,1)",
+                rusqlite::params![gone_id],
+            )
+            .unwrap();
+            c.execute("INSERT INTO albums(name,ts) VALUES('a',0)", []).unwrap();
+            let album_id = c.last_insert_rowid();
+            c.execute(
+                "INSERT INTO album_photos(album_id,photo_id,pos) VALUES(?1,?2,0)",
+                rusqlite::params![album_id, gone_id],
+            )
+            .unwrap();
+        }
+        let removed = store
+            .drop_missing_paths(&[keep.clone(), gone.clone(), format!("{gone}x")])
+            .unwrap();
+        assert_eq!(removed, vec![(gone_id, gone.clone())]);
+
+        let c = store.0.lock().unwrap();
+        for (tbl, col) in [
+            ("photos", "id"),
+            ("clips_cn", "photo_id"),
+            ("thumb_tiers", "photo_id"),
+            ("album_photos", "photo_id"),
+        ] {
+            let n: i64 = c
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {tbl} WHERE {col}=?1"),
+                    rusqlite::params![gone_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "{tbl} 应清空");
+        }
+        let kept: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM photos WHERE path=?1",
+                rusqlite::params![keep],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "仍存在的文件不能移出图库");
+        let logged: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM changes WHERE action='removed' AND photo_id=?1",
+                rusqlite::params![gone_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(logged, 1, "移出应写入变更日志");
+        drop(c);
+        let _ = std::fs::remove_file(&keep);
+    }
+
+    /// 目录被删:事件只报目录路径,库里的子文件也要一起移出;
+    /// 前缀相近的兄弟文件不能误伤。
+    #[test]
+    fn drop_missing_paths_removes_subtree_but_not_sibling_prefix() {
+        let store = Store::open_mem().unwrap();
+        let dir = std::env::temp_dir().join(format!("rk-gone-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let child = dir.join("a.jpg");
+        let sibling = PathBuf::from(format!("{}x.jpg", dir.display()));
+        {
+            let c = store.0.lock().unwrap();
+            for p in [&child, &sibling] {
+                c.execute(
+                    "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'/',0,0)",
+                    rusqlite::params![p.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            }
+        }
+        let removed = store
+            .drop_missing_paths(&[dir.to_string_lossy().into_owned()])
+            .unwrap();
+        assert_eq!(removed.len(), 1, "只应移出目录内的文件:{removed:?}");
+        assert_eq!(removed[0].1, child.to_string_lossy());
+
+        let c = store.0.lock().unwrap();
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM photos WHERE path=?1",
+                rusqlite::params![sibling.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "前缀相近的兄弟文件不能误删");
     }
 
     // ===== P1-14 字符串池 =====

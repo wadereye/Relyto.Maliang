@@ -1,13 +1,13 @@
 //! 模型功能(OCR/人脸/CLIP)。**默认启用**(`default = ["ai"]`);
 //! `cargo build --no-default-features` 可关闭。
-//! 运行时模型文件放 `%APPDATA%\Relyto\Maliang\models\`,缺失时全部功能优雅不可用。
+//! 运行时模型文件放数据目录 `models\`(跟随数据目录迁移),缺失时全部功能优雅不可用。
 
 use ort::environment::Environment;
 use ort::session::Session;
 use std::sync::OnceLock;
 
 pub fn models_dir() -> Option<std::path::PathBuf> {
-    dirs::data_dir().map(|d| d.join("Relyto").join("Maliang").join("models"))
+    Some(crate::db::data_dir().join("models"))
 }
 
 static ENV: OnceLock<Environment> = OnceLock::new();

@@ -9,7 +9,7 @@
 //! | 落库列 `photos.filters` | 效果字段落库 | `filters` 与 `width`/`height`/`rotate`/`crop` 并列的普通 TEXT 列 |
 //! | 复制/粘贴所有效果 | 效果复制粘贴 | 复制单张 → 粘贴给多张;效果**不能作用于电影** |
 //! | 撤销/重做 | 编辑历史 | 粒度是**命名编辑项**,非逐帧快照 |
-//! | 亮度/对比度/饱和度 | 亮度/对比度/饱和度 | 参数名 `contrast`/`brightness`/`saturation` + 联动开关 |
+//! | 亮度/对比度/饱和度 | 亮度/对比度/饱和度 | 参数名 `contrast`/`brightness`/`saturation`(联动开关未实现,见下) |
 //! | 3×3 色彩矩阵 | 3×3 色彩矩阵 | 3×3 矩阵 + 2 个平移量 |
 //! | 曝光/暗部 | 曝光/暗部 | 参数名 `exposure`/`blacks` |
 //! | 锐化核 | 3×3 锐化核 | `a=clamp(v,0,100)/(-100)`,中心 `1-8a`,8 邻域 `a`(核和=1) |
@@ -192,6 +192,37 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "shadow",
     "rot",
     "crop",
+    // 着色器族(参考 `Shader` 类效果)已钉死的 6 项,见 `crate::shaders`
+    "hexcells",
+    "rippleblocks",
+    "circlesplash",
+    "crystallize",
+    "waterfall",
+    "hslfilter",
+];
+
+/// 参考 Picasa 3 的 `Shader` 类效果共 10 项,我方已落地的 6 项
+/// (算法口径已在行为层面确定,实现见 [`crate::shaders`])。
+///
+/// 这 6 个名字必须同时出现在 [`PIXEL_EFFECTS`] 与 `apply_effect` 的分支里,
+/// 由 `shaders_ledger_stays_consistent` 守住。
+#[cfg(test)]
+pub const SHADER_EFFECTS: &[&str] = &[
+    "hexcells",
+    "rippleblocks",
+    "circlesplash",
+    "crystallize",
+    "waterfall",
+    "hslfilter",
+];
+
+/// 同一族里仍有含糊处的 4 项(系数 / 尾段语义未定),落地前不得进效果表。
+#[cfg(test)]
+pub const SHADER_PENDING: &[&str] = &[
+    "vibrance",
+    "smudge",
+    "hypnotic",
+    "adjustablethreshold",
 ];
 
 /// `tilt`(Straighten)滑杆满量程对应的角度。
@@ -1284,6 +1315,39 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 }
             }
         }
+        // ===== 着色器族(参考 `Shader` 类效果,实现见 `crate::shaders`)=====
+        // 这一族的参数在原版里是**按位置排的数值数组**,没有键名也没有滑杆界面,
+        // 所以「出厂缺省」无对应资料。这里用 `p0..p5` 的位置键名接外部传参,
+        // 取不到时落到我方选定的可见缺省值(不是恒等),便于在效果栈里一眼看出生效。
+        "hexcells" => crate::shaders::hexcells(img, shader_axis(e, 0, 24.0)),
+        "rippleblocks" => crate::shaders::ripple_blocks(
+            img,
+            shader_axis(e, 0, 12.0),
+            shader_axis(e, 1, 12.0),
+            shader_axis(e, 2, 20.0),
+            shader_axis(e, 3, 20.0),
+            shader_axis(e, 4, 0.0),
+            shader_axis(e, 5, 0.0),
+        ),
+        "circlesplash" => crate::shaders::circle_splash(
+            img,
+            shader_axis(e, 0, 0.5),
+            shader_axis(e, 1, 0.5),
+            shader_axis(e, 2, 12.0),
+        ),
+        "crystallize" => crate::shaders::crystallize(img, shader_axis(e, 0, 20.0)),
+        "waterfall" => crate::shaders::waterfall(
+            img,
+            shader_axis(e, 0, 0.5),
+            shader_axis(e, 1, 0.5),
+            shader_axis(e, 2, 0.0),
+        ),
+        "hslfilter" => crate::shaders::hsl_filter(
+            img,
+            shader_axis(e, 0, 60.0),
+            shader_axis(e, 1, 0.0),
+            shader_axis(e, 2, 0.0),
+        ),
         _ => {
             // 成组配方(见 `crate::recipes`):一个名字对应一串固定顺序的操作,
             // 强度由 `amount`(0~100)统一控制 —— 与"淡出"滑杆语义等价;
@@ -1312,6 +1376,17 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
 fn oneclick_amount(e: &Effect, default: f32) -> f32 {
     e.params
         .get("amount")
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
+}
+
+/// 着色器族的位置参数(`p0`…`p5`)。
+///
+/// 原版把这族的参数存成一个不记键名的数值数组,键名是我方为了效果栈可
+/// 序列化而定的;越界与缺省的判断留在各算子内部,不在这里改口径。
+fn shader_axis(e: &Effect, index: usize, default: f32) -> f32 {
+    e.params
+        .get(&format!("p{index}"))
         .and_then(|v| v.parse::<f32>().ok())
         .unwrap_or(default)
 }
@@ -2312,5 +2387,92 @@ mod tests {
             crate::effects::Support::Unknown,
             "没见过的名字应是 Unknown"
         );
+    }
+
+    /// 第 2 项-b:着色器族的台账必须自洽 —— 已落地的 6 项在效果表里,
+    /// 未闭环的 4 项在效果表外,两边合起来正好是参考那一族的 10 项。
+    #[test]
+    fn shaders_ledger_stays_consistent() {
+        for name in crate::effects::SHADER_EFFECTS {
+            assert!(
+                crate::effects::PIXEL_EFFECTS.contains(name),
+                "{name} 已落地却没登记进像素效果表"
+            );
+            assert!(
+                !crate::recipes::is_recipe(name),
+                "{name} 既算子又配方,分派会走第二条路"
+            );
+        }
+        for name in crate::effects::SHADER_PENDING {
+            assert!(
+                !crate::effects::PIXEL_EFFECTS.contains(name),
+                "{name} 口径仍未闭环,不得进像素效果表"
+            );
+            assert!(
+                !crate::recipes::is_recipe(name),
+                "{name} 口径仍未闭环,不得成为可执行配方"
+            );
+        }
+        assert_eq!(
+            crate::effects::SHADER_EFFECTS.len() + crate::effects::SHADER_PENDING.len(),
+            10,
+            "参考的着色器族共 10 项,台账缺了或多出来说明分档漂了"
+        );
+    }
+
+    /// 第 2 项-c:分派接线 —— 缺省参数要看得出生效,位置参数 `p0..p5`
+    /// 必须真被读进去(能落到各算子自己的「越界即恒等」分支)。
+    #[test]
+    fn shader_arms_read_their_positional_params() {
+        let sample = || {
+            let mut img = image::RgbaImage::new(24, 24);
+            for y in 0..24u32 {
+                for x in 0..24u32 {
+                    img.put_pixel(
+                        x,
+                        y,
+                        image::Rgba([(x * 9 + y) as u8, (y * 7 + 3) as u8, (x * 3 + y * 5) as u8, 255]),
+                    );
+                }
+            }
+            img
+        };
+        let run = |name: &str, params: &[(&str, &str)]| {
+            let mut img = sample();
+            apply_effect(
+                &mut img,
+                &Effect {
+                    name: name.to_string(),
+                    params: params
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                },
+            );
+            img
+        };
+        // 每一族成员:缺省参数改像素,给它「出界 / 零强度」的位置参数则整幅恒等
+        let cases: &[(&str, &[(&str, &str)])] = &[
+            ("hexcells", &[("p0", "0.5")]),
+            ("rippleblocks", &[("p0", "0"), ("p1", "0")]),
+            ("circlesplash", &[("p2", "301")]),
+            ("crystallize", &[("p0", "0.5")]),
+            ("waterfall", &[("p2", "271")]),
+            ("hslfilter", &[("p0", "0"), ("p1", "0"), ("p2", "0")]),
+        ];
+        for (name, neutral) in cases {
+            let default = run(name, &[]);
+            let neutral_img = run(name, neutral);
+            assert_ne!(
+                default.as_raw(),
+                sample().as_raw(),
+                "{name} 的缺省参数没有落地(分派臂没接上,或缺省值取了恒等)"
+            );
+            assert_eq!(
+                neutral_img.as_raw(),
+                sample().as_raw(),
+                "{name} 的位置参数没被读进去,或出界分支写错了"
+            );
+        }
     }
 }

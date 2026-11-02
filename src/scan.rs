@@ -18,11 +18,11 @@ use std::sync::Arc;
 use walkdir::WalkDir;
 
 /// 可解码的常见图片格式(image crate 支持)。
-const IMG_EXTS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
+pub const IMG_EXTS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
 
 /// 相机 RAW 格式(image crate 解不了,缩略图走 Windows Shell 扩展;
 /// 索引仍照常收录,可按 EXIF 时间/相机/GPS 检索)。
-const RAW_EXTS: [&str; 14] = [
+pub const RAW_EXTS: [&str; 14] = [
     "nef", "cr2", "cr3", "arw", "raf", "orf", "rw2", "dng", "pef", "srw", "3fr", "erf", "iiq", "kdc",
 ];
 
@@ -303,7 +303,7 @@ fn load_fingerprints(store: &Store) -> HashMap<String, (i64, i64)> {
 /// - `ctrl` 提供进度上报与取消(P1-8)。
 pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
     let ctrl = Arc::new(ScanControl::new());
-    scan_dir_ctrl(store, roots, &ctrl)
+    scan_dir_ctrl(store, roots, &ctrl, None)
 }
 
 /// 带进度与取消的扫描。
@@ -314,22 +314,129 @@ pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
 ///   任一线程发现取消即整体短路;
 /// - 取消时**已算出的记录照常入库**(已完成的工作不丢),
 ///   只是不再继续处理剩余文件。
+/// MFT 名字索引候选快路的结果。
+pub struct MftCandidates {
+    pub paths: Vec<PathBuf>,
+    pub excluded_dirs: usize,
+}
+
+/// 在已载入的全盘名字索引里定位 `root` 子树,按扩展名(图片+RAW+视频)
+/// 直接产出候选路径 —— 跳过 walkdir 的逐目录枚举(索引已在内存,
+/// 枚举成本毫秒级;真正的 stat/EXIF 管线不变)。
+///
+/// 返回 `None` = 索引定位不到该根(盘不在索引 / 逐级名字失配,常见于
+/// 索引快照之后新建的目录)→ 调用方回退 walkdir;
+/// `Some(空)` = 定位成功但子树没有可收录文件。
+/// 口径:索引是快照(默认每次启动 USN 增量保鲜);watch 事件链路不受影响。
+pub fn mft_candidates(
+    vols: &[crate::nameidx::VolumeIndex],
+    root: &Path,
+    excl: &Exclusions,
+) -> Option<MftCandidates> {
+    use std::path::Component;
+    let mut letter = None;
+    let mut comps: Vec<String> = Vec::new();
+    for c in root.components() {
+        match c {
+            Component::Prefix(p) => {
+                // "C:" / "\\?\C:" 都取首个 ASCII 字母当盘符。
+                let s = p.as_os_str().to_string_lossy();
+                let b = *s.as_bytes().first()?;
+                if !b.is_ascii_alphabetic() {
+                    return None;
+                }
+                letter = Some(b.to_ascii_uppercase() as char);
+            }
+            Component::RootDir => {}
+            Component::Normal(s) => comps.push(s.to_string_lossy().into_owned()),
+            _ => return None,
+        }
+    }
+    let letter = letter?;
+    let v = vols.iter().find(|v| v.letter == letter)?;
+    let n = v.count();
+    // parent 下标 → 子条目邻接表;槽位 n 是「卷根直属」虚拟桶
+    // (parent 列的 PARENT_ROOT 哨兵统一落进去,孤儿跳过)。
+    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n + 1];
+    for i in 0..n {
+        let p = v.parent_of(i);
+        let slot = if p == crate::nameidx::PARENT_ROOT {
+            n as u32
+        } else if (p as usize) < n {
+            p
+        } else {
+            continue; // PARENT_ORPHAN
+        };
+        children[slot as usize].push(i as u32);
+    }
+    // 从卷根逐级下钻定位根目录(名字比较口径与折叠池一致:ASCII 不区分大小写)。
+    let mut level: Vec<u32> = children[n].clone();
+    for comp in &comps {
+        let mut next = None;
+        for &ci in &level {
+            if v.is_dir(ci as usize) && v.name(ci as usize).eq_ignore_ascii_case(comp) {
+                next = Some(ci);
+                break;
+            }
+        }
+        level = match next {
+            Some(ci) => children[ci as usize].clone(),
+            None => return None,
+        };
+    }
+    // level 即根目录直属条目(comps 为空时 = 卷根直属)。
+    let mut paths = Vec::new();
+    let mut excluded_dirs = 0usize;
+    let mut stack: Vec<u32> = level;
+    while let Some(i) = stack.pop() {
+        let name = v.name(i as usize);
+        if v.is_dir(i as usize) {
+            if excl.excludes_dir(&name) {
+                excluded_dirs += 1;
+                continue;
+            }
+            stack.extend(children[i as usize].iter().copied());
+        } else if is_indexable(Path::new(&name)) {
+            paths.push(PathBuf::from(v.path_of(i as usize)));
+        }
+    }
+    Some(MftCandidates {
+        paths,
+        excluded_dirs,
+    })
+}
+
 pub fn scan_dir_ctrl(
     store: &Store,
     roots: &[PathBuf],
     ctrl: &Arc<ScanControl>,
+    index: Option<&crate::nameidx::IndexFile>,
 ) -> Result<ScanSummary> {
     crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
 
     let excl = Exclusions::from_store(store);
     // 快速路径基线:库内已有指纹
     let prints = load_fingerprints(store);
+    // MFT 快路的卷数据(索引在位才有;Linux/无索引为 None → walkdir)。
+    let vols: Option<&[crate::nameidx::VolumeIndex]> =
+        index.map(|f| f.vols.as_slice());
 
     let mut excluded_dirs = 0usize;
     let mut candidates: Vec<PathBuf> = Vec::new();
     // 遍历阶段的可取消性:目录项计数(原版按文件队列分段查取消)。
     let mut visit_counter = 0usize;
     'outer: for r in roots {
+        // MFT 快路:索引在位且根可定位 → 免逐目录枚举;定位失败回退 walkdir。
+        if let Some(vs) = vols {
+            if let Some(mc) = mft_candidates(vs, r, &excl) {
+                excluded_dirs += mc.excluded_dirs;
+                candidates.extend(mc.paths);
+                if ctrl.is_cancelled() {
+                    break 'outer;
+                }
+                continue;
+            }
+        }
         let it = WalkDir::new(r)
             .into_iter()
             .filter_entry(|e| {
@@ -649,6 +756,20 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// 测试暂存目录。固定在 `target/rk-scratch/` 下,不能用系统 temp:
+    /// Windows 的 temp 落在 `...\AppData\Local\Temp`,路径里同时命中默认排除表的
+    /// `AppData` 与 `temp` 两项,`excludes_path` 逐级祖先匹配会把待测文件判成排除,
+    /// 使 `index_file` 恒返回 false(换台机器 TMP 不在 AppData 下就复现不了)。
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("rk-scratch")
+            .join(format!("{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn default_exclusions_are_stable() {
         // 原版目录排除规则
@@ -700,9 +821,7 @@ mod tests {
     /// 快速路径:未变文件不重解码 EXIF(不产生新记录),变更文件会重索引。
     #[test]
     fn scan_skips_unchanged_files() {
-        let dir = std::env::temp_dir().join(format!("rk-scanfast-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("scanfast");
         // 一张最小 JPEG
         let p = dir.join("a.jpg");
         let mut img = image::RgbImage::new(8, 6);
@@ -732,8 +851,7 @@ mod tests {
     /// 排除规则:被排除目录整棵子树不入索引。
     #[test]
     fn scan_applies_exclusion_rules() {
-        let dir = std::env::temp_dir().join(format!("rk-scanexcl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = scratch_dir("scanexcl");
         let good = dir.join("Pictures");
         let bad = dir.join("Originals");
         std::fs::create_dir_all(&good).unwrap();
@@ -760,9 +878,7 @@ mod tests {
     /// 事件驱动的单文件入库:新文件写入索引,未变文件跳过。
     #[test]
     fn index_file_handles_single_file() {
-        let dir = std::env::temp_dir().join(format!("rk-indexfile-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("indexfile");
         let p = dir.join("a.jpg");
         let img = image::RgbImage::new(8, 6);
         let mut buf: Vec<u8> = Vec::new();
@@ -789,9 +905,7 @@ mod tests {
     /// 只有文件头的占位 .mp4 就够了。
     #[test]
     fn video_files_are_indexed() {
-        let dir = std::env::temp_dir().join(format!("rk-scanvideo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("scanvideo");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
@@ -816,8 +930,8 @@ mod tests {
 
     /// 排除规则对单文件路径同样生效(事件驱动路径)。
     #[test]
-    fn index_file_respects_exclusion_dirs() {        let dir = std::env::temp_dir().join(format!("rk-indexexcl-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+    fn index_file_respects_exclusion_dirs() {
+        let dir = scratch_dir("indexexcl");
         let bad = dir.join("Originals");
         std::fs::create_dir_all(&bad).unwrap();
         let p = bad.join("a.jpg");
@@ -877,9 +991,7 @@ mod tests {
     /// 取消真的能中断扫描(遍历阶段就退出,索引数少于全部文件)。
     #[test]
     fn scan_can_be_cancelled() {
-        let dir = std::env::temp_dir().join(format!("rk-scancel-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("scancel");
         // 放 8 张小图
         for i in 0..8 {
             let mut buf: Vec<u8> = Vec::new();
@@ -892,7 +1004,7 @@ mod tests {
         let ctrl = Arc::new(ScanControl::new());
         // 先取消 → 遍历阶段立刻退出,一张都不索引。
         ctrl.cancel();
-        let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl).unwrap();
+        let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl, None).unwrap();
         assert!(s.cancelled, "应标记为已取消");
         assert_eq!(s.indexed, 0, "取消后不应索引任何文件");
 
@@ -902,9 +1014,7 @@ mod tests {
     /// 正常扫描不标记取消,且 uid64 被自动分配(P1-11)。
     #[test]
     fn scan_assigns_uid64() {
-        let dir = std::env::temp_dir().join(format!("rk-uid-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("uid");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
@@ -940,9 +1050,7 @@ mod tests {
     /// (v5 审计发现:此前只有扫描路径写,监听发现的变化会丢)。
     #[test]
     fn index_file_logs_change() {
-        let dir = std::env::temp_dir().join(format!("rk-idxlog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("idxlog");
         let p = dir.join("a.jpg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
@@ -974,9 +1082,7 @@ mod tests {
     /// P1-12:扫描会写变更日志(新增记 added)。
     #[test]
     fn scan_logs_changes() {
-        let dir = std::env::temp_dir().join(format!("rk-chg-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = scratch_dir("chg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
             .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
@@ -997,5 +1103,44 @@ mod tests {
         assert!(store.recent_changes(10).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// MFT 快路:索引子树定位、排除目录、扩展名过滤、大小写与回退。
+    #[test]
+    fn mft_candidates_resolves_subtree_and_falls_back() {
+        use crate::nameidx::VolumeIndexBuilder;
+        // 0x10 = FILE_ATTRIBUTE_DIRECTORY(nameidx 私有常量,这里用字面量)。
+        const DIR: u32 = 0x10;
+        let mut b = VolumeIndexBuilder::new('C');
+        b.push(0x1000, 5, DIR, &"Pics".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x1001, 0x1000, 0x20, &"IMG_0001.JPG".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x2000, 0x1000, DIR, &"RAW".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x2001, 0x2000, 0x20, &"DSC.NEF".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x3000, 0x1000, DIR, &"thumbs".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x3001, 0x3000, 0x20, &"cache.jpg".encode_utf16().collect::<Vec<u16>>());
+        b.push(0x1002, 0x1000, 0x20, &"notes.txt".encode_utf16().collect::<Vec<u16>>());
+        let v = b.finish();
+        let excl = Exclusions::default();
+
+        // 子树根可定位:只收 JPG/NEF,排除 thumbs 整棵,notes.txt 不收。
+        let mc = mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\Pics"), &excl).unwrap();
+        assert_eq!(mc.paths.len(), 2, "实际: {:?}", mc.paths);
+        assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\IMG_0001.JPG")));
+        assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\RAW\DSC.NEF")));
+        assert_eq!(mc.excluded_dirs, 1, "thumbs 应计一次目录排除");
+
+        // 根目录大小写不敏感(与折叠池口径一致)。
+        let mc2 =
+            mft_candidates(std::slice::from_ref(&v), Path::new(r"c:\pics"), &excl).unwrap();
+        assert_eq!(mc2.paths.len(), 2);
+
+        // 逐级失配 / 盘不在索引 → None(调用方回退 walkdir)。
+        assert!(mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\NoSuchDir"), &excl).is_none());
+        assert!(mft_candidates(&[], Path::new(r"C:\Pics"), &excl).is_none());
+
+        // 卷根直扫:整卷候选(排除 thumbs 子树)。
+        let mc3 = mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\"), &excl).unwrap();
+        assert_eq!(mc3.paths.len(), 2, "实际: {:?}", mc3.paths);
+        assert_eq!(mc3.excluded_dirs, 1);
     }
 }

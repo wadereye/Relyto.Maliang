@@ -13,6 +13,8 @@ mod effects;
 mod exif;
 mod export;
 mod hash;
+mod mft;
+mod nameidx;
 mod net;
 mod oneclick;
 mod picasa;
@@ -21,7 +23,9 @@ mod recipes;
 mod save;
 mod scan;
 mod scroll;
+mod shaders;
 mod share;
+mod theme;
 mod thumbs;
 mod timeline;
 mod video;
@@ -96,15 +100,62 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // 提权索引器:全量枚举 NTFS 卷 USN/MFT → SoA 名字索引落盘。
+        // GUI 启动后延迟拉起本子命令(ShellExecuteW runas);也可手动运行,
+        // 用法:`--mft-scan [卷字母表] [--mft-report <报告文件>]`,
+        // 报告文件直写(提权会话里 stdout 可能被 attach 控制台顶掉)。
+        "--mft-scan" => {
+            let mut spec: Option<String> = None;
+            let mut report: Option<String> = None;
+            let mut it = args.iter().skip(1);
+            while let Some(a) = it.next() {
+                if a == "--mft-report" {
+                    report = it.next().cloned();
+                } else if spec.is_none() && !a.starts_with("--") {
+                    spec = Some(a.clone());
+                }
+            }
+            match nameidx::cli_mft_scan(spec.as_deref(), report.as_deref()) {
+                Ok(()) => {}
+                Err(e) => eprintln!("MFT 扫描失败:{e:#}"),
+            }
+            true
+        }
+        // 诊断:载入名字索引,打印统计与样例查询结果。
+        "--mft-check" => {
+            match nameidx::cli_mft_check() {
+                Ok(()) => {}
+                Err(e) => eprintln!("索引检查失败:{e:#}"),
+            }
+            true
+        }
         _ => false,
+    }
+}
+
+fn window_icon() -> egui::IconData {
+    let img = image::load_from_memory(include_bytes!("../assets/icon.png"))
+        .expect("内置图标 assets/icon.png 解码失败")
+        .into_rgba8();
+    let (w, h) = img.dimensions();
+    egui::IconData {
+        width: w,
+        height: h,
+        rgba: img.into_raw(),
     }
 }
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 数据目录 pending 迁移必须先于一切打开库/索引的动作(包括命令行子命令)。
+    crate::db::migrate_pending_data();
     // GUI 子系统下带参数启动,多半是命令行子命令;先把输出挂回父终端再执行,
     // 否则 println! 的结果无处可去。普通双击(无参数)不受影响。
-    if !args.is_empty() {
+    // 计划任务拉起的索引器(--mft-task):debug 构建是控制台子系统,任务被计划
+    // 任务服务拉起时会新起一个黑控制台框 —— 这里直接摘掉控制台,用户只看界面进度。
+    if args.iter().any(|a| a == "--mft-task") {
+        win::hide_console();
+    } else if !args.is_empty() {
         win::attach_parent_console();
     }
     if handle_cli(&args) {
@@ -119,7 +170,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Relyto.Maliang")
-            .with_inner_size([1280.0, 860.0]),
+            .with_inner_size([1280.0, 860.0])
+            .with_icon(Arc::new(window_icon())),
         ..Default::default()
     };
     eframe::run_native(
