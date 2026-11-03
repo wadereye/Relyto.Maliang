@@ -27,8 +27,7 @@ enum ViewKind {
 /// 排序方式(`SortBy`)与视图过滤(`Filters`)定义在 `timeline`,
 /// 由 SQL 谓词一次完成 —— 大图库不在 UI 层筛全表。
 
-/// 人物列表排序(工具栏「查看选项」> Sort People,参考件
-/// `ID_PEOPLEBYNAME` / `ID_PEOPLEBYAMOUNT` / `ID_PEOPLEBYAMOUNTTOP10`;
+/// 人物列表排序(工具栏「查看选项」> Sort People 三项;
 /// 菜单顺序即此处声明顺序)。
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum PeopleSort {
@@ -61,6 +60,51 @@ impl PeopleSort {
 
     fn from_key(s: &str) -> Option<PeopleSort> {
         PeopleSort::ALL.into_iter().find(|x| x.key() == s)
+    }
+}
+
+/// 右栏抽屉的四个面板(参考件右抽屉的属性 / 标签 / 人物 / 地点四页)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DrawerTab {
+    /// 照片属性 + 标题。
+    #[default]
+    Props,
+    /// 本张的标签增删与常用标签。
+    Tags,
+    /// 本张的人脸与人物命名。
+    People,
+    /// 本张的 GPS 与地图入口。
+    Places,
+}
+
+impl DrawerTab {
+    const ALL: [DrawerTab; 4] = [
+        DrawerTab::Props,
+        DrawerTab::Tags,
+        DrawerTab::People,
+        DrawerTab::Places,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            DrawerTab::Props => "属性",
+            DrawerTab::Tags => "标签",
+            DrawerTab::People => "人物",
+            DrawerTab::Places => "地点",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            DrawerTab::Props => "props",
+            DrawerTab::Tags => "tags",
+            DrawerTab::People => "people",
+            DrawerTab::Places => "places",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<DrawerTab> {
+        DrawerTab::ALL.into_iter().find(|x| x.key() == s)
     }
 }
 
@@ -188,8 +232,10 @@ pub struct App {
     // —— P2-16 效果系统(效果栈 + 撤销栈)——
     /// 效果面板是否展开。
     fx_panel: bool,
-    /// 右侧属性面板是否展开(可伸缩,平时收起;设置项 props_panel)。
-    props_panel: bool,
+    /// 右侧属性面板是否展开(可伸缩,平时收起;设置项 drawer_open)。
+    drawer_open: bool,
+    /// 右栏抽屉当前页签(属性/标签/人物/地点;设置项 drawer_tab)。
+    drawer_tab: DrawerTab,
     /// 效果面板当前标签页(调整/曲线/一键/裁剪/维护)。
     fx_tab: usize,
     /// 当前草稿调整值(面板滑块;未应用到库里)。
@@ -310,18 +356,18 @@ pub struct App {
     sel_album: Option<i64>,
     /// 新建相簿输入框。
     album_input: String,
-    // —— 属性 / 选项窗口(imageproperties.fen / options.fen 等价物)——
+    // —— 属性 / 选项窗口(原版 File > Properties / Tools > Options 等价物)——
     show_props: bool,
     show_options: bool,
     /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
     options_tab: usize,
     /// 文件夹视图树形形态(参考件 Simplified Tree View;设置项 folder_tree)。
     folder_tree: bool,
-    /// 中间栏是否一次铺开所有文件夹(每组一个 `CAlbumLabel` 组头)。
+    /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
     /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
     folder_show_all: bool,
-    /// 左栏每行画该目录的缩略图(参考件 `ID_VIEW_THUMBNAILS` =
-    /// Show Thumbnails in Library;设置项 tree_thumbs)。
+    /// 左栏每行画该目录的缩略图(参考件 View > Show Thumbnails in Library;
+    /// 设置项 tree_thumbs)。
     tree_thumbs: bool,
     /// 人物列表排序方式(参考件 Sort People by Name / Amount / Top 10)。
     people_sort: PeopleSort,
@@ -355,6 +401,9 @@ pub struct App {
     face_version_warn: bool,
     #[cfg(feature = "ai")]
     input_rename: String,
+    /// 右栏「人物」页正在改名的脸(face_id, 草稿名);失焦/回车即写回所属人物。
+    #[cfg(feature = "ai")]
+    face_name_draft: Option<(i64, String)>,
     #[cfg(feature = "ai")]
     clip_index_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
     #[cfg(feature = "ai")]
@@ -943,10 +992,14 @@ impl App {
             .and_then(|v| PeopleSort::from_key(&v))
             .unwrap_or(PeopleSort::Amount);
         // 右侧属性面板的收展状态(平时收起,记住上次的选择)。
-        let props_panel = store
-            .get_setting("props_panel")
+        let drawer_open = store
+            .get_setting("drawer_open")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let drawer_tab = store
+            .get_setting("drawer_tab")
+            .and_then(|v| DrawerTab::from_key(&v))
+            .unwrap_or_default();
         // 排序与视图过滤同属"怎么看图库",重启后保持(参考件亦记忆视图状态)。
         let sort_by = store
             .get_setting("sort_by")
@@ -989,7 +1042,8 @@ impl App {
             device_watch: None,
             last_volumes: Vec::new(),
             fx_panel: false,
-            props_panel,
+            drawer_open,
+            drawer_tab,
             fx_tab: 0,
             fx_draft: crate::effects::Adjust::default(),
             fx_draft_id: None,
@@ -1121,6 +1175,8 @@ impl App {
             face_version_warn: false,
             #[cfg(feature = "ai")]
             input_rename: String::new(),
+            #[cfg(feature = "ai")]
+            face_name_draft: None,
             #[cfg(feature = "ai")]
             clip_index_rx: None,
             #[cfg(feature = "ai")]
@@ -1734,7 +1790,7 @@ impl App {
         }
     }
 
-    /// 顶部工具条(参考件 `thumbui/basecontrolset`),左→右:
+    /// 顶部工具条(参考件主界面顶部那一排),左→右:
     /// 导入 · 新建相簿 · 放映 · 平铺/树形 · 查看选项 ▾ …… 过滤四开关 · 尺寸滑块 · 搜索框 · 活动灯。
     fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1815,16 +1871,16 @@ impl App {
                     crate::theme::switch(ctx, next);
                     let _ = self.store.set_setting("ui_theme", next.key());
                 }
-                // 右栏抽屉开关(参考件 `thumbui/properties_toggle`;抽屉内四页签见右栏)。
+                // 右栏抽屉开关(参考件工具栏的属性面板按钮;抽屉内四页签见右栏)。
                 if ui
-                    .add(tool_button("panel-right", self.props_panel))
+                    .add(tool_button("panel-right", self.drawer_open))
                     .on_hover_text("属性面板")
                     .clicked()
                 {
-                    self.props_panel = !self.props_panel;
+                    self.drawer_open = !self.drawer_open;
                     let _ = self
                         .store
-                        .set_setting("props_panel", if self.props_panel { "1" } else { "0" });
+                        .set_setting("drawer_open", if self.drawer_open { "1" } else { "0" });
                 }
                 ui.separator();
                 if self.busy() {
@@ -1896,7 +1952,7 @@ impl App {
     }
 
     /// 「查看选项」下拉:条目与顺序照抄参考件的 View 菜单
-    /// (`ID_VIEW_*` → 排序 → `ID_PEOPLEBY*` → 壳目录快捷键 → 缩略图/树形选项)。
+    /// (View 组 → 排序 → Sort People 组 → 壳目录快捷键 → 缩略图/树形选项)。
     fn view_options_menu(&mut self, ui: &mut egui::Ui) {
         if ui
             .selectable_label(!self.folder_tree, "平铺文件夹视图")
@@ -3551,25 +3607,19 @@ impl App {
         });
     }
 
-    /// 属性窗口(参考件 imageproperties 窗:文件名 / 位置 / 大小+日期 /
-    /// Property-Value 列表 / 上一张-下一张)。
-    fn props_ui(&mut self, ctx: &egui::Context) {
-        let id = match self.preview {
-            Some(id) => id,
-            // 没开预览时取第一个选中的照片。
-            None => match self.sel.iter().next() {
-                Some(&id) => id,
-                None => {
-                    self.show_props = false;
-                    return;
-                }
-            },
-        };
+    /// 本张照片的文件路径(不在当前视图时 None)。
+    fn photo_path(&self, id: i64) -> Option<String> {
+        self.id_row.get(&id).map(|&idx| self.rows[idx].path.clone())
+    }
+
+    /// 属性详情:名称 / 位置 / 大小+修改日期 + Property-Value 两列清单。
+    /// 浮动属性窗与右栏抽屉「属性」页共用(参考件属性窗上半部)。
+    fn props_detail_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         let Some(&idx) = self.id_row.get(&id) else {
-            self.show_props = false;
+            ui.small("该照片不在当前视图。");
             return;
         };
-        // 先取齐数据再进窗口(避免闭包里借用 self.rows 冲突)。
+        // 先取齐数据再排版(避免闭包里借用 self.rows 冲突)。
         let (path, taken, cam, caption, star, kind) = {
             let r = &self.rows[idx];
             (
@@ -3584,6 +3634,106 @@ impl App {
         let dims = (self.rows[idx].width, self.rows[idx].height);
         let (lat, lon) = (self.rows[idx].lat, self.rows[idx].lon);
         let fx_count = self.fx_preview_stack(id).items.len();
+        let name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        ui.strong(name);
+        ui.small(
+            Path::new(&path)
+                .parent()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        );
+        // 大小 + 修改日期(参考件 Size 行)。
+        if let Ok(md) = std::fs::metadata(&path) {
+            let kb = md.len() as f64 / 1024.0;
+            let size_s = if kb >= 1024.0 {
+                format!("{:.1} MB", kb / 1024.0)
+            } else {
+                format!("{kb:.0} KB")
+            };
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| {
+                    chrono::DateTime::<chrono::Local>::from(t)
+                        .format("%Y-%m-%d %H:%M")
+                        .to_string()
+                        .into()
+                })
+                .unwrap_or_default();
+            ui.small(format!("{size_s}    修改:{mtime}"));
+        }
+        ui.separator();
+        // Property / Value 两列清单(参考件 list 控件)。
+        egui::Grid::new("props-grid").num_columns(2).show(ui, |ui| {
+            ui.label("类型");
+            ui.label(if kind == crate::video::kind::MOVIE {
+                "视频".into()
+            } else {
+                Path::new(&path)
+                    .extension()
+                    .map(|e| format!("图片({})", e.to_string_lossy().to_uppercase()))
+                    .unwrap_or_else(|| "图片".into())
+            });
+            ui.end_row();
+            ui.label("像素");
+            ui.label(match dims {
+                (Some(w), Some(h)) => format!("{w} × {h}"),
+                _ => "—".into(),
+            });
+            ui.end_row();
+            ui.label("拍摄时间");
+            ui.label(taken.unwrap_or_default().replace('T', " "));
+            ui.end_row();
+            ui.label("相机");
+            ui.label(if cam.is_empty() { "—".into() } else { cam });
+            ui.end_row();
+            ui.label("GPS");
+            ui.label(match (lat, lon) {
+                (Some(a), Some(b)) => format!("{a:.5}, {b:.5}"),
+                _ => "—".into(),
+            });
+            ui.end_row();
+            ui.label("星标");
+            ui.label(if star {
+                "★ 已加星"
+            } else {
+                "☆ 未加星"
+            });
+            ui.end_row();
+            ui.label("标题");
+            ui.label(if caption.is_empty() {
+                "—".into()
+            } else {
+                caption
+            });
+            ui.end_row();
+            ui.label("效果项");
+            ui.label(format!("{fx_count} 项"));
+            ui.end_row();
+        });
+    }
+
+    /// 属性窗口(参考件 File > Properties:文件名 / 位置 / 大小+日期 /
+    /// Property-Value 列表 / 上一张-下一张)。
+    fn props_ui(&mut self, ctx: &egui::Context) {
+        let id = match self.preview {
+            Some(id) => id,
+            // 没开预览时取第一个选中的照片。
+            None => match self.sel.iter().next() {
+                Some(&id) => id,
+                None => {
+                    self.show_props = false;
+                    return;
+                }
+            },
+        };
+        if !self.id_row.contains_key(&id) {
+            self.show_props = false;
+            return;
+        }
         let total = self.view_ids().len();
         let pos = self
             .preview
@@ -3595,86 +3745,7 @@ impl App {
             .open(&mut props_open)
             .default_width(460.0)
             .show(ctx, |ui| {
-                let name = Path::new(&path)
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.clone());
-                ui.strong(&name);
-                ui.label(
-                    Path::new(&path)
-                        .parent()
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                );
-                // 大小 + 修改日期(参考件 Size 行)。
-                if let Ok(md) = std::fs::metadata(&path) {
-                    let kb = md.len() as f64 / 1024.0;
-                    let size_s = if kb >= 1024.0 {
-                        format!("{:.1} MB", kb / 1024.0)
-                    } else {
-                        format!("{kb:.0} KB")
-                    };
-                    let mtime = md
-                        .modified()
-                        .ok()
-                        .and_then(|t| {
-                            chrono::DateTime::<chrono::Local>::from(t)
-                                .format("%Y-%m-%d %H:%M")
-                                .to_string()
-                                .into()
-                        })
-                        .unwrap_or_default();
-                    ui.label(format!("{size_s}    修改:{mtime}"));
-                }
-                ui.separator();
-                // Property / Value 两列清单(参考件 list 控件)。
-                egui::Grid::new("props-grid").num_columns(2).show(ui, |ui| {
-                    ui.label("类型");
-                    ui.label(if kind == crate::video::kind::MOVIE {
-                        "视频".into()
-                    } else {
-                        Path::new(&path)
-                            .extension()
-                            .map(|e| format!("图片({})", e.to_string_lossy().to_uppercase()))
-                            .unwrap_or_else(|| "图片".into())
-                    });
-                    ui.end_row();
-                    ui.label("像素");
-                    ui.label(match (dims.0, dims.1) {
-                        (Some(w), Some(h)) => format!("{w} × {h}"),
-                        _ => "—".into(),
-                    });
-                    ui.end_row();
-                    ui.label("拍摄时间");
-                    ui.label(taken.unwrap_or_default().replace('T', " "));
-                    ui.end_row();
-                    ui.label("相机");
-                    ui.label(if cam.is_empty() { "—".into() } else { cam });
-                    ui.end_row();
-                    ui.label("GPS");
-                    ui.label(match (lat, lon) {
-                        (Some(a), Some(b)) => format!("{a:.5}, {b:.5}"),
-                        _ => "—".into(),
-                    });
-                    ui.end_row();
-                    ui.label("星标");
-                    ui.label(if star {
-                        "★ 已加星"
-                    } else {
-                        "☆ 未加星"
-                    });
-                    ui.end_row();
-                    ui.label("标题");
-                    ui.label(if caption.is_empty() {
-                        "—".into()
-                    } else {
-                        caption
-                    });
-                    ui.end_row();
-                    ui.label("效果项");
-                    ui.label(format!("{fx_count} 项"));
-                    ui.end_row();
-                });
+                self.props_detail_ui(ui, id);
                 ui.separator();
                 // 上一张 / 下一张(参考件 nav 行:"x of x files")。
                 ui.horizontal(|ui| {
@@ -3692,12 +3763,369 @@ impl App {
                         self.show_props = false;
                     }
                     if ui.button("在资源管理器中显示").clicked() {
-                        show_in_explorer(&path);
+                        if let Some(path) = self.photo_path(id) {
+                            show_in_explorer(&path);
+                        }
                     }
                 });
             });
         // 标题栏 X(props_open=false)或关闭按钮都会关掉窗口。
         self.show_props = props_open && self.show_props;
+    }
+
+    /// 标题编辑(参考件 Caption:失焦或回车即保存)。
+    /// 单图预览与右栏抽屉「属性」页共用同一份 caption_edit 草稿。
+    fn caption_editor(&mut self, ui: &mut egui::Ui, id: i64) {
+        if self.caption_edit.as_ref().map(|(k, _)| *k) != Some(id) {
+            self.caption_edit = Some((id, self.store.get_caption(id)));
+        }
+        if let Some((_, cap)) = &mut self.caption_edit {
+            let resp = ui
+                .horizontal(|ui| {
+                    ui.label("标题:");
+                    ui.add(
+                        egui::TextEdit::singleline(cap).desired_width(ui.available_width() - 60.0),
+                    )
+                })
+                .inner;
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
+            if resp.lost_focus() || enter {
+                if *cap != self.store.get_caption(id) {
+                    let _ = self.store.set_caption(id, cap);
+                    self.fx_msg = "标题已保存".into();
+                }
+            }
+        }
+    }
+
+    /// 标签编辑(参考件 Tag 面板:输入框 + 色标 + 点 ✕ 移除)。
+    fn tags_editor(&mut self, ui: &mut egui::Ui, id: i64) {
+        ui.horizontal(|ui| {
+            ui.label("标签:");
+            if ui.text_edit_singleline(&mut self.input_tag).lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            {
+                let t = std::mem::take(&mut self.input_tag);
+                if !t.is_empty() {
+                    let _ = timeline::add_tag(&self.store, id, &t);
+                    self.sync_sidecars(id, self.star_of(id));
+                }
+            }
+            if ui.button("添加").clicked() {
+                let t = std::mem::take(&mut self.input_tag);
+                if !t.is_empty() {
+                    let _ = timeline::add_tag(&self.store, id, &t);
+                    self.sync_sidecars(id, self.star_of(id));
+                }
+            }
+        });
+        if let Ok(tags) = timeline::tags_of(&self.store, id) {
+            if !tags.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for t in tags.clone() {
+                        let col = self
+                            .tags
+                            .iter()
+                            .find(|x| x.name == t)
+                            .and_then(|x| tag_color(x.color.as_deref()));
+                        ui.horizontal(|ui| {
+                            if let Some(col) = col {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(8.0, 8.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().rect_filled(rect, 1.0, col);
+                            }
+                            if ui.small_button(format!("{t} ✕")).clicked() {
+                                let _ = timeline::remove_tag(&self.store, id, &t);
+                                self.sync_sidecars(id, self.star_of(id));
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    }
+
+    /// 本张当前星标值(不在视图里时按未加星处理)。
+    fn star_of(&self, id: i64) -> i32 {
+        self.id_row
+            .get(&id)
+            .map(|&idx| self.rows[idx].star)
+            .unwrap_or(0)
+    }
+
+    /// 切换单张星标(网格右键、预览窗与右栏抽屉共用同一条写库 + 旁文件链路)。
+    fn toggle_star(&mut self, id: i64) {
+        let new = if self.star_of(id) != 0 { 0 } else { 1 };
+        let _ = timeline::set_star(&self.store, id, new);
+        if let Some(&idx) = self.id_row.get(&id) {
+            self.rows[idx].star = new;
+        }
+        self.sync_sidecars(id, new);
+    }
+
+    /// 抽屉作用的照片:优先单图预览里那张,其次第一个选中项。
+    fn drawer_target(&self) -> Option<i64> {
+        self.preview.or_else(|| self.sel.iter().next().copied())
+    }
+
+    /// 没选中照片时四个页签共用的提示。
+    fn drawer_need_photo(ui: &mut egui::Ui) {
+        ui.small("先在图库点选一张照片(或双击打开单图)。");
+        ui.small("这里显示它的属性、标签、人物与拍摄地点。");
+    }
+
+    /// 右栏抽屉(参考件右栏面板:属性 / 标签 / 人物 / 地点 四页签,
+    /// 面板头「»」收起,当前页签记忆到设置项 drawer_tab)。
+    fn drawer_ui(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("props")
+            .resizable(true)
+            .default_width(280.0)
+            .width_range(220.0..=420.0)
+            .frame(crate::theme::side_frame())
+            .show(ctx, |ui| {
+                let cur = self.drawer_tab;
+                ui.horizontal(|ui| {
+                    for t in DrawerTab::ALL {
+                        if ui.selectable_label(cur == t, t.label()).clicked() {
+                            self.drawer_tab = t;
+                            let _ = self.store.set_setting("drawer_tab", t.key());
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("»").on_hover_text("收起属性面板").clicked() {
+                            self.drawer_open = false;
+                            let _ = self.store.set_setting("drawer_open", "0");
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("drawer")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| match self.drawer_tab {
+                        DrawerTab::Props => self.drawer_props_ui(ui),
+                        DrawerTab::Tags => self.drawer_tags_ui(ui),
+                        #[cfg(feature = "ai")]
+                        DrawerTab::People => self.drawer_people_ui(ui),
+                        #[cfg(not(feature = "ai"))]
+                        DrawerTab::People => ui.small("此构建未开启人脸功能(ai 特性)。"),
+                        DrawerTab::Places => self.drawer_places_ui(ui, ctx),
+                    });
+            });
+    }
+
+    /// 抽屉「属性」页:属性清单 + 标题编辑 + 星标/定位。
+    fn drawer_props_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.drawer_target() else {
+            Self::drawer_need_photo(ui);
+            return;
+        };
+        self.props_detail_ui(ui, id);
+        ui.add_space(4.0);
+        self.caption_editor(ui, id);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let starred = self.star_of(id) != 0;
+            if ui
+                .small_button(if starred {
+                    "★ 取消星标"
+                } else {
+                    "☆ 加星"
+                })
+                .clicked()
+            {
+                self.toggle_star(id);
+            }
+            if ui.small_button("在资源管理器中显示").clicked() {
+                if let Some(path) = self.photo_path(id) {
+                    show_in_explorer(&path);
+                }
+            }
+        });
+    }
+
+    /// 抽屉「标签」页:本张标签增删 + 库内已有标签一键套用(参考件 Tag 面板)。
+    fn drawer_tags_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.drawer_target() else {
+            Self::drawer_need_photo(ui);
+            return;
+        };
+        self.tags_editor(ui, id);
+        ui.add_space(6.0);
+        ui.separator();
+        ui.small("库内标签(点一下即加到本张):");
+        let names: Vec<String> = self.tags.iter().map(|t| t.name.clone()).collect();
+        if names.is_empty() {
+            ui.small("(还没有标签)");
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for n in names {
+                let col = self
+                    .tags
+                    .iter()
+                    .find(|x| x.name == n)
+                    .and_then(|x| tag_color(x.color.as_deref()));
+                ui.horizontal(|ui| {
+                    if let Some(col) = col {
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect, 1.0, col);
+                    }
+                    if ui.small_button(&n).clicked() {
+                        let _ = timeline::add_tag(&self.store, id, &n);
+                        self.sync_sidecars(id, self.star_of(id));
+                    }
+                });
+            }
+        });
+    }
+
+    /// 抽屉「人物」页:本张检测到的人脸 + 命名 / 忽略 / 跳到该人物。
+    #[cfg(feature = "ai")]
+    fn drawer_people_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(id) = self.drawer_target() else {
+            Self::drawer_need_photo(ui);
+            return;
+        };
+        let mut faces = crate::faces::photo_faces(&self.store, id);
+        // 大脸在前(参考件把最大的人脸当主脸显示)。
+        faces.sort_by(|a, b| {
+            let area = |r: &(f32, f32, f32, f32)| (r.2 - r.0).max(0.0) * (r.3 - r.1).max(0.0);
+            area(&b.rect)
+                .partial_cmp(&area(&a.rect))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        if faces.is_empty() {
+            ui.small("本张照片还没有人脸数据。");
+            ui.small("左栏「人物」里可以扫描图库并自动聚类。");
+            return;
+        }
+        for f in faces {
+            let Some(cluster) = f.cluster else {
+                ui.small(format!(
+                    "未归入人物的脸  · 质量 {:.2}{}",
+                    f.quality,
+                    if f.ignored { "(已忽略)" } else { "" }
+                ));
+                continue;
+            };
+            ui.separator();
+            let named = f.person.clone().unwrap_or_default();
+            ui.horizontal(|ui| {
+                if named.is_empty() {
+                    ui.strong(format!("簇 {cluster}"));
+                } else {
+                    ui.strong(named.as_str());
+                }
+                ui.small(format!("质量 {:.2}", f.quality));
+                if f.ignored {
+                    ui.small("(已忽略)");
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.small_button("命名").clicked() {
+                    self.face_name_draft = Some((f.face_id, named.clone()));
+                }
+                if ui.small_button("查看该人物").clicked() {
+                    if self.face_people.is_empty() {
+                        self.refresh_people_and_suggestions();
+                    }
+                    self.view = ViewKind::Faces;
+                    self.sel_cluster = Some(cluster);
+                    self.face_hits = crate::faces::faces_for_cluster(
+                        &self.store,
+                        cluster,
+                        self.face_show_ignored,
+                        if self.face_hide_low { 0.4 } else { 0.0 },
+                    );
+                }
+                if ui
+                    .small_button(if f.ignored { "恢复" } else { "忽略" })
+                    .clicked()
+                {
+                    let _ = crate::faces::ignore_cluster(&self.store, cluster, !f.ignored);
+                    self.face_show_ignored = true;
+                    self.refresh_people_and_suggestions();
+                }
+            });
+            if self.face_name_draft.as_ref().map(|(k, _)| *k) == Some(f.face_id) {
+                let mut commit: Option<String> = None;
+                if let Some((_, draft)) = &mut self.face_name_draft {
+                    let resp = ui.text_edit_singleline(draft);
+                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
+                    if resp.lost_focus() || enter {
+                        commit = Some(draft.clone());
+                    }
+                }
+                if let Some(name) = commit {
+                    if !name.is_empty() {
+                        let _ = crate::faces::rename_cluster(&self.store, cluster, &name);
+                        self.refresh_people_and_suggestions();
+                        self.status = format!("已命名:{name}");
+                    }
+                    self.face_name_draft = None;
+                }
+            }
+        }
+    }
+
+    /// 抽屉「地点」页:GPS 坐标、复制、地图入口与全库 KML 导出。
+    fn drawer_places_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(id) = self.drawer_target() else {
+            Self::drawer_need_photo(ui);
+            return;
+        };
+        let Some(&idx) = self.id_row.get(&id) else {
+            ui.small("该照片不在当前视图。");
+            return;
+        };
+        let (lat, lon) = (self.rows[idx].lat, self.rows[idx].lon);
+        let taken = self.rows[idx].taken.clone();
+        match (lat, lon) {
+            (Some(a), Some(b)) => {
+                ui.label(format!("GPS:{a:.6}, {b:.6}"));
+                if let Some(t) = taken {
+                    ui.small(format!("拍摄时间:{}", t.replace('T', " ")));
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.small_button("复制坐标").clicked() {
+                        ctx.copy_text(format!("{a:.6}, {b:.6}"));
+                        self.status = "已复制 GPS 坐标".into();
+                    }
+                    if ui.small_button("在地图中打开").clicked() {
+                        // 交给系统默认浏览器(OpenStreetMap,无需第三方密钥)。
+                        let url = format!(
+                            "https://www.openstreetmap.org/?mlat={a}&mlon={b}#map=17/{a}/{b}"
+                        );
+                        if !crate::win::shell_open(Path::new(&url)) {
+                            self.status = "无法打开地图(没有默认浏览器?)".into();
+                        }
+                    }
+                });
+            }
+            (Some(a), None) => {
+                ui.small("只有纬度,坐标不完整(原图 EXIF 可能损坏)。");
+                ui.small(format!("纬度:{a:.6}"));
+            }
+            (None, Some(b)) => {
+                ui.small("只有经度,坐标不完整(原图 EXIF 可能损坏)。");
+                ui.small(format!("经度:{b:.6}"));
+            }
+            (None, None) => {
+                ui.small("本张照片的 EXIF 里没有 GPS 坐标。");
+                ui.small("相机未定位或导出时丢掉了定位信息;可在原图属性里补写。");
+            }
+        }
+        ui.add_space(6.0);
+        ui.separator();
+        ui.small("整个图库的定位数据:");
+        if ui.small_button("导出地理标记(KML)…").clicked() {
+            self.export_kml();
+        }
     }
 
     /// 选项窗口(参考件 options 窗:General / E-Mail / Slideshow 等页签;
@@ -4455,7 +4883,7 @@ impl App {
         std::mem::take(&mut self.folder_groups.1)
     }
 
-    /// 组头(参考件 `CAlbumLabel`,偏移取自 `constants.ui` 的 alabel_iconoffset*):
+    /// 组头(参考件每个相册上方那行:大图标 + 名称 + 日期,图标偏移照原版排版):
     /// 大号目录图标 + 文件夹名 + 组内最早拍摄日期与张数,右侧挂本组动作按钮。
     ///
     /// `date` 由调用方缓存好传进来(见 `take_folder_groups`):逐帧扫全组找最早日期
@@ -4869,10 +5297,7 @@ impl App {
             )
         });
         if star_clicked {
-            let new = if star0 { 0 } else { 1 };
-            let _ = timeline::set_star(&self.store, id, new);
-            self.rows[idx].star = new;
-            self.sync_sidecars(id, new);
+            self.toggle_star(id);
         }
         if preview_clicked {
             if self.rows[idx].kind == crate::video::kind::MOVIE {
@@ -5555,7 +5980,7 @@ impl eframe::App for App {
                     ui.separator();
                     // —— 文件 ——
                     ui.menu_button("文件(F)", |ui| {
-                        // 属性(参考件 File > Properties,imageproperties 窗)。
+                        // 属性(参考件 File > Properties 窗)。
                         if ui
                             .add_enabled(
                                 self.preview.is_some() || !self.sel.is_empty(),
@@ -6104,28 +6529,10 @@ impl eframe::App for App {
                 });
             });
 
-        // ===== 右侧属性面板:可伸缩,平时收起,工具栏「属性面板」或面板头「»」收展;
-        // 未来属性类工具(信息/EXIF 等)放这里 =====
-        if self.props_panel {
-            egui::SidePanel::right("props")
-                .resizable(true)
-                .default_width(280.0)
-                .width_range(220.0..=420.0)
-                .frame(crate::theme::side_frame())
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("属性").size(14.0).strong());
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("»").clicked() {
-                                self.props_panel = false;
-                                let _ = self.store.set_setting("props_panel", "0");
-                            }
-                        });
-                    });
-                    ui.separator();
-                    ui.add_space(4.0);
-                    ui.small("预留面板:照片属性、信息等将放在这里。");
-                });
+        // ===== 右栏抽屉:可伸缩,平时收起,工具栏「属性面板」或面板头「»」收展;
+        // 属性 / 标签 / 人物 / 地点 四页签共用同一张目标照片 =====
+        if self.drawer_open {
+            self.drawer_ui(ctx);
         }
 
         // 右侧面板:效果系统
@@ -6142,7 +6549,7 @@ impl eframe::App for App {
                 });
         }
 
-        // 左侧导航面板(参考件 CAlbumList:分类列表常驻,内容随选中项切换)。
+        // 左侧导航面板(参考件左栏分类列表:常驻,内容随选中项切换)。
         #[cfg(feature = "ai")]
         if self.view == ViewKind::Faces && self.face_people.is_empty() && self.face_rx.is_none() {
             self.refresh_people_and_suggestions();
@@ -6785,7 +7192,7 @@ impl eframe::App for App {
                     ViewKind::Folder => {
                         if self.folder_show_all {
                             // 平铺图库(参考件):一次铺开所有文件夹,
-                            // 每个文件夹一个 CAlbumLabel 组头 + 一组逐行缩略图。
+                            // 每个文件夹一个相册组头 + 一组逐行缩略图。
                             let groups = self.take_folder_groups();
                             for (folder, idxs, date) in &groups {
                                 self.album_label(ui, folder, date, idxs.len());
@@ -7380,10 +7787,7 @@ impl eframe::App for App {
                                 })
                                 .clicked()
                             {
-                                let new = if star { 0 } else { 1 };
-                                let _ = timeline::set_star(&self.store, id, new);
-                                self.rows[idx].star = new;
-                                self.sync_sidecars(id, new);
+                                self.toggle_star(id);
                             }
                             if ui.button("保存(烘培)").clicked() {
                                 self.start_bake(id);
@@ -7414,75 +7818,9 @@ impl eframe::App for App {
                             ui.label(parts.join(" · "));
                         }
                         ui.label(format!("文件: {path}"));
-                        // 标题(参考件 Caption:单图视图直接编辑,失焦/回车保存)。
-                        if self.caption_edit.as_ref().map(|(k, _)| *k) != Some(id) {
-                            self.caption_edit = Some((id, self.store.get_caption(id)));
-                        }
-                        if let Some((_, cap)) = &mut self.caption_edit {
-                            let resp = ui
-                                .horizontal(|ui| {
-                                    ui.label("标题:");
-                                    ui.add(
-                                        egui::TextEdit::singleline(cap)
-                                            .desired_width(ui.available_width() - 60.0),
-                                    )
-                                })
-                                .inner;
-                            let enter =
-                                ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
-                            if resp.lost_focus() || enter {
-                                if *cap != self.store.get_caption(id) {
-                                    let _ = self.store.set_caption(id, cap);
-                                    self.fx_msg = "标题已保存".into();
-                                }
-                            }
-                        }
+                        self.caption_editor(ui, id);
                         ui.separator();
-                        ui.horizontal(|ui| {
-                            ui.label("标签:");
-                            if ui.text_edit_singleline(&mut self.input_tag).lost_focus()
-                                && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                            {
-                                let t = std::mem::take(&mut self.input_tag);
-                                if !t.is_empty() {
-                                    let _ = timeline::add_tag(&self.store, id, &t);
-                                    self.sync_sidecars(id, self.rows[idx].star);
-                                }
-                            }
-                            if ui.button("添加").clicked() {
-                                let t = std::mem::take(&mut self.input_tag);
-                                if !t.is_empty() {
-                                    let _ = timeline::add_tag(&self.store, id, &t);
-                                    self.sync_sidecars(id, self.rows[idx].star);
-                                }
-                            }
-                        });
-                        if let Ok(tags) = timeline::tags_of(&self.store, id) {
-                            if !tags.is_empty() {
-                                ui.horizontal_wrapped(|ui| {
-                                    for t in tags.clone() {
-                                        let col = self
-                                            .tags
-                                            .iter()
-                                            .find(|x| x.name == t)
-                                            .and_then(|x| tag_color(x.color.as_deref()));
-                                        ui.horizontal(|ui| {
-                                            if let Some(col) = col {
-                                                let (rect, _) = ui.allocate_exact_size(
-                                                    egui::vec2(8.0, 8.0),
-                                                    egui::Sense::hover(),
-                                                );
-                                                ui.painter().rect_filled(rect, 1.0, col);
-                                            }
-                                            if ui.small_button(format!("{t} ✕")).clicked() {
-                                                let _ = timeline::remove_tag(&self.store, id, &t);
-                                                self.sync_sidecars(id, self.rows[idx].star);
-                                            }
-                                        });
-                                    }
-                                });
-                            }
-                        }
+                        self.tags_editor(ui, id);
                     });
                 if !preview_open {
                     self.preview = None;
@@ -7757,7 +8095,7 @@ impl eframe::App for App {
             self.show_changes = open;
         }
 
-        // P3-ui:属性窗口(imageproperties 等价物)。
+        // P3-ui:属性窗口(原版 File > Properties 等价物)。
         if self.show_props {
             self.props_ui(ctx);
         }
