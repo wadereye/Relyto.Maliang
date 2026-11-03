@@ -8397,7 +8397,7 @@ impl eframe::App for App {
         if self.mft_ask_grant {
             let mut open = self.mft_ask_grant;
             let mut decided: Option<MftGrant> = None;
-            // msgbox 式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
+            // 系统对话框式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
             // 推荐档绿底,其余两档浅蓝/深蓝递进。
             const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
             const GRANT_BLUE_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x9A, 0xD2);
