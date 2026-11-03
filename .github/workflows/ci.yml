@@ -1,0 +1,25 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+      - name: Check tests
+        run: cargo check --tests --no-default-features
+      - name: Run tests
+        run: cargo test --no-default-features
