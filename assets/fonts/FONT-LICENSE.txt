@@ -1,0 +1,10 @@
+阿里巴巴普惠体 3.0 (Alibaba PuHuiTi 3.0)
+=========================================
+
+文件:AlibabaPuHuiTi-3-55-Regular.ttf(55 Regular 字重,8.5MB)
+来源:npm 包 alibabapuhuiti-3-55-regular@1.0.0(经 jsdelivr/unpkg 分发的官方字体文件)
+官方站点:https://www.alibabafonts.com/
+
+授权:阿里巴巴普惠体官方声明免费授权,允许个人与商业场景免费使用(含 App 内置),
+无需支付费用;具体条款以官方站点公布的《阿里巴巴普惠体使用许可》为准。
+本应用内置该字体文件用于界面渲染,未做修改。
