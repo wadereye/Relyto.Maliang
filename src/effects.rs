@@ -2275,7 +2275,9 @@ mod tests {
     /// `vignette_glow` 有分派没登记,再到本轮 `enhance` 有分支却不在效果表里 ——
     /// 三件事是同一个病。分支清单直接从源码解析,杜绝手工清单漂移。
     fn apply_effect_arms() -> Vec<String> {
-        let src = include_str!("effects.rs");
+        // 统一成 LF 再解析:Windows 签出是 CRLF,顶层 `}` 那行会是 `}\r\n`,
+        // 直接找 "\n}\n" 会一个都匹配不到(测试本身不该依赖签出的换行风格)。
+        let src = include_str!("effects.rs").replace("\r\n", "\n");
         let start = src.find("pub fn apply_effect").expect("apply_effect 应存在");
         let body = &src[start..];
         let end = body.find("\n}\n").expect("apply_effect 应以顶层 } 结束");
