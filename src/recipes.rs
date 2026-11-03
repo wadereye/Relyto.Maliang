@@ -2752,7 +2752,8 @@ mod sampler_tests {
     ///
     /// 分支清单直接从本文件源码里解析,不另抄一份常量表,避免以后两处漂移。
     fn dispatch_arms() -> Vec<String> {
-        let src = include_str!("recipes.rs");
+        // 同 effects 的那个坑:先统一换行风格,`"\n}\n"` 才稳定匹配。
+        let src = include_str!("recipes.rs").replace("\r\n", "\n");
         let start = src
             .find("pub fn apply_with")
             .expect("apply_with 应存在");
