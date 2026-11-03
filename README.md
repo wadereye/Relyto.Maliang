@@ -1,8 +1,4 @@
-<div align="right">
-
-English | [简体中文](./README.zh-CN.md)
-
-</div>
+| English | [简体中文](./README.zh-CN.md) |
 
 # Relyto.Maliang (马良)
 
@@ -12,7 +8,7 @@ English | [简体中文](./README.zh-CN.md)
 management and editing app — fast, simple, and a joy to use. Sadly, Google
 discontinued it in 2016, leaving a gap that no modern tool has quite filled.
 That's why this project sets out to rewrite Picasa in Rust and release it as
-open source, so the experience we loved can live on.
+open source, so this classic experience can live on.
 
 If Maliang is useful to you, please consider giving the repo a
 [⭐ star](https://github.com/wadereye/Relyto.Maliang/stargazers) — and if
@@ -26,60 +22,101 @@ organization, and native, offline, privacy-first AI capabilities. All of your
 data stays on your own machine — nothing is uploaded to the cloud, and your
 private photos are never scanned and sent anywhere.
 
-The project is in early development (v0.1.0). The core browsing, indexing, and
-thumbnail pipeline are already working.
+Version 0.1 was released on 2026-10-31, and v0.2 is wrapping up. See the
+[changelog](./CHANGELOG.en.md) for what's new in each release.
 
-## Feature Roadmap
+## Feature Overview (gradually implemented)
 
-### Implemented / In Progress
-- **Photo indexing & browsing**: scans local directories and builds a SQLite
-  index, with timeline and folder views.
-- **Multi-level thumbnails**: a persistent background worker generates and
-  caches thumbnails at four sizes — Small96 / Normal256 / Big512 /
-  Preview1024 — keeping the UI smooth and responsive.
-- **Timeline view**: grouped by capture date, following Picasa's view and
-  sorting conventions.
-- **Folder view**: watches directory changes (event debouncing + polling +
-  baseline three-tier gating) and incrementally updates the index.
-- **Tags / star ratings**: reads and writes the classic `picasa.ini`,
+### Browsing & Organizing
+
+- **Full-disk scan & index**: once a folder is added to the library, a local
+  index (SQLite) is built automatically; folders come first — your originals
+  are never copied or moved.
+- **Multiple views**: timeline (grouped by capture date) / folders / albums
+  (named collections that never touch files).
+- **Left sidebar directory tree**: a real, recursively expanded tree with a
+  scan progress percentage.
+- **Multi-level thumbnails**: generated and cached on demand at four sizes —
+  96 / 256 / 512 / 1024 — keeping browsing smooth.
+- **Automatic updates**: while running, changes are tracked live via file
+  system events; files added or removed while the app was closed are
+  reconciled automatically at the next launch.
+- **Slideshow**: play the selected photos or the entire current view.
+- **Sorting & thumbnail size**: by capture date / filename, ascending or
+  descending, normal / small.
+
+### Quick Search
+
+- **Whole-disk filename index**: the first use builds a name index for the
+  entire disk (a few seconds for millions of files); afterwards, searching
+  for photos, videos, or documents returns results in milliseconds.
+- **Filter by type**: all / images (RAW included) / videos / audio /
+  archives / executables / documents.
+- **Top bar global search box**: type a filename anywhere to jump into
+  quick search.
+- **One-time authorization, silent background updates**: once registered as
+  a scheduled task with administrator authorization, the index stays fresh
+  automatically at boot; it can be revoked anytime under Options > General.
+
+### Editing & Effects
+
+- **Preview editing**: rotate, crop, zoom & pan, curves, exposure, contrast,
+  color temperature, tint, sharpen, blur, grain, vignette, and more — all
+  non-destructive; changes are only baked to disk via F2 save.
+- **One-click effects**: auto contrast / auto color / warm tone / cool tone /
+  positive film / LOMO / backlight compensation and dozens more, aligned
+  with the original Picasa's behavior.
+- **Style filters**: dozens of grouped recipes — film grain, toy camera,
+  instant photo, cinemascope, sixties, pencil sketch, cross process,
+  two-tone, neon, night vision, mat board, rounded corners…
+- **Shader effects**: hexagonal cells, block ripples, circular splatter,
+  crystallize, waterfall, per-channel HSL.
+
+### AI Capabilities (the `ai` feature is enabled by default, can be trimmed off)
+
+- **OCR text recognition**: text inside photos becomes searchable.
+- **Face organizing**: detection, clustering, quality scoring, semi-automatic
+  naming suggestions, ignored clusters.
+- **CLIP semantic search**: bilingual Chinese/English descriptive search such
+  as "find photos with cats".
+
+### Import & Export
+
+- **WiFi phone import**: visit the computer's address from a phone browser
+  and send photos into Incoming.
+- **Device import**: import from USB-connected cameras, phones, and other
+  portable devices via WPD / WIA (Windows).
+- **Export & baking**: export by the current view range with edit parameters
+  baked into the output; the original files are never touched.
+- **Video**: recognizes common formats, extracts thumbnails, and plays them
+  with the system player.
+
+### Management & Interoperability
+
+- **Duplicate photo detection**: perceptual hashing finds visually similar
+  photos (beyond the original's capabilities).
+- **Color labels / star ratings**: reads and writes the classic `picasa.ini`,
   interoperable with the original Picasa.
-- **Duplicate detection**: perceptual hashing based on dHash to find visually
-  similar photos (beyond the original's capabilities).
-- **EXIF & GPS**: reads capture parameters and coordinates, with KML export.
-- **Faces & albums**: face detection, template matching, clustering, and
-  naming (enabled by default via the `ai` feature).
-- **Editing & one-click enhance**: curves (natural cubic spline), exposure /
-  black-and-white / grain effects; the one-click enhance set includes
-  black-and-white, sepia, grain, and sharpen, plus self-designed warm tone,
-  cool tone, vignette, and fade, and gamma, linear blur, focal softening,
-  focal desaturation, and directional brightness / saturation / sharpness.
-  Effect parameters live in an asset pack for easy tuning.
-- **Style recipes**: 28 grouped filter recipes (Fade, Frame, Drop Shadow,
-  Center Mosaic, Zoom Blur, Film Grain, Strong Dynamic, Thermal Imaging, Toy
-  Camera, Infrared Film, Local Contrast, Vignette Glow, Edge Glow, Mat Board,
-  Neon, Night Vision, Pixelate, Instant Photo, Posterize, Rounded Corners,
-  Monochrome Wash, Two-Tone, Comic, Soft Glow, Pencil Sketch, Cross Process,
-  Cinemascope, Sixties). Each recipe is a fixed sequence of pixel operations
-  with a unified strength control that sets the blend ratio against the
-  original image. A set of reusable primitive operators is also provided
-  (blend modes, masks, box blur, linear blur, gradient maps, edge detection,
-  zoom blur, posterization, borders, drop shadow, rotation, directional
-  adjustments, and more).
-- **Device import**: imports from cameras, phones, and other portable devices
-  via WPD / WIA (Windows).
-- **Video support**: recognizes common video formats, extracts thumbnails,
-  and plays them with the system player.
-- **XMP mirroring**: mirrors edits and metadata to XMP for interoperability
-  with other tools.
-- **Export / save**: bakes edit parameters into exports while preserving the
-  original files.
+- **XMP mirroring**: edits and metadata are mirrored to XMP for
+  interoperability with other tools.
+- **EXIF / GPS**: reads capture parameters and coordinates, with KML
+  geotag export.
+- **Folder manager**: add/remove watched directories, rescan each one, and
+  clean up missing files.
+- **Index backup & compaction**; **relocatable data directory** (thumbnails /
+  index / models all move together).
 
-### AI Capabilities (the `ai` feature is enabled by default)
-- OCR text recognition
-- Automatic people-grouping suggestions and semi-automatic clustering
-- CLIP semantic search ("find photos with cats")
+### Interface & Experience
 
-### Intentionally Out of Scope
+- Dark / light themes; built-in Alibaba PuHuiTi Chinese font; icons use the
+  open-source Lucide set.
+- Menu structure follows Picasa 3 (File / Edit / View / Tools / Help);
+  native right-click menus on photos.
+- Right info drawer: properties / tags / people / places.
+- **Fully local: no network access, no telemetry.**
+
+### Intentionally Not Planned (present in the original Picasa, but not planned for now)
+
 Advanced retouching workflows (retouch / picnik), collage / poster / CD
 burning, online sharing (Picasa Web / social platforms / email / printing),
 TWAIN camera scanning, cloud album sync, and Picasa2 migration.
