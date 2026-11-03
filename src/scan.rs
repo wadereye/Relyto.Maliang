@@ -180,8 +180,8 @@ pub struct ScanSummary {
 ///   之后每次上报只做一次浮点乘法(不反复做整数除法)。本结构采用同一思路:
 ///   `total` 设定后立即算出 `inv_total`,进度 = `done * inv_total`。
 /// - 目录扫描 + 取消检查:
-///   取消标志是**独立于工作线程的原子字节**,热路径每处理 N 个文件查一次;
-///   取消时停止批量入库。
+///   取消标志独立于工作线程。遍历阶段每 N 个目录项检查一次。
+///   并行处理阶段检查每个候选文件。取消后仍写入已完成记录。
 ///
 /// 进度是**原子计数**而非回调 —— UI 线程读时无锁,与原版
 /// 进度接口的解耦思路一致。
@@ -195,7 +195,7 @@ pub struct ScanControl {
     inv_total: AtomicU64,
     /// 取消标志(1 字节原子标志)。
     cancelled: AtomicBool,
-    /// 命中取消检查的间隔(每 N 个文件查一次,避免每文件一次原子读)。
+    /// 遍历阶段的取消检查间隔。
     check_every: usize,
 }
 
@@ -260,7 +260,7 @@ impl ScanControl {
         self.cancelled.load(Ordering::Relaxed)
     }
 
-    /// 热路径检查:每 `check_every` 个文件查一次取消标志(省原子读开销)。
+    /// 遍历阶段每 `check_every` 个目录项检查一次取消标志。
     #[inline]
     pub fn should_stop(&self, counter: usize) -> bool {
         if counter % self.check_every == 0 {
@@ -306,14 +306,29 @@ pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
     scan_dir_ctrl(store, roots, &ctrl)
 }
 
+// 收集已完成的记录。取消后跳过未开始的候选文件。
+fn collect_completed<T: Send>(
+    candidates: Vec<PathBuf>,
+    ctrl: &ScanControl,
+    process: impl Fn(PathBuf) -> Option<T> + Sync + Send,
+) -> Vec<T> {
+    candidates
+        .into_par_iter()
+        .filter_map(|p| {
+            if ctrl.is_cancelled() {
+                None
+            } else {
+                process(p)
+            }
+        })
+        .collect()
+}
+
 /// 带进度与取消的扫描。
 ///
-/// 取消语义(对齐原版扫描取消检查):
-/// - **遍历阶段**每 64 个目录项查一次取消标志(原版同样是分段查,不是每文件一次);
-/// - **并行处理阶段**用 rayon 的 `collect::<Result<Vec<_>,_>>()`,
-///   任一线程发现取消即整体短路;
-/// - 取消时**已算出的记录照常入库**(已完成的工作不丢),
-///   只是不再继续处理剩余文件。
+/// 遍历阶段每 64 个目录项检查一次取消标志。
+/// 并行处理阶段每个候选文件检查一次。
+/// 取消后将已完成的记录入库。
 pub fn scan_dir_ctrl(
     store: &Store,
     roots: &[PathBuf],
@@ -360,64 +375,47 @@ pub fn scan_dir_ctrl(
     let total = candidates.len();
     ctrl.set_total(total);
 
-    let counter = Arc::new(AtomicUsize::new(0));
     let unchanged = Arc::new(AtomicUsize::new(0));
     let added = Arc::new(AtomicUsize::new(0));
     let modified = Arc::new(AtomicUsize::new(0));
-    let ctrl2 = ctrl.clone();
-    let counter2 = counter.clone();
     let unchanged2 = unchanged.clone();
     let added2 = added.clone();
     let modified2 = modified.clone();
 
-    // rayon 支持 `collect::<Result<Vec<T>, E>>()`:任一线程返回 Err 即整体短路。
-    let collected: Result<Vec<Option<Record>>, Cancelled> = candidates
-        .into_par_iter()
-        .map(|p| {
-            // ---- 快速路径:指纹一致则整条跳过(不读 EXIF、不解码) ----
-            let md = match std::fs::metadata(&p) {
-                Ok(m) => m,
-                Err(_) => return Ok(None),
-            };
-            let mtime = match md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            {
-                Some(d) => d.as_millis() as i64,
-                None => return Ok(None),
-            };
-            let size = md.len() as i64;
-            let key = p.to_string_lossy().into_owned();
-            if let Some(&(osize, omtime)) = prints.get(&key) {
-                if osize == size && omtime == mtime {
-                    unchanged2.fetch_add(1, Ordering::Relaxed);
-                    counter2.fetch_add(1, Ordering::Relaxed);
-                    ctrl2.advance(1);
-                    return Ok(None);
-                }
-                // 库里有但内容变了 → 算"修改"(P1-12 变更日志)。
-                modified2.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // 库里没有 → 算"新增"。
-                added2.fetch_add(1, Ordering::Relaxed);
+    let records = collect_completed(candidates, ctrl, |p| {
+        // 快速路径:未变文件跳过 EXIF 和解码。
+        let md = match std::fs::metadata(&p) {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        let mtime = match md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        {
+            Some(d) => d.as_millis() as i64,
+            None => return None,
+        };
+        let size = md.len() as i64;
+        let key = p.to_string_lossy().into_owned();
+        if let Some(&(osize, omtime)) = prints.get(&key) {
+            if osize == size && omtime == mtime {
+                unchanged2.fetch_add(1, Ordering::Relaxed);
+                ctrl.advance(1);
+                return None;
             }
-            // 取消检查:每处理 64 个文件查一次(原版分段查的思路)。
-            let n = counter2.fetch_add(1, Ordering::Relaxed);
-            ctrl2.advance(1);
-            if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
-                return Err(Cancelled);
-            }
-            Ok(read_record_with_meta(&p, size, mtime))
-        })
-        .collect();
+            // 库里有但内容变了 → 算"修改"(P1-12 变更日志)。
+            modified2.fetch_add(1, Ordering::Relaxed);
+        } else {
+            // 库里没有 → 算"新增"。
+            added2.fetch_add(1, Ordering::Relaxed);
+        }
+        let record = read_record_with_meta(&p, size, mtime);
+        ctrl.advance(1);
+        record
+    });
 
-    let cancelled = collected.is_err();
-    let records: Vec<Record> = collected
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect();
+    let cancelled = ctrl.is_cancelled();
     let indexed = records.len();
     // 取消也要把已算出的记录入库(不丢已完成的工作)。
     store_insert(store, &records)?;
@@ -444,9 +442,6 @@ pub fn scan_dir_ctrl(
         cancelled,
     })
 }
-
-/// 取消标记内部类型(rayon 短路信号)。
-struct Cancelled;
 
 /// 读取一条记录(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
 fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
@@ -890,11 +885,70 @@ mod tests {
         }
         let store = Store::open_mem().unwrap();
         let ctrl = Arc::new(ScanControl::new());
-        // 先取消 → 遍历阶段立刻退出,一张都不索引。
+        // 先取消。并行处理阶段不索引文件。
         ctrl.cancel();
         let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl).unwrap();
         assert!(s.cancelled, "应标记为已取消");
         assert_eq!(s.indexed, 0, "取消后不应索引任何文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelled_scan_keeps_completed_records_and_resumes_without_duplicates() {
+        let dir = std::env::temp_dir().join(format!("rk-scanpartial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidates: Vec<PathBuf> = (0..5)
+            .map(|i| {
+                let path = dir.join(format!("clip-{i}.mp4"));
+                std::fs::write(&path, b"\0\0\0\x18ftypmp42").unwrap();
+                path
+            })
+            .collect();
+
+        let store = Store::open_mem().unwrap();
+        let ctrl = ScanControl::new();
+        let completed = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let records = pool.install(|| {
+            collect_completed(candidates, &ctrl, |path| {
+                let md = std::fs::metadata(&path).unwrap();
+                let mtime = md
+                    .modified()
+                    .unwrap()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64;
+                let record = read_record_with_meta(&path, md.len() as i64, mtime);
+                if completed.fetch_add(1, Ordering::Relaxed) == 1 {
+                    ctrl.cancel();
+                }
+                record
+            })
+        });
+        assert!(ctrl.is_cancelled());
+        assert_eq!(records.len(), 2);
+        store_insert(&store, &records).unwrap();
+
+        let count = || -> i64 {
+            store
+                .0
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM photos", [], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(), 2);
+
+        let resumed = scan_dir(&store, &[dir.clone()]).unwrap();
+        assert_eq!(resumed.indexed, 3);
+        assert_eq!(resumed.unchanged, 2);
+        assert_eq!(count(), 5);
+        let repeated = scan_dir(&store, &[dir.clone()]).unwrap();
+        assert_eq!(repeated.indexed, 0);
+        assert_eq!(repeated.unchanged, 5);
+        assert_eq!(count(), 5);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
