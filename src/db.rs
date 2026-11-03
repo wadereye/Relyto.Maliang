@@ -119,7 +119,9 @@ pub fn set_data_dir(dir: Option<&Path>) -> std::io::Result<()> {
 
 /// 启动早期(Store 打开前)执行 pending 迁移:把 `pending_from` 目录里的
 /// 文件按「目标缺失才复制」搬到当前数据目录(逐文件 tmp+rename,失败不动
-/// 已复制部分,下次启动重试),成功后清掉 pending 行。
+/// 已复制部分,下次启动重试),成功后清掉 pending 行,并**尽力删除旧目录**
+/// —— 旧目录残留会让人分不清哪份是生效数据(2026-11-03 清库事故);
+/// 删不掉的条目(被占用)留着即可,不影响新目录生效(用户拍板:能删尽删)。
 /// 环境变量覆盖(测试/便携)时直接跳过,不碰任何目录。
 pub fn migrate_pending_data() {
     let env_set = std::env::var_os("MALIANG_DATA_DIR")
@@ -140,6 +142,7 @@ pub fn migrate_pending_data() {
     if from != target {
         let _ = std::fs::create_dir_all(&target);
         if copy_missing_recursive(&from, &target) {
+            remove_tree_best_effort(&from);
             let kept: Vec<&str> = text
                 .lines()
                 .filter(|l| !l.starts_with("pending_from="))
@@ -195,6 +198,26 @@ fn copy_missing_recursive(src: &Path, dst: &Path) -> bool {
         }
     }
     ok
+}
+
+/// 尽力删除一棵目录树:单个条目删不掉(被占用)就跳过继续,绝不报错。
+/// 用于迁移完成后清旧数据目录 — 残留的少数文件不构成正确性问题。
+fn remove_tree_best_effort(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        let _ = std::fs::remove_file(dir);
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => remove_tree_best_effort(&p),
+            Ok(_) => {
+                let _ = std::fs::remove_file(&p);
+            }
+            Err(_) => {}
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// 缓存目录(缩略图)。可用 MALIANG_CACHE_DIR 覆盖。
@@ -1786,6 +1809,31 @@ mod tests {
         assert!(!dst.join("data.location").exists(), "marker 不随迁");
         assert!(!dst.join("mft_report.txt").exists());
         assert!(!dst.join("junk.tmp").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_tree_best_effort_deletes_all_and_survives_locked_file() {
+        let base = std::env::temp_dir().join(format!("rk-rmbe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(base.join("a.db"), b"A").unwrap();
+        std::fs::write(sub.join("b.bin"), b"B").unwrap();
+        // Windows 上只读文件删除会被拒 — 正好验证 best-effort 不中断不 panic。
+        let ro = base.join("locked.txt");
+        std::fs::write(&ro, b"R").unwrap();
+        let mut perm = std::fs::metadata(&ro).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&ro, perm).unwrap();
+        remove_tree_best_effort(&base);
+        assert!(!base.join("a.db").exists(), "普通文件应删掉");
+        assert!(!sub.exists(), "子目录应删掉");
+        if ro.exists() {
+            let mut perm = std::fs::metadata(&ro).unwrap().permissions();
+            perm.set_readonly(false);
+            std::fs::set_permissions(&ro, perm).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
