@@ -825,6 +825,33 @@ pub fn cli_mft_scan(spec: Option<&str>, report: Option<&str>) -> Result<()> {
     res
 }
 
+/// 报告文本里是否有会影响图库对账的实质变更:
+/// 任一卷的增量行(新增/更新/删除任一 >0),或发生了全量重建
+/// (checkpoint 已换代,保守按有变)。GUI 据此决定要不要做对账重扫。
+pub fn report_has_changes(text: &str) -> bool {
+    let count_after = |line: &str, key: &str| -> u64 {
+        line.split(key)
+            .nth(1)
+            .and_then(|rest| {
+                rest.trim_start()
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+            })
+            .and_then(|d| d.parse().ok())
+            .unwrap_or(0)
+    };
+    for l in text.lines() {
+        if l.contains("增量完成") {
+            if count_after(l, "新增") + count_after(l, "更新") + count_after(l, "删除") > 0 {
+                return true;
+            }
+        } else if l.contains("] 完成:") {
+            return true;
+        }
+    }
+    false
+}
+
 fn cli_mft_scan_run(spec: Option<&str>, report: Option<&std::path::Path>) -> Result<()> {
     let mut rep = report
         .map(|p| -> Result<std::fs::File> {
@@ -1070,6 +1097,25 @@ pub fn cli_mft_check() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_has_changes_parses_volume_lines() {
+        let ok = "成功 索引已写入 nameindex.bin(1 卷,文件 56.5 MB),总耗时 0.2s";
+        // 增量但零变化 → 不算
+        let inc0 = "[D:] 增量完成:CLOSE 记录 16744 条 → 新增 0,更新 0,删除 0,checkpoint → 0x1a2b,耗时 0.1s";
+        assert!(!report_has_changes(&format!("{inc0}\n{ok}")));
+        // 增量有实质变化 → 算
+        let inc = "[D:] 增量完成:CLOSE 记录 16744 条 → 新增 3160,更新 1147,删除 472,checkpoint → 0x1a2b,耗时 0.1s";
+        assert!(report_has_changes(&format!("{inc}\n{ok}")));
+        // 只要删除 >0 也算(改名旧名/移走都走删除位)
+        let del = "[C:] 增量完成:CLOSE 记录 12 条 → 新增 0,更新 0,删除 2,checkpoint → 0x9c,耗时 0.0s";
+        assert!(report_has_changes(&format!("{del}\n{ok}")));
+        // 全量枚举收尾行(checkpoint 换代)→ 保守算有变
+        let full = "[C:] 完成:内核记录 959000 条 → 索引 900000 条(文件 800000,目录 100000),名字池 40.0 MB,耗时 3.6s";
+        assert!(report_has_changes(&format!("{full}\n{ok}")));
+        // 只有进度行、没有卷收尾行 → 不算
+        assert!(!report_has_changes("PROGRESS 0.50 [C:] 全量枚举中…已 1234 条"));
+    }
 
     /// 造一个小卷:C:\Pics\IMG_0001.JPG、C:\Pics\RAW\DSC.NEF、孤儿条目。
     fn tiny_volume() -> VolumeIndex {

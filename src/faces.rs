@@ -11,20 +11,21 @@ use std::collections::HashMap;
 pub const FACE_ALGO_VERSION: &str = "v2";
 
 pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT id, path FROM photos
-         WHERE id NOT IN (SELECT DISTINCT photo_id FROM faces)
-         ORDER BY id LIMIT ?1",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map(params![cap as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT id, path FROM photos
+             WHERE id NOT IN (SELECT DISTINCT photo_id FROM faces)
+             ORDER BY id LIMIT ?1",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(params![cap as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
 }
 
 /// 存一张人脸(含质量评分与嵌入模板)。
@@ -39,30 +40,31 @@ pub fn save_face(
     quality: f32,
     vec: &[f32],
 ) -> Result<i64> {
-    let conn = store.0.lock().unwrap();
     let mut blob = Vec::with_capacity(vec.len() * 4);
     for v in vec {
         blob.extend_from_slice(&v.to_le_bytes());
     }
-    conn.execute(
-        "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
-        params![
-            photo_id,
-            x1 as f64,
-            y1 as f64,
-            x2 as f64,
-            y2 as f64,
-            score as f64,
-            quality as f64
-        ],
-    )?;
-    let face_id = conn.last_insert_rowid();
-    conn.execute(
-        "INSERT INTO face_templates(face_id,dim,vec) VALUES(?1,?2,?3)",
-        params![face_id, vec.len() as i64, blob],
-    )?;
-    Ok(face_id)
+    store.write(move |conn| -> Result<i64> {
+        conn.execute(
+            "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
+            params![
+                photo_id,
+                x1 as f64,
+                y1 as f64,
+                x2 as f64,
+                y2 as f64,
+                score as f64,
+                quality as f64
+            ],
+        )?;
+        let face_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO face_templates(face_id,dim,vec) VALUES(?1,?2,?3)",
+            params![face_id, vec.len() as i64, blob],
+        )?;
+        Ok(face_id)
+    })
 }
 
 /// 人脸质量评分 [0,1](对应原版 facequality):
@@ -157,9 +159,8 @@ fn cos(a: &[f32], b: &[f32]) -> f32 {
 /// 增量聚类:未分配且未忽略的脸与各簇**质量加权质心**比余弦,
 /// >= thr 归簇,否则新建簇。忽略的脸(ignored=1)不参与也不成簇。
 pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
-    let conn = store.0.lock().unwrap();
-    let mut clusters: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
-    {
+    let mut clusters: HashMap<i64, Vec<(Vec<f32>, f32)>> = store.read(|conn| -> Result<_> {
+        let mut clusters: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
         let mut st = conn.prepare(
             "SELECT f.cluster, t.vec, COALESCE(f.quality,0.5) FROM faces f
              JOIN face_templates t ON t.face_id=f.id
@@ -175,8 +176,9 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 .or_default()
                 .push((blob_to_vec(&blob), q as f32));
         }
-    }
-    let todo: Vec<(i64, Vec<f32>, f32)> = {
+        Ok(clusters)
+    })?;
+    let todo: Vec<(i64, Vec<f32>, f32)> = store.read(|conn| -> Result<_> {
         let mut st = conn.prepare(
             "SELECT f.id, t.vec, COALESCE(f.quality,0.5) FROM faces f
              JOIN face_templates t ON t.face_id=f.id
@@ -190,8 +192,10 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             let q: f64 = r.get(2)?;
             out.push((id, blob_to_vec(&blob), q as f32));
         }
-        out
-    };
+        Ok(out)
+    })?;
+    // 先在内存里定簇,再一次事务写回 —— 每脸一条 UPDATE 也锁一次写连接。
+    let mut updates: Vec<(i64, i64)> = Vec::with_capacity(todo.len());
     for (face_id, v, q) in todo {
         let mut best: Option<(i64, f32)> = None;
         for (&cid, vs) in &clusters {
@@ -204,22 +208,27 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
         }
         match best {
             Some((cid, c)) if c >= thr => {
-                conn.execute(
-                    "UPDATE faces SET cluster=?1 WHERE id=?2",
-                    params![cid, face_id],
-                )?;
+                updates.push((face_id, cid));
                 clusters.get_mut(&cid).unwrap().push((v, q));
             }
             _ => {
                 let next = clusters.keys().copied().max().unwrap_or(0) + 1;
-                conn.execute(
-                    "UPDATE faces SET cluster=?1 WHERE id=?2",
-                    params![next, face_id],
-                )?;
+                updates.push((face_id, next));
                 clusters.insert(next, vec![(v, q)]);
             }
         }
     }
+    store.write(|conn| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut st = tx.prepare_cached("UPDATE faces SET cluster=?1 WHERE id=?2")?;
+            for (face_id, cid) in &updates {
+                st.execute(params![cid, face_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })?;
     // 簇的默认名不写 people 表:people_overview 是 LEFT JOIN,name 为 NULL 时
     // GUI 回退显示"簇 N";rename_cluster 才会写入 people(id=cluster, name)。
     Ok(clusters.len())
@@ -236,26 +245,27 @@ pub struct PeopleRow {
 
 /// 簇列表(忽略的人脸不计入;按人数升序,与 GUI 显示一致)。
 pub fn people_overview(store: &Store) -> Vec<PeopleRow> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT f.cluster, p.name, COUNT(*), AVG(COALESCE(f.quality,0.5))
-         FROM faces f LEFT JOIN people p ON p.id = f.cluster
-         WHERE f.cluster IS NOT NULL AND f.ignored=0
-         GROUP BY f.cluster ORDER BY count(f.cluster)",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map([], |r| {
-        Ok(PeopleRow {
-            cluster: r.get::<_, i64>(0)?,
-            person: r.get(1)?,
-            count: r.get::<_, i64>(2)? as usize,
-            quality: r.get::<_, f64>(3)? as f32,
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT f.cluster, p.name, COUNT(*), AVG(COALESCE(f.quality,0.5))
+             FROM faces f LEFT JOIN people p ON p.id = f.cluster
+             WHERE f.cluster IS NOT NULL AND f.ignored=0
+             GROUP BY f.cluster ORDER BY count(f.cluster)",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([], |r| {
+            Ok(PeopleRow {
+                cluster: r.get::<_, i64>(0)?,
+                person: r.get(1)?,
+                count: r.get::<_, i64>(2)? as usize,
+                quality: r.get::<_, f64>(3)? as f32,
+            })
         })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
 }
 
 pub struct FaceHit {
@@ -282,20 +292,49 @@ pub fn faces_for_cluster(
     include_ignored: bool,
     min_quality: f32,
 ) -> Vec<FaceHit> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT f.id, f.photo_id, p.path, f.x1, f.y1, f.x2, f.y2, COALESCE(f.quality,0.5)
-         FROM faces f JOIN photos p ON p.id = f.photo_id
-         WHERE f.cluster = ?1 AND (?2=1 OR f.ignored=0)
-           AND COALESCE(f.quality,0.5) >= ?3
-         ORDER BY p.path",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map(
-        params![cluster, include_ignored as i32, min_quality as f64],
-        |r| {
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT f.id, f.photo_id, p.path, f.x1, f.y1, f.x2, f.y2, COALESCE(f.quality,0.5)
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+             WHERE f.cluster = ?1 AND (?2=1 OR f.ignored=0)
+               AND COALESCE(f.quality,0.5) >= ?3
+             ORDER BY p.path",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(
+            params![cluster, include_ignored as i32, min_quality as f64],
+            |r| {
+                Ok(FaceHit {
+                    face_id: r.get(0)?,
+                    photo_id: r.get(1)?,
+                    photo_path: r.get(2)?,
+                    x1: r.get::<_, f64>(3)? as f32,
+                    y1: r.get::<_, f64>(4)? as f32,
+                    x2: r.get::<_, f64>(5)? as f32,
+                    y2: r.get::<_, f64>(6)? as f32,
+                    quality: r.get::<_, f64>(7)? as f32,
+                })
+            },
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    })
+}
+
+/// 单张照片的全部人脸(预览窗叠框用;坐标 = 未旋转原图像素)。
+pub fn faces_for_photo(store: &Store, photo_id: i64) -> Vec<FaceHit> {
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT f.id, f.photo_id, p.path, f.x1, f.y1, f.x2, f.y2, COALESCE(f.quality,0.5)
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+             WHERE f.photo_id = ?1 ORDER BY f.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(params![photo_id], |r| {
             Ok(FaceHit {
                 face_id: r.get(0)?,
                 photo_id: r.get(1)?,
@@ -306,37 +345,10 @@ pub fn faces_for_cluster(
                 y2: r.get::<_, f64>(6)? as f32,
                 quality: r.get::<_, f64>(7)? as f32,
             })
-        },
-    )
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
-}
-
-/// 单张照片的全部人脸(预览窗叠框用;坐标 = 未旋转原图像素)。
-pub fn faces_for_photo(store: &Store, photo_id: i64) -> Vec<FaceHit> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT f.id, f.photo_id, p.path, f.x1, f.y1, f.x2, f.y2, COALESCE(f.quality,0.5)
-         FROM faces f JOIN photos p ON p.id = f.photo_id
-         WHERE f.photo_id = ?1 ORDER BY f.id",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map(params![photo_id], |r| {
-        Ok(FaceHit {
-            face_id: r.get(0)?,
-            photo_id: r.get(1)?,
-            photo_path: r.get(2)?,
-            x1: r.get::<_, f64>(3)? as f32,
-            y1: r.get::<_, f64>(4)? as f32,
-            x2: r.get::<_, f64>(5)? as f32,
-            y2: r.get::<_, f64>(6)? as f32,
-            quality: r.get::<_, f64>(7)? as f32,
         })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
 }
 
 /// 一张照片的人脸 + 归属(右栏人物面板用)。
@@ -354,61 +366,69 @@ pub struct PhotoFace {
 
 /// 单张照片的人脸清单,连簇号与姓名(左连接 people,未命名照样返回)。
 pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT f.id, f.cluster, p.name, f.ignored, COALESCE(f.quality,0.5),
-                f.x1, f.y1, f.x2, f.y2
-         FROM faces f LEFT JOIN people p ON p.id = f.cluster
-         WHERE f.photo_id = ?1 ORDER BY f.id",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map(params![photo_id], |r| {
-        Ok(PhotoFace {
-            face_id: r.get(0)?,
-            cluster: r.get(1)?,
-            person: r.get(2)?,
-            ignored: r.get::<_, i64>(3)? != 0,
-            quality: r.get::<_, f64>(4)? as f32,
-            rect: (
-                r.get::<_, f64>(5)? as f32,
-                r.get::<_, f64>(6)? as f32,
-                r.get::<_, f64>(7)? as f32,
-                r.get::<_, f64>(8)? as f32,
-            ),
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT f.id, f.cluster, p.name, f.ignored, COALESCE(f.quality,0.5),
+                    f.x1, f.y1, f.x2, f.y2
+             FROM faces f LEFT JOIN people p ON p.id = f.cluster
+             WHERE f.photo_id = ?1 ORDER BY f.id",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(params![photo_id], |r| {
+            Ok(PhotoFace {
+                face_id: r.get(0)?,
+                cluster: r.get(1)?,
+                person: r.get(2)?,
+                ignored: r.get::<_, i64>(3)? != 0,
+                quality: r.get::<_, f64>(4)? as f32,
+                rect: (
+                    r.get::<_, f64>(5)? as f32,
+                    r.get::<_, f64>(6)? as f32,
+                    r.get::<_, f64>(7)? as f32,
+                    r.get::<_, f64>(8)? as f32,
+                ),
+            })
         })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
 }
 
 pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
-    store.0.lock().unwrap().execute(
-        "INSERT OR REPLACE INTO people(id,name) VALUES(?1,?2)",
-        params![cluster, name],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO people(id,name) VALUES(?1,?2)",
+            params![cluster, name],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 忽略/恢复整个簇(对应原版 ignoreface:误检簇一键排除)。
 pub fn ignore_cluster(store: &Store, cluster: i64, ignored: bool) -> Result<()> {
-    store.0.lock().unwrap().execute(
-        "UPDATE faces SET ignored=?1 WHERE cluster=?2",
-        params![ignored as i32, cluster],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "UPDATE faces SET ignored=?1 WHERE cluster=?2",
+            params![ignored as i32, cluster],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 pub fn analyzed_photo_ids(store: &Store) -> Vec<i64> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare("SELECT DISTINCT photo_id FROM faces") {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map([], |r| r.get(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    store.read(|conn| {
+        let mut st = match conn.prepare("SELECT DISTINCT photo_id FROM faces") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([], |r| r.get(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    })
 }
 
 pub fn photo_ids_done(store: &Store) -> std::collections::HashSet<i64> {
@@ -417,25 +437,28 @@ pub fn photo_ids_done(store: &Store) -> std::collections::HashSet<i64> {
 
 /// 被忽略的簇列表(GUI "显示已忽略" 时恢复用)。
 pub fn ignored_clusters(store: &Store) -> Vec<i64> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare(
-        "SELECT DISTINCT cluster FROM faces
-         WHERE ignored=1 AND cluster IS NOT NULL ORDER BY cluster",
-    ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map([], |r| r.get::<_, i64>(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT DISTINCT cluster FROM faces
+             WHERE ignored=1 AND cluster IS NOT NULL ORDER BY cluster",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map([], |r| r.get::<_, i64>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// 清空全部人脸数据(算法版本迁移:旧算法产物作废,整库重扫)。
 pub fn wipe_faces(store: &Store) -> Result<()> {
-    let conn = store.0.lock().unwrap();
-    conn.execute("DELETE FROM face_templates", [])?;
-    conn.execute("DELETE FROM faces", [])?;
-    conn.execute("DELETE FROM people", [])?;
+    store.write(|conn| -> Result<()> {
+        conn.execute("DELETE FROM face_templates", [])?;
+        conn.execute("DELETE FROM faces", [])?;
+        conn.execute("DELETE FROM people", [])?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -512,108 +535,109 @@ pub struct Suggestion {
 /// 生成命名建议(score 降序)。thr 建议下限(ArcFace 512 维:
 /// 同人通常 >0.6,异人 <0.3;0.55 起步,分数展示供用户判断)。
 pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
-    let conn = store.0.lock().unwrap();
-    // 已命名簇 -> (name, [(vec, quality)])
-    let mut named: HashMap<i64, (String, Vec<(Vec<f32>, f32)>)> = HashMap::new();
-    {
-        let mut st = match conn.prepare(
-            "SELECT f.cluster, p.name, t.vec, COALESCE(f.quality,0.5) FROM faces f
-             JOIN face_templates t ON t.face_id=f.id
-             JOIN people p ON p.id=f.cluster
-             WHERE f.ignored=0",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let mut rows = match st.query([]) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        loop {
-            let Ok(Some(r)) = rows.next() else { break };
-            let (Ok(cid), Ok(name), Ok(blob), Ok(q)) = (
-                r.get::<_, i64>(0),
-                r.get::<_, String>(1),
-                r.get::<_, Vec<u8>>(2),
-                r.get::<_, f64>(3),
-            ) else {
-                continue;
+    store.read(|conn| {
+        // 已命名簇 -> (name, [(vec, quality)])
+        let mut named: HashMap<i64, (String, Vec<(Vec<f32>, f32)>)> = HashMap::new();
+        {
+            let mut st = match conn.prepare(
+                "SELECT f.cluster, p.name, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                 JOIN face_templates t ON t.face_id=f.id
+                 JOIN people p ON p.id=f.cluster
+                 WHERE f.ignored=0",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
             };
-            named
-                .entry(cid)
-                .or_insert_with(|| (name, Vec::new()))
-                .1
-                .push((blob_to_vec(&blob), q as f32));
-        }
-    }
-    let named_centroids: Vec<(String, Vec<f32>)> = named
-        .iter()
-        .filter_map(|(_, (n, vs))| mean_vec_weighted(vs).map(|m| (n.clone(), m)))
-        .collect();
-    if named_centroids.is_empty() {
-        return Vec::new();
-    }
-    // 未命名簇 -> centroid + count
-    let mut unnamed: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
-    {
-        let mut st = match conn.prepare(
-            "SELECT f.cluster, t.vec, COALESCE(f.quality,0.5) FROM faces f
-             JOIN face_templates t ON t.face_id=f.id
-             LEFT JOIN people p ON p.id=f.cluster
-             WHERE p.id IS NULL AND f.cluster IS NOT NULL AND f.ignored=0",
-        ) {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
-        let mut rows = match st.query([]) {
-            Ok(r) => r,
-            Err(_) => return Vec::new(),
-        };
-        loop {
-            let Ok(Some(r)) = rows.next() else { break };
-            let (Ok(cid), Ok(blob), Ok(q)) = (
-                r.get::<_, i64>(0),
-                r.get::<_, Vec<u8>>(1),
-                r.get::<_, f64>(2),
-            ) else {
-                continue;
+            let mut rows = match st.query([]) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
             };
-            unnamed
-                .entry(cid)
-                .or_default()
-                .push((blob_to_vec(&blob), q as f32));
+            loop {
+                let Ok(Some(r)) = rows.next() else { break };
+                let (Ok(cid), Ok(name), Ok(blob), Ok(q)) = (
+                    r.get::<_, i64>(0),
+                    r.get::<_, String>(1),
+                    r.get::<_, Vec<u8>>(2),
+                    r.get::<_, f64>(3),
+                ) else {
+                    continue;
+                };
+                named
+                    .entry(cid)
+                    .or_insert_with(|| (name, Vec::new()))
+                    .1
+                    .push((blob_to_vec(&blob), q as f32));
+            }
         }
-    }
-    let mut out: Vec<Suggestion> = unnamed
-        .iter()
-        .filter_map(|(&cid, vs)| {
-            let centroid = mean_vec_weighted(vs)?;
-            let mut best: Option<(String, f32)> = None;
-            for (name, c) in &named_centroids {
-                let s = cos(&centroid, c);
-                if best.as_ref().map(|(_, b)| s > *b).unwrap_or(true) {
-                    best = Some((name.clone(), s));
+        let named_centroids: Vec<(String, Vec<f32>)> = named
+            .iter()
+            .filter_map(|(_, (n, vs))| mean_vec_weighted(vs).map(|m| (n.clone(), m)))
+            .collect();
+        if named_centroids.is_empty() {
+            return Vec::new();
+        }
+        // 未命名簇 -> centroid + count
+        let mut unnamed: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
+        {
+            let mut st = match conn.prepare(
+                "SELECT f.cluster, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                 JOIN face_templates t ON t.face_id=f.id
+                 LEFT JOIN people p ON p.id=f.cluster
+                 WHERE p.id IS NULL AND f.cluster IS NOT NULL AND f.ignored=0",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let mut rows = match st.query([]) {
+                Ok(r) => r,
+                Err(_) => return Vec::new(),
+            };
+            loop {
+                let Ok(Some(r)) = rows.next() else { break };
+                let (Ok(cid), Ok(blob), Ok(q)) = (
+                    r.get::<_, i64>(0),
+                    r.get::<_, Vec<u8>>(1),
+                    r.get::<_, f64>(2),
+                ) else {
+                    continue;
+                };
+                unnamed
+                    .entry(cid)
+                    .or_default()
+                    .push((blob_to_vec(&blob), q as f32));
+            }
+        }
+        let mut out: Vec<Suggestion> = unnamed
+            .iter()
+            .filter_map(|(&cid, vs)| {
+                let centroid = mean_vec_weighted(vs)?;
+                let mut best: Option<(String, f32)> = None;
+                for (name, c) in &named_centroids {
+                    let s = cos(&centroid, c);
+                    if best.as_ref().map(|(_, b)| s > *b).unwrap_or(true) {
+                        best = Some((name.clone(), s));
+                    }
                 }
-            }
-            let (name, score) = best?;
-            if score >= thr {
-                Some(Suggestion {
-                    cluster: cid,
-                    name,
-                    score,
-                    count: vs.len(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
+                let (name, score) = best?;
+                if score >= thr {
+                    Some(Suggestion {
+                        cluster: cid,
+                        name,
+                        score,
+                        count: vs.len(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        out
+    })
 }
 
 #[cfg(test)]
@@ -630,7 +654,7 @@ mod tests {
         for v in vec {
             blob.extend_from_slice(&v.to_le_bytes());
         }
-        let c = store.0.lock().unwrap();
+        let c = store.test_conn();
         c.execute(
             "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored,cluster)
              VALUES(?1,10,10,50,50,0.9,?2,0,?3)",
@@ -648,7 +672,7 @@ mod tests {
     #[test]
     fn cluster_roundtrip() {
         let store = test_store();
-        let conn = store.0.lock().unwrap();
+        let conn = store.test_conn();
         conn.execute(
             "INSERT INTO photos(id,path,parent,mtime,size) VALUES(90,'x.jpg','.','0',1)",
             [],
@@ -707,7 +731,7 @@ mod tests {
     #[test]
     fn suggestion_for_similar_unnamed_cluster() {
         let store = test_store();
-        let conn = store.0.lock().unwrap();
+        let conn = store.test_conn();
         conn.execute(
             "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
             [],
@@ -742,7 +766,7 @@ mod tests {
     #[test]
     fn ignore_hides_from_overview() {
         let store = test_store();
-        let conn = store.0.lock().unwrap();
+        let conn = store.test_conn();
         conn.execute(
             "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
             [],
@@ -779,7 +803,7 @@ mod tests {
     #[test]
     fn weighted_centroid_resists_low_quality_outlier() {
         let store = test_store();
-        let conn = store.0.lock().unwrap();
+        let conn = store.test_conn();
         conn.execute(
             "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
             [],
@@ -809,11 +833,7 @@ mod tests {
     #[test]
     fn photo_faces_carries_cluster_name_and_rect() {
         let store = test_store();
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(7,'g.jpg','.',0,1)",
                 [],
             )

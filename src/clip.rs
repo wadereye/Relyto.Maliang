@@ -716,12 +716,17 @@ pub fn save_clip_lang(
     if vec.len() != DIM {
         return Err(format!("嵌入维度 {} != {DIM}", vec.len()));
     }
-    let conn = store.0.lock().unwrap();
     let sql = format!(
         "INSERT OR REPLACE INTO {}(photo_id,dim,vec) VALUES(?1,?2,?3)",
         lang.table()
     );
-    conn.execute(&sql, rusqlite::params![photo_id, vec.len() as i64, vec_to_blob(vec)])
+    let blob = vec_to_blob(vec);
+    store
+        .write(move |conn| -> Result<(), String> {
+            conn.execute(&sql, rusqlite::params![photo_id, vec.len() as i64, blob])
+                .map_err(|e| e.to_string())
+                .map(|_| ())
+        })
         .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -729,46 +734,49 @@ pub fn save_clip_lang(
 /// 读取单张照片的嵌入(测试/调试用;GUI 走 search 全量比对)。
 #[allow(dead_code)]
 pub fn clip_vec(store: &Store, photo_id: i64) -> Option<Vec<f32>> {
-    let conn = store.0.lock().unwrap();
-    let b: Vec<u8> = conn
-        .query_row(
-            "SELECT vec FROM clips WHERE photo_id=?1",
-            rusqlite::params![photo_id],
-            |r| r.get(0),
-        )
+    let b: Vec<u8> = store
+        .read(|conn| {
+            conn.query_row(
+                "SELECT vec FROM clips WHERE photo_id=?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+        })
         .ok()?;
     Some(blob_to_vec(&b))
 }
 
 /// 某语言模型已嵌入的照片数(GUI 显示"已索引 x/y")。
 pub fn clip_count_lang(store: &Store, lang: Lang) -> usize {
-    let conn = store.0.lock().unwrap();
-    conn.query_row(
-        &format!("SELECT COUNT(*) FROM {}", lang.table()),
-        [],
-        |r| r.get::<_, i64>(0),
-    )
-    .unwrap_or(0) as usize
+    store.read(|conn| {
+        conn.query_row(
+            &format!("SELECT COUNT(*) FROM {}", lang.table()),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    })
 }
 
 /// 某语言模型下尚未嵌入的照片(增量索引用)。
 pub fn photos_todo_lang(store: &Store, lang: Lang, cap: usize) -> Vec<(i64, String)> {
-    let conn = store.0.lock().unwrap();
     let sql = format!(
         "SELECT id, path FROM photos
          WHERE id NOT IN (SELECT photo_id FROM {})
          ORDER BY id LIMIT ?1",
         lang.table()
     );
-    let mut st = match conn.prepare(&sql) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
-    st.query_map(rusqlite::params![cap as i64], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+    store.read(|conn| {
+        let mut st = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(rusqlite::params![cap as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
     })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
 }
 
 /// 后台语义索引:按语言选模型(缺模型则报错,由 GUI 提示用户)。
@@ -829,21 +837,26 @@ pub fn search_lang(
             engine.embed_text(&q)?
         }
     };
-    let conn = store.0.lock().unwrap();
-    let mut st = conn
-        .prepare(&format!("SELECT photo_id, vec FROM {}", lang.table()))
-        .map_err(|e| e.to_string())?;
-    let rows = st
-        .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })
-        .map_err(|e| e.to_string())?;
+    let rows: Vec<(i64, Vec<u8>)> = store.read(|conn| -> Result<Vec<(i64, Vec<u8>)>, String> {
+        let mut st = conn
+            .prepare(&format!("SELECT photo_id, vec FROM {}", lang.table()))
+            .map_err(|e| e.to_string())?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+        for row in rows {
+            if let Ok(r) = row {
+                out.push(r);
+            }
+        }
+        Ok(out)
+    })
+    .map_err(|e| e.to_string())?;
     let mut hits: Vec<(i64, f32)> = Vec::new();
-    for row in rows {
-        let (pid, blob) = match row {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
+    for (pid, blob) in rows {
         let v = blob_to_vec(&blob);
         if v.len() != DIM {
             continue;
@@ -897,7 +910,7 @@ mod tests {
     fn cn_clip_db_roundtrip() {
         let store = test_store();
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             conn.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0)",
                 [],
@@ -975,7 +988,7 @@ mod tests {
     fn clip_db_roundtrip() {
         let store = test_store();
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             conn.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.','0',1)",
                 [],
@@ -1052,7 +1065,7 @@ mod tests {
         }
         let store = test_store();
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             for (id, path) in [(1i64, "x.jpg"), (2, "y.jpg")] {
                 conn.execute(
                     "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'.','0',1)",

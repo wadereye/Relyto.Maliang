@@ -380,13 +380,15 @@ pub fn backfill_tier(store: &crate::db::Store, tier: Tier, limit: usize) -> Resu
     }
     if tier == Tier::Normal {
         // Normal 档额外回写 thumb_ok + dhash(dhash 只在中档算)。
-        let conn = store.0.lock().unwrap();
-        for (id, h) in &ok {
-            conn.execute(
-                "UPDATE photos SET thumb_ok=1, dhash=?2 WHERE id=?1",
-                rusqlite::params![id, *h as i64],
-            )?;
-        }
+        store.write(|conn| -> anyhow::Result<()> {
+            for (id, h) in &ok {
+                conn.execute(
+                    "UPDATE photos SET thumb_ok=1, dhash=?2 WHERE id=?1",
+                    rusqlite::params![id, *h as i64],
+                )?;
+            }
+            Ok(())
+        })?;
     }
     for (id, _) in &ok {
         let _ = store.mark_tier_done(*id, tier as u8);
@@ -477,20 +479,17 @@ impl Drop for ThumbWorker {
 
 /// 重新生成单张缩略图并回写 dhash/thumb_ok(烘培保存后调用)。
 pub fn regen(store: &crate::db::Store, id: i64) -> Result<()> {
-    let path: String = store
-        .0
-        .lock()
-        .unwrap()
-        .query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))?;
+    let path: String = store.read(|conn| {
+        conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
+    })?;
     let h = generate(id, Path::new(&path))?;
-    store
-        .0
-        .lock()
-        .unwrap()
-        .execute(
+    store.write(|conn| -> anyhow::Result<()> {
+        conn.execute(
             "UPDATE photos SET thumb_ok=1, dhash=?2 WHERE id=?1",
             rusqlite::params![id, h as i64],
         )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -782,7 +781,7 @@ mod tests {
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
         let photo_id = unique_id();
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             conn.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'/x',0,0)",
                 rusqlite::params![photo_id, "/nonexistent/rk-fail/bad.jpg"],
@@ -794,11 +793,7 @@ mod tests {
             let ids = backfill_tier(&store, Tier::Normal, 10).unwrap();
             assert!(ids.is_empty(), "第 {round} 轮不应有成功产出");
         }
-        let f: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
+        let f: i64 = store.test_conn().query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
             .unwrap();
         assert_eq!(f, 3, "三次失败应各记一笔");
         // 之后 missing_tier 不再返回它,worker 得以推进到后续照片。
@@ -828,7 +823,7 @@ mod tests {
         let photo_id = unique_id();
         let _guard = CacheGuard(photo_id);
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             conn.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
                 rusqlite::params![photo_id, src.to_string_lossy(), dir.to_string_lossy()],
@@ -848,11 +843,7 @@ mod tests {
         }
         assert!(!done.is_empty(), "worker 应回报生成成功的 id");
         // 库里应已置 thumb_ok=1
-        let ok: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT thumb_ok FROM photos WHERE path=?1", [&src.to_string_lossy()], |r| r.get(0))
+        let ok: i64 = store.test_conn().query_row("SELECT thumb_ok FROM photos WHERE path=?1", [&src.to_string_lossy()], |r| r.get(0))
             .unwrap();
         assert_eq!(ok, 1, "应回写 thumb_ok=1");
 
@@ -938,7 +929,7 @@ mod tests {
         let photo_id = unique_id();
         let _guard = CacheGuard(photo_id);
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             conn.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
                 rusqlite::params![photo_id, src.to_string_lossy(), dir.to_string_lossy()],
@@ -949,11 +940,7 @@ mod tests {
         // Big 档(2):不写 thumb_ok,只写 thumb_tiers。
         let ids = backfill_tier(&store, Tier::Big, 10).unwrap();
         assert_eq!(ids, vec![photo_id], "应生成 Big 档");
-        let ok: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT thumb_ok FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
+        let ok: i64 = store.test_conn().query_row("SELECT thumb_ok FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
             .unwrap();
         assert_eq!(ok, 0, "Big 档不应改 thumb_ok(Normal 档专用)");
         assert_eq!(store.tier_count(Tier::Big as u8), 1, "应记入 thumb_tiers");

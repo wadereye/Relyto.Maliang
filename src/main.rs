@@ -166,7 +166,7 @@ fn main() -> eframe::Result {
     // 扫描/缩略图后台线程 BELOW_NORMAL —— 交互永远优先于后台计算)。
     win::set_current_thread_priority(win::Priority::AboveNormal);
 
-    let store = Arc::new(db::Store::open().expect("打开索引数据库失败"));
+    let store = db::Store::open().expect("打开索引数据库失败");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Relyto.Maliang")

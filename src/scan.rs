@@ -273,27 +273,28 @@ impl ScanControl {
 
 /// 库内已有记录的指纹:path -> (size, mtime)。用于未变文件快速路径。
 fn load_fingerprints(store: &Store) -> HashMap<String, (i64, i64)> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare("SELECT path, size, mtime FROM photos") {
-        Ok(s) => s,
-        Err(_) => return HashMap::new(),
-    };
-    let rows: HashMap<String, (i64, i64)> = st
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })
-        .ok()
-        .map(|rows| {
-            rows.filter_map(|r| r.ok())
-                .map(|(p, s, m)| (p, (s, m)))
-                .collect()
-        })
-        .unwrap_or_default();
-    rows
+    store.read(|conn| {
+        let mut st = match conn.prepare("SELECT path, size, mtime FROM photos") {
+            Ok(s) => s,
+            Err(_) => return HashMap::new(),
+        };
+        let rows: HashMap<String, (i64, i64)> = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .ok()
+            .map(|rows| {
+                rows.filter_map(|r| r.ok())
+                    .map(|(p, s, m)| (p, (s, m)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows
+    })
 }
 
 /// 并行扫描多个根目录,仅记录存在的图像文件(增量 upsert 交给数据库)
@@ -404,6 +405,42 @@ pub fn mft_candidates(
         paths,
         excluded_dirs,
     })
+}
+
+/// 启动对账的删除侧:把「库里有行、磁盘上已消失」的照片移出图库。
+///
+/// 以磁盘为准(与 watch 事件路径同一原语 `drop_missing_paths`:逐路径复核
+/// 存在性,目录缺失连子树一起摘)。只考虑**当前监听根之内**、且根目录仍
+/// 在线(可 stat)的行 —— 根被删/盘未挂载/网络断开时整根跳过,防止离线
+/// 造成整根误清;已移除监听的目录行不在此管。返回被移除的 (id, path)。
+pub fn reconcile_missing(store: &Store, roots: &[PathBuf]) -> Vec<(i64, String)> {
+    let online: Vec<&PathBuf> = roots.iter().filter(|r| r.is_dir()).collect();
+    if online.is_empty() {
+        return Vec::new();
+    }
+    let all: Vec<String> = store.read(|conn| {
+        let mut st = match conn.prepare("SELECT path FROM photos") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows: Vec<String> = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .ok()
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default();
+        rows
+    });
+    let in_roots: Vec<String> = all
+        .into_iter()
+        .filter(|p| {
+            let pb = Path::new(p.as_str());
+            online.iter().any(|r| pb.starts_with(r.as_path()))
+        })
+        .collect();
+    if in_roots.is_empty() {
+        return Vec::new();
+    }
+    store.drop_missing_paths(&in_roots).unwrap_or_default()
 }
 
 pub fn scan_dir_ctrl(
@@ -658,10 +695,12 @@ pub fn index_file_ctrl(
         .unwrap_or(0);
     let size = md.len() as i64;
 
-    // 快速路径:指纹一致则跳过(事件重复通知时不再重解码 EXIF)。
     let key = path.to_string_lossy().into_owned();
-    let existed = {
-        let conn = store.0.lock().unwrap();
+    // 快速路径:指纹一致则跳过(事件重复通知时不再重解码 EXIF)。
+    // 读网关返回 None = 未变(外层直接跳过);Some(existed) = 要入库,
+    // existed 指示新增(false)还是修改(true)。注意闭包内的 return
+    // 只退出闭包,"跳过"必须用返回值传出来。
+    let existed: bool = match store.read(|conn| -> anyhow::Result<Option<bool>> {
         let old: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT size, mtime FROM photos WHERE path=?1",
@@ -669,15 +708,14 @@ pub fn index_file_ctrl(
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
-        match old {
-            Some((osize, omtime)) => {
-                if osize == size && omtime == mtime {
-                    return Ok(false);
-                }
-                true // 已有记录但内容变了 → 修改
-            }
-            None => false, // 库里没有 → 新增
-        }
+        Ok(match old {
+            Some((osize, omtime)) if osize == size && omtime == mtime => None,
+            Some(_) => Some(true),  // 已有记录但内容变了 → 修改
+            None => Some(false),    // 库里没有 → 新增
+        })
+    })? {
+        Some(existed) => existed,
+        None => return Ok(false),
     };
 
     let rec = match read_record_with_meta(path, size, mtime) {
@@ -719,12 +757,11 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
         .zip(has_cam.iter())
         .map(|((_, id), has)| if *has { Some(*id) } else { None })
         .collect();
-    let conn = store.0.lock().unwrap();
     // 注意:必须用 execute_batch —— rusqlite 的 `execute` 只接受单条语句,
     // 传多条会报 "Multiple statements provided"。
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-    let tx = conn.unchecked_transaction()?;
-    {
+    store.write(|conn| -> Result<()> {
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        let tx = conn.unchecked_transaction()?;
         let mut st = tx.prepare_cached(
             "INSERT INTO photos(path,parent,mtime,size,width,height,taken_utc,cam,cam_id,rot,star,thumb_ok,lat,lon,uid64,kind)
              VALUES(:path,:parent,:mtime,:size,:w,:h,:taken,NULL,:cam_id,:rot,0,0,:lat,:lon,:uid,:kind)
@@ -747,14 +784,65 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
                 ":uid": uid as i64, ":kind": r.kind,
             })?;
         }
-    }
-    tx.commit()?;
-    Ok(())
+        drop(st);
+        tx.commit()?;
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 删除对账:消失的行被移出、在盘的保留;离线根与根外路径一律不碰。
+    #[test]
+    fn reconcile_missing_drops_gone_keeps_present_and_offline() {
+        let store = crate::db::Store::open_mem().unwrap();
+        let root = scratch_dir("reconcile-root");
+        let kept = root.join("kept.jpg");
+        std::fs::write(&kept, b"x").unwrap();
+        let gone = root.join("gone.jpg"); // 从未落盘
+        // 离线根:确定不存在的目录(不能用 Q: 这类盘符 —— 有些机器真有映射)。
+        let offline = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("rk-reconcile-offline-{}", std::process::id()));
+        let outside = scratch_dir("reconcile-outside");
+        let outside_file = outside.join("other.jpg");
+        std::fs::write(&outside_file, b"y").unwrap();
+        {
+            let c = store.test_conn();
+            for p in [&kept, &gone, &offline.join("u.jpg"), &outside_file] {
+                c.execute(
+                    "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'/',0,0)",
+                    rusqlite::params![p.to_string_lossy().as_ref()],
+                )
+                .unwrap();
+            }
+        }
+        let dropped = reconcile_missing(&store, &[root.clone(), offline.clone()]);
+        let dropped_paths: Vec<&str> = dropped.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(dropped.len(), 1, "只有消失的文件被移出: {dropped_paths:?}");
+        assert!(dropped_paths[0].ends_with("gone.jpg"));
+        // 离线根之下的行不能被误清(根不可 stat → 整根跳过)。
+        let off_str = offline.join("u.jpg").to_string_lossy().into_owned();
+        let n: i64 = store
+            .test_conn()
+            .query_row(
+                "SELECT COUNT(*) FROM photos WHERE path=?1",
+                [off_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "离线根下的行必须保留");
+        // 根之外的行不在此管。
+        let o: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM photos WHERE path=?1", [outside_file.to_string_lossy().as_ref()], |r| r.get(0))
+            .unwrap();
+        assert_eq!(o, 1, "监听根之外的行必须保留");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
 
     /// 测试暂存目录。固定在 `target/rk-scratch/` 下,不能用系统 temp:
     /// Windows 的 temp 落在 `...\AppData\Local\Temp`,路径里同时命中默认排除表的
@@ -1026,20 +1114,12 @@ mod tests {
         assert_eq!(s.indexed, 1);
         assert!(!s.cancelled);
 
-        let uid: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
+        let uid: i64 = store.test_conn().query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
             .unwrap();
         assert_ne!(uid, 0, "uid64 应被分配");
         // 重新扫描不应改变 uid64(标识是持久的)。
         let _ = scan_dir(&store, &[dir.clone()]).unwrap();
-        let uid2: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
+        let uid2: i64 = store.test_conn().query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uid, uid2, "重新扫描后 uid64 应保持不变");
 
