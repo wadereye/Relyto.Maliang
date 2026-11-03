@@ -1818,7 +1818,7 @@ mod tests {
     fn mem_store_with_photos(n: i64) -> crate::db::Store {
         let store = crate::db::Store::open_mem().unwrap();
         {
-            let conn = store.0.lock().unwrap();
+            let conn = store.test_conn();
             for i in 1..=n {
                 conn.execute(
                     "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'/p',0,0)",

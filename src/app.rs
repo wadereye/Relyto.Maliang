@@ -173,6 +173,8 @@ struct ScanResult {
     unchanged: usize,
     /// 被排除规则跳过的目录数。
     excluded_dirs: usize,
+    /// 删除对账移出的行数(仅启动增量对账做;以磁盘为准)。
+    removed: usize,
     /// 被用户取消(而非正常完成)。
     cancelled: bool,
     err: Option<String>,
@@ -533,6 +535,10 @@ pub struct App {
     name_index: Option<Arc<crate::nameidx::IndexFile>>,
     /// 索引文件后台载入结果。
     name_index_rx: Option<mpsc::Receiver<Result<crate::nameidx::IndexFile, String>>>,
+    /// 本轮索引文件载入完成后要不要做对账重扫(索引器报告有实质变更时置位)。
+    name_index_catchup: bool,
+    /// 对账重扫因扫描忙而挂起,当前扫描结束后补发。
+    mft_catchup_armed: bool,
     /// 索引器子进程事件(启动结果)。
     mft_rx: Option<mpsc::Receiver<MftEvent>>,
     /// 用户拒绝 UAC 后本次会话不再重复发起(可从搜索页手动再试)。
@@ -548,23 +554,191 @@ pub struct App {
     /// 快速查找输入与结果。
     name_query: String,
     name_results: Vec<crate::nameidx::SearchHit>,
+    /// 最近一次检索耗时(毫秒;状态栏与结果面板展示)。
+    name_search_ms: f64,
     /// 类型过滤档(顶栏/搜索页共用,换档即重查)。
     name_class: crate::nameidx::FileClass,
-    /// 搜索行缩略图缓存(路径 → 纹理;超过上限整体清空,搜索页是临时工作区)。
+    /// 搜索行缩略图缓存(路径 → 纹理;超上限按入序逐出)。
     name_thumbs: HashMap<String, egui::TextureHandle>,
+    /// 缩略图缓存逐出顺序(与 name_thumbs 同步维护)。
+    name_thumb_order: std::collections::VecDeque<String>,
+    /// 后台检索线程的收发两端(tx 发请求,rx 收结果)。
+    search_tx: Option<mpsc::Sender<SearchReq>>,
+    search_rx: Option<mpsc::Receiver<SearchResp>>,
+    /// 请求代数:每次 dispatch 递增,过期响应直接丢弃。
+    search_gen: u64,
+    /// 同一代数的共享副本:检索线程 stat 阶段看到代数前进就放弃本批。
+    search_abort: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// 有一批检索在途(结果面板显示"检索中…")。
+    search_inflight: bool,
+    /// 查询缓存:(查询, 档位) → (结果, 耗时 ms)。重复输入零成本回显。
+    name_search_cache: HashMap<(String, u8), (Vec<crate::nameidx::SearchHit>, f64)>,
+    /// size/创建时间缓存(路径 → (字节, epoch ms));后台 stat 批量回填。
+    name_stats: HashMap<String, (u64, i64)>,
+    /// 后台缩略图解码线程的收发两端。
+    thumb_tx: Option<mpsc::Sender<String>>,
+    thumb_rx: Option<mpsc::Receiver<(String, Option<image::DynamicImage>)>>,
+    /// 已请求未回图的路径(去重 + 在途上限)。
+    thumb_inflight: std::collections::HashSet<String>,
+    /// 快速查找列表当前选中行(视觉反馈;右键菜单直接作用于所在行)。
+    name_sel: Option<String>,
 }
 
 /// 索引器子进程回报事件。
 #[derive(Debug)]
 enum MftEvent {
-    /// 索引文件已就绪(新建或已有缓存)。
-    Ready,
+    /// 索引文件已就绪(新建或已有缓存);bool = 本轮是否有实质变更
+    /// (增量新增/更新/删除任一 >0,或发生全量重建 —— 解析自收尾报告,
+    /// 见 `nameidx::report_has_changes`)。有变更才值得做对账重扫。
+    Ready(bool),
     /// 未成功(含 UAC 拒绝/启动失败/超时),附原因。
     Declined(String),
     /// 索引器进度:比例(按已完成卷数)+ 报告里的文案。
     Progress(f32, String),
     /// 计划任务注册结果:None=成功,Some(错误文案)=失败。
     Installed(Option<String>),
+}
+
+/// 后台检索请求(快照式:带请求时的索引,重扫后旧快照照常出结果)。
+struct SearchReq {
+    gen: u64,
+    q: String,
+    class: crate::nameidx::FileClass,
+    idx: std::sync::Arc<crate::nameidx::IndexFile>,
+}
+
+/// 后台检索结果:先回命中列表(毫秒级),再回 size/创建时间批。
+enum SearchResp {
+    Hits {
+        gen: u64,
+        hits: Vec<crate::nameidx::SearchHit>,
+        ms: f64,
+    },
+    /// 与 hits 等长同序;None = stat 失败(文件没了/不可达)。
+    Stats {
+        gen: u64,
+        stats: Vec<Option<(u64, i64)>>,
+    },
+}
+
+/// 启动常驻检索线程:收请求(合并到最新)→ 内存索引毫秒级出命中 →
+/// 逐条 stat 补大小/创建时间。排队有新请求时放弃 stat 阶段(新查询马上重来)。
+fn spawn_search_worker(
+    abort: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    mpsc::Sender<SearchReq>,
+    mpsc::Receiver<SearchResp>,
+    std::thread::JoinHandle<()>,
+) {
+    let (req_tx, req_rx) = mpsc::channel::<SearchReq>();
+    let (res_tx, res_rx) = mpsc::channel::<SearchResp>();
+    let h = std::thread::Builder::new()
+        .name("search".into())
+        .spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            while let Ok(req) = req_rx.recv() {
+                // 合并:队列里还有更新的请求就只跑最新(打字流不逐键全跑)。
+                let mut req = req;
+                while let Ok(latest) = req_rx.try_recv() {
+                    req = latest;
+                }
+                let t0 = std::time::Instant::now();
+                let hits = crate::nameidx::search_class(&req.idx.vols, &req.q, 500, req.class);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if res_tx
+                    .send(SearchResp::Hits {
+                        gen: req.gen,
+                        hits: hits.clone(),
+                        ms,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                // 二阶段:补 size/创建时间(stat 很便宜,但文件可能刚被删)。
+                // 共享代数已前进 → 有新请求排队,本批 stats 作废,新查询会重新出全套。
+                let mut stats = Vec::new();
+                let mut aborted = false;
+                for h in &hits {
+                    if abort.load(std::sync::atomic::Ordering::Relaxed) != req.gen {
+                        aborted = true;
+                        break;
+                    }
+                    stats.push(stat_size_ctime(Path::new(&h.path)));
+                }
+                if aborted
+                    || res_tx
+                        .send(SearchResp::Stats { gen: req.gen, stats })
+                        .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .expect("启动检索线程失败");
+    (req_tx, res_rx, h)
+}
+
+/// 一次 stat 拿 (大小字节, 创建时间 epoch ms);失败(不存在/权限)返回 None。
+fn stat_size_ctime(p: &Path) -> Option<(u64, i64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let ctime = md
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Some((md.len(), ctime))
+}
+
+/// 字节数的短格式(与导入面板的 KB/MB 口径一致,补 GB/B 两档)。
+fn fmt_size(bytes: u64) -> String {
+    let b = bytes as f64;
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{b:.0} KB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// 创建时间(epoch 毫秒)的短格式。
+fn fmt_ctime(ms: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(ms).single() {
+        Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
+/// 启动常驻缩略图解码线程:收路径 → 纯路径解码 128px 预览(可失败)。
+/// 与图库缩略图 worker 无关:这些文件多半未入库,走文件系统直读。
+fn spawn_thumb_worker() -> (
+    mpsc::Sender<String>,
+    mpsc::Receiver<(String, Option<image::DynamicImage>)>,
+    ) {
+    let (tx, rx) = mpsc::channel::<String>();
+    let (out_tx, out_rx) = mpsc::channel::<(String, Option<image::DynamicImage>)>();
+    std::thread::Builder::new()
+        .name("search-thumb".into())
+        .spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            while let Ok(p) = rx.recv() {
+                let img = crate::thumbs::load_for_preview(Path::new(&p), 128)
+                    .map(|(img, _)| img);
+                if out_tx.send((p, img)).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("启动搜索缩略图线程失败");
+    (tx, out_rx)
 }
 
 /// 全盘索引的授权档位(设置项 `mft_grant`)。
@@ -1509,6 +1683,8 @@ impl App {
             input_query: String::new(),
             name_index: None,
             name_index_rx: None,
+            name_index_catchup: false,
+            mft_catchup_armed: false,
             mft_rx: None,
             mft_declined: false,
             mft_progress: None,
@@ -1517,13 +1693,34 @@ impl App {
             mft_task_ok: false,
             name_query: String::new(),
             name_results: Vec::new(),
+            name_search_ms: 0.0,
             name_class: crate::nameidx::FileClass::All,
             name_thumbs: HashMap::new(),
+            name_thumb_order: std::collections::VecDeque::new(),
+            search_tx: None,
+            search_rx: None,
+            search_gen: 0,
+            search_abort: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            search_inflight: false,
+            name_search_cache: HashMap::new(),
+            name_stats: HashMap::new(),
+            thumb_tx: None,
+            thumb_rx: None,
+            thumb_inflight: std::collections::HashSet::new(),
+            name_sel: None,
         };
         app
     }
 
     pub fn start_initial_tasks(&mut self) {
+        // 快速查找后台线程(即输即搜:检索毫秒级,stat 补大小/创建时间不挡 UI)。
+        let (stx, srx, _) = spawn_search_worker(self.search_abort.clone());
+        self.search_tx = Some(stx);
+        self.search_rx = Some(srx);
+        // 搜索行缩略图解码线程(命中列表先出,缩略图异步补)。
+        let (ttx, trx) = spawn_thumb_worker();
+        self.thumb_tx = Some(ttx);
+        self.thumb_rx = Some(trx);
         // 后台缩略图补齐(持续 worker:启动时补存量,扫描后自动补新增)
         self.thumb_bg = Some(crate::thumbs::spawn_worker(self.store.clone()));
         // P1-10:预览后台 worker(解码 + 落盘 previews/ 缓存,不阻塞 UI)
@@ -1553,7 +1750,7 @@ impl App {
                             self.status = format!("全盘名字索引就绪({n} 条),扫描走 MFT 快路");
                         }
                     }
-                    Err(_) => self.load_name_index_async(),
+                    Err(_) => self.load_name_index_async(false),
                 }
             }
         }
@@ -1589,7 +1786,7 @@ impl App {
             let idx_path = crate::db::data_dir().join("nameindex.bin");
             // 同步载入失败(损坏等)才退回异步重试;成功后不重复读盘。
             if idx_path.exists() && self.name_index.is_none() {
-                self.load_name_index_async();
+                self.load_name_index_async(false);
             }
             let auto = self.store.get_setting("mft_auto_update").as_deref() != Some("0");
             if auto && !declined {
@@ -1635,12 +1832,14 @@ impl App {
     }
 
     /// 后台线程载入名字索引文件(0.5s 级 IO,不阻塞 UI)。
-    fn load_name_index_async(&mut self) {
+    /// `catchup` = 载入完成后是否做对账重扫(索引器增量报告有实质变更时置位)。
+    fn load_name_index_async(&mut self, catchup: bool) {
         if self.name_index_rx.is_some() {
             return;
         }
         let (tx, rx) = mpsc::channel();
         self.name_index_rx = Some(rx);
+        self.name_index_catchup = catchup;
         std::thread::spawn(move || {
             let path = crate::db::data_dir().join("nameindex.bin");
             let res = crate::nameidx::load(&path).map_err(|e| e.to_string());
@@ -1706,7 +1905,7 @@ impl App {
                             .clamp(0.0, 1.0);
                         prog = Some((frac, it.next().unwrap_or("").to_string()));
                     } else if l.starts_with("成功") {
-                        done = Some(MftEvent::Ready);
+                        done = Some(MftEvent::Ready(crate::nameidx::report_has_changes(&s)));
                     } else if l.starts_with("失败") {
                         done = Some(MftEvent::Declined(l.to_string()));
                     }
@@ -1816,12 +2015,18 @@ impl App {
         #[cfg(windows)]
         if let Some(rx) = &self.mft_rx {
             match rx.try_recv() {
-                Ok(MftEvent::Ready) => {
+                Ok(MftEvent::Ready(changed)) => {
                     self.mft_rx = None;
                     self.mft_progress = None;
                     // 成功即清除拒绝标记:下次启动恢复自动更新。
                     let _ = self.store.set_setting("mft_declined", "0");
-                    self.load_name_index_async();
+                    if self.name_index_rx.is_some() {
+                        // 理论竞态(启动时同步载入失败引发的异步轮次还没回来):
+                        // 作废在飞轮次,改发带对账标记的新轮 —— 索引器已重写
+                        // 索引文件,等旧轮载到的是过期内容。
+                        self.name_index_rx = None;
+                    }
+                    self.load_name_index_async(changed);
                 }
                 Ok(MftEvent::Declined(e)) => {
                     self.mft_rx = None;
@@ -1868,11 +2073,17 @@ impl App {
         if let Some(rx) = &self.name_index_rx {
             if let Ok(r) = rx.try_recv() {
                 self.name_index_rx = None;
+                let catchup = self.name_index_catchup;
+                self.name_index_catchup = false;
                 match r {
                     Ok(idx) => {
                         let n: usize = idx.vols.iter().map(|v| v.count()).sum();
                         self.status = format!("全盘名字索引就绪:{} 卷 {n} 条", idx.vols.len());
-                        self.name_index = Some(Arc::new(idx));
+                        // 缓存失效 + 在输的查询立即重发(dispatch 走后台线程)。
+                        self.on_name_index_ready(idx);
+                        if catchup {
+                            self.mft_catchup_scan();
+                        }
                     }
                     Err(e) => {
                         self.status = format!("名字索引加载失败: {e}");
@@ -1882,26 +2093,151 @@ impl App {
         }
     }
 
-    /// 执行快速查找(索引在内存里,毫秒级同步跑);结果计数与耗时进状态栏。
-    /// 顶栏回车与搜索页「搜索」按钮共用。
-    fn run_name_search(&mut self) {
+    /// 即输即搜:把当前输入交给后台检索线程(毫秒级内存查询,不挡 UI)。
+    /// 命中缓存直接回显;空输入清空结果。换档/重扫后缓存自动失效。
+    fn dispatch_name_search(&mut self) {
         let q = self.name_query.trim().to_string();
         if q.is_empty() {
+            self.name_results.clear();
+            self.name_stats.clear();
+            self.search_inflight = false;
             return;
         }
         let Some(idx) = self.name_index.clone() else {
-            self.status = "快速索引尚未就绪(等待载入或授权),稍后再试".into();
+            // 索引未就绪:搜索页有进度提示,这里不发请求。
             return;
         };
-        let t0 = std::time::Instant::now();
-        self.name_results = crate::nameidx::search_class(&idx.vols, &q, 500, self.name_class);
-        self.status = format!(
-            "快速查找 \"{}\"({}):{} 条命中,耗时 {:.1} ms",
-            q,
-            self.name_class.label(),
-            self.name_results.len(),
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
+        let key = (q.clone(), self.name_class as u8);
+        if let Some((hits, ms)) = self.name_search_cache.get(&key) {
+            // 缓存即时回显(命中列先出);仍照发一次后台请求 —— 打字途中被
+            // abort 掉的 stats 只有这条路能补齐,重跑本身毫秒级。
+            self.name_results = hits.clone();
+            self.name_search_ms = *ms;
+        }
+        self.search_gen += 1;
+        // 通知检索线程:代数前进,在跑的 stat 阶段可以放弃。
+        self.search_abort
+            .store(self.search_gen, std::sync::atomic::Ordering::Relaxed);
+        if let Some(tx) = &self.search_tx {
+            let _ = tx.send(SearchReq {
+                gen: self.search_gen,
+                q,
+                class: self.name_class,
+                idx,
+            });
+            self.search_inflight = true;
+        }
+    }
+
+    /// 泵后台检索结果与搜索行缩略图(每帧调用,非阻塞)。
+    fn pump_search(&mut self, ctx: &egui::Context) {
+        // —— 检索结果:同代才收,过期代直接丢 ——
+        if let Some(rx) = &self.search_rx {
+            let mut hits: Option<(u64, Vec<crate::nameidx::SearchHit>, f64)> = None;
+            let mut stats: Option<(u64, Vec<Option<(u64, i64)>>)> = None;
+            while let Ok(resp) = rx.try_recv() {
+                match resp {
+                    SearchResp::Hits { gen, hits: h, ms } => hits = Some((gen, h, ms)),
+                    SearchResp::Stats { gen, stats: s } => stats = Some((gen, s)),
+                }
+            }
+            if let Some((gen, h, ms)) = hits {
+                if gen == self.search_gen {
+                    // 进查询缓存(查重输入零成本回显)。
+                    let q = self.name_query.trim().to_string();
+                    if !q.is_empty() {
+                        let key = (q, self.name_class as u8);
+                        if self.name_search_cache.len() >= 64 {
+                            self.name_search_cache.clear();
+                        }
+                        self.name_search_cache.insert(key, (h.clone(), ms));
+                    }
+                    self.name_results = h;
+                    self.name_search_ms = ms;
+                    self.status = format!(
+                        "快速查找 \"{}\"({}):{} 条命中,耗时 {:.1} ms",
+                        self.name_query.trim(),
+                        self.name_class.label(),
+                        self.name_results.len(),
+                        ms
+                    );
+                    ctx.request_repaint();
+                }
+            }
+            if let Some((gen, s)) = stats {
+                if gen == self.search_gen {
+                    // stats 与当代 hits 等长同序;失败条目(None)不进缓存。
+                    for (hit, st) in self.name_results.iter().zip(s) {
+                        if let Some((size, ctime)) = st {
+                            if self.name_stats.len() >= 4096 {
+                                self.name_stats.clear();
+                            }
+                            self.name_stats.insert(hit.path.clone(), (size, ctime));
+                        }
+                    }
+                    self.search_inflight = false;
+                    ctx.request_repaint();
+                }
+            }
+        }
+        // —— 搜索行缩略图:解码完成的建纹理进缓存 ——
+        if let Some(rx) = &self.thumb_rx {
+            let mut got = false;
+            while let Ok((path, img)) = rx.try_recv() {
+                self.thumb_inflight.remove(&path);
+                if let Some(img) = img {
+                    let rgba = img.to_rgba8();
+                    let size = [rgba.width() as usize, rgba.height() as usize];
+                    let tex = ctx.load_texture(
+                        "name-thumb",
+                        egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    self.name_thumbs.insert(path.clone(), tex);
+                    self.name_thumb_order.push_back(path);
+                    // 超上限按入序逐出(整表清空会闪,搜索页翻页时很难受)。
+                    while self.name_thumbs.len() > 512 {
+                        if let Some(old) = self.name_thumb_order.pop_front() {
+                            self.name_thumbs.remove(&old);
+                        } else {
+                            break;
+                        }
+                    }
+                    got = true;
+                }
+            }
+            if got {
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    /// 索引快照到手(启动载入/重扫完成)后统一做的事:缓存失效 + 重查。
+    fn on_name_index_ready(&mut self, idx: crate::nameidx::IndexFile) {
+        self.name_index = Some(std::sync::Arc::new(idx));
+        self.name_search_cache.clear();
+        self.name_stats.clear();
+        if !self.name_query.trim().is_empty() {
+            self.dispatch_name_search();
+        }
+    }
+
+    /// 索引器增量保鲜后,用新索引对监听根做一次对账重扫。
+    ///
+    /// 缺口:关机期间新建的文件不在启动扫描吃的旧快照里(MFT 快路定位不到
+    /// 它们),watch 基线又把它们当存量 —— 不补这一步,它们要等下次重启
+    /// 才进图库。未变文件走指纹快路,实际代价只有毫秒级枚举 + 新文件的
+    /// EXIF 管线。删除对账不在此做(与启动扫描同口径,事件路径才删行)。
+    fn mft_catchup_scan(&mut self) {
+        if self.scan_busy.load(Ordering::SeqCst) {
+            // 启动扫描还在跑:挂起,扫描结果泵里补发(忙时入队只惠及下次启动)。
+            self.mft_catchup_armed = true;
+            return;
+        }
+        let roots = self.store.list_watched();
+        if !roots.is_empty() {
+            self.start_scan_roots_ext(roots, "索引增量对账", true);
+        }
     }
 
     /// 快速查找视图(自绘 CentralPanel:任意文件/文件夹结果列表)。
@@ -1953,87 +2289,110 @@ impl App {
                 return;
             }
 
-            // 搜索框 + 按钮(回车即搜;索引在内存,毫秒级,无需后台线程)。
-            let resp = ui.add(
-                egui::TextEdit::singleline(&mut self.name_query)
-                    .hint_text("输入文件名/文件夹名片段,如 IMG_2、照片、.nef")
-                    .desired_width(420.0),
-            );
-            let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.horizontal(|ui| {
-                egui::ComboBox::from_id_salt("name-class")
-                    .width(100.0)
-                    .selected_text(self.name_class.label())
-                    .show_ui(ui, |ui| {
-                        for c in crate::nameidx::FileClass::all() {
-                            if ui
-                                .selectable_label(self.name_class == c, c.label())
-                                .clicked()
-                            {
-                                self.name_class = c;
-                                // 换档即重查,保持结果与档位一致。
-                                if !self.name_query.trim().is_empty() {
-                                    self.run_name_search();
-                                }
-                            }
-                        }
+            // 输入框在顶部整条快速查找栏(gsearch),这里只出结果面板;
+            // 即输即搜由 gsearch 的 changed() 触发,本页被动刷新。
+            if self.name_query.trim().is_empty() {
+                ui.label("在上方搜索栏输入关键字开始查找(文件与文件夹都搜,大小写不敏感)");
+                return;
+            }
+            if self.name_results.is_empty() {
+                if self.search_inflight {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("正在检索…");
                     });
-                if ui.button("搜索").clicked() || enter {
-                    self.run_name_search();
-                }
-                if ui.button("清空").clicked() {
-                    self.name_query.clear();
-                    self.name_results.clear();
-                }
-            });
-            ui.separator();
-
-            let results = std::mem::take(&mut self.name_results);
-            if results.is_empty() {
-                if self.name_query.trim().is_empty() {
-                    ui.label("输入关键字开始查找(文件与文件夹都搜,大小写不敏感)");
                 } else {
                     ui.label("没有命中的文件");
                 }
+                return;
             }
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                for h in &results {
-                    let (name, path, is_dir) = (h.name.clone(), h.path.clone(), h.is_dir);
-                    ui.horizontal(|ui| {
-                        // 图片/视频顺手出缩略图(未入库的文件走纯路径解码入口)。
-                        let p = PathBuf::from(&path);
-                        if let Some(tex) = self.name_thumb(ctx, &p) {
-                            ui.add(
-                                egui::Image::new(&tex).fit_to_exact_size(egui::vec2(48.0, 48.0)),
-                            );
-                        } else {
-                            let icon = if is_dir { "📁" } else { "📄" };
-                            ui.add_sized([48.0, 48.0], egui::Label::new(icon));
-                        }
-                        ui.vertical(|ui| {
-                            ui.strong(name);
-                            ui.small(&path);
+
+            let results = std::mem::take(&mut self.name_results);
+            let mut opened: Option<String> = None;
+            let mut menu_for: Option<String> = None;
+            egui_extras::TableBuilder::new(ui)
+                .striped(true)
+                .vscroll(true)
+                .min_scrolled_height(320.0)
+                .column(
+                    egui_extras::Column::initial(220.0)
+                        .resizable(true)
+                        .clip(true),
+                )
+                .column(egui_extras::Column::remainder())
+                .column(egui_extras::Column::auto())
+                .column(egui_extras::Column::auto())
+                .column(egui_extras::Column::auto())
+                .header(26.0, |mut h| {
+                    for title in ["文件名称", "路径", "大小", "创建时间", "预览"] {
+                        h.col(|ui| {
+                            ui.strong(title);
                         });
-                        if ui.button("打开位置").clicked() {
-                            if is_dir {
-                                crate::win::shell_open(std::path::Path::new(&path));
-                            } else {
-                                crate::win::reveal_in_explorer(&p);
+                    }
+                })
+                .body(|mut body| {
+                    for h in &results {
+                        body.row(64.0, |mut row| {
+                            row.set_selected(self.name_sel.as_deref() == Some(h.path.as_str()));
+                            row.col(|ui| {
+                                ui.strong(&h.name);
+                            });
+                            row.col(|ui| {
+                                ui.small(&h.path);
+                            });
+                            row.col(|ui| {
+                                match self.name_stats.get(&h.path) {
+                                    Some((size, _)) => ui.label(fmt_size(*size)),
+                                    None => ui.label("…"),
+                                };
+                            });
+                            row.col(|ui| {
+                                match self.name_stats.get(&h.path) {
+                                    Some((_, ctime)) => ui.label(fmt_ctime(*ctime)),
+                                    None => ui.label("…"),
+                                };
+                            });
+                            row.col(|ui| {
+                                // 缩略图按需异步解码(未入库文件走纯路径入口)。
+                                let p = PathBuf::from(&h.path);
+                                if let Some(tex) = self.name_thumb(ctx, &p) {
+                                    ui.add(
+                                        egui::Image::new(&tex)
+                                            .fit_to_exact_size(egui::vec2(56.0, 56.0)),
+                                    );
+                                } else {
+                                    let icon = if h.is_dir { "📁" } else { "📄" };
+                                    ui.add_sized([56.0, 56.0], egui::Label::new(icon));
+                                }
+                            });
+                            let resp = row.response();
+                            if resp.clicked() {
+                                self.name_sel = Some(h.path.clone());
                             }
-                        }
-                        if !is_dir && ui.button("打开").clicked() {
-                            crate::win::shell_open(&p);
-                        }
-                    });
-                    ui.separator();
-                }
-            });
+                            if resp.double_clicked() {
+                                opened = Some(h.path.clone());
+                            }
+                            if resp.secondary_clicked() {
+                                menu_for = Some(h.path.clone());
+                            }
+                        });
+                    }
+                });
             self.name_results = results;
+            // 打开/菜单在表外执行:右键菜单是模态的,不在遍历中途弹。
+            if let Some(p) = opened {
+                crate::win::shell_open(std::path::Path::new(&p));
+            }
+            if let Some(p) = menu_for {
+                // 与资源管理器同一份系统右键菜单(Shell IContextMenu)。
+                crate::win::shell_context_menu(std::path::Path::new(&p));
+            }
         });
     }
 
-    /// 搜索行缩略图(有界缓存;不可索引的文件返回 None 显示图标)。
-    fn name_thumb(&mut self, ctx: &egui::Context, p: &Path) -> Option<egui::TextureHandle> {
+    /// 搜索行缩略图:命中缓存直接回显;未命中丢给后台解码线程(去重 + 在途
+    /// 上限),下一帧才出现。UI 线程绝不解码 —— 翻长列表不卡。
+    fn name_thumb(&mut self, _ctx: &egui::Context, p: &Path) -> Option<egui::TextureHandle> {
         let key = p.to_string_lossy().into_owned();
         if let Some(t) = self.name_thumbs.get(&key) {
             return Some(t.clone());
@@ -2041,19 +2400,17 @@ impl App {
         if !crate::scan::is_indexable(p) {
             return None;
         }
-        if self.name_thumbs.len() >= 96 {
-            self.name_thumbs.clear();
+        if self.thumb_inflight.len() < 16 && self.thumb_inflight.insert(key.clone()) {
+            match &self.thumb_tx {
+                Some(tx) => {
+                    let _ = tx.send(key);
+                }
+                None => {
+                    self.thumb_inflight.remove(&key);
+                }
+            }
         }
-        let (img, _) = crate::thumbs::load_for_preview(p, 128)?;
-        let rgba = img.to_rgba8();
-        let size = [rgba.width() as usize, rgba.height() as usize];
-        let tex = ctx.load_texture(
-            "name-thumb",
-            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()),
-            egui::TextureOptions::LINEAR,
-        );
-        self.name_thumbs.insert(key, tex.clone());
-        Some(tex)
+        None
     }
 
     /// 平铺 / 树形一对互斥档(参考件同一开关的两态:平铺列表或多级树)。
@@ -2234,30 +2591,7 @@ impl App {
                     // 不忙也占住同样的宽度,免得指示灯出现时整行左右抖。
                     ui.add_space(23.0);
                 }
-                // 搜索框(参考件的搜索一体容器:放大镜在左,清除在右)。
-                if !self.filters.text.is_empty() {
-                    if ui
-                        .add(tool_button("x", false))
-                        .on_hover_text("清除库内搜索")
-                        .clicked()
-                    {
-                        self.filters.text.clear();
-                        self.apply_view_state();
-                    }
-                }
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.filters.text)
-                        .hint_text("库内搜索:文件名 / 标题 / 标签")
-                        .desired_width(168.0),
-                );
-                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                let searched = ui
-                    .add(tool_button("search", !self.filters.text.is_empty()))
-                    .on_hover_text("在图库中搜索(回车亦可)")
-                    .clicked();
-                if searched || enter {
-                    self.apply_view_state();
-                }
+                // 库内搜索框已取消(与全盘快速查找重复,统一走顶部整条搜索)。
                 ui.separator();
                 // 滑块(参考件的缩放滑块);档位即已缓存的缩略图尺寸。
                 let mut idx = self.thumb_tier as i32;
@@ -2470,6 +2804,13 @@ impl App {
     /// P2-15:扫描根先登记进持久化队列,线程完成后移除 ——
     /// 应用中途退出时残留条目在下次启动自动续扫(`start_initial_tasks`)。
     fn start_scan_roots(&mut self, roots: Vec<PathBuf>, scope: &str) {
+        self.start_scan_roots_ext(roots, scope, false)
+    }
+
+    /// 带删除对账开关的扫描入口:仅启动增量对账传 `true` —— 扫描干净完成后
+    /// 在同一线程里把「库里有行、磁盘已消失」的行移出图库(以磁盘为准,
+    /// 离线根整根跳过)。常规扫描/导入/设备扫描不做删除,维持原口径。
+    fn start_scan_roots_ext(&mut self, roots: Vec<PathBuf>, scope: &str, reconcile: bool) {
         if self.scan_busy.swap(true, Ordering::SeqCst) {
             // 忙时也登记:本次请求不丢,当前扫描结束后由续扫逻辑接管。
             let _ = self.store.enqueue_scan(&roots, scope);
@@ -2491,6 +2832,18 @@ impl App {
         self.status = format!("正在{}{scope}…", self.scan_verb);
         std::thread::spawn(move || {
             let res = crate::scan::scan_dir_ctrl(&store, &roots, &ctrl, index.as_deref());
+            let mut removed = 0usize;
+            if reconcile {
+                if let Ok(s) = &res {
+                    if !s.cancelled {
+                        let dropped = crate::scan::reconcile_missing(&store, &roots);
+                        removed = dropped.len();
+                        for (id, _) in &dropped {
+                            crate::thumbs::purge_cached(*id);
+                        }
+                    }
+                }
+            }
             busy.store(false, Ordering::SeqCst);
             // P2-15:无论成功/失败/取消都出队(取消是用户意志,不续扫);
             // 只有线程根本没跑完(进程退出)才会残留 → 下次启动续扫。
@@ -2503,6 +2856,7 @@ impl App {
                     indexed: s.indexed,
                     unchanged: s.unchanged,
                     excluded_dirs: s.excluded_dirs,
+                    removed,
                     cancelled: s.cancelled,
                     err: None,
                     scope: scope_owned,
@@ -2512,6 +2866,7 @@ impl App {
                     indexed: 0,
                     unchanged: 0,
                     excluded_dirs: 0,
+                    removed,
                     cancelled: false,
                     err: Some(e.to_string()),
                     scope: scope_owned,
@@ -2912,6 +3267,7 @@ impl App {
                 indexed,
                 unchanged: skipped,
                 excluded_dirs: 0,
+                removed: 0,
                 cancelled,
                 err: None,
                 scope: scope_owned,
@@ -3397,10 +3753,9 @@ impl App {
             .ok_or_else(|| format!("未找到 uid64 = {uid} 的照片"))?;
         let path: String = self
             .store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
+            .read(|conn| {
+                conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
+            })
             .map_err(|e| e.to_string())?;
         Ok(path)
     }
@@ -5395,10 +5750,10 @@ impl App {
             let r = (|| -> anyhow::Result<String> {
                 if reset {
                     store
-                        .0
-                        .lock()
-                        .unwrap()
-                        .execute("UPDATE photos SET xmp_imported=0", [])?;
+                        .write(|conn| -> anyhow::Result<()> {
+                            conn.execute("UPDATE photos SET xmp_imported=0", [])?;
+                            Ok(())
+                        })?;
                 }
                 let (stars, tagged) = timeline::import_xmp_batch(&store, 1_000_000)?;
                 Ok(format!("XMP 导入完成:{stars} 张星标,{tagged} 张标签"))
@@ -6536,6 +6891,8 @@ impl eframe::App for App {
         // 全盘索引事件(进度 / 完成 / 计划任务注册结果)在顶层泵:人在哪个页面
         // 都收得到,不要求停在快速查找页。索引在途时每 200ms 自刷一帧,进度条才动。
         self.pump_mft_events();
+        // 即输即搜的回流(命中结果 / size·创建时间 / 缩略图)每帧非阻塞泵。
+        self.pump_search(ctx);
         if self.mft_rx.is_some() || self.name_index_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -6575,12 +6932,23 @@ impl eframe::App for App {
                         "{}{}已取消:已索引 {} 张(已处理 {} 个文件)",
                         self.scan_verb, r.scope, r.indexed, r.scanned
                     ),
-                    None => format!(
-                        "{}{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
-                        self.scan_verb, r.scope, r.scanned, r.indexed, r.unchanged, r.excluded_dirs
-                    ),
+                    None => {
+                        let mut msg = format!(
+                            "{}{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
+                            self.scan_verb, r.scope, r.scanned, r.indexed, r.unchanged, r.excluded_dirs
+                        );
+                        if r.removed > 0 {
+                            msg.push_str(&format!(";{} 个已消失文件移出图库", r.removed));
+                        }
+                        msg
+                    }
                 };
                 self.rebuild();
+                // 索引增量对账被这次扫描压着:现在补发。
+                if self.mft_catchup_armed {
+                    self.mft_catchup_armed = false;
+                    self.mft_catchup_scan();
+                }
             }
         }
         // P1-13:设备热插拔事件("置刷新标志 + 触发刷新")。
@@ -7448,12 +7816,13 @@ impl eframe::App for App {
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| self.toolbar_ui(ctx, ui));
 
-        // ===== 全局快速查找:独占一行,输入框拉通整行,右侧档位+查找 =====
+        // ===== 全局快速查找:独占一行,输入框拉通整行,右侧档位 =====
+        // 即输即搜:每敲一个字就检索,越输越准(后台线程合并连击,UI 不卡);
+        // 清空则退出查找页回时间线。
         egui::TopBottomPanel::top("gsearch")
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let go = ui.button("查找").clicked();
                     egui::ComboBox::from_id_salt("top-name-class")
                         .width(84.0)
                         .selected_text(self.name_class.label())
@@ -7464,34 +7833,36 @@ impl eframe::App for App {
                                     .clicked()
                                 {
                                     self.name_class = c;
-                                    // 搜索页在位时换档即重查。
-                                    if self.view == ViewKind::Search
-                                        && !self.name_query.trim().is_empty()
-                                    {
-                                        self.run_name_search();
+                                    // 换档即重查(缓存未命中时走后台线程)。
+                                    if !self.name_query.trim().is_empty() {
+                                        self.dispatch_name_search();
                                     }
                                 }
                             }
                         });
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.name_query)
-                            .hint_text("全盘快速查找:文件名 / 文件夹名片段,回车即搜…")
+                            .hint_text("全盘快速查找:文件名 / 文件夹名片段,即输即搜…")
                             .desired_width(ui.available_width() - 6.0),
                     );
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if go || enter {
-                        self.set_view(ViewKind::Search);
-                        if !self.name_query.trim().is_empty() {
-                            self.run_name_search();
-                        }
-                        // 首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
-                        #[cfg(windows)]
-                        if self.name_index.is_none()
-                            && self.mft_rx.is_none()
-                            && self.name_index_rx.is_none()
-                            && !crate::db::data_dir().join("nameindex.bin").exists()
-                        {
-                            self.mft_try_start();
+                    if resp.changed() {
+                        if self.name_query.trim().is_empty() {
+                            self.dispatch_name_search();
+                            if self.view == ViewKind::Search {
+                                self.set_view(ViewKind::Timeline);
+                            }
+                        } else {
+                            self.set_view(ViewKind::Search);
+                            self.dispatch_name_search();
+                            // 首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
+                            #[cfg(windows)]
+                            if self.name_index.is_none()
+                                && self.mft_rx.is_none()
+                                && self.name_index_rx.is_none()
+                                && !crate::db::data_dir().join("nameindex.bin").exists()
+                            {
+                                self.mft_try_start();
+                            }
                         }
                     }
                 });

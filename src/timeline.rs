@@ -229,7 +229,6 @@ pub fn load_query(
         },
         order
     );
-    let conn = store.0.lock().unwrap();
     // P1-14:相机型号走字符串池 —— 行里只存 `cam_id`(INTEGER),
     // 字符串本体在 `string_pool` 里去重存一份(对齐原版的池化列)。
     // LEFT JOIN 保证:未池化的历史行(cam 有值、cam_id 为 NULL)仍能显示。
@@ -241,30 +240,33 @@ pub fn load_query(
     } else {
         vec![&CAM_POOL]
     };
-    let mut st = conn.prepare(&sql)?;
-    let rows: Vec<PhotoRow> = st
-        .query_map(rusqlite::params_from_iter(args.iter()), |r| {
-            Ok(PhotoRow {
-                id: r.get(0)?,
-                path: r.get(1)?,
-                taken: r.get(2)?,
-                star: r.get(3)?,
-                thumb_ok: r.get(4)?,
-                width: r.get(5)?,
-                height: r.get(6)?,
-                // 池命中 → sp.value;未命中 → 回退旧 cam 列;都没有 → 空串
-                cam: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
-                lat: r.get(8)?,
-                lon: r.get(9)?,
-                kind: r.get(10)?,
-                caption: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
-                mtime: r.get(12)?,
-                size: r.get(13)?,
-                parent: r.get(14)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let rows: Vec<PhotoRow> = store.read(|conn| -> Result<Vec<PhotoRow>> {
+        let mut st = conn.prepare(&sql)?;
+        let rows: Vec<PhotoRow> = st
+            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                Ok(PhotoRow {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    taken: r.get(2)?,
+                    star: r.get(3)?,
+                    thumb_ok: r.get(4)?,
+                    width: r.get(5)?,
+                    height: r.get(6)?,
+                    // 池命中 → sp.value;未命中 → 回退旧 cam 列;都没有 → 空串
+                    cam: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    lat: r.get(8)?,
+                    lon: r.get(9)?,
+                    kind: r.get(10)?,
+                    caption: r.get::<_, Option<String>>(11)?.unwrap_or_default(),
+                    mtime: r.get(12)?,
+                    size: r.get(13)?,
+                    parent: r.get(14)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })?;
     Ok(rows)
 }
 
@@ -338,22 +340,26 @@ pub fn by_month(rows: &[PhotoRow]) -> Vec<(String, Vec<usize>)> {
 
 /// 星标（0/1）。
 pub fn set_star(store: &Store, id: i64, star: i32) -> Result<()> {
-    store.0.lock().unwrap().execute(
-        "UPDATE photos SET star=?1 WHERE id=?2",
-        rusqlite::params![star, id],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "UPDATE photos SET star=?1 WHERE id=?2",
+            rusqlite::params![star, id],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 重复照片组:按 dHash 精确相等分组(每桶 ≥2 张)。
 pub fn dup_groups(store: &Store) -> Result<Vec<(i64, Vec<i64>)>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare("SELECT id, dhash FROM photos WHERE dhash IS NOT NULL")?;
-    let rows: Vec<(i64, i64)> = st
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(st);
+    let rows: Vec<(i64, i64)> = store.read(|conn| -> Result<Vec<(i64, i64)>> {
+        let mut st = conn.prepare("SELECT id, dhash FROM photos WHERE dhash IS NOT NULL")?;
+        let rows: Vec<(i64, i64)> = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })?;
     let mut buckets: std::collections::HashMap<i64, Vec<i64>> = Default::default();
     for (id, h) in rows {
         buckets.entry(h).or_default().push(id);
@@ -371,15 +377,14 @@ pub fn import_xmp(store: &Store, id: i64, path: &str) -> Result<(bool, usize)> {
     if meta.star == 0 && meta.tags.is_empty() {
         return Ok((false, 0));
     }
-    let cur_star: i32 = {
-        let conn = store.0.lock().unwrap();
+    let cur_star: i32 = store.read(|conn| {
         conn.query_row(
             "SELECT star FROM photos WHERE id=?1",
             rusqlite::params![id],
             |r| r.get(0),
         )
         .unwrap_or(0)
-    };
+    });
     let cur_tags = tags_of(store, id).unwrap_or_default();
     let mut got_star = false;
     if meta.star > 0 && cur_star == 0 {
@@ -399,14 +404,13 @@ pub fn import_xmp(store: &Store, id: i64, path: &str) -> Result<(bool, usize)> {
 /// 批量导入所有未处理照片(`xmp_imported=0`)的 XMP sidecar。
 /// 返回 (导入星标的照片数, 导入标签的照片数)。用于启动时静默增量 + 菜单手动触发。
 pub fn import_xmp_batch(store: &Store, limit: usize) -> Result<(usize, usize)> {
-    let rows: Vec<(i64, String)> = {
-        let conn = store.0.lock().unwrap();
+    let rows: Vec<(i64, String)> = store.read(|conn| -> Result<Vec<(i64, String)>> {
         let mut st = conn.prepare("SELECT id, path FROM photos WHERE xmp_imported=0 LIMIT ?1")?;
         let it = st.query_map([limit.min(1_000_000_000) as i64], |r| {
             Ok((r.get(0)?, r.get(1)?))
         })?;
-        it.filter_map(|r| r.ok()).collect()
-    };
+        Ok(it.filter_map(|r| r.ok()).collect())
+    })?;
     let (mut stars, mut tagged) = (0usize, 0usize);
     for (id, path) in rows {
         let (s, t) = import_xmp(store, id, &path)?;
@@ -416,11 +420,13 @@ pub fn import_xmp_batch(store: &Store, limit: usize) -> Result<(usize, usize)> {
         if t > 0 {
             tagged += 1;
         }
-        let conn = store.0.lock().unwrap();
-        conn.execute(
-            "UPDATE photos SET xmp_imported=1 WHERE id=?1",
-            rusqlite::params![id],
-        )?;
+        store.write(|conn| -> Result<()> {
+            conn.execute(
+                "UPDATE photos SET xmp_imported=1 WHERE id=?1",
+                rusqlite::params![id],
+            )?;
+            Ok(())
+        })?;
     }
     Ok((stars, tagged))
 }
@@ -429,15 +435,16 @@ pub fn import_xmp_batch(store: &Store, limit: usize) -> Result<(usize, usize)> {
 /// 返回 (组内最小 id 作 key, 成员 id 升序),仅含 ≥2 张的组,按组大小降序。
 /// 复杂度 O(n²·popcount);万张级约 0.2s,同步可接受(仅用户勾选时触发)。
 pub fn dup_groups_near(store: &Store, max_dist: u32) -> Result<Vec<(i64, Vec<i64>)>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare("SELECT id, dhash FROM photos WHERE dhash IS NOT NULL")?;
-    let rows: Vec<(i64, u64)> = st
-        .query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    drop(st);
+    let rows: Vec<(i64, u64)> = store.read(|conn| -> Result<Vec<(i64, u64)>> {
+        let mut st = conn.prepare("SELECT id, dhash FROM photos WHERE dhash IS NOT NULL")?;
+        let rows: Vec<(i64, u64)> = st
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })?;
     let n = rows.len();
     let mut parent: Vec<usize> = (0..n).collect();
 
@@ -484,27 +491,31 @@ pub fn dup_groups_near(store: &Store, max_dist: u32) -> Result<Vec<(i64, Vec<i64
 
 /// 加标签(不存在则创建),并挂到照片。
 pub fn add_tag(store: &Store, id: i64, name: &str) -> Result<()> {
-    let conn = store.0.lock().unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO tags(name) VALUES(?1)",
-        rusqlite::params![name],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO photo_tags(photo_id, tag_id)
-         SELECT ?1, id FROM tags WHERE name=?2",
-        rusqlite::params![id, name],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name) VALUES(?1)",
+            rusqlite::params![name],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_tags(photo_id, tag_id)
+             SELECT ?1, id FROM tags WHERE name=?2",
+            rusqlite::params![id, name],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 解除一条标签关联;标签本身保留(其他照片可能仍在用)。
 pub fn remove_tag(store: &Store, id: i64, name: &str) -> Result<()> {
-    let conn = store.0.lock().unwrap();
-    conn.execute(
-        "DELETE FROM photo_tags WHERE photo_id=?1 AND tag_id
-         IN (SELECT id FROM tags WHERE name=?2)",
-        rusqlite::params![id, name],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "DELETE FROM photo_tags WHERE photo_id=?1 AND tag_id
+             IN (SELECT id FROM tags WHERE name=?2)",
+            rusqlite::params![id, name],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -512,28 +523,30 @@ pub fn remove_tag(store: &Store, id: i64, name: &str) -> Result<()> {
 /// 导入页用它把"已经在图库里"的行标出来 —— 列目录读的是文件系统,
 /// 不查库就分不清"新照片"和"早就索引过的"。
 pub fn indexed_paths_in(store: &Store, folder: &str) -> std::collections::HashSet<String> {
-    let conn = store.0.lock().unwrap();
-    let mut st = match conn.prepare("SELECT path FROM photos WHERE parent=?1") {
-        Ok(s) => s,
-        Err(_) => return std::collections::HashSet::new(),
-    };
-    st.query_map([folder], |r| r.get::<_, String>(0))
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+    store.read(|conn| {
+        let mut st = match conn.prepare("SELECT path FROM photos WHERE parent=?1") {
+            Ok(s) => s,
+            Err(_) => return std::collections::HashSet::new(),
+        };
+        st.query_map([folder], |r| r.get::<_, String>(0))
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+    })
 }
 
 /// 竖排列出照片的所有标签名。
 pub fn tags_of(store: &Store, id: i64) -> Result<Vec<String>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare(
-        "SELECT t.name FROM tags t JOIN photo_tags pt ON pt.tag_id=t.id
-         WHERE pt.photo_id=?1 ORDER BY t.name",
-    )?;
-    let rows: Vec<String> = st
-        .query_map([id], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    store.read(|conn| -> Result<Vec<String>> {
+        let mut st = conn.prepare(
+            "SELECT t.name FROM tags t JOIN photo_tags pt ON pt.tag_id=t.id
+             WHERE pt.photo_id=?1 ORDER BY t.name",
+        )?;
+        let rows: Vec<String> = st
+            .query_map([id], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
 }
 
 /// 标签及照片数、颜色(视图 > 标签 左侧列表面板)。
@@ -546,74 +559,80 @@ pub struct TagInfo {
 }
 
 pub fn all_tags(store: &Store) -> Result<Vec<TagInfo>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare(
-        "SELECT t.name, t.color, COUNT(pt.photo_id) AS n FROM tags t
-         LEFT JOIN photo_tags pt ON pt.tag_id=t.id
-         GROUP BY t.id ORDER BY t.name",
-    )?;
-    let rows: Vec<TagInfo> = st
-        .query_map([], |r| {
-            Ok(TagInfo {
-                name: r.get::<_, String>(0)?,
-                color: r.get::<_, Option<String>>(1)?,
-                count: r.get::<_, usize>(2)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    store.read(|conn| -> Result<Vec<TagInfo>> {
+        let mut st = conn.prepare(
+            "SELECT t.name, t.color, COUNT(pt.photo_id) AS n FROM tags t
+             LEFT JOIN photo_tags pt ON pt.tag_id=t.id
+             GROUP BY t.id ORDER BY t.name",
+        )?;
+        let rows: Vec<TagInfo> = st
+            .query_map([], |r| {
+                Ok(TagInfo {
+                    name: r.get::<_, String>(0)?,
+                    color: r.get::<_, Option<String>>(1)?,
+                    count: r.get::<_, usize>(2)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
 }
 
 /// 设置/清除标签颜色(颜色面板;None = 无颜色)。
 pub fn set_tag_color(store: &Store, name: &str, color: Option<&str>) -> Result<()> {
-    let conn = store.0.lock().unwrap();
-    conn.execute(
-        "UPDATE tags SET color=?1 WHERE name=?2",
-        rusqlite::params![color, name],
-    )?;
+    store.write(|conn| -> Result<()> {
+        conn.execute(
+            "UPDATE tags SET color=?1 WHERE name=?2",
+            rusqlite::params![color, name],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// 某标签下的照片 id 列表(按 id 升序)。
 pub fn photos_by_tag(store: &Store, tag: &str) -> Result<Vec<i64>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare(
-        "SELECT pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
-         WHERE t.name=?1 ORDER BY pt.photo_id",
-    )?;
-    let rows: Vec<i64> = st
-        .query_map([tag], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    store.read(|conn| -> Result<Vec<i64>> {
+        let mut st = conn.prepare(
+            "SELECT pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+             WHERE t.name=?1 ORDER BY pt.photo_id",
+        )?;
+        let rows: Vec<i64> = st
+            .query_map([tag], |r| r.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
 }
 
 /// 从图库索引移除照片:只删索引行(photo_tags/faces/face_templates/photos),
 /// 绝不删除磁盘上的原文件。对应菜单 编辑 > 从图库中移除。
 pub fn remove_photos(store: &Store, ids: &[i64]) -> Result<()> {
-    let conn = store.0.lock().unwrap();
-    let tx = conn.unchecked_transaction()?;
-    {
-        let mut st_tags = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id=?1")?;
-        let mut st_ft = tx.prepare_cached(
-            "DELETE FROM face_templates WHERE face_id IN
-             (SELECT id FROM faces WHERE photo_id=?1)",
-        )?;
-        let mut st_faces = tx.prepare_cached("DELETE FROM faces WHERE photo_id=?1")?;
-        let mut st_clips = tx.prepare_cached("DELETE FROM clips WHERE photo_id=?1")?;
-        let mut st_clips_cn = tx.prepare_cached("DELETE FROM clips_cn WHERE photo_id=?1")?;
-        let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
-        for id in ids {
-            st_tags.execute(rusqlite::params![id])?;
-            st_clips.execute(rusqlite::params![id])?;
-            st_clips_cn.execute(rusqlite::params![id])?;
-            st_ft.execute(rusqlite::params![id])?;
-            st_faces.execute(rusqlite::params![id])?;
-            st_photos.execute(rusqlite::params![id])?;
+    store.write(|conn| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut st_tags = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id=?1")?;
+            let mut st_ft = tx.prepare_cached(
+                "DELETE FROM face_templates WHERE face_id IN
+                 (SELECT id FROM faces WHERE photo_id=?1)",
+            )?;
+            let mut st_faces = tx.prepare_cached("DELETE FROM faces WHERE photo_id=?1")?;
+            let mut st_clips = tx.prepare_cached("DELETE FROM clips WHERE photo_id=?1")?;
+            let mut st_clips_cn = tx.prepare_cached("DELETE FROM clips_cn WHERE photo_id=?1")?;
+            let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
+            for id in ids {
+                st_tags.execute(rusqlite::params![id])?;
+                st_clips.execute(rusqlite::params![id])?;
+                st_clips_cn.execute(rusqlite::params![id])?;
+                st_ft.execute(rusqlite::params![id])?;
+                st_faces.execute(rusqlite::params![id])?;
+                st_photos.execute(rusqlite::params![id])?;
+            }
         }
-    }
-    tx.commit()?;
+        tx.commit()?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -621,15 +640,14 @@ pub fn remove_photos(store: &Store, ids: &[i64]) -> Result<()> {
 /// 只删索引,绝不碰磁盘文件(文件夹管理器 > 从图库移除)。
 pub fn remove_photos_under(store: &Store, folder: &str) -> Result<usize> {
     let prefix = folder.trim_end_matches(['\\', '/']);
-    let ids: Vec<i64> = {
-        let conn = store.0.lock().unwrap();
+    let ids: Vec<i64> = store.read(|conn| -> Result<Vec<i64>> {
         let mut st = conn.prepare("SELECT id FROM photos WHERE path LIKE ?1 ESCAPE '\\'")?;
         let rows = st.query_map(
             rusqlite::params![format!("{}%", like_escape(prefix))],
             |r| r.get::<_, i64>(0),
         )?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    })?;
     let n = ids.len();
     if n > 0 {
         remove_photos(store, &ids)?;
@@ -654,24 +672,25 @@ pub struct GpsPoint {
 }
 
 pub fn gps_points(store: &Store) -> Result<Vec<GpsPoint>> {
-    let conn = store.0.lock().unwrap();
-    let mut st = conn.prepare(
-        "SELECT path, taken_utc, star, lat, lon FROM photos
-         WHERE lat IS NOT NULL AND lon IS NOT NULL ORDER BY path",
-    )?;
-    let rows: Vec<GpsPoint> = st
-        .query_map([], |r| {
-            Ok(GpsPoint {
-                path: r.get(0)?,
-                taken: r.get(1)?,
-                star: r.get(2)?,
-                lat: r.get(3)?,
-                lon: r.get(4)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    store.read(|conn| -> Result<Vec<GpsPoint>> {
+        let mut st = conn.prepare(
+            "SELECT path, taken_utc, star, lat, lon FROM photos
+             WHERE lat IS NOT NULL AND lon IS NOT NULL ORDER BY path",
+        )?;
+        let rows: Vec<GpsPoint> = st
+            .query_map([], |r| {
+                Ok(GpsPoint {
+                    path: r.get(0)?,
+                    taken: r.get(1)?,
+                    star: r.get(2)?,
+                    lat: r.get(3)?,
+                    lon: r.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    })
 }
 
 #[cfg(test)]
@@ -680,16 +699,12 @@ mod tests {
     use crate::db::Store;
 
     fn one_photo(store: &Store) -> i64 {
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "INSERT INTO photos(path,parent,mtime,size) VALUES('a.jpg','.',0,0)",
                 [],
             )
             .unwrap();
-        store.0.lock().unwrap().last_insert_rowid()
+        store.test_conn().last_insert_rowid()
     }
 
     /// 复核修复:删除标签后 DB 关联必须真正消失(此前 XMP 残留会把标签复活回 DB)。
@@ -756,7 +771,7 @@ mod tests {
     #[test]
     fn remove_photos_under_folder() {
         let store = Store::open_mem().unwrap();
-        let c = store.0.lock().unwrap();
+        let c = store.test_conn();
         c.execute(
             "INSERT INTO photos(path,parent,mtime,size) VALUES('/d/a.jpg','/d',0,0)",
             [],
@@ -785,28 +800,16 @@ mod tests {
     fn remove_photos_clears_clips() {
         let store = Store::open_mem().unwrap();
         let id = one_photo(&store);
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "INSERT INTO clips(photo_id,dim,vec) VALUES(?1,2,X'0000803f0000003f')",
                 rusqlite::params![id],
             )
             .unwrap();
-        let n: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+        let n: i64 = store.test_conn().query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
         remove_photos(&store, &[id]).unwrap();
-        let n2: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+        let n2: i64 = store.test_conn().query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n2, 0, "clips 行应随照片索引一并删除");
     }
@@ -815,7 +818,7 @@ mod tests {
     #[test]
     fn gps_points_query() {
         let store = Store::open_mem().unwrap();
-        let c = store.0.lock().unwrap();
+        let c = store.test_conn();
         c.execute("INSERT INTO photos(path,parent,mtime,size,lat,lon) VALUES('/a.jpg','.',0,0,31.24,121.47)", []).unwrap();
         c.execute(
             "INSERT INTO photos(path,parent,mtime,size) VALUES('/b.jpg','.',0,0)",
@@ -849,11 +852,7 @@ mod tests {
 
         let store = Store::open_mem().unwrap();
         let id = one_photo(&store);
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "UPDATE photos SET path=?1 WHERE id=?2",
                 rusqlite::params![p1.to_string_lossy(), id],
             )
@@ -874,11 +873,7 @@ mod tests {
         assert!(tags_of(&store, id).unwrap().is_empty());
 
         // 3. 重置标记 → 合理重导(仅补 DB 空值)
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "UPDATE photos SET xmp_imported=0 WHERE id=?1",
                 rusqlite::params![id],
             )
@@ -887,22 +882,14 @@ mod tests {
         assert_eq!((s3, t3), (1, 1));
 
         // 4. 无 sidecar 的照片:直接标记,不报错
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'.',0,0)",
                 rusqlite::params![dir.join("b.jpg").to_string_lossy()],
             )
             .unwrap();
         let (s4, t4) = import_xmp_batch(&store, 100).unwrap();
         assert_eq!((s4, t4), (0, 0));
-        let left: i64 = store
-            .0
-            .lock()
-            .unwrap()
-            .query_row(
+        let left: i64 = store.test_conn().query_row(
                 "SELECT COUNT(*) FROM photos WHERE xmp_imported=0",
                 [],
                 |r| r.get(0),
@@ -917,7 +904,7 @@ mod tests {
     fn dup_groups_near_threshold() {
         let store = Store::open_mem().unwrap();
         {
-            let c = store.0.lock().unwrap();
+            let c = store.test_conn();
             // 3 张照片:a=0x00,b=0x01(与 a 距 1),c=0x0f(与 a 距 4)
             c.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size,dhash) VALUES(1,'a.jpg','.',0,0,0)",
@@ -968,7 +955,7 @@ mod tests {
         size: i64,
         lat: Option<f64>,
     ) -> i64 {
-        let c = store.0.lock().unwrap();
+        let c = store.test_conn();
         c.execute(
             "INSERT INTO photos(path,parent,mtime,size,star,kind,taken_utc,lat,lon)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -989,11 +976,7 @@ mod tests {
     }
 
     fn add_face(store: &Store, photo_id: i64, ignored: i32) {
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "INSERT INTO faces(photo_id,x1,y1,x2,y2,ignored) VALUES(?1,0.1,0.1,0.5,0.5,?2)",
                 rusqlite::params![photo_id, ignored],
             )
@@ -1148,11 +1131,7 @@ mod tests {
             400,
             None,
         );
-        store
-            .0
-            .lock()
-            .unwrap()
-            .execute(
+        store.test_conn().execute(
                 "UPDATE photos SET caption='海边日落' WHERE id=?1",
                 rusqlite::params![titled],
             )

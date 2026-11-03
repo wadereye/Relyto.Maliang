@@ -15,15 +15,15 @@ pub struct Baked {
 
 /// 从 photos 行取 (path, rot)。
 fn photo(store: &Store, id: i64) -> Result<(String, i32)> {
-    let conn = store.0.lock().unwrap();
-    let (p, rot): (String, i32) = conn
-        .query_row(
-            "SELECT path, rot FROM photos WHERE id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .context("照片不在索引中")?;
-    Ok((p, rot))
+    store
+        .read(|conn| {
+            conn.query_row(
+                "SELECT path, rot FROM photos WHERE id=?1",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
+            )
+        })
+        .context("照片不在索引中")
 }
 
 /// 提取 JPEG 全部 APP1(Exif)段负载(不含 FF E1 与长度)。
@@ -122,11 +122,14 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as i64;
-    let conn = store.0.lock().unwrap();
-    conn.execute(
-        "UPDATE photos SET rot=1, mtime=?2, size=?3, baked=1, dhash=NULL, thumb_ok=0 WHERE id=?1",
-        rusqlite::params![id, mtime_ms, jpg.len() as i64],
-    )?;
+    // 烘培是慢操作(重编码占绝对大头),这里同步写保证返回时已落库。
+    store.write(|conn| -> anyhow::Result<()> {
+        conn.execute(
+            "UPDATE photos SET rot=1, mtime=?2, size=?3, baked=1, dhash=NULL, thumb_ok=0 WHERE id=?1",
+            rusqlite::params![id, mtime_ms, jpg.len() as i64],
+        )?;
+        Ok(())
+    })?;
     Ok(Baked { path: path_s, backup: backup_s })
 }
 

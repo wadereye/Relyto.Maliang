@@ -457,7 +457,7 @@ mod tests {
         std::fs::write(&kept, b"x").unwrap();
         let _ = std::fs::remove_file(&gone);
         {
-            let c = store.0.lock().unwrap();
+            let c = store.test_conn();
             for p in [&kept, &gone] {
                 c.execute(
                     "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'/',0,0)",
@@ -475,7 +475,7 @@ mod tests {
         ];
         assert_eq!(drop_removed(&store, &items, &[root.clone()]), 1);
 
-        let c = store.0.lock().unwrap();
+        let c = store.test_conn();
         let kept_n: i64 = c
             .query_row(
                 "SELECT COUNT(*) FROM photos WHERE path=?1",

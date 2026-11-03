@@ -948,6 +948,103 @@ unsafe fn shell_thumbnail_inner(wide: &[u16], size: u32) -> Option<(Vec<u8>, u32
     }
 }
 
+/// 弹出 Windows 资源管理器**原生**右键菜单(含"打开方式""发送到"等全部扩展项)。
+///
+/// COM 流程:`SHCreateItemFromParsingName` → `BindToHandler(BHID_SFUIObject)`
+/// → `IContextMenu::QueryContextMenu` 填充 HMENU → `TrackPopupMenuEx`
+/// (`TPM_RETURNCMD` 模态收命令号) → `InvokeCommand`。
+/// 菜单位于光标处;模态阻塞直到用户选完/取消,返回是否执行了命令。
+/// 文件与文件夹通用(文件夹拿到的是目录自身的上下文菜单)。
+pub fn shell_context_menu(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        let p = path.to_string_lossy().into_owned();
+        let wide = to_wide(&p);
+        // 与 shell_thumbnail 同一套配平约定:本调用可能发生在任一线程。
+        // SAFETY: CoInitializeEx/CoUninitialize 标准配对;后续 unsafe 块各自注释。
+        unsafe {
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let needs_uninit = hr.is_ok();
+            let res = shell_context_menu_inner(&wide);
+            if needs_uninit {
+                CoUninitialize();
+            }
+            res
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+#[cfg(windows)]
+unsafe fn shell_context_menu_inner(wide: &[u16]) -> bool {
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::Shell::{
+        BHID_SFUIObject, CMF_NORMAL, IContextMenu, SHCreateItemFromParsingName,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, TrackPopupMenuEx,
+        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    };
+
+    // SAFETY: wide 为 NUL 结尾宽串;COM 已由外层初始化。
+    // 结果行可能在右键前被删/不可达(网络路径),失败即静默放弃,不 panic。
+    let Ok(item) = SHCreateItemFromParsingName::<_, _, windows::Win32::UI::Shell::IShellItem>(
+        PCWSTR(wide.as_ptr()),
+        None,
+    ) else {
+        return false;
+    };
+    let Ok(menu) = item.BindToHandler::<_, IContextMenu>(None, &BHID_SFUIObject) else {
+        return false;
+    };
+
+    // SAFETY: hmenu 由 CreatePopupMenu 创建,失败即退出。
+    let Ok(hmenu) = CreatePopupMenu() else {
+        return false;
+    };
+    // 命令号区间 [1, 0x7FFF]:TrackPopupMenuEx(TPM_RETURNCMD) 返回选中号,
+    // InvokeCommand 的整数动词 = 选中号 - idcmdfirst。
+    let first_cmd: u32 = 1;
+    if menu.QueryContextMenu(hmenu, 0, first_cmd, 0x7FFF, CMF_NORMAL).is_err() {
+        let _ = DestroyMenu(hmenu);
+        return false;
+    }
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let hwnd = GetForegroundWindow();
+    // SAFETY: hmenu 有效;TPM_RETURNCMD 下返回值即命令号(0 = 未选)。
+    let cmd = TrackPopupMenuEx(
+        hmenu,
+        (TPM_RETURNCMD | TPM_LEFTALIGN | TPM_RIGHTBUTTON).0,
+        pt.x,
+        pt.y,
+        hwnd,
+        None,
+    )
+    .0 as u32;
+    let _ = DestroyMenu(hmenu);
+    if cmd == 0 {
+        return false; // 取消
+    }
+    let ici = windows::Win32::UI::Shell::CMINVOKECOMMANDINFO {
+        cbSize: std::mem::size_of::<windows::Win32::UI::Shell::CMINVOKECOMMANDINFO>() as u32,
+        hwnd,
+        lpVerb: PCSTR((cmd - first_cmd) as *const u8),
+        nShow: windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // SAFETY: ici 已填 cbSize/hwnd/lpVerb(整数动词);menu 有效。
+    menu.InvokeCommand(&ici).is_ok()
+}
+
 #[cfg(windows)]
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
