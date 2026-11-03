@@ -508,6 +508,18 @@ impl Store {
         .unwrap_or_default()
     }
 
+    /// 单个相簿的名字(标题用)。
+    ///
+    /// 只取一行;`albums()` 会为每个相簿跑一次成员 COUNT(*) 子查询,
+    /// 逐帧画标题时别用它。
+    pub fn album_name(&self, album_id: i64) -> Option<String> {
+        self.0.lock().unwrap().query_row(
+            "SELECT name FROM albums WHERE id=?1",
+            [album_id],
+            |r| r.get::<_, String>(0),
+        ).ok()
+    }
+
     /// 新建相簿,返回 id(重名返回既有 id,与参考件「不能重名」一致)。
     pub fn album_create(&self, name: &str) -> Result<i64> {
         let conn = self.0.lock().unwrap();
