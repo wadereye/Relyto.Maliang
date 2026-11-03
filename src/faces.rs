@@ -439,27 +439,43 @@ pub fn wipe_faces(store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// 后台扫描一批未分析照片。
-pub fn scan_batch(store: &Store, cap: usize) -> Result<(usize, usize)> {
+/// 后台扫描一批未分析照片:每处理完一张就把(本批已走张数, 本批总张数)
+/// 回报给调用方,供 UI 画百分比 —— 一批 200 张在机械盘上要跑几十秒,
+/// 没有进度就是黑箱。不需要进度时传 `&|_, _| {}`。
+pub fn scan_batch(
+    store: &Store,
+    cap: usize,
+    on_progress: &(dyn Fn(usize, usize) + Send),
+) -> Result<(usize, usize)> {
     let done = photo_ids_done(store);
     let todo = photos_todo(store, cap);
+    let total = todo.len();
     let mut faces_engine = match Faces::load() {
         Ok(e) => e,
         Err(e) => return Err(anyhow::anyhow!(e)),
     };
     let mut face_count = 0;
     let mut photo_count = 0;
-    for (pid, path) in todo {
+    for (i, (pid, path)) in todo.into_iter().enumerate() {
+        // 进度按"走过的张数"算,跳过的(已有结果 / 解不开)也算走完,才不会卡住不动。
+        let step = i + 1;
         if done.contains(&pid) {
+            on_progress(step, total);
             continue;
         }
         let img = match image::open(&path) {
             Ok(i) => i,
-            Err(_) => continue,
+            Err(_) => {
+                on_progress(step, total);
+                continue;
+            }
         };
         let res = match faces_engine.analyze(&img) {
             Ok(r) => r,
-            Err(_) => continue,
+            Err(_) => {
+                on_progress(step, total);
+                continue;
+            }
         };
         for f in &res {
             let q = face_quality(&img, &f.det);
@@ -477,6 +493,7 @@ pub fn scan_batch(store: &Store, cap: usize) -> Result<(usize, usize)> {
         }
         face_count += res.len();
         photo_count += 1;
+        on_progress(step, total);
     }
     assign_clusters(store, 0.5)?;
     Ok((photo_count, face_count))

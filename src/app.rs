@@ -1,7 +1,7 @@
 use crate::db::Store;
 use crate::timeline::{self, PhotoRow};
 use eframe::egui;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -122,6 +122,35 @@ struct ScanResult {
 }
 
 type Dup = (i64, Vec<i64>);
+
+/// 人脸扫描后台线程 → UI 的回报:逐张进度 + 收尾结果。
+#[cfg(feature = "ai")]
+enum FaceScan {
+    Progress(usize, usize),
+    Done(Result<(usize, usize), String>),
+}
+
+/// 左栏文件夹树的一个目录节点(节点号即 `FolderTree::nodes` 的下标)。
+struct TreeNode {
+    /// 行内显示名(末级目录名;根节点是盘符/`/`)。
+    name: String,
+    /// 完整路径(展开状态与选中判定的键)。
+    path: String,
+    kids: Vec<usize>,
+    /// 该目录自己在 `App::folders` 里的下标 —— 只有装照片的目录才可选。
+    folder_index: Option<usize>,
+    /// 行缩略图用哪张照片代表本目录(本目录优先,否则取子树里第一个命中的)。
+    photo_id: Option<i64>,
+}
+
+/// 由 `App::folders` 反推的目录树(含中间层目录,它们本身可以没有照片)。
+#[derive(Default)]
+struct FolderTree {
+    /// 对应的 `rows_gen`;不等即视为过期,重建。
+    gen: u64,
+    nodes: Vec<TreeNode>,
+    roots: Vec<usize>,
+}
 
 pub struct App {
     store: Arc<Store>,
@@ -369,6 +398,12 @@ pub struct App {
     /// 左栏每行画该目录的缩略图(参考件 View > Show Thumbnails in Library;
     /// 设置项 tree_thumbs)。
     tree_thumbs: bool,
+    /// 文件夹树的节点缓存(键 = rows_gen;逐帧重建是 O(目录数×层级) 的白活)。
+    folder_tree_cache: FolderTree,
+    /// 展开中的目录路径(点三角切换;选中项的祖先链自动展开)。
+    tree_open: HashSet<String>,
+    /// 树行缩略图纹理缓存(按照片 id;档位固定 Small,数量有上限就整体丢弃)。
+    tree_texs: HashMap<i64, egui::TextureHandle>,
     /// 人物列表排序方式(参考件 Sort People by Name / Amount / Top 10)。
     people_sort: PeopleSort,
     /// 工具栏「新建相册」弹窗(选中照片时把选中项一并放进新相册)。
@@ -384,7 +419,10 @@ pub struct App {
     /// 全图解码结果通道(Option = 解码失败或超过内存上限);防重复派发的在途照片 id。
     zoom_rx: Option<mpsc::Receiver<(i64, Option<image::RgbaImage>)>>,
     #[cfg(feature = "ai")]
-    face_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
+    face_rx: Option<mpsc::Receiver<FaceScan>>,
+    /// 人脸扫描本批进度(已走张数, 本批总张数)。
+    #[cfg(feature = "ai")]
+    face_prog: (usize, usize),
     #[cfg(feature = "ai")]
     face_people: Vec<crate::faces::PeopleRow>,
     #[cfg(feature = "ai")]
@@ -527,6 +565,79 @@ fn folder_of(path: &str) -> String {
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default()
+}
+
+/// 由「装了照片的目录」列表反推目录树:链上每一层都建节点,所以中间层目录
+/// (本身没有照片)也在树里,能一路展开到底层相册;`rep` 给出每个目录的代表照片,
+/// 没有照片的中间层借用子树里第一个命中的,行上才不会是一片空位。
+/// 返回 (节点表, 根节点号)。
+fn build_folder_tree(
+    folders: &[String],
+    rep: &HashMap<String, i64>,
+) -> (Vec<TreeNode>, Vec<usize>) {
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    let mut by_path: HashMap<String, usize> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    // 每个目录的祖先链(根 → 自身)与它的照片/下标,先记下来再统一回填。
+    let mut chains: Vec<(Vec<usize>, Option<i64>, usize)> = Vec::new();
+    for (fi, f) in folders.iter().enumerate() {
+        let mut chain: Vec<String> = Path::new(f)
+            .ancestors()
+            .take(64)
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        chain.reverse();
+        chain.dedup();
+        let mut ids: Vec<usize> = Vec::with_capacity(chain.len());
+        let mut parent: Option<usize> = None;
+        for seg in &chain {
+            let id = match by_path.get(seg) {
+                Some(&i) => i,
+                None => {
+                    let name = Path::new(seg)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| seg.clone());
+                    nodes.push(TreeNode {
+                        name,
+                        path: seg.clone(),
+                        kids: Vec::new(),
+                        folder_index: None,
+                        photo_id: None,
+                    });
+                    let id = nodes.len() - 1;
+                    by_path.insert(seg.clone(), id);
+                    match parent {
+                        Some(pi) => nodes[pi].kids.push(id),
+                        None => roots.push(id),
+                    }
+                    id
+                }
+            };
+            ids.push(id);
+            parent = Some(id);
+        }
+        chains.push((ids, rep.get(f).copied(), fi));
+    }
+    // 第一遍:目录自己的照片与 `folders` 下标只挂在链尾(即该目录节点)。
+    for (ids, pid, fi) in &chains {
+        if let (Some(&last), Some(pid)) = (ids.last(), pid) {
+            nodes[last].folder_index = Some(*fi);
+            nodes[last].photo_id = Some(*pid);
+        }
+    }
+    // 第二遍:还空着的(中间层)借子树第一个命中。
+    for (ids, pid, _) in &chains {
+        if pid.is_none() {
+            continue;
+        }
+        for &id in ids {
+            if nodes[id].photo_id.is_none() {
+                nodes[id].photo_id = *pid;
+            }
+        }
+    }
+    (nodes, roots)
 }
 
 /// 从**已落盘的缩略图**加载纹理(不碰原图)。
@@ -1151,6 +1262,9 @@ impl App {
             folder_tree,
             folder_show_all: true,
             tree_thumbs,
+            folder_tree_cache: FolderTree::default(),
+            tree_open: HashSet::new(),
+            tree_texs: HashMap::new(),
             people_sort,
             album_new_win: false,
             pending_thumbs: 0,
@@ -1159,6 +1273,8 @@ impl App {
             zoom_active_for: None,
             #[cfg(feature = "ai")]
             face_rx: None,
+            #[cfg(feature = "ai")]
+            face_prog: (0, 0),
             #[cfg(feature = "ai")]
             face_people: Vec::new(),
             #[cfg(feature = "ai")]
@@ -1784,6 +1900,8 @@ impl App {
                 self.selected_folder = i;
                 self.folder_show_all = false;
                 self.view = ViewKind::Folder;
+                let p = self.folders[i].clone();
+                self.tree_reveal(&p);
                 self.status = format!("已定位到 {label}");
             }
             None => self.status = format!("{label} 未导入图库:文件夹管理器 > 添加文件夹"),
@@ -2296,10 +2414,14 @@ impl App {
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.face_rx = Some(rx);
+        self.face_prog = (0, 0);
         self.status = "正在人脸识别(扫描 200 张照片)…".into();
         std::thread::spawn(move || {
-            let res = crate::faces::scan_batch(&store, 200).map_err(|e| e.to_string());
-            let _ = tx.send(res.map_err(|e| e.to_string()));
+            let res = crate::faces::scan_batch(&store, 200, &|done, total| {
+                let _ = tx.send(FaceScan::Progress(done, total));
+            })
+            .map_err(|e| e.to_string());
+            let _ = tx.send(FaceScan::Done(res));
         });
     }
 
@@ -4883,6 +5005,148 @@ impl App {
         std::mem::take(&mut self.folder_groups.1)
     }
 
+    /// 由 `folders` 反推目录树并接管展开状态(树本体见 `build_folder_tree`)。
+    fn rebuild_folder_tree(&mut self) {
+        // 每个目录的代表照片:当前排序下第一张命中的行(新图优先)。
+        let mut rep: HashMap<String, i64> = HashMap::new();
+        for r in &self.rows {
+            rep.entry(folder_of(&r.path)).or_insert(r.id);
+        }
+        let (nodes, roots) = build_folder_tree(&self.folders, &rep);
+        // 展开状态:丢掉已不存在的目录,盘根默认摊开,选中项的祖先链补开。
+        let alive: HashSet<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
+        self.tree_open.retain(|p| alive.contains(p.as_str()));
+        for &r in &roots {
+            self.tree_open.insert(nodes[r].path.clone());
+        }
+        if let Some(f) = self.folders.get(self.selected_folder).cloned() {
+            self.tree_reveal(&f);
+        }
+        self.folder_tree_cache = FolderTree {
+            gen: self.rows_gen,
+            nodes,
+            roots,
+        };
+    }
+
+    /// 展开某目录的全部祖先(选中后树上看得见选中的那一条)。
+    fn tree_reveal(&mut self, path: &str) {
+        for p in Path::new(path).ancestors().take(64) {
+            self.tree_open.insert(p.to_string_lossy().into_owned());
+        }
+    }
+
+    /// 左栏文件夹树入口:树本体按 rows_gen 缓存,逐帧只走可见节点。
+    fn folder_tree_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.folder_tree_cache.gen != self.rows_gen {
+            self.rebuild_folder_tree();
+        }
+        let cache = std::mem::take(&mut self.folder_tree_cache);
+        for &r in &cache.roots {
+            self.walk_tree(ui, ctx, &cache.nodes, r, 0);
+        }
+        self.folder_tree_cache = cache;
+    }
+
+    /// 递归画一个目录节点及其展开中的子树。
+    fn walk_tree(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        nodes: &[TreeNode],
+        id: usize,
+        depth: usize,
+    ) {
+        let n = &nodes[id];
+        let kids = n.kids.clone();
+        let path = n.path.clone();
+        let name = n.name.clone();
+        let folder_index = n.folder_index;
+        let thumb = n.photo_id;
+        let open = self.tree_open.contains(&path);
+        let active = folder_index.is_some()
+            && !self.folder_show_all
+            && self.selected_folder == folder_index.unwrap_or(usize::MAX);
+        ui.horizontal(|ui| {
+            ui.add_space((depth as f32) * 10.0);
+            if !kids.is_empty() {
+                if ui
+                    .small_button(if open { "▾" } else { "▸" })
+                    .on_hover_text("展开 / 收起")
+                    .clicked()
+                {
+                    if open {
+                        self.tree_open.remove(&path);
+                    } else {
+                        self.tree_open.insert(path.clone());
+                    }
+                }
+            } else {
+                ui.add_space(26.0);
+            }
+            if self.tree_thumbs {
+                if let Some(pid) = thumb {
+                    self.tree_thumb_ui(ui, ctx, pid);
+                }
+            }
+            let text = egui::RichText::new(name.as_str()).color(if folder_index.is_some() {
+                crate::theme::p().text
+            } else {
+                crate::theme::p().muted
+            });
+            if ui.selectable_label(active, text).clicked() {
+                match folder_index {
+                    Some(fi) => {
+                        self.selected_folder = fi;
+                        self.folder_show_all = false;
+                        self.tree_reveal(&path);
+                    }
+                    // 中间层目录本身没有照片:点名字即展开/收起,不当作选中。
+                    None => {
+                        if open {
+                            self.tree_open.remove(&path);
+                        } else {
+                            self.tree_open.insert(path.clone());
+                        }
+                    }
+                }
+            }
+        });
+        if open {
+            for k in kids {
+                self.walk_tree(ui, ctx, nodes, k, depth + 1);
+            }
+        }
+    }
+
+    /// 树行的 18px 代表图。
+    ///
+    /// 取的是**当前档**的已落盘缩略图(后台 worker 只补当前档,单开一档会做成
+    /// 一片空位);纹理按照片 id 缓存,不逐帧重传。
+    fn tree_thumb_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: i64) {
+        if self.tree_texs.len() > 256 {
+            self.tree_texs.clear();
+        }
+        let tier = self.thumb_tier;
+        let tex = match self.tree_texs.get(&id) {
+            Some(t) => Some(t.clone()),
+            None => {
+                let t = thumb_tex(ctx, id, tier);
+                if let Some(t) = &t {
+                    self.tree_texs.insert(id, t.clone());
+                }
+                t
+            }
+        };
+        match tex {
+            Some(t) => {
+                ui.add(egui::Image::new(&t).fit_to_exact_size(egui::vec2(18.0, 18.0)));
+            }
+            // 还没生成缩略图时留同宽的空位,行不会左右跳。
+            None => ui.add_space(18.0),
+        }
+    }
+
     /// 组头(参考件每个相册上方那行:大图标 + 名称 + 日期,图标偏移照原版排版):
     /// 大号目录图标 + 文件夹名 + 组内最早拍摄日期与张数,右侧挂本组动作按钮。
     ///
@@ -4955,6 +5219,7 @@ impl App {
             // 只在点击时反查一次左栏槽位(逐帧扫 folders 列表没必要)。
             if let Some(slot) = self.folders.iter().position(|f| f == folder) {
                 self.selected_folder = slot;
+                self.tree_reveal(folder);
             }
             self.view = ViewKind::Folder;
             self.folder_show_all = false;
@@ -5516,6 +5781,60 @@ fn orient_rect(
 mod tests {
     use super::*;
 
+    /// 目录树两件事必须成立,左栏的真递归树全靠它们:
+    /// 1) 中间层目录(本身没有照片)也成节点,并且借到子树里的一张代表图;
+    /// 2) 只有装了照片的目录带 `folder_index`,即树上只有它可选。
+    #[test]
+    fn folder_tree_adds_intermediate_dirs() {
+        fn walk(nodes: &[TreeNode], id: usize, out: &mut Vec<String>) {
+            out.push(nodes[id].path.clone());
+            for &k in &nodes[id].kids {
+                walk(nodes, k, out);
+            }
+        }
+        // 用系统临时目录起头,两种平台的祖先链形状一致(单一根)。
+        let base = std::env::temp_dir().join("maliang-tree-case");
+        let folders: Vec<String> = [
+            base.join("2024").join("jan"),
+            base.join("2024").join("feb"),
+            base.join("solo"),
+        ]
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+        let mut rep: HashMap<String, i64> = HashMap::new();
+        for (fi, f) in folders.iter().enumerate() {
+            rep.insert(f.clone(), 11 + fi as i64);
+        }
+        let (nodes, roots) = build_folder_tree(&folders, &rep);
+
+        let uniq: HashSet<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
+        assert_eq!(uniq.len(), nodes.len(), "同一路径不应出现两个节点");
+        assert_eq!(roots.len(), 1, "同一盘/同一根应收敛成一个根");
+
+        let mut seen = Vec::new();
+        walk(&nodes, roots[0], &mut seen);
+        assert_eq!(seen.len(), nodes.len(), "所有节点都应能从根走到");
+        for f in &folders {
+            assert!(seen.contains(f), "{f} 应在树上");
+        }
+
+        let mid_path = base.join("2024").to_string_lossy().into_owned();
+        let mid = nodes
+            .iter()
+            .find(|n| n.path == mid_path)
+            .expect("中间层目录 2024 应成节点");
+        assert!(mid.folder_index.is_none(), "本身没有照片的目录不该是可选项");
+        assert_eq!(mid.photo_id, Some(11), "应借到子树里的第一张代表图");
+        assert_eq!(mid.kids.len(), 2);
+
+        for (fi, f) in folders.iter().enumerate() {
+            let n = nodes.iter().find(|n| &n.path == f).expect("目录自身节点");
+            assert_eq!(n.folder_index, Some(fi), "目录应记回它在 folders 里的下标");
+            assert_eq!(n.photo_id, Some(11 + fi as i64));
+        }
+    }
+
     /// orientation 映射与 thumbs::apply_exif_rotation 语义一致
     /// (以左上角点为基准;3=180°,6=顺时针 90°,8=逆时针 90°)。
     #[test]
@@ -5815,8 +6134,17 @@ impl eframe::App for App {
         // 人脸(M2c)结果轮询
         #[cfg(feature = "ai")]
         if let Some(rx) = &self.face_rx {
-            if let Ok(res) = rx.try_recv() {
+            let msgs: Vec<FaceScan> = rx.try_iter().collect();
+            let mut finished: Option<Result<(usize, usize), String>> = None;
+            for m in msgs {
+                match m {
+                    FaceScan::Progress(done, total) => self.face_prog = (done, total),
+                    FaceScan::Done(res) => finished = Some(res),
+                }
+            }
+            if let Some(res) = finished {
                 self.face_rx = None;
+                self.face_prog = (0, 0);
                 match res {
                     Ok((np, nf)) => {
                         self.status = format!("人脸扫描完成:{np} 张照片,检出 {nf} 张人脸")
@@ -6514,17 +6842,29 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
                     }
-                    // P1-8:扫描进度条 + 取消按钮。
+                    // P1-8:扫描进度条 + 取消按钮(百分比照原版说法,明细挂悬停)。
                     if let Some(ctrl) = &self.scan_ctrl {
                         let (done, total) = ctrl.counts();
                         let frac = ctrl.fraction();
                         ui.separator();
-                        ui.label(format!("扫描进度 {done}/{total}"));
-                        ui.add(egui::ProgressBar::new(frac).desired_width(160.0));
+                        let pct = (frac * 100.0).round() as i32;
+                        ui.label(format!("正在扫描… {pct}%"))
+                            .on_hover_text(format!("{done}/{total} 张已完成"));
+                        ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                         if ui.button("取消扫描").clicked() {
                             ctrl.cancel();
                             self.status = format!("正在取消扫描{}…", self.scan_scope);
                         }
+                    }
+                    // 人脸扫描进度(分母 = 本批待分析张数;逐张回报,不会卡在 0%)。
+                    #[cfg(feature = "ai")]
+                    if self.face_rx.is_some() {
+                        let (d, t) = self.face_prog;
+                        let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
+                        ui.separator();
+                        ui.label(format!("正在扫描人物… {}%", (frac * 100.0).round() as i32))
+                            .on_hover_text(format!("本批 {d}/{t} 张"));
+                        ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                     }
                 });
             });
@@ -6622,41 +6962,9 @@ impl eframe::App for App {
                         });
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if self.folder_tree {
-                                // 简化树形视图(参考件 Simplified Tree View):
-                                // 按父目录分组,组头为父目录,子项缩进显示末级目录名。
-                                let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
-                                for (i, f) in self.folders.iter().enumerate() {
-                                    let parent = Path::new(f)
-                                        .parent()
-                                        .map(|p| p.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
-                                    match groups.iter_mut().find(|(p, _)| *p == parent) {
-                                        Some((_, v)) => v.push(i),
-                                        None => groups.push((parent, vec![i])),
-                                    }
-                                }
-                                for (parent, kids) in groups {
-                                    ui.strong(parent);
-                                    ui.indent("folder-tree", |ui| {
-                                        for i in kids {
-                                            let leaf = Path::new(&self.folders[i])
-                                                .file_name()
-                                                .map(|s| s.to_string_lossy().into_owned())
-                                                .unwrap_or_else(|| self.folders[i].clone());
-                                            if ui
-                                                .selectable_label(
-                                                    !self.folder_show_all
-                                                        && self.selected_folder == i,
-                                                    leaf,
-                                                )
-                                                .clicked()
-                                            {
-                                                self.selected_folder = i;
-                                                self.folder_show_all = false;
-                                            }
-                                        }
-                                    });
-                                }
+                                // 真递归目录树:每层缩进,三角展开/收起;
+                                // 只有装了照片的目录才是可选项(点父级 = 展开)。
+                                self.folder_tree_ui(ui, ctx);
                             } else {
                                 // 扁平文件夹视图(参考件 Flat Folder View)。
                                 for (i, f) in self.folders.clone().iter().enumerate() {
@@ -6664,6 +6972,7 @@ impl eframe::App for App {
                                     if ui.selectable_label(on, f).clicked() {
                                         self.selected_folder = i;
                                         self.folder_show_all = false;
+                                        self.tree_reveal(f);
                                     }
                                 }
                             }
