@@ -255,7 +255,11 @@ pub fn apply(ctx: &egui::Context) {
     ]
     .into();
 
-    ctx.set_style(style);
+    // egui 0.33 按主题分存 dark_style / light_style 两份,set_style 只写「当前主题」那一份。
+    // 首帧之前系统主题还没传进来,写进去的往往是 dark 槽;Windows 处于浅色时,第一帧会切到
+    // 从未被改过的 light_style 默认值,整套配色/间距/字号全部失效。两个槽都写才稳。
+    ctx.set_style_of(egui::Theme::Dark, style.clone());
+    ctx.set_style_of(egui::Theme::Light, style);
 }
 
 /// 顶栏/底栏的抬升面。
