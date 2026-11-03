@@ -451,7 +451,7 @@ pub struct App {
     show_options: bool,
     /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
     options_tab: usize,
-    /// 文件夹视图树形形态(参考件 Simplified Tree View;设置项 folder_tree)。
+    /// 文件夹视图树形形态(参考件左栏可逐级展开的那棵树;设置项 folder_tree)。
     folder_tree: bool,
     /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
     /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
@@ -1048,7 +1048,7 @@ fn toolbar_icon(name: &str) -> egui::Image<'static> {
         .fit_to_exact_size(egui::vec2(18.0, 18.0))
 }
 
-/// 组头图标(参考件 `icons/folder_lg`,大一号的目录图标)。
+/// 组头图标(参考件组头那枚大一号的目录图标)。
 fn album_icon(name: &str, size: f32) -> egui::Image<'static> {
     let (tag, bytes) = icon_source(name);
     let half = if crate::theme::p().is_light { "l" } else { "d" };
@@ -2056,7 +2056,7 @@ impl App {
         Some(tex)
     }
 
-    /// 平铺 / 树形一对互斥档(参考件 Flat Folder View 与 Tree View 是同一开关的两态)。
+    /// 平铺 / 树形一对互斥档(参考件同一开关的两态:平铺列表或多级树)。
     fn set_folder_tree(&mut self, tree: bool) {
         if self.folder_tree == tree {
             return;
@@ -2234,7 +2234,7 @@ impl App {
                     // 不忙也占住同样的宽度,免得指示灯出现时整行左右抖。
                     ui.add_space(23.0);
                 }
-                // 搜索框(参考件 `searchcontainer/search` + `searchclr`:放大镜在左,清除在右)。
+                // 搜索框(参考件的搜索一体容器:放大镜在左,清除在右)。
                 if !self.filters.text.is_empty() {
                     if ui
                         .add(tool_button("x", false))
@@ -2259,7 +2259,7 @@ impl App {
                     self.apply_view_state();
                 }
                 ui.separator();
-                // 滑块(参考件 `zoomslider/scaleslider`);档位即已缓存的缩略图尺寸。
+                // 滑块(参考件的缩放滑块);档位即已缓存的缩略图尺寸。
                 let mut idx = self.thumb_tier as i32;
                 let slider = egui::Slider::new(&mut idx, 0..=3)
                     .show_value(false)
@@ -5813,7 +5813,7 @@ impl App {
                         .selectable(false),
                 );
             });
-            // 参考件把动作按钮钉在组头右侧(outputlayout 的槽位序,从右往左)。
+            // 参考件把动作按钮钉在组头右侧(槽位序照原版排版,从右往左)。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("mail", false))
@@ -7231,7 +7231,7 @@ impl eframe::App for App {
                                 if self.thumb_captions { "1" } else { "0" },
                             );
                         }
-                        // 文件夹视图形态(参考件 Tree View / Flat Folder View)。
+                        // 文件夹视图形态(树形 / 平铺)。
                         ui.menu_button("文件夹视图", |ui| {
                             if ui
                                 .selectable_label(!self.folder_tree, "平铺文件夹视图")
@@ -7657,7 +7657,7 @@ impl eframe::App for App {
                                 // 只有装了照片的目录才是可选项(点父级 = 展开)。
                                 self.folder_tree_ui(ui, ctx);
                             } else {
-                                // 扁平文件夹视图(参考件 Flat Folder View)。
+                                // 扁平文件夹视图(参考件左栏的平铺列表)。
                                 for (i, f) in self.folders.clone().iter().enumerate() {
                                     let on = !self.folder_show_all && self.selected_folder == i;
                                     if ui.selectable_label(on, f).clicked() {

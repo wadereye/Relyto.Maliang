@@ -50,8 +50,8 @@ pub enum SortBy {
     Name,
 }
 
-/// 视图过滤(参考件 `searchcontainer/{starsearch,facesearch,moviesearch,geotagsearch}`,
-/// 四个可叠加的开关 + 搜索框文本;全默认 = 显示全部)。
+/// 视图过滤(参考件搜索框右端那排可叠加的开关:星标 / 人脸 / 视频 / 地理标记,
+/// 加上搜索框文本;全默认 = 显示全部)。
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Filters {
     /// 只显示加星标的照片。
@@ -62,8 +62,8 @@ pub struct Filters {
     pub movies: bool,
     /// 只显示有地理标记的照片。
     pub geotagged: bool,
-    /// 搜索框文本(参考件 `searchcontainer/search` + `searchautocomplete`;
-    /// 空串 = 不过滤。匹配路径 / 标题 / 标签名)。
+    /// 搜索框文本(参考件同框的输入 + 自动补全;空串 = 不过滤。
+    /// 匹配路径 / 标题 / 标签名)。
     pub text: String,
 }
 
@@ -97,7 +97,7 @@ impl SortBy {
 }
 
 /// 四个过滤开关的(图标, 悬停文案),索引顺序即工具栏从左到右与设置串顺序。
-/// 参考件控件名:`searchcontainer/{starsearch,facesearch,moviesearch,geotagsearch}`。
+/// 四枚开关对应参考件搜索框右端的那四个小图标,顺序也照抄。
 pub const FILTER_BTNS: [(&str, &str); 4] = [
     ("star", "只显示加星标的照片"),
     ("smile", "只显示有人物头像的照片"),
