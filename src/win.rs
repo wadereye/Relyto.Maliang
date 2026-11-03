@@ -32,7 +32,10 @@ impl DriveType {
     /// - DRIVE_REMOVABLE(移动硬盘/U盘/相机卡)→ 收录
     /// - DRIVE_FIXED(固定盘)→ 收录
     pub fn scannable(self) -> bool {
-        matches!(self, DriveType::Removable | DriveType::Fixed | DriveType::RamDisk)
+        matches!(
+            self,
+            DriveType::Removable | DriveType::Fixed | DriveType::RamDisk
+        )
     }
 }
 
@@ -248,7 +251,9 @@ pub fn attach_parent_console() {
 
 /// 取系统逻辑 CPU 数(用于扫描线程数上限)。
 pub fn cpu_count() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 /// 取用户壳目录(我的文档 / 图片 / 桌面),按存在性过滤。
@@ -257,47 +262,73 @@ pub fn cpu_count() -> usize {
 /// "Only search My Documents, My Pictures, and the Desktop"。
 /// 参考件首启只登记这三个壳目录,绝不扫盘根;扩大范围由用户手动添加。
 pub fn known_dirs() -> Vec<std::path::PathBuf> {
+    SHELL_DIRS.iter().filter_map(|f| known_path(*f)).collect()
+}
+
+/// 工具栏「查看选项」的壳目录快捷键(参考件 `ID_VIEW_DESKTOP` /
+/// `ID_VIEW_MYDOCS` / `ID_VIEW_MYPICTURES` / `ID_VIEW_MYCOMPUTER`)。
+///
+/// 我的电脑在参考 Picasa 3是浏览树根(可下探任意盘);我方左栏是图库树,
+/// 覆盖不到全盘,故路径给 `None`,由调用方给出明确说明而不是假装能跳。
+pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
+    vec![
+        ("桌面", known_path(FOLDERID::Desktop)),
+        ("我的文档", known_path(FOLDERID::Documents)),
+        ("我的图片", known_path(FOLDERID::Pictures)),
+        ("我的电脑", None),
+    ]
+}
+
+/// 壳目录枚举(Windows 用 KNOWNFOLDERID,其它平台退回家目录同名子目录)。
+#[derive(Clone, Copy)]
+enum FOLDERID {
+    Desktop,
+    Documents,
+    Pictures,
+}
+
+/// 单个壳目录路径;不存在(未重定向/未创建)返回 None。
+fn known_path(which: FOLDERID) -> Option<std::path::PathBuf> {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Com::CoTaskMemFree;
         use windows::Win32::UI::Shell::{
-            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, KNOWN_FOLDER_FLAG,
-            SHGetKnownFolderPath,
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, SHGetKnownFolderPath,
+            KNOWN_FOLDER_FLAG,
         };
-        let mut v = Vec::new();
-        for fid in [&FOLDERID_Documents, &FOLDERID_Pictures, &FOLDERID_Desktop] {
-            // SAFETY: rfid 指向静态常量 GUID;htoken 传 NULL 表示当前用户。
-            if let Ok(pw) =
-                unsafe { SHGetKnownFolderPath(fid, KNOWN_FOLDER_FLAG(0), HANDLE(std::ptr::null_mut())) }
-            {
-                let s = unsafe { pw.to_string() }.unwrap_or_default();
-                unsafe { CoTaskMemFree(Some(pw.as_ptr() as _)) };
-                if !s.is_empty() {
-                    let p = std::path::PathBuf::from(s);
-                    if p.is_dir() {
-                        v.push(p);
-                    }
-                }
-            }
+        let fid = match which {
+            FOLDERID::Desktop => &FOLDERID_Desktop,
+            FOLDERID::Documents => &FOLDERID_Documents,
+            FOLDERID::Pictures => &FOLDERID_Pictures,
+        };
+        // SAFETY: rfid 指向静态常量 GUID;htoken 传 NULL 表示当前用户。
+        let pw = unsafe {
+            SHGetKnownFolderPath(fid, KNOWN_FOLDER_FLAG(0), HANDLE(std::ptr::null_mut()))
         }
-        v
+        .ok()?;
+        let s = unsafe { pw.to_string() }.unwrap_or_default();
+        unsafe { CoTaskMemFree(Some(pw.as_ptr() as _)) };
+        if s.is_empty() {
+            return None;
+        }
+        let p = std::path::PathBuf::from(s);
+        p.is_dir().then_some(p)
     }
     #[cfg(not(windows))]
     {
-        let mut v = Vec::new();
-        if let Some(h) = dirs::home_dir() {
-            for n in ["Documents", "Pictures", "Desktop"] {
-                let p = h.join(n);
-                if p.is_dir() {
-                    v.push(p);
-                }
-            }
-        }
-        v
+        let name = match which {
+            FOLDERID::Desktop => "Desktop",
+            FOLDERID::Documents => "Documents",
+            FOLDERID::Pictures => "Pictures",
+        };
+        let p = dirs::home_dir()?.join(name);
+        p.is_dir().then_some(p)
     }
 }
 
+/// `known_dirs` 的三件套(顺序沿用参考件:文档、图片、桌面)。
+const SHELL_DIRS: [FOLDERID; 3] = [FOLDERID::Documents, FOLDERID::Pictures, FOLDERID::Desktop];
 
 /// 用系统关联的编辑器打开文件(参考件「Open File(s) in an Editor」)。
 ///
@@ -343,7 +374,7 @@ pub fn set_wallpaper(path: &Path) -> bool {
     #[cfg(windows)]
     {
         use windows::Win32::UI::WindowsAndMessaging::{
-            SystemParametersInfoW, SPI_SETDESKWALLPAPER, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
+            SystemParametersInfoW, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_SETDESKWALLPAPER,
         };
 
         let wide = to_wide(&path.to_string_lossy().into_owned());
@@ -406,11 +437,15 @@ pub fn shell_open(path: &Path) -> bool {
 /// `wait_ms` = `Some(n)`:最多等 n 毫秒并返回退出码(注册/删除计划任务要用);
 /// `wait_ms` = `None`:发后即忘(索引器子进程,结果靠 `--mft-report` 文件回报)。
 #[cfg(windows)]
-fn shell_execute_elevated(file: &str, params: &str, wait_ms: Option<u32>) -> Result<Option<u32>, String> {
+fn shell_execute_elevated(
+    file: &str,
+    params: &str,
+    wait_ms: Option<u32>,
+) -> Result<Option<u32>, String> {
     use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Foundation::{CloseHandle, HWND};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows::Win32::UI::Shell::{SHELLEXECUTEINFOW, SEE_MASK_NOCLOSEPROCESS, ShellExecuteExW};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     let file_w = to_wide(file);
@@ -527,7 +562,7 @@ pub fn run_hidden(program: &str, args: &[&str]) -> Result<i32, String> {
 #[cfg(windows)]
 fn current_user_sid() -> Result<String, String> {
     use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, LocalFree, HLOCAL};
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
     use windows::Win32::Security::{
         Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
         TOKEN_USER,
@@ -595,7 +630,9 @@ fn schtasks_exe() -> String {
 }
 
 fn xml_esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// 计划任务定义 XML(UTF-16 编码由调用方落盘时处理)。
@@ -674,7 +711,10 @@ pub fn mft_task_install(exe: &Path, tmp_dir: &Path) -> Result<(), String> {
 pub fn mft_task_registered() -> bool {
     #[cfg(windows)]
     {
-        matches!(run_hidden(&schtasks_exe(), &["/Query", "/TN", MFT_TASK_NAME]), Ok(0))
+        matches!(
+            run_hidden(&schtasks_exe(), &["/Query", "/TN", MFT_TASK_NAME]),
+            Ok(0)
+        )
     }
     #[cfg(not(windows))]
     {
@@ -820,7 +860,11 @@ unsafe fn shell_thumbnail_inner(wide: &[u16], size: u32) -> Option<(Vec<u8>, u32
         cy: size as i32,
     };
     // SAFETY: factory 有效;flags 组合合法。
-    let hbitmap = unsafe { factory.GetImage(dim, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK).ok()? };
+    let hbitmap = unsafe {
+        factory
+            .GetImage(dim, SIIGBF_RESIZETOFIT | SIIGBF_BIGGERSIZEOK)
+            .ok()?
+    };
 
     // 取 HBITMAP 的像素。
     // SAFETY: hbitmap 是有效 HBITMAP;GetDC(NULL) 返回屏幕 DC,ReleaseDC 配平。
@@ -832,9 +876,8 @@ unsafe fn shell_thumbnail_inner(wide: &[u16], size: u32) -> Option<(Vec<u8>, u32
         }
         // 先问一次尺寸
         let mut tmp = BITMAPINFO::default();
-        tmp.bmiHeader.biSize = std::mem::size_of::<
-            windows::Win32::Graphics::Gdi::BITMAPINFOHEADER,
-        >() as u32;
+        tmp.bmiHeader.biSize =
+            std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
         let got = GetDIBits(hdc, hbitmap, 0, 0, None, &mut tmp, DIB_RGB_COLORS);
         if got == 0 {
             ReleaseDC(HWND(std::ptr::null_mut()), hdc);
@@ -850,9 +893,8 @@ unsafe fn shell_thumbnail_inner(wide: &[u16], size: u32) -> Option<(Vec<u8>, u32
         }
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let mut info = BITMAPINFO::default();
-        info.bmiHeader.biSize = std::mem::size_of::<
-            windows::Win32::Graphics::Gdi::BITMAPINFOHEADER,
-        >() as u32;
+        info.bmiHeader.biSize =
+            std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
         info.bmiHeader.biWidth = w as i32;
         info.bmiHeader.biHeight = h as i32;
         info.bmiHeader.biPlanes = 1;
@@ -906,7 +948,10 @@ mod tests {
     fn drive_type_of_nonexistent_is_none_or_unknown() {
         // Z: 通常不存在;无论返回 None 还是 Unknown,都不应被判为可扫描。
         let t = drive_type(Path::new("Z:\\"));
-        assert!(!matches!(t, Some(DriveType::Fixed) | Some(DriveType::Removable)));
+        assert!(!matches!(
+            t,
+            Some(DriveType::Fixed) | Some(DriveType::Removable)
+        ));
     }
 
     #[test]
@@ -918,10 +963,7 @@ mod tests {
     fn mft_task_xml_points_at_exe_and_stays_silent_about_privileges() {
         // 任务定义必须:跑当前 exe + 固定的 --mft-scan --mft-task(不带可变的报告
         // 路径,否则数据目录一改就永远等不到信号)+ 最高权限 + 交互登录型。
-        let xml = mft_task_xml(
-            "S-1-5-21-1&2",
-            Path::new(r"D:\Some Dir\maliang.exe"),
-        );
+        let xml = mft_task_xml("S-1-5-21-1&2", Path::new(r"D:\Some Dir\maliang.exe"));
         assert!(xml.contains(r#"<Command>D:\Some Dir\maliang.exe</Command>"#));
         assert!(xml.contains(&format!("<Arguments>{MFT_TASK_ARGS}</Arguments>")));
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));

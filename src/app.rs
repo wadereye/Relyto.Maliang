@@ -24,11 +24,44 @@ enum ViewKind {
     Search,
 }
 
-/// 排序方式(视图 > 排序方式,参照 Picasa)。
-#[derive(PartialEq, Clone, Copy)]
-enum SortMode {
-    Date,
+/// 排序方式(`SortBy`)与视图过滤(`Filters`)定义在 `timeline`,
+/// 由 SQL 谓词一次完成 —— 大图库不在 UI 层筛全表。
+
+/// 人物列表排序(工具栏「查看选项」> Sort People,参考件
+/// `ID_PEOPLEBYNAME` / `ID_PEOPLEBYAMOUNT` / `ID_PEOPLEBYAMOUNTTOP10`;
+/// 菜单顺序即此处声明顺序)。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum PeopleSort {
+    /// 按姓名(未命名簇排最后)。
     Name,
+    /// 按人脸张数,多的在前。
+    Amount,
+    /// 只要张数最多的前 10 个簇。
+    Top10,
+}
+
+impl PeopleSort {
+    const ALL: [PeopleSort; 3] = [PeopleSort::Name, PeopleSort::Amount, PeopleSort::Top10];
+
+    fn label(self) -> &'static str {
+        match self {
+            PeopleSort::Name => "按姓名给人物排序",
+            PeopleSort::Amount => "按数量给人物排序",
+            PeopleSort::Top10 => "给人物排序并只看前 10",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            PeopleSort::Name => "name",
+            PeopleSort::Amount => "amount",
+            PeopleSort::Top10 => "top10",
+        }
+    }
+
+    fn from_key(s: &str) -> Option<PeopleSort> {
+        PeopleSort::ALL.into_iter().find(|x| x.key() == s)
+    }
 }
 
 struct ScanResult {
@@ -88,8 +121,10 @@ pub struct App {
     wifi_panel: bool,
     // —— 菜单相关状态 ——
     sel: BTreeSet<i64>,
-    sort_mode: SortMode,
+    sort_by: timeline::SortBy,
     sort_rev: bool,
+    /// 工具栏过滤开关(星标/人物/视频/地理标记;全 false = 显示全部)。
+    filters: timeline::Filters,
     /// 当前缩略图档位(P1-9:小 96 / 普通 256 / 大 512 / 预览 1024)。
     thumb_tier: crate::thumbs::Tier,
     tags: Vec<timeline::TagInfo>,
@@ -127,6 +162,17 @@ pub struct App {
     thumb_decode_budget: usize,
     /// 本帧已用的解码配额(每帧开头清零)。
     thumb_decode_count: usize,
+    /// 当前档位已生成缩略图的数量(状态栏用)。
+    /// 只在切档 / 批次回报 / 重建图库时刷新 —— 逐帧查库会抢锁且白跑 COUNT(*)。
+    tier_cached: usize,
+    /// 图库行集的版本号(每次 rebuild 自增)。缓存的派生数据靠它判新旧。
+    rows_gen: u64,
+    /// 「文件夹」视图的行下标缓存:(版本号, 文件夹, 行下标, 组头日期)。
+    /// 每帧从全部行里按目录筛一遍是 O(行数) 次路径字符串运算,没必要。
+    folder_cells: (u64, String, Vec<usize>, String),
+    /// 「文件夹」视图一次铺开所有文件夹时的分组缓存:(版本号, [(文件夹, 行下标, 组头日期)])。
+    /// `by_folder` 每行都要 clone 一个目录串,逐帧重跑大图库必掉帧。
+    folder_groups: (u64, Vec<(String, Vec<usize>, String)>),
     /// 上一帧主图库的滚动偏移(用于算增量)。
     last_scroll_y: f32,
     /// 上一帧主图库视口高度(作为阻尼的可视范围)。
@@ -271,6 +317,18 @@ pub struct App {
     options_tab: usize,
     /// 文件夹视图树形形态(参考件 Simplified Tree View;设置项 folder_tree)。
     folder_tree: bool,
+    /// 中间栏是否一次铺开所有文件夹(每组一个 `CAlbumLabel` 组头)。
+    /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
+    folder_show_all: bool,
+    /// 左栏每行画该目录的缩略图(参考件 `ID_VIEW_THUMBNAILS` =
+    /// Show Thumbnails in Library;设置项 tree_thumbs)。
+    tree_thumbs: bool,
+    /// 人物列表排序方式(参考件 Sort People by Name / Amount / Top 10)。
+    people_sort: PeopleSort,
+    /// 工具栏「新建相册」弹窗(选中照片时把选中项一并放进新相册)。
+    album_new_win: bool,
+    /// 当前视图里尚未生成缩略图的张数(>0 → 工具栏最右的动画 spinner)。
+    pending_thumbs: usize,
     /// 壁纸设置结果通道(后台解码 + 落盘 + SystemParametersInfoW)。
     wallpaper_rx: Option<mpsc::Receiver<Result<String, String>>>,
     /// 放大态专用纹理(全图 + 效果栈合成;键 = 照片 id + 栈签名,平移/缩放复用)。
@@ -505,62 +563,152 @@ fn thumb_star(
     resp.on_hover_text(if on { "取消星标" } else { "加星标" });
 }
 
-/// 工具栏图标(Lucide,ISC 许可,见 assets/icons/LICENSE-lucide.txt):
-/// 按主题烤好两套描边色,SVG 运行时栅格化,高 DPI 不糊;URI 带主题段,切主题即重载纹理。
-fn toolbar_icon(name: &str) -> egui::Image<'static> {
-    const LIGHT: &[(&str, &[u8])] = &[
-        (
-            "folder-plus",
-            include_bytes!("../assets/icons/light/folder-plus.svg"),
-        ),
-        (
-            "smartphone",
-            include_bytes!("../assets/icons/light/smartphone.svg"),
-        ),
-        (
-            "images",
-            include_bytes!("../assets/icons/light/images.svg"),
-        ),
-        (
-            "wand-sparkles",
-            include_bytes!("../assets/icons/light/wand-sparkles.svg"),
-        ),
-        (
-            "panel-right",
-            include_bytes!("../assets/icons/light/panel-right.svg"),
-        ),
-    ];
-    const DARK: &[(&str, &[u8])] = &[
-        (
-            "folder-plus",
-            include_bytes!("../assets/icons/dark/folder-plus.svg"),
-        ),
-        (
-            "smartphone",
-            include_bytes!("../assets/icons/dark/smartphone.svg"),
-        ),
-        ("images", include_bytes!("../assets/icons/dark/images.svg")),
-        (
-            "wand-sparkles",
-            include_bytes!("../assets/icons/dark/wand-sparkles.svg"),
-        ),
-        (
-            "panel-right",
-            include_bytes!("../assets/icons/dark/panel-right.svg"),
-        ),
-    ];
+/// 主题化图标源表(Lucide,ISC 许可,见 assets/icons/LICENSE-lucide.txt):
+/// 每个图标按主题烤好两套描边色,SVG 运行时栅格化,高 DPI 不糊。
+const ICON_LIGHT: &[(&str, &[u8])] = &[
+    ("folder", include_bytes!("../assets/icons/light/folder.svg")),
+    (
+        "folder-open",
+        include_bytes!("../assets/icons/light/folder-open.svg"),
+    ),
+    (
+        "folder-plus",
+        include_bytes!("../assets/icons/light/folder-plus.svg"),
+    ),
+    (
+        "smartphone",
+        include_bytes!("../assets/icons/light/smartphone.svg"),
+    ),
+    ("images", include_bytes!("../assets/icons/light/images.svg")),
+    (
+        "image-plus",
+        include_bytes!("../assets/icons/light/image-plus.svg"),
+    ),
+    ("play", include_bytes!("../assets/icons/light/play.svg")),
+    ("mail", include_bytes!("../assets/icons/light/mail.svg")),
+    (
+        "wand-sparkles",
+        include_bytes!("../assets/icons/light/wand-sparkles.svg"),
+    ),
+    (
+        "panel-right",
+        include_bytes!("../assets/icons/light/panel-right.svg"),
+    ),
+    ("moon", include_bytes!("../assets/icons/light/moon.svg")),
+    (
+        "layout-grid",
+        include_bytes!("../assets/icons/light/layout-grid.svg"),
+    ),
+    (
+        "list-tree",
+        include_bytes!("../assets/icons/light/list-tree.svg"),
+    ),
+    (
+        "sliders-horizontal",
+        include_bytes!("../assets/icons/light/sliders-horizontal.svg"),
+    ),
+    ("star", include_bytes!("../assets/icons/light/star.svg")),
+    ("smile", include_bytes!("../assets/icons/light/smile.svg")),
+    ("video", include_bytes!("../assets/icons/light/video.svg")),
+    (
+        "map-pin",
+        include_bytes!("../assets/icons/light/map-pin.svg"),
+    ),
+    ("search", include_bytes!("../assets/icons/light/search.svg")),
+    ("x", include_bytes!("../assets/icons/light/x.svg")),
+];
+const ICON_DARK: &[(&str, &[u8])] = &[
+    ("folder", include_bytes!("../assets/icons/dark/folder.svg")),
+    (
+        "folder-open",
+        include_bytes!("../assets/icons/dark/folder-open.svg"),
+    ),
+    (
+        "folder-plus",
+        include_bytes!("../assets/icons/dark/folder-plus.svg"),
+    ),
+    (
+        "smartphone",
+        include_bytes!("../assets/icons/dark/smartphone.svg"),
+    ),
+    ("images", include_bytes!("../assets/icons/dark/images.svg")),
+    (
+        "image-plus",
+        include_bytes!("../assets/icons/dark/image-plus.svg"),
+    ),
+    ("play", include_bytes!("../assets/icons/dark/play.svg")),
+    ("mail", include_bytes!("../assets/icons/dark/mail.svg")),
+    (
+        "wand-sparkles",
+        include_bytes!("../assets/icons/dark/wand-sparkles.svg"),
+    ),
+    (
+        "panel-right",
+        include_bytes!("../assets/icons/dark/panel-right.svg"),
+    ),
+    ("sun", include_bytes!("../assets/icons/dark/sun.svg")),
+    (
+        "layout-grid",
+        include_bytes!("../assets/icons/dark/layout-grid.svg"),
+    ),
+    (
+        "list-tree",
+        include_bytes!("../assets/icons/dark/list-tree.svg"),
+    ),
+    (
+        "sliders-horizontal",
+        include_bytes!("../assets/icons/dark/sliders-horizontal.svg"),
+    ),
+    ("star", include_bytes!("../assets/icons/dark/star.svg")),
+    ("smile", include_bytes!("../assets/icons/dark/smile.svg")),
+    ("video", include_bytes!("../assets/icons/dark/video.svg")),
+    (
+        "map-pin",
+        include_bytes!("../assets/icons/dark/map-pin.svg"),
+    ),
+    ("search", include_bytes!("../assets/icons/dark/search.svg")),
+    ("x", include_bytes!("../assets/icons/dark/x.svg")),
+];
+
+/// 取当前主题的图标字节;URI 带主题段,切主题即重载纹理。
+fn icon_source(name: &str) -> (&'static str, &'static [u8]) {
     let table = if crate::theme::p().is_light {
-        LIGHT
+        ICON_LIGHT
     } else {
-        DARK
+        ICON_DARK
     };
     let (tag, bytes) = table
         .iter()
         .find(|(n, _)| *n == name)
         .unwrap_or_else(|| panic!("未知工具栏图标: {name}"));
+    (tag, bytes)
+}
+
+/// 工具栏图标(18px)。
+fn toolbar_icon(name: &str) -> egui::Image<'static> {
+    let (tag, bytes) = icon_source(name);
     let half = if crate::theme::p().is_light { "l" } else { "d" };
-    egui::Image::from_bytes(format!("bytes://{half}/{tag}.svg"), *bytes)
+    egui::Image::from_bytes(format!("bytes://{half}/{tag}.svg"), bytes)
         .fit_to_exact_size(egui::vec2(18.0, 18.0))
+}
+
+/// 组头图标(参考件 `icons/folder_lg`,大一号的目录图标)。
+fn album_icon(name: &str, size: f32) -> egui::Image<'static> {
+    let (tag, bytes) = icon_source(name);
+    let half = if crate::theme::p().is_light { "l" } else { "d" };
+    egui::Image::from_bytes(format!("bytes://big-{half}/{tag}-{size}.svg"), bytes)
+        .fit_to_exact_size(egui::vec2(size, size))
+}
+
+/// 工具栏图标按钮(选中态即"这个视图档/过滤正生效")。
+// 0.33 起 ImageButton 标了 deprecated,推荐 `Button::image`;但后者会把图片
+// 高度限制到字体高度(见 button.rs 的 atom_max_height_font_size),
+// 18px 工具栏图标与 26px 组头图标都会缩一号,所以这里继续用 ImageButton。
+#[allow(deprecated)]
+fn tool_button(name: &str, selected: bool) -> egui::ImageButton<'static> {
+    egui::ImageButton::new(toolbar_icon(name))
+        .selected(selected)
+        .corner_radius(4)
 }
 
 fn load_cjk_font(ctx: &egui::Context) {
@@ -785,11 +933,28 @@ impl App {
             .get_setting("folder_tree")
             .map(|v| v != "0")
             .unwrap_or(false);
+        // 左栏缩略图:参考件默认在库里显示,这里同样默认开。
+        let tree_thumbs = store
+            .get_setting("tree_thumbs")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let people_sort = store
+            .get_setting("people_sort")
+            .and_then(|v| PeopleSort::from_key(&v))
+            .unwrap_or(PeopleSort::Amount);
         // 右侧属性面板的收展状态(平时收起,记住上次的选择)。
         let props_panel = store
             .get_setting("props_panel")
             .map(|v| v == "1")
             .unwrap_or(false);
+        // 排序与视图过滤同属"怎么看图库",重启后保持(参考件亦记忆视图状态)。
+        let sort_by = store
+            .get_setting("sort_by")
+            .and_then(|v| timeline::SortBy::from_key(&v))
+            .unwrap_or_default();
+        let filters =
+            timeline::Filters::from_setting(&store.get_setting("view_filters").unwrap_or_default());
+        let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
         // P3-ui:邮件默认尺寸从设置读(选项 > 电子邮件;参考件默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
             store
@@ -813,6 +978,10 @@ impl App {
             scroll_throttle: crate::scroll::ScrollSmoother::new(600.0, 0.0),
             thumb_decode_budget: crate::scroll::MAX_THUMB_DECODE_PER_FRAME,
             thumb_decode_count: 0,
+            tier_cached: 0,
+            rows_gen: 0,
+            folder_cells: Default::default(),
+            folder_groups: Default::default(),
             last_scroll_y: 0.0,
             last_viewport_h: 600.0,
             last_content_h: 0.0,
@@ -867,8 +1036,9 @@ impl App {
             wifi: None,
             wifi_panel: false,
             sel: BTreeSet::new(),
-            sort_mode: SortMode::Date,
-            sort_rev: false,
+            sort_by,
+            sort_rev,
+            filters,
             thumb_tier: crate::thumbs::Tier::Normal,
             tags: Vec::new(),
             sel_tag: None,
@@ -925,6 +1095,11 @@ impl App {
             show_options: false,
             options_tab: 0,
             folder_tree,
+            folder_show_all: true,
+            tree_thumbs,
+            people_sort,
+            album_new_win: false,
+            pending_thumbs: 0,
             wallpaper_rx: None,
             zoom_tex: None,
             zoom_active_for: None,
@@ -1080,11 +1255,7 @@ impl App {
             return false;
         };
         crate::win::mft_task_registered()
-            && self
-                .store
-                .get_setting("mft_task_exe")
-                .unwrap_or_default()
-                == exe.to_string_lossy()
+            && self.store.get_setting("mft_task_exe").unwrap_or_default() == exe.to_string_lossy()
     }
 
     /// 后台线程载入名字索引文件(0.5s 级 IO,不阻塞 UI)。
@@ -1123,9 +1294,7 @@ impl App {
             let report = data.join("mft_report.txt");
             // 上一轮的报告由提权进程写下(高完整性级),这里未必删得动 ——
             // 所以先记下 mtime,只认比它新的内容;删得掉更好,删不掉也不误判。
-            let stale = std::fs::metadata(&report)
-                .and_then(|m| m.modified())
-                .ok();
+            let stale = std::fs::metadata(&report).and_then(|m| m.modified()).ok();
             let _ = std::fs::remove_file(&report);
             let params = format!("--mft-scan --mft-report \"{}\"", report.display());
             let started = if via_task {
@@ -1141,10 +1310,7 @@ impl App {
             for _ in 0..1800 {
                 std::thread::sleep(std::time::Duration::from_millis(500));
                 if stale.is_some()
-                    && std::fs::metadata(&report)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        <= stale
+                    && std::fs::metadata(&report).and_then(|m| m.modified()).ok() <= stale
                 {
                     // 还是上一轮那份(或本轮还没落盘),不作数。
                     continue;
@@ -1229,7 +1395,9 @@ impl App {
         match crate::win::mft_task_uninstall() {
             Ok(()) => {
                 let _ = self.store.set_setting("mft_task_exe", "");
-                let _ = self.store.set_setting("mft_grant", MftGrant::Unasked.as_setting());
+                let _ = self
+                    .store
+                    .set_setting("mft_grant", MftGrant::Unasked.as_setting());
                 let _ = self.store.set_setting("mft_never_ask", "0");
                 self.mft_task_ok = false;
                 self.status = "已删除全盘索引计划任务(下次启动会重新询问授权)".into();
@@ -1390,7 +1558,9 @@ impl App {
                     }
                 }
                 if self.mft_declined {
-                    ui.label("全盘索引不可用(授权被取消或索引器失败),仅图库内现有照片可按文件名查。");
+                    ui.label(
+                        "全盘索引不可用(授权被取消或索引器失败),仅图库内现有照片可按文件名查。",
+                    );
                     if ui.button("重新发起全盘索引").clicked() {
                         self.mft_declined = false;
                         let _ = self.store.set_setting("mft_declined", "0");
@@ -1510,15 +1680,341 @@ impl App {
         Some(tex)
     }
 
+    /// 平铺 / 树形一对互斥档(参考件 Flat Folder View 与 Tree View 是同一开关的两态)。
+    fn set_folder_tree(&mut self, tree: bool) {
+        if self.folder_tree == tree {
+            return;
+        }
+        self.folder_tree = tree;
+        let _ = self
+            .store
+            .set_setting("folder_tree", if tree { "1" } else { "0" });
+    }
+
+    /// 后台是否还有活在干(工具栏最右的动画指示灯)。
+    fn busy(&self) -> bool {
+        self.scan_busy.load(Ordering::Relaxed)
+            || self.pending_thumbs > 0
+            || self.mft_rx.is_some()
+            || self.name_index_rx.is_some()
+            || self.export_rx.is_some()
+    }
+
+    /// 「查看选项」里的壳目录快捷键(参考件 Desktop / My Docs / My Pictures / My Computer):
+    /// 目录已在图库里 → 跳到该文件夹页;没导入 → 只给提示,不擅自扩扫描范围。
+    fn goto_known_dir(&mut self, dir: Option<std::path::PathBuf>, label: &str) {
+        let Some(p) = dir else {
+            self.status = format!("{label}:图库树只覆盖已导入的目录");
+            return;
+        };
+        let want = p
+            .to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .to_string();
+        // 该目录本身或其任意子目录在库里,取路径最短的那个作为落点。
+        let hit = self
+            .folders
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let f = f.trim_end_matches(['\\', '/']);
+                f.eq_ignore_ascii_case(&want)
+                    || f.to_ascii_lowercase()
+                        .starts_with(&want.to_ascii_lowercase())
+            })
+            .min_by_key(|(_, f)| f.len());
+        match hit {
+            Some((i, _)) => {
+                self.selected_folder = i;
+                self.folder_show_all = false;
+                self.view = ViewKind::Folder;
+                self.status = format!("已定位到 {label}");
+            }
+            None => self.status = format!("{label} 未导入图库:文件夹管理器 > 添加文件夹"),
+        }
+    }
+
+    /// 顶部工具条(参考件 `thumbui/basecontrolset`),左→右:
+    /// 导入 · 新建相簿 · 放映 · 平铺/树形 · 查看选项 ▾ …… 过滤四开关 · 尺寸滑块 · 搜索框 · 活动灯。
+    fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            if ui
+                .add(tool_button("folder-plus", false))
+                .on_hover_text("导入文件夹…(登记一个目录并扫描)")
+                .clicked()
+            {
+                self.add_folder_to_library();
+            }
+            if ui
+                .add(tool_button("smartphone", false))
+                .on_hover_text("从设备导入…")
+                .clicked()
+            {
+                self.open_import_devices();
+            }
+            if ui
+                .add(tool_button("image-plus", false))
+                .on_hover_text("新建相簿(有选中照片则一并放入)")
+                .clicked()
+            {
+                self.album_input.clear();
+                self.album_new_win = true;
+            }
+            ui.separator();
+            if ui
+                .add(tool_button("images", false))
+                .on_hover_text("幻灯片放映(选中照片;未选中则放映当前视图)")
+                .clicked()
+            {
+                self.start_slideshow();
+            }
+            ui.separator();
+            if ui
+                .add(tool_button("layout-grid", !self.folder_tree))
+                .on_hover_text("平铺文件夹视图")
+                .clicked()
+            {
+                self.set_folder_tree(false);
+            }
+            if ui
+                .add(tool_button("list-tree", self.folder_tree))
+                .on_hover_text("树形视图(只显示有照片的目录)")
+                .clicked()
+            {
+                self.set_folder_tree(true);
+            }
+            ui.menu_button("查看选项", |ui| self.view_options_menu(ui));
+            ui.separator();
+            if ui
+                .add(tool_button("wand-sparkles", self.fx_panel))
+                .on_hover_text("效果面板")
+                .clicked()
+            {
+                self.fx_panel = !self.fx_panel;
+            }
+            // —— 右端成组控件:参考件从右往左依次是 活动灯 → 搜索框 → 滑块 → 过滤开关 ——
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 二选一的配色开关:浅色显月亮(点了变暗),暗色显太阳(点了变亮)。
+                let dark = !crate::theme::p().is_light;
+                let tip = if dark {
+                    "切回灰色配色"
+                } else {
+                    "切到蓝黑配色"
+                };
+                if ui
+                    .add(tool_button(if dark { "sun" } else { "moon" }, false))
+                    .on_hover_text(tip)
+                    .clicked()
+                {
+                    let next = if dark {
+                        crate::theme::Kind::Gray
+                    } else {
+                        crate::theme::Kind::Blue
+                    };
+                    crate::theme::switch(ctx, next);
+                    let _ = self.store.set_setting("ui_theme", next.key());
+                }
+                // 右栏抽屉开关(参考件 `thumbui/properties_toggle`;抽屉内四页签见右栏)。
+                if ui
+                    .add(tool_button("panel-right", self.props_panel))
+                    .on_hover_text("属性面板")
+                    .clicked()
+                {
+                    self.props_panel = !self.props_panel;
+                    let _ = self
+                        .store
+                        .set_setting("props_panel", if self.props_panel { "1" } else { "0" });
+                }
+                ui.separator();
+                if self.busy() {
+                    ui.add(egui::Spinner::new().size(17.0))
+                        .on_hover_text("后台正在扫描 / 生成缩略图 / 建立索引");
+                } else {
+                    // 不忙也占住同样的宽度,免得指示灯出现时整行左右抖。
+                    ui.add_space(23.0);
+                }
+                // 搜索框(参考件 `searchcontainer/search` + `searchclr`:放大镜在左,清除在右)。
+                if !self.filters.text.is_empty() {
+                    if ui
+                        .add(tool_button("x", false))
+                        .on_hover_text("清除库内搜索")
+                        .clicked()
+                    {
+                        self.filters.text.clear();
+                        self.apply_view_state();
+                    }
+                }
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.filters.text)
+                        .hint_text("库内搜索:文件名 / 标题 / 标签")
+                        .desired_width(168.0),
+                );
+                let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                let searched = ui
+                    .add(tool_button("search", !self.filters.text.is_empty()))
+                    .on_hover_text("在图库中搜索(回车亦可)")
+                    .clicked();
+                if searched || enter {
+                    self.apply_view_state();
+                }
+                ui.separator();
+                // 滑块(参考件 `zoomslider/scaleslider`);档位即已缓存的缩略图尺寸。
+                let mut idx = self.thumb_tier as i32;
+                let slider = egui::Slider::new(&mut idx, 0..=3)
+                    .show_value(false)
+                    .text("图");
+                // egui 的滑块宽度取自 spacing.slider_width,工具栏里要收窄。
+                let old_w = ui.spacing().slider_width;
+                ui.spacing_mut().slider_width = 96.0;
+                let moved = ui
+                    .add(slider)
+                    .on_hover_text("缩略图大小:小 · 普通 · 大 · 预览")
+                    .changed();
+                ui.spacing_mut().slider_width = old_w;
+                if moved {
+                    if let Some(t) = crate::thumbs::Tier::from_u8(idx.clamp(0, 3) as u8) {
+                        self.set_thumb_tier(t);
+                    }
+                }
+                ui.separator();
+                // 四个可叠加的过滤开关(参考件 星标搜索 / 人脸搜索 / 视频搜索 / 地理标签搜索)。
+                // 右到左布局里后加的在左边,所以倒序添加,视觉顺序才是 星标·人物·视频·地理标记。
+                for i in (0..timeline::FILTER_BTNS.len()).rev() {
+                    let (name, tip) = timeline::FILTER_BTNS[i];
+                    if ui
+                        .add(tool_button(name, self.filters.flag(i)))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.filters.flip(i);
+                        self.apply_view_state();
+                    }
+                }
+            });
+        });
+    }
+
+    /// 「查看选项」下拉:条目与顺序沿用参考件的 View 菜单
+    /// (`ID_VIEW_*` → 排序 → `ID_PEOPLEBY*` → 壳目录快捷键 → 缩略图/树形选项)。
+    fn view_options_menu(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .selectable_label(!self.folder_tree, "平铺文件夹视图")
+            .clicked()
+        {
+            self.set_folder_tree(false);
+            ui.close();
+        }
+        if ui.selectable_label(self.folder_tree, "树形视图").clicked() {
+            self.set_folder_tree(true);
+            ui.close();
+        }
+        ui.separator();
+        for s in timeline::SortBy::ALL {
+            if ui.selectable_label(self.sort_by == s, s.label()).clicked() {
+                self.sort_by = s;
+                self.apply_view_state();
+                ui.close();
+            }
+        }
+        if ui.selectable_label(self.sort_rev, "反向排序").clicked() {
+            self.sort_rev = !self.sort_rev;
+            self.apply_view_state();
+            ui.close();
+        }
+        ui.separator();
+        for p in PeopleSort::ALL {
+            if ui
+                .selectable_label(self.people_sort == p, p.label())
+                .clicked()
+            {
+                self.people_sort = p;
+                let _ = self.store.set_setting("people_sort", p.key());
+                self.rebuild();
+                ui.close();
+            }
+        }
+        ui.separator();
+        for (label, dir) in crate::win::shell_shortcuts() {
+            let tip = if dir.is_some() {
+                "跳到该目录(需已导入图库)"
+            } else {
+                "图库树只覆盖已导入的目录"
+            };
+            if ui
+                .add_enabled(dir.is_some(), egui::Button::new(label))
+                .on_hover_text(tip)
+                .clicked()
+            {
+                self.goto_known_dir(dir, label);
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui
+            .selectable_label(self.tree_thumbs, "在图库中显示缩略图")
+            .clicked()
+        {
+            self.tree_thumbs = !self.tree_thumbs;
+            let _ = self
+                .store
+                .set_setting("tree_thumbs", if self.tree_thumbs { "1" } else { "0" });
+            ui.close();
+        }
+        if ui
+            .selectable_label(self.thumb_captions, "缩略图说明")
+            .clicked()
+        {
+            self.thumb_captions = !self.thumb_captions;
+            let _ = self.store.set_setting(
+                "thumb_captions",
+                if self.thumb_captions { "1" } else { "0" },
+            );
+            ui.close();
+        }
+    }
+
+    /// 视图状态(排序/反向/过滤)变更后统一落库并重建。
+    /// 调用方改完 `self.sort_by` / `self.sort_rev` / `self.filters` 再调这里,
+    /// 避免多处入口漏存设置导致重启后视图回到默认。
+    fn apply_view_state(&mut self) {
+        let _ = self.store.set_setting("sort_by", self.sort_by.key());
+        let _ = self
+            .store
+            .set_setting("sort_rev", if self.sort_rev { "1" } else { "0" });
+        let _ = self
+            .store
+            .set_setting("view_filters", &self.filters.as_setting());
+        self.rebuild();
+    }
+
+    /// 人物列表按「查看选项 > 给人物排序」重排(前 10 是截断显示,不是重新统计)。
+    fn sorted_people(&self) -> Vec<crate::faces::PeopleRow> {
+        let mut v = self.face_people.clone();
+        let by_count = |a: &crate::faces::PeopleRow, b: &crate::faces::PeopleRow| {
+            b.count.cmp(&a.count).then(a.cluster.cmp(&b.cluster))
+        };
+        match self.people_sort {
+            PeopleSort::Name => v.sort_by(|a, b| match (&a.person, &b.person) {
+                (Some(x), Some(y)) => x.cmp(y),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cluster.cmp(&b.cluster),
+            }),
+            PeopleSort::Amount => v.sort_by(by_count),
+            PeopleSort::Top10 => {
+                v.sort_by(by_count);
+                v.truncate(10);
+            }
+        }
+        v
+    }
+
     fn rebuild(&mut self) {
-        let mut rows = timeline::load_all(&self.store).unwrap_or_default();
-        match self.sort_mode {
-            SortMode::Date => rows.sort_by(|a, b| b.taken.cmp(&a.taken).then(a.path.cmp(&b.path))),
-            SortMode::Name => rows.sort_by(|a, b| a.path.cmp(&b.path)),
-        }
-        if self.sort_rev {
-            rows.reverse();
-        }
+        // 排序与过滤都在 SQL 侧完成:rows 即"当前视图该显示的行",
+        // UI 层不再拿全表二次排序(大图库下每帧搬全表不可接受)。
+        let rows = timeline::load_query(&self.store, self.sort_by, self.sort_rev, &self.filters)
+            .unwrap_or_default();
         self.months = timeline::by_month(&rows).into_iter().rev().collect(); // 新月份在前
         let mut seen = BTreeSet::new();
         let mut folders = Vec::new();
@@ -1549,6 +2045,10 @@ impl App {
         if self.selected_folder >= self.folders.len() {
             self.selected_folder = 0;
         }
+        self.rows_gen = self.rows_gen.wrapping_add(1);
+        // 工具栏 spinner:本视图还有多少张缩略图没落地(后台 worker 在补就是"有活")。
+        self.pending_thumbs = self.rows.iter().filter(|r| r.thumb_ok == 0).count();
+        self.refresh_tier_count();
     }
 
     /// 重扫当前全部监听目录。
@@ -1829,6 +2329,11 @@ impl App {
         match self.view {
             ViewKind::Timeline => self.rows.iter().map(|r| r.id).collect(),
             ViewKind::Folder => {
+                // 铺开全部文件夹时,选择/导出/放映的范围就是整个图库
+                // (与中间栏看到的组头一致,不能只算 selected_folder 那一组)。
+                if self.folder_show_all {
+                    return self.rows.iter().map(|r| r.id).collect();
+                }
                 let folder = self
                     .folders
                     .get(self.selected_folder)
@@ -2096,6 +2601,14 @@ impl App {
         Ok(path)
     }
 
+    /// 刷新当前档位「已生成缩略图数」(状态栏进度用)。
+    ///
+    /// 这个数只在切档 / 后台批次回报 / 重建图库时变,
+    /// 逐帧查是一次 `COUNT(*)` 还要和后台线程抢库锁,所以缓存起来。
+    fn refresh_tier_count(&mut self) {
+        self.tier_cached = self.store.tier_count(self.thumb_tier as u8);
+    }
+
     /// P1-9:切换缩略图档位。    ///
     /// 三件事:
     /// 1. 清空纹理缓存(旧档的纹理不能复用 —— egui 的 TextureId 按 alloc 分配);
@@ -2112,6 +2625,7 @@ impl App {
         if let Some(w) = &self.thumb_bg {
             w.tier.store(tier as u8, Ordering::Relaxed);
         }
+        self.refresh_tier_count();
         self.status = format!("已切换到{}", tier.label());
     }
 
@@ -3923,6 +4437,114 @@ impl App {
         self.zoom_pending = None;
     }
 
+    /// 中间栏按文件夹分组的缓存:`(文件夹, 行下标, 组头日期)`。
+    ///
+    /// `by_folder` 每行都要 clone 一个目录串,`group_date` 每组再扫一遍行,
+    /// 逐帧重跑大图库会掉帧 —— 只在图库版本(rows_gen)变化时重算。
+    /// 借出后由调用方在同一帧末尾归还(与 `months` / `folder_cells` 同一套路)。
+    fn take_folder_groups(&mut self) -> Vec<(String, Vec<usize>, String)> {
+        if self.folder_groups.0 != self.rows_gen {
+            let groups = timeline::by_folder(&self.rows);
+            let mut dated = Vec::with_capacity(groups.len());
+            for (folder, idxs) in groups {
+                let date = timeline::group_date(&self.rows, &idxs);
+                dated.push((folder, idxs, date));
+            }
+            self.folder_groups = (self.rows_gen, dated);
+        }
+        std::mem::take(&mut self.folder_groups.1)
+    }
+
+    /// 组头(参考件 `CAlbumLabel`,偏移取自 `constants.ui` 的 alabel_iconoffset*):
+    /// 大号目录图标 + 文件夹名 + 组内最早拍摄日期与张数,右侧挂本组动作按钮。
+    ///
+    /// `date` 由调用方缓存好传进来(见 `take_folder_groups`):逐帧扫全组找最早日期
+    /// 在大图库里是 O(行数) 的白活。
+    ///
+    /// 放映与邮件复用视图级入口:先把视图范围收窄到本组,再调现成的
+    /// `start_slideshow` / 邮件窗口 —— 不必为幻灯片另开一条 id 队列。
+    fn album_label(&mut self, ui: &mut egui::Ui, folder: &str, date: &str, count: usize) {
+        let mut name = Path::new(folder.trim_end_matches(['\\', '/']))
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| folder.to_string());
+        if name.is_empty() {
+            name = "(未知位置)".into();
+        }
+        // 组内全无 EXIF 拍摄时间时 date 是空串:只报张数,不编日期。
+        let sub = if date.is_empty() {
+            format!("{count} 张")
+        } else {
+            format!("{date} · {count} 张")
+        };
+        let muted = crate::theme::p().muted;
+        let mut act_play = false;
+        let mut act_mail = false;
+        let mut act_open = false;
+        ui.horizontal(|ui| {
+            ui.add(album_icon("folder", 26.0));
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&name).size(17.0).strong())
+                        .selectable(false),
+                );
+                ui.add(
+                    egui::Label::new(egui::RichText::new(&sub).size(12.0).color(muted))
+                        .selectable(false),
+                );
+            });
+            // 参考件把动作按钮钉在组头右侧(outputlayout 的槽位序,从右往左)。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add(tool_button("mail", false))
+                    .on_hover_text("以邮件发送本组照片")
+                    .clicked()
+                {
+                    act_mail = true;
+                }
+                if ui
+                    .add(tool_button("folder-open", false))
+                    .on_hover_text("在资源管理器中打开该文件夹")
+                    .clicked()
+                {
+                    act_open = true;
+                }
+                if ui
+                    .add(tool_button("play", false))
+                    .on_hover_text("放映本组幻灯片")
+                    .clicked()
+                {
+                    act_play = true;
+                }
+            });
+        });
+        if act_open && !crate::win::shell_open(Path::new(folder)) {
+            self.status = format!("无法在资源管理器中打开:{folder}");
+        }
+        if act_play || act_mail {
+            // 只在点击时反查一次左栏槽位(逐帧扫 folders 列表没必要)。
+            if let Some(slot) = self.folders.iter().position(|f| f == folder) {
+                self.selected_folder = slot;
+            }
+            self.view = ViewKind::Folder;
+            self.folder_show_all = false;
+            if act_play {
+                // 预览停在别的文件夹时,start_slideshow 会接着放那张不相关的;
+                // 不在本组范围内就清掉,让它从本组第一张起步。
+                let ids = self.view_ids();
+                if self.preview.is_some_and(|p| !ids.contains(&p)) {
+                    self.preview = None;
+                    self.preview_tex = None;
+                }
+                self.start_slideshow();
+            } else {
+                self.email_win = true;
+            }
+        }
+    }
+
     /// 照片网格(按缩略图档位决定列数与格子大小;选中项加蓝框)。
     ///
     /// P1-9:缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)。
@@ -3937,15 +4559,45 @@ impl App {
         let cols = ((avail + gap) / (card_outer + gap))
             .floor()
             .clamp(2.0, 16.0) as usize;
+        // 行级虚拟化:视口外的行不建 widget,只按同一高度占位。
+        // 行高是确定的(卡片外框 + 该行有说明文字时再加 20px)。
+        // 占位记法:每行连它后面的那个间距一起记(行高 + gap),这样后续行
+        // 依旧落在原来的位置;若占位段结尾就是整个网格,得多退一次间距,
+        // 否则内容总高会比真实值多出一个 gap。
+        let clip = ui.clip_rect();
         ui.push_id(salt, |ui| {
             ui.spacing_mut().item_spacing.y = gap;
+            let mut hidden = 0.0f32;
             for chunk in cells.chunks(cols) {
+                let cap = if self.thumb_captions
+                    && chunk
+                        .iter()
+                        .any(|&i| !self.rows[i].caption.trim().is_empty())
+                {
+                    20.0
+                } else {
+                    0.0
+                };
+                let row_h = card_outer + cap;
+                let top = ui.cursor().top();
+                if top + row_h < clip.min.y || top > clip.max.y {
+                    // 整行在视口外:记进占位高度,这一帧不建行。
+                    hidden += row_h + gap;
+                    continue;
+                }
+                if hidden > 0.0 {
+                    ui.add_space(hidden);
+                    hidden = 0.0;
+                }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
                     for &i in chunk {
                         self.photo_cell(ui, i, cell);
                     }
                 });
+            }
+            if hidden > 0.0 {
+                ui.add_space(hidden - gap);
             }
         });
     }
@@ -4571,7 +5223,7 @@ impl eframe::App for App {
                 }
             }
         }
-        // 缩略图后台 worker:完成一批 → 清占位标记 + 触发重绘
+        // 缩略图后台 worker:完成一批 → 清占位标记 + 刷新缓存计数 + 触发重绘
         if let Some(w) = &self.thumb_bg {
             let mut got: Vec<i64> = Vec::new();
             while let Ok(ids) = w.done.try_recv() {
@@ -4579,7 +5231,9 @@ impl eframe::App for App {
             }
             if !got.is_empty() {
                 self.texs.clear_pending(&got);
-                self.status = format!("缩略图已生成 {} 张", got.len());
+                // 库里刚多了一批已生成记录,顺手刷新;不写 status ——
+                // 逐批覆盖会让状态栏文字一直跳,进度看「N缓存 x/y」就够了。
+                self.refresh_tier_count();
                 ctx.request_repaint();
             }
         }
@@ -5144,44 +5798,29 @@ impl eframe::App for App {
                         // 文件夹视图形态(参考件 Tree View / Flat Folder View)。
                         ui.menu_button("文件夹视图", |ui| {
                             if ui
-                                .selectable_label(!self.folder_tree, "扁平文件夹视图")
+                                .selectable_label(!self.folder_tree, "平铺文件夹视图")
                                 .clicked()
                             {
-                                self.folder_tree = false;
-                                let _ = self.store.set_setting("folder_tree", "0");
+                                self.set_folder_tree(false);
                                 ui.close();
                             }
-                            if ui
-                                .selectable_label(self.folder_tree, "简化树形视图")
-                                .clicked()
-                            {
-                                self.folder_tree = true;
-                                let _ = self.store.set_setting("folder_tree", "1");
+                            if ui.selectable_label(self.folder_tree, "树形视图").clicked() {
+                                self.set_folder_tree(true);
                                 ui.close();
                             }
                         });
                         ui.separator();
-                        ui.menu_button("排序方式", |ui| {
-                            if ui
-                                .selectable_label(self.sort_mode == SortMode::Date, "按拍摄日期")
-                                .clicked()
-                            {
-                                self.sort_mode = SortMode::Date;
-                                self.rebuild();
+                        // 参考件的四种排序是同一层菜单项(不套子菜单),顺序沿用。
+                        for s in timeline::SortBy::ALL {
+                            if ui.selectable_label(self.sort_by == s, s.label()).clicked() {
+                                self.sort_by = s;
+                                self.apply_view_state();
                                 ui.close();
                             }
-                            if ui
-                                .selectable_label(self.sort_mode == SortMode::Name, "按文件名")
-                                .clicked()
-                            {
-                                self.sort_mode = SortMode::Name;
-                                self.rebuild();
-                                ui.close();
-                            }
-                        });
+                        }
                         if ui.selectable_label(self.sort_rev, "反向排序").clicked() {
                             self.sort_rev = !self.sort_rev;
-                            self.rebuild();
+                            self.apply_view_state();
                             ui.close();
                         }
                         ui.menu_button("缩略图", |ui| {
@@ -5371,59 +6010,7 @@ impl eframe::App for App {
         // ===== 工具栏:菜单下面一排常用操作,一键直达 =====
         egui::TopBottomPanel::top("toolbar")
             .frame(crate::theme::bar_frame())
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(2.0);
-                    if ui
-                        .add(egui::ImageButton::new(toolbar_icon("folder-plus")).corner_radius(4))
-                        .on_hover_text("导入文件夹…")
-                        .clicked()
-                    {
-                        self.add_folder_to_library();
-                    }
-                    if ui
-                        .add(egui::ImageButton::new(toolbar_icon("smartphone")).corner_radius(4))
-                        .on_hover_text("从设备导入…")
-                        .clicked()
-                    {
-                        self.open_import_devices();
-                    }
-                    ui.separator();
-                    if ui
-                        .add(egui::ImageButton::new(toolbar_icon("images")).corner_radius(4))
-                        .on_hover_text("幻灯片放映")
-                        .clicked()
-                    {
-                        self.start_slideshow();
-                    }
-                    ui.separator();
-                    if ui
-                        .add(
-                            egui::ImageButton::new(toolbar_icon("wand-sparkles"))
-                                .selected(self.fx_panel)
-                                .corner_radius(4),
-                        )
-                        .on_hover_text("效果面板")
-                        .clicked()
-                    {
-                        self.fx_panel = !self.fx_panel;
-                    }
-                    if ui
-                        .add(
-                            egui::ImageButton::new(toolbar_icon("panel-right"))
-                                .selected(self.props_panel)
-                                .corner_radius(4),
-                        )
-                        .on_hover_text("属性面板")
-                        .clicked()
-                    {
-                        self.props_panel = !self.props_panel;
-                        let _ = self
-                            .store
-                            .set_setting("props_panel", if self.props_panel { "1" } else { "0" });
-                    }
-                });
-            });
+            .show(ctx, |ui| self.toolbar_ui(ctx, ui));
 
         // ===== 全局快速查找:独占一行,输入框拉通整行,右侧档位+查找 =====
         egui::TopBottomPanel::top("gsearch")
@@ -5455,8 +6042,7 @@ impl eframe::App for App {
                             .hint_text("全盘快速查找:文件名 / 文件夹名片段,回车即搜…")
                             .desired_width(ui.available_width() - 6.0),
                     );
-                    let enter =
-                        resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if go || enter {
                         self.view = ViewKind::Search;
                         if !self.name_query.trim().is_empty() {
@@ -5482,40 +6068,26 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("共 {} 张", self.rows.len()));
+                    // 过滤开着时必须说清"这是过滤后的张数",否则看起来像丢图。
+                    if !self.filters.is_none() {
+                        ui.label("(视图过滤中)");
+                        if ui.small_button("清除过滤").clicked() {
+                            self.filters = Default::default();
+                            self.apply_view_state();
+                        }
+                    }
                     if !self.sel.is_empty() {
                         ui.label(format!("已选 {} 张", self.sel.len()));
                     }
                     ui.separator();
                     ui.label(&self.status);
                     // P1-9:当前档位的缓存进度(已生成 / 总数)。
-                    // 切档时后台 worker 才开始补该档,这里实时反映。
-                    let tier = self.thumb_tier;
-                    let cached = self.store.tier_count(tier as u8);
+                    // 计数只在切档 / 批次回报 / 重建图库时刷新,不逐帧查库。
+                    let cached = self.tier_cached;
                     let total = self.rows.len();
                     if cached < total {
                         ui.separator();
-                        ui.label(format!("{}缓存 {cached}/{total}", tier.label()));
-                    }
-                    // P1-9:滚动限速状态(平滑速度)。
-                    // 正在滚动时显示整形后的速度与本帧解码预算;
-                    // 静止时显示"限速待机"。
-                    {
-                        let vel = self.scroll_throttle.velocity();
-                        if vel != 0.0 {
-                            ui.separator();
-                            ui.label(format!(
-                                "限速 {:.0}px/帧({} 位移 {:.0}px,本帧解码≤{})",
-                                vel,
-                                crate::scroll::thumb_event_name(),
-                                self.scroll_throttle.last_raw(),
-                                self.thumb_decode_budget
-                            ));
-                        } else if self.thumb_decode_budget
-                            < crate::scroll::MAX_THUMB_DECODE_PER_FRAME
-                        {
-                            ui.separator();
-                            ui.label(format!("限速待机(本帧解码≤{})", self.thumb_decode_budget));
-                        }
+                        ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
                     }
                     // P1-8:扫描进度条 + 取消按钮。
                     if let Some(ctrl) = &self.scan_ctrl {
@@ -5621,7 +6193,26 @@ impl eframe::App for App {
                 ui.separator();
                 match self.view {
                     ViewKind::Folder => {
-                        crate::theme::section_title(ui, "文件夹");
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("文件夹")
+                                    .size(12.0)
+                                    .color(crate::theme::p().muted)
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .small_button("全部文件夹")
+                                        .on_hover_text("中间栏一次铺开所有文件夹(每组一个相册头)")
+                                        .clicked()
+                                    {
+                                        self.folder_show_all = true;
+                                    }
+                                },
+                            );
+                        });
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if self.folder_tree {
                                 // 简化树形视图(参考件 Simplified Tree View):
@@ -5646,10 +6237,15 @@ impl eframe::App for App {
                                                 .map(|s| s.to_string_lossy().into_owned())
                                                 .unwrap_or_else(|| self.folders[i].clone());
                                             if ui
-                                                .selectable_label(self.selected_folder == i, leaf)
+                                                .selectable_label(
+                                                    !self.folder_show_all
+                                                        && self.selected_folder == i,
+                                                    leaf,
+                                                )
                                                 .clicked()
                                             {
                                                 self.selected_folder = i;
+                                                self.folder_show_all = false;
                                             }
                                         }
                                     });
@@ -5657,8 +6253,10 @@ impl eframe::App for App {
                             } else {
                                 // 扁平文件夹视图(参考件 Flat Folder View)。
                                 for (i, f) in self.folders.clone().iter().enumerate() {
-                                    if ui.selectable_label(self.selected_folder == i, f).clicked() {
+                                    let on = !self.folder_show_all && self.selected_folder == i;
+                                    if ui.selectable_label(on, f).clicked() {
                                         self.selected_folder = i;
+                                        self.folder_show_all = false;
                                     }
                                 }
                             }
@@ -5813,7 +6411,7 @@ impl eframe::App for App {
                             }
                         }
                         egui::ScrollArea::vertical().show(ui, |ui| {
-                            for p in self.face_people.clone() {
+                            for p in self.sorted_people() {
                                 let display = p
                                     .person
                                     .clone()
@@ -6185,19 +6783,48 @@ impl eframe::App for App {
                         }
                     }
                     ViewKind::Folder => {
+                        if self.folder_show_all {
+                            // 平铺图库(参考件):一次铺开所有文件夹,
+                            // 每个文件夹一个 CAlbumLabel 组头 + 一组逐行缩略图。
+                            let groups = self.take_folder_groups();
+                            for (folder, idxs, date) in &groups {
+                                self.album_label(ui, folder, date, idxs.len());
+                                ui.add_space(4.0);
+                                self.photo_grid(ui, &format!("fb-{folder}"), idxs);
+                                ui.add_space(16.0);
+                            }
+                            if self.rows.is_empty() {
+                                ui.label("图库里还没有照片,或当前过滤把照片都滤掉了。");
+                            }
+                            self.folder_groups.1 = groups;
+                            return;
+                        }
                         let folder = self
                             .folders
                             .get(self.selected_folder)
                             .cloned()
                             .unwrap_or_default();
-                        let idxs: Vec<usize> = self
-                            .rows
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, r)| folder_of(&r.path) == folder)
-                            .map(|(i, _)| i)
-                            .collect();
+                        // 从全部行里按目录筛一遍是 O(行数) 次路径运算,
+                        // 只在图库版本变了或换了目录时重算(缓存借出后归还)。
+                        let mut idxs = std::mem::take(&mut self.folder_cells.2);
+                        let mut date = std::mem::take(&mut self.folder_cells.3);
+                        if self.folder_cells.0 != self.rows_gen || self.folder_cells.1 != folder {
+                            idxs = self
+                                .rows
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, r)| folder_of(&r.path) == folder)
+                                .map(|(i, _)| i)
+                                .collect();
+                            date = timeline::group_date(&self.rows, &idxs);
+                            self.folder_cells.0 = self.rows_gen;
+                            self.folder_cells.1 = folder.clone();
+                        }
+                        self.album_label(ui, &folder, &date, idxs.len());
+                        ui.add_space(4.0);
                         self.photo_grid(ui, "folder-grid", &idxs);
+                        self.folder_cells.2 = idxs;
+                        self.folder_cells.3 = date;
                     }
                     // 快速查找视图在进入本面板前已自绘并 return;留空仅为穷尽性。
                     ViewKind::Search => {}
@@ -6210,13 +6837,7 @@ impl eframe::App for App {
                                 );
                             }
                             Some(a) => {
-                                let name = self
-                                    .store
-                                    .albums()
-                                    .into_iter()
-                                    .find(|(aid, _, _)| *aid == a)
-                                    .map(|(_, n, _)| n)
-                                    .unwrap_or_default();
+                                let name = self.store.album_name(a).unwrap_or_default();
                                 ui.heading(format!("相簿:{name}"));
                                 // 相簿成员按加入顺序显示(链上 pos 序)。
                                 let ids = self.store.album_photo_ids(a);
@@ -6908,6 +7529,61 @@ impl eframe::App for App {
         }
         self.wifi_panel = wifi_open;
 
+        // 工具栏「新建相簿」(参考件 New Album from selected:有选中就同时放入照片)。
+        if self.album_new_win {
+            let mut open = self.album_new_win;
+            let mut close = false;
+            egui::Window::new("新建相簿")
+                .open(&mut open)
+                .default_width(360.0)
+                .show(ctx, |ui| {
+                    let n = self.sel.len();
+                    ui.small(if n == 0 {
+                        "相簿是照片 id 的命名集合,不移动文件。"
+                    } else {
+                        "将把选中的照片一并放入新相簿。"
+                    });
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.album_input).hint_text("相簿名称"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let name = self.album_input.trim().to_string();
+                    let ok = (ui.button("创建").clicked() || enter) && !name.is_empty();
+                    ui.horizontal(|ui| {
+                        if n > 0 {
+                            ui.small(format!("已选中 {n} 张"));
+                        }
+                        if ui.button("取消").clicked() {
+                            close = true;
+                        }
+                    });
+                    if ok {
+                        match self.store.album_create(&name) {
+                            Ok(aid) => {
+                                let ids: Vec<i64> = self.sel.iter().copied().collect();
+                                let mut added = 0usize;
+                                for id in ids {
+                                    if self.store.album_add_photo(aid, id).is_ok() {
+                                        added += 1;
+                                    }
+                                }
+                                self.sel_album = Some(aid);
+                                self.view = ViewKind::Albums;
+                                self.album_input.clear();
+                                self.status = if added == 0 {
+                                    format!("已创建相簿「{name}」")
+                                } else {
+                                    format!("已创建相簿「{name}」,放入 {added} 张")
+                                };
+                                close = true;
+                            }
+                            Err(e) => self.status = format!("创建相簿失败: {e}"),
+                        }
+                    }
+                });
+            self.album_new_win = open && !close;
+        }
+
         // P1-13:从设备导入窗口(统一设备列表)。
         if self.show_import_devices {
             let mut open = self.show_import_devices;
@@ -7506,7 +8182,8 @@ impl eframe::App for App {
                         self.mft_ask_grant = false;
                         self.mft_declined = false;
                         let _ = self.store.set_setting("mft_declined", "0");
-                        self.status = "本次跳过全盘索引,下次启动会再问(勾选「不再提示」可免打扰)。".into();
+                        self.status =
+                            "本次跳过全盘索引,下次启动会再问(勾选「不再提示」可免打扰)。".into();
                     }
                     g => {
                         self.mft_apply_grant(g);
