@@ -4,7 +4,7 @@ All user-visible changes are documented here, newest first.
 中文版见 [CHANGELOG.md](./CHANGELOG.md)；the full feature list is in
 [README.md](./README.md).
 
-## 0.2.0 (Unreleased)
+## 0.2.0 (2026-11-03)
 
 This release focuses on three things: **searching the whole disk instantly
 without importing first**, **a fully revamped gallery page**, and an
@@ -68,6 +68,9 @@ without importing first**, **a fully revamped gallery page**, and an
 
 ### Fixed
 
+- Fixed all faces clustering into a single group due to a face embedding
+  preprocessing bug (face algorithm version v3; the app will prompt for a
+  rescan on first launch).
 - Fixed cancelled scans discarding already-completed records: files processed
   before cancellation are now kept in the library, and a resumed scan only
   picks up the remainder without creating duplicates.
