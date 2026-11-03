@@ -3418,7 +3418,7 @@ impl eframe::App for App {
                 self.status = match r.err {
                     Some(e) => format!("扫描{}失败: {e}", r.scope),
                     None if r.cancelled => format!(
-                        "扫描{}已取消:已索引 {} 张(已处理 {} 个文件)",
+                        "扫描{}已取消:已索引 {} 张(发现 {} 个候选文件)",
                         r.scope, r.indexed, r.scanned
                     ),
                     None => format!(
