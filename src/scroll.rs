@@ -59,18 +59,13 @@ pub const SCROLL_EVENTS: [&str; 7] = [
     "scroll/page_down",
     "scroll/next_album",
     "scroll/prev_album",
-    "scroll/thumb",
+    EVENT_SCROLL_THUMB,
 ];
 
 /// 缩略图滚动事件名(唯一走质心位移算法的事件)。
 ///
 /// 对应缩略图质心位移算法(滚动事件处理直接调它,不走派发路径)。
 pub const EVENT_SCROLL_THUMB: &str = "scroll/thumb";
-
-/// 该事件对应的质心位移算法(供 UI 侧标注当前生效的路径)。
-pub fn thumb_event_name() -> &'static str {
-    EVENT_SCROLL_THUMB
-}
 
 /// 滚动停止时的缩略图解码满额(每帧最多解码多少张)。
 pub const MAX_THUMB_DECODE_PER_FRAME: usize = 64;
@@ -175,7 +170,6 @@ impl ScrollThrottle {
             return 0.0;
         }
 
-        
         let mut v = delta as f64 * consts::damp();
         // 记录 delta 的符号
         let neg = v < 0.0;
@@ -207,7 +201,6 @@ impl ScrollThrottle {
 
         // v < 100 时走 ease-out 分支
         if v < consts::ease_scale() {
-
             v = (v / consts::ease_scale()).powf(consts::exp_ease() as f64) * consts::ease_scale();
         }
         // 恢复符号(原版在 ease-out 之后执行)
@@ -244,7 +237,7 @@ impl ScrollThrottle {
 pub fn thumb_delta(node_box: &[i32; 5], content_box: &[i32; 5]) -> f32 {
     let node_mid = (node_box[0] as f64 + node_box[2] as f64) * consts::mid();
     let content_mid = (content_box[0] as f64 + content_box[2] as f64) * consts::mid();
-    
+
     ((node_mid - content_mid) * consts::gain()) as f32
 }
 
@@ -266,6 +259,12 @@ pub struct ScrollSmoother {
     last_raw: f32,
     /// 视口在滚动轴上的长度(px),作为阻尼的可视范围与标度。
     viewport: f32,
+    /// 复位后待重锚:下一帧只把基准挪到当前位置,不产生位移。
+    ///
+    /// 没有它,复位会把基准停在偏移 0,而图库可能正滚在半路 ——
+    /// 下一帧就会算出 `(当前偏移 + 视口/2) × 增益` 这么大一个**伪造位移**,
+    /// 静止不动时也会在"有速度/无速度"两帧之间来回跳。
+    reanchor: bool,
 }
 
 impl ScrollSmoother {
@@ -282,6 +281,7 @@ impl ScrollSmoother {
             content: [0, 0, content_len.round() as i32, 0, 0],
             last_raw: 0.0,
             viewport,
+            reanchor: false,
         }
     }
 
@@ -313,6 +313,13 @@ impl ScrollSmoother {
         ];
         // 原版是"节点质心 vs 内容质心",这里逐帧求差 → 得到本次事件的像素位移。
         let disp_now = thumb_delta(&node, &self.content);
+        if self.reanchor {
+            // 复位后的第一帧:只把基准挪到当前位置,不产生位移。
+            self.reanchor = false;
+            self.prev_node = node;
+            self.last_raw = 0.0;
+            return 0.0;
+        }
         let disp_prev = thumb_delta(&self.prev_node, &self.content);
         self.prev_node = node;
         let raw = disp_now - disp_prev;
@@ -332,21 +339,14 @@ impl ScrollSmoother {
         self.th.damp(raw)
     }
 
-    /// 当前整形后的速度(px/帧)。
-    pub fn velocity(&self) -> f64 {
-        self.th.vel
-    }
-
-    /// 上一次的原始位移(px)。
-    pub fn last_raw(&self) -> f32 {
-        self.last_raw
-    }
-
     /// 复位(对应原版焦点切换时的复位 / 销毁时的复位的复位调用)。
+    ///
+    /// 只清速度与位移读数,基准留给下一帧重锚 —— 直接把基准写成 0
+    /// 会让"停在半路的图库"在下一帧算出一个根本不存在的位移。
     pub fn reset(&mut self) {
         self.th.reset();
         self.last_raw = 0.0;
-        self.prev_node = [0, 0, 0, 0, 0];
+        self.reanchor = true;
     }
 }
 
@@ -463,10 +463,7 @@ mod tests {
         let neg = th.damp(-50.0);
         assert!(pos < 0.0, "正 delta 经 ×(-2.4) 后应为负");
         assert!(neg > 0.0, "负 delta 经 ×(-2.4) 后应为正");
-        assert!(
-            approx(pos.abs(), neg.abs(), 1e-12),
-            "正负同幅应等幅反号"
-        );
+        assert!(approx(pos.abs(), neg.abs(), 1e-12), "正负同幅应等幅反号");
     }
 
     /// delta == 0 → 复位(对齐原版)。
@@ -523,12 +520,8 @@ mod tests {
 
         let node2 = [10i32, 0, 30, 0, 0]; // 中点 20
         let content2 = [0i32, 0, 10, 0, 0]; // 中点 5
-        // (20 - 5) * 2.7 = 40.5
-        assert!(approx(
-            thumb_delta(&node2, &content2) as f64,
-            40.5,
-            1e-6
-        ));
+                                            // (20 - 5) * 2.7 = 40.5
+        assert!(approx(thumb_delta(&node2, &content2) as f64, 40.5, 1e-6));
     }
 
     /// 质心位移为 0(两者对齐)→ delta 为 0。
@@ -566,7 +559,7 @@ mod tests {
         assert!(v != 0.0, "有滚动时应产生非零速度");
         assert!(v.is_finite());
         assert!(
-            approx(s.last_raw() as f64, 270.0, 1e-3),
+            approx(s.last_raw as f64, 270.0, 1e-3),
             "原始位移应含 ×2.7 增益"
         );
     }
@@ -577,10 +570,10 @@ mod tests {
         let mut s = ScrollSmoother::new(600.0, 6000.0);
         s.feed_offset(0.0, 6000.0);
         s.feed_offset(100.0, 6000.0);
-        assert!(s.velocity() != 0.0);
+        assert!(s.th.vel != 0.0);
         let v = s.feed_offset(100.0, 6000.0);
         assert_eq!(v, 0.0, "偏移不变 → 位移 0 → 复位");
-        assert_eq!(s.velocity(), 0.0);
+        assert_eq!(s.th.vel, 0.0);
     }
 
     /// 限速器:反向滚动 → 速度符号相反。
@@ -590,7 +583,10 @@ mod tests {
         s.feed_offset(0.0, 6000.0);
         let up = s.feed_offset(100.0, 6000.0);
         let down = s.feed_offset(0.0, 6000.0);
-        assert!(up.is_sign_negative() != down.is_sign_negative(), "反向应异号");
+        assert!(
+            up.is_sign_negative() != down.is_sign_negative(),
+            "反向应异号"
+        );
     }
 
     /// 限速器复位。
@@ -600,8 +596,27 @@ mod tests {
         s.feed_offset(0.0, 6000.0);
         s.feed_offset(100.0, 6000.0);
         s.reset();
-        assert_eq!(s.velocity(), 0.0);
-        assert_eq!(s.last_raw(), 0.0);
+        assert_eq!(s.th.vel, 0.0);
+        assert_eq!(s.last_raw, 0.0);
+    }
+
+    /// 滚到半路停住后:逐帧复位不得凭空造出位移。
+    ///
+    /// 复位把基准写成偏移 0 时,下一帧的位移 = `(当前偏移 + 视口/2) × 增益`,
+    /// 于是不滚动也会出现大速度 → 解码预算被压到 0 → 网格在满图与灰块间抖。
+    #[test]
+    fn idle_frames_do_not_fabricate_velocity() {
+        let mut s = ScrollSmoother::new(600.0, 6000.0);
+        assert_eq!(s.feed_offset(0.0, 6000.0), 0.0);
+        // 模拟 app 侧 update_scroll_throttle:速度归零即复位,然后停在 1200px。
+        assert!(s.feed_offset(1200.0, 6000.0) != 0.0, "真滚动应产生速度");
+        for _ in 0..8 {
+            if s.th.vel == 0.0 {
+                s.reset();
+            }
+            assert_eq!(s.feed_offset(1200.0, 6000.0), 0.0, "偏移不变不应产生速度");
+            assert_eq!(s.last_raw, 0.0, "偏移不变不应产生位移");
+        }
     }
 
     /// 解码预算:不滚动 → 满额;滚动越快 → 预算越小,最低 0。
