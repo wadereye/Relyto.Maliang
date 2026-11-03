@@ -453,7 +453,7 @@ pub struct App {
     show_options: bool,
     /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
     options_tab: usize,
-    /// 文件夹视图树形形态(参考件左栏可逐级展开的那棵树;设置项 folder_tree)。
+    /// 文件夹视图树形形态(参考件左栏可逐级展开的那棵树;设置项 folder_tree,缺省树形)。
     folder_tree: bool,
     /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
     /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
@@ -1459,10 +1459,11 @@ impl App {
             .get_setting("thumb_captions")
             .map(|v| v != "0")
             .unwrap_or(false);
+        // 缺省树形(参考件左栏即树);显式选过平铺的库存的是 "0",不受影响。
         let folder_tree = store
             .get_setting("folder_tree")
             .map(|v| v != "0")
-            .unwrap_or(false);
+            .unwrap_or(true);
         // 左栏缩略图:参考件默认在库里显示,这里同样默认开。
         let tree_thumbs = store
             .get_setting("tree_thumbs")
@@ -6241,6 +6242,10 @@ impl App {
         let clip = ui.clip_rect();
         ui.push_id(salt, |ui| {
             ui.spacing_mut().item_spacing.y = gap;
+            // 逐行维护虚拟坐标:跳过的行不建 widget,光标不会前移,
+            // 若继续用 `ui.cursor()` 判视口,滚动后光标始终停在本网格顶部,
+            // 整片网格都会被判成"在视口上方"而不画(滚着滚着就全空)。
+            let mut y = ui.cursor().top();
             let mut hidden = 0.0f32;
             for chunk in cells.chunks(cols) {
                 let cap = if self.thumb_captions
@@ -6253,10 +6258,10 @@ impl App {
                     0.0
                 };
                 let row_h = card_outer + cap;
-                let top = ui.cursor().top();
-                if top + row_h < clip.min.y || top > clip.max.y {
+                if y + row_h < clip.min.y || y > clip.max.y {
                     // 整行在视口外:记进占位高度,这一帧不建行。
                     hidden += row_h + gap;
+                    y += row_h + gap;
                     continue;
                 }
                 if hidden > 0.0 {
@@ -6269,6 +6274,7 @@ impl App {
                         self.photo_cell(ui, i, cell);
                     }
                 });
+                y += row_h + gap;
             }
             if hidden > 0.0 {
                 ui.add_space(hidden - gap);
