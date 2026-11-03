@@ -1,10 +1,5 @@
-<div align="right">
 
-|                        |      |
-| ---------------------- | ---- |
 | [English](./README.md) | 简体中文 |
-
-</div>
 
 # Relyto.Maliang（马良）
 
@@ -15,10 +10,8 @@
 此后一直没有一款现代工具能真正填补这个空缺。因此，本项目决定用 Rust  
 参考 Picasa 3 的 并开源，让这份经典体验延续下去。
 
-如果马良对你有用，欢迎给仓库点一个  
-[⭐ Star](https://github.com/wadereye/Relyto.Maliang/stargazers)；  
-如果有缺失的功能或遇到问题，欢迎提  
-[Issue](https://github.com/wadereye/Relyto.Maliang/issues)。  
+如果马良对你有用，欢迎给仓库点一个[⭐ Star](https://github.com/wadereye/Relyto.Maliang/stargazers)；  
+如果有缺失的功能或遇到问题，欢迎提[Issue](https://github.com/wadereye/Relyto.Maliang/issues)。  
 功能需求随时欢迎。
 
 Maliang（马良）是一个面向桌面端的本地照片管理工具，目标是把经典的  
@@ -29,7 +22,7 @@ Picasa 3 的体验现代化：更顺滑的浏览、更智能的组织，以及�
 项目已发布 v0.1（2026-10-31），v0.2 正在收尾。各版本的新增内容见  
 [更新日志](./CHANGELOG.md)。
 
-## 功能总览
+## 功能总览（逐步实现）
 
 ### 浏览与整理
 
@@ -91,7 +84,7 @@ Picasa 3 的体验现代化：更顺滑的浏览、更智能的组织，以及�
 - 右栏信息抽屉：属性 / 标签 / 人物 / 地点。
 - **全本地、无联网、无遥测。**
 
-### 有意不做（范围外）
+### 不打算做（原Picasa有，但目前暂不做）
 
 图片精修编辑链（retouch / picnik）、拼贴 / 海报 / CD 刻录、在线分享  
 （Picasa Web / 社交平台 / 邮件 / 打印）、TWAIN 相机扫描、相簿系统云同步、  
