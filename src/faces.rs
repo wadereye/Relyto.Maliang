@@ -47,7 +47,15 @@ pub fn save_face(
     conn.execute(
         "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored)
          VALUES(?1,?2,?3,?4,?5,?6,?7,0)",
-        params![photo_id, x1 as f64, y1 as f64, x2 as f64, y2 as f64, score as f64, quality as f64],
+        params![
+            photo_id,
+            x1 as f64,
+            y1 as f64,
+            x2 as f64,
+            y2 as f64,
+            score as f64,
+            quality as f64
+        ],
     )?;
     let face_id = conn.last_insert_rowid();
     conn.execute(
@@ -162,7 +170,10 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             let cid: i64 = r.get(0)?;
             let blob: Vec<u8> = r.get(1)?;
             let q: f64 = r.get(2)?;
-            clusters.entry(cid).or_default().push((blob_to_vec(&blob), q as f32));
+            clusters
+                .entry(cid)
+                .or_default()
+                .push((blob_to_vec(&blob), q as f32));
         }
     }
     let todo: Vec<(i64, Vec<f32>, f32)> = {
@@ -193,12 +204,18 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
         }
         match best {
             Some((cid, c)) if c >= thr => {
-                conn.execute("UPDATE faces SET cluster=?1 WHERE id=?2", params![cid, face_id])?;
+                conn.execute(
+                    "UPDATE faces SET cluster=?1 WHERE id=?2",
+                    params![cid, face_id],
+                )?;
                 clusters.get_mut(&cid).unwrap().push((v, q));
             }
             _ => {
                 let next = clusters.keys().copied().max().unwrap_or(0) + 1;
-                conn.execute("UPDATE faces SET cluster=?1 WHERE id=?2", params![next, face_id])?;
+                conn.execute(
+                    "UPDATE faces SET cluster=?1 WHERE id=?2",
+                    params![next, face_id],
+                )?;
                 clusters.insert(next, vec![(v, q)]);
             }
         }
@@ -276,18 +293,21 @@ pub fn faces_for_cluster(
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    st.query_map(params![cluster, include_ignored as i32, min_quality as f64], |r| {
-        Ok(FaceHit {
-            face_id: r.get(0)?,
-            photo_id: r.get(1)?,
-            photo_path: r.get(2)?,
-            x1: r.get::<_, f64>(3)? as f32,
-            y1: r.get::<_, f64>(4)? as f32,
-            x2: r.get::<_, f64>(5)? as f32,
-            y2: r.get::<_, f64>(6)? as f32,
-            quality: r.get::<_, f64>(7)? as f32,
-        })
-    })
+    st.query_map(
+        params![cluster, include_ignored as i32, min_quality as f64],
+        |r| {
+            Ok(FaceHit {
+                face_id: r.get(0)?,
+                photo_id: r.get(1)?,
+                photo_path: r.get(2)?,
+                x1: r.get::<_, f64>(3)? as f32,
+                y1: r.get::<_, f64>(4)? as f32,
+                x2: r.get::<_, f64>(5)? as f32,
+                y2: r.get::<_, f64>(6)? as f32,
+                quality: r.get::<_, f64>(7)? as f32,
+            })
+        },
+    )
     .map(|rows| rows.filter_map(|r| r.ok()).collect())
     .unwrap_or_default()
 }
@@ -364,24 +384,19 @@ pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
 }
 
 pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
-    store
-        .0
-        .lock()
-        .unwrap()
-        .execute("INSERT OR REPLACE INTO people(id,name) VALUES(?1,?2)", params![cluster, name])?;
+    store.0.lock().unwrap().execute(
+        "INSERT OR REPLACE INTO people(id,name) VALUES(?1,?2)",
+        params![cluster, name],
+    )?;
     Ok(())
 }
 
 /// 忽略/恢复整个簇(对应原版 ignoreface:误检簇一键排除)。
 pub fn ignore_cluster(store: &Store, cluster: i64, ignored: bool) -> Result<()> {
-    store
-        .0
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE faces SET ignored=?1 WHERE cluster=?2",
-            params![ignored as i32, cluster],
-        )?;
+    store.0.lock().unwrap().execute(
+        "UPDATE faces SET ignored=?1 WHERE cluster=?2",
+        params![ignored as i32, cluster],
+    )?;
     Ok(())
 }
 
@@ -448,7 +463,17 @@ pub fn scan_batch(store: &Store, cap: usize) -> Result<(usize, usize)> {
         };
         for f in &res {
             let q = face_quality(&img, &f.det);
-            save_face(store, pid, f.det.x0, f.det.y0, f.det.x1, f.det.y1, f.det.score, q, &f.emb)?;
+            save_face(
+                store,
+                pid,
+                f.det.x0,
+                f.det.y0,
+                f.det.x1,
+                f.det.y1,
+                f.det.score,
+                q,
+                &f.emb,
+            )?;
         }
         face_count += res.len();
         photo_count += 1;
@@ -497,7 +522,11 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             ) else {
                 continue;
             };
-            named.entry(cid).or_insert_with(|| (name, Vec::new())).1.push((blob_to_vec(&blob), q as f32));
+            named
+                .entry(cid)
+                .or_insert_with(|| (name, Vec::new()))
+                .1
+                .push((blob_to_vec(&blob), q as f32));
         }
     }
     let named_centroids: Vec<(String, Vec<f32>)> = named
@@ -532,7 +561,10 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             ) else {
                 continue;
             };
-            unnamed.entry(cid).or_default().push((blob_to_vec(&blob), q as f32));
+            unnamed
+                .entry(cid)
+                .or_default()
+                .push((blob_to_vec(&blob), q as f32));
         }
     }
     let mut out: Vec<Suggestion> = unnamed
@@ -548,13 +580,22 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             }
             let (name, score) = best?;
             if score >= thr {
-                Some(Suggestion { cluster: cid, name, score, count: vs.len() })
+                Some(Suggestion {
+                    cluster: cid,
+                    name,
+                    score,
+                    count: vs.len(),
+                })
             } else {
                 None
             }
         })
         .collect();
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -591,8 +632,11 @@ mod tests {
     fn cluster_roundtrip() {
         let store = test_store();
         let conn = store.0.lock().unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(90,'x.jpg','.','0',1)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(90,'x.jpg','.','0',1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.9, 0.1, 0.0];
@@ -613,15 +657,29 @@ mod tests {
     fn quality_orders_sharp_over_blurry() {
         let mut img = image::RgbImage::new(240, 240);
         for (x, y, p) in img.enumerate_pixels_mut() {
-            let c = if (x / 4 + y / 4) % 2 == 0 { 20u8 } else { 235u8 };
+            let c = if (x / 4 + y / 4) % 2 == 0 {
+                20u8
+            } else {
+                235u8
+            };
             *p = image::Rgb([c, c, c]);
         }
         let sharp = image::DynamicImage::ImageRgb8(img.clone());
-        let blurry = image::DynamicImage::ImageRgb8(
-            image::imageops::resize(&img, 24, 24, image::imageops::FilterType::Triangle),
-        )
+        let blurry = image::DynamicImage::ImageRgb8(image::imageops::resize(
+            &img,
+            24,
+            24,
+            image::imageops::FilterType::Triangle,
+        ))
         .resize(240, 240, image::imageops::FilterType::Triangle);
-        let det = Det { x0: 60.0, y0: 60.0, x1: 180.0, y1: 180.0, score: 0.9, kps: [(0.0, 0.0); 5] };
+        let det = Det {
+            x0: 60.0,
+            y0: 60.0,
+            x1: 180.0,
+            y1: 180.0,
+            score: 0.9,
+            kps: [(0.0, 0.0); 5],
+        };
         let qs = face_quality(&sharp, &det);
         let qb = face_quality(&blurry, &det);
         assert!(qs > 0.6, "清晰脸应高分: {qs}");
@@ -633,10 +691,16 @@ mod tests {
     fn suggestion_for_similar_unnamed_cluster() {
         let store = test_store();
         let conn = store.0.lock().unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)", [])
-            .unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(2,'b.jpg','.',0,1)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(2,'b.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         // 簇 1 = 张三(已命名)
         insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
@@ -645,7 +709,12 @@ mod tests {
         insert_face(&store, 1, &[0.95, 0.31, 0.0], 1.0, Some(2));
         insert_face(&store, 2, &[0.0, 1.0, 0.0], 1.0, Some(3));
         let sugs = face_suggestions(&store, 0.55);
-        assert_eq!(sugs.len(), 1, "只应有 1 条建议: {:?}", sugs.iter().map(|s| (&s.name, s.score)).collect::<Vec<_>>());
+        assert_eq!(
+            sugs.len(),
+            1,
+            "只应有 1 条建议: {:?}",
+            sugs.iter().map(|s| (&s.name, s.score)).collect::<Vec<_>>()
+        );
         assert_eq!(sugs[0].name, "张三");
         assert_eq!(sugs[0].cluster, 2);
         assert!(sugs[0].score > 0.9, "score={}", sugs[0].score);
@@ -657,10 +726,16 @@ mod tests {
     fn ignore_hides_from_overview() {
         let store = test_store();
         let conn = store.0.lock().unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)", [])
-            .unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(2,'b.jpg','.',0,1)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(2,'b.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.9, None);
         insert_face(&store, 2, &[0.98, 0.2, 0.0], 0.9, None);
@@ -670,8 +745,15 @@ mod tests {
         let cid = rows[0].cluster;
         ignore_cluster(&store, cid, true).unwrap();
         assert!(people_overview(&store).is_empty(), "忽略后不应出现在列表");
-        assert!(faces_for_cluster(&store, cid, false, 0.0).is_empty(), "默认不显示已忽略");
-        assert_eq!(faces_for_cluster(&store, cid, true, 0.0).len(), 2, "显式包含时可看");
+        assert!(
+            faces_for_cluster(&store, cid, false, 0.0).is_empty(),
+            "默认不显示已忽略"
+        );
+        assert_eq!(
+            faces_for_cluster(&store, cid, true, 0.0).len(),
+            2,
+            "显式包含时可看"
+        );
         ignore_cluster(&store, cid, false).unwrap();
         assert_eq!(people_overview(&store).len(), 1, "恢复后回来");
     }
@@ -681,8 +763,11 @@ mod tests {
     fn weighted_centroid_resists_low_quality_outlier() {
         let store = test_store();
         let conn = store.0.lock().unwrap();
-        conn.execute("INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
         // 簇 1:一张高质量 x + 一张 0.05 权重的 75° 异类脸
         insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
@@ -692,7 +777,14 @@ mod tests {
         // thr=0.9:无权重的均值质心 cos≈0.79 会另起新簇;加权后 cos≈0.999 归簇 1
         assign_clusters(&store, 0.9).unwrap();
         let rows = people_overview(&store);
-        assert_eq!(rows.len(), 1, "低质量异类不应撕裂簇: {:?}", rows.iter().map(|r| (r.cluster, r.count)).collect::<Vec<_>>());
+        assert_eq!(
+            rows.len(),
+            1,
+            "低质量异类不应撕裂簇: {:?}",
+            rows.iter()
+                .map(|r| (r.cluster, r.count))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(rows[0].count, 3);
     }
 
