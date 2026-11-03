@@ -321,6 +321,8 @@ pub struct App {
     mft_progress: Option<(f32, String)>,
     /// 授权说明弹窗待示(没决定过就先问,问明白再动手)。
     mft_ask_grant: bool,
+    /// 授权窗里「不再提示」勾选(仅窗口打开期间的临时态;拒绝/关窗且勾选才落库)。
+    mft_never_ask: bool,
     /// 计划任务在位且指向当前 exe(启动时查一次缓存;查询是进程调用,不能逐帧问)。
     mft_task_ok: bool,
     /// 快速查找输入与结果。
@@ -503,13 +505,84 @@ fn thumb_star(
     resp.on_hover_text(if on { "取消星标" } else { "加星标" });
 }
 
+/// 工具栏图标(Lucide,ISC 许可,见 assets/icons/LICENSE-lucide.txt):
+/// 按主题烤好两套描边色,SVG 运行时栅格化,高 DPI 不糊;URI 带主题段,切主题即重载纹理。
+fn toolbar_icon(name: &str) -> egui::Image<'static> {
+    const LIGHT: &[(&str, &[u8])] = &[
+        (
+            "folder-plus",
+            include_bytes!("../assets/icons/light/folder-plus.svg"),
+        ),
+        (
+            "smartphone",
+            include_bytes!("../assets/icons/light/smartphone.svg"),
+        ),
+        (
+            "images",
+            include_bytes!("../assets/icons/light/images.svg"),
+        ),
+        (
+            "wand-sparkles",
+            include_bytes!("../assets/icons/light/wand-sparkles.svg"),
+        ),
+        (
+            "panel-right",
+            include_bytes!("../assets/icons/light/panel-right.svg"),
+        ),
+    ];
+    const DARK: &[(&str, &[u8])] = &[
+        (
+            "folder-plus",
+            include_bytes!("../assets/icons/dark/folder-plus.svg"),
+        ),
+        (
+            "smartphone",
+            include_bytes!("../assets/icons/dark/smartphone.svg"),
+        ),
+        ("images", include_bytes!("../assets/icons/dark/images.svg")),
+        (
+            "wand-sparkles",
+            include_bytes!("../assets/icons/dark/wand-sparkles.svg"),
+        ),
+        (
+            "panel-right",
+            include_bytes!("../assets/icons/dark/panel-right.svg"),
+        ),
+    ];
+    let table = if crate::theme::p().is_light {
+        LIGHT
+    } else {
+        DARK
+    };
+    let (tag, bytes) = table
+        .iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("未知工具栏图标: {name}"));
+    let half = if crate::theme::p().is_light { "l" } else { "d" };
+    egui::Image::from_bytes(format!("bytes://{half}/{tag}.svg"), *bytes)
+        .fit_to_exact_size(egui::vec2(18.0, 18.0))
+}
+
 fn load_cjk_font(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    // 主字体:内置阿里普惠体 3.0 Regular(免费可商用),拉丁与中文观感统一;
+    // 系统微软雅黑等保留为 CJK 兜底。strong() 在 egui 里只是变色,一档字重即可。
+    fonts.font_data.insert(
+        "puhui".into(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/AlibabaPuHuiTi-3-55-Regular.ttf"
+        ))),
+    );
+    fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default()
+        .insert(0, "puhui".into());
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",   // 微软雅黑(ttc,ab_glyph 兼容时优先)
         r"C:\Windows\Fonts\simhei.ttf", // 黑体(纯 ttf,最稳妥)
         r"C:\Windows\Fonts\simsun.ttc", // 宋体
     ];
-    let mut fonts = egui::FontDefinitions::default();
     for path in candidates {
         let Ok(data) = std::fs::read(path) else {
             continue;
@@ -524,6 +597,7 @@ fn load_cjk_font(ctx: &egui::Context) {
         ctx.set_fonts(fonts);
         return;
     }
+    ctx.set_fonts(fonts);
     eprintln!("未找到系统中文字体,界面中文可能显示为方块");
 }
 
@@ -698,6 +772,8 @@ impl App {
             .unwrap_or(crate::theme::Kind::Gray);
         crate::theme::set_kind(ui_theme);
         crate::theme::apply(&cc.egui_ctx);
+        // SVG 图标加载器(工具栏图标等),必须在首帧前装好。
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         load_cjk_font(&cc.egui_ctx);
         // 自定义裁剪比例 / 缩略图说明开关在 move store 之前读取。
         let custom_ratios = Self::load_custom_ratios(&store);
@@ -886,6 +962,7 @@ impl App {
             mft_declined: false,
             mft_progress: None,
             mft_ask_grant: false,
+            mft_never_ask: false,
             mft_task_ok: false,
             name_query: String::new(),
             name_results: Vec::new(),
@@ -953,7 +1030,7 @@ impl App {
         // 快速查找:启动 3s 后(等首帧渲染与首扫错峰)处理名字索引。
         // 有索引 → 后台载入;要更新则按授权档位发起:
         // task = 触发计划任务(静默,不再弹 UAC)、once = 每次提权(每次都弹)、
-        // none = 不打扰、没问过 = 先弹说明窗取得同意再动手。
+        // none = 不打扰、没问过 = 先弹说明窗取得同意再动手;勾过「不再提示」则不再问。
         // 上次失败/被拒(declined)则本轮不自动发起,由页面手动重试。
         #[cfg(windows)]
         {
@@ -972,7 +1049,11 @@ impl App {
                         self.spawn_mft_indexer(std::time::Duration::from_secs(3))
                     }
                     // 档位是 task 但任务不在了(换机/exe 搬家/被删)→ 回来说明窗重授。
-                    MftGrant::Task | MftGrant::Unasked => self.mft_ask_grant = true,
+                    MftGrant::Task | MftGrant::Unasked => {
+                        if self.store.get_setting("mft_never_ask").as_deref() != Some("1") {
+                            self.mft_open_grant();
+                        }
+                    }
                     MftGrant::Once => self.spawn_mft_indexer(std::time::Duration::from_secs(3)),
                     MftGrant::None => {}
                 }
@@ -983,6 +1064,13 @@ impl App {
     /// 全盘索引的当前授权档位(没存过就是「未问过」)。
     fn mft_grant(&self) -> MftGrant {
         MftGrant::from_setting(self.store.get_setting("mft_grant").as_deref().unwrap_or(""))
+    }
+
+    /// 打开授权说明窗(「不再提示」勾选每次打开时复位)。
+    #[cfg(windows)]
+    fn mft_open_grant(&mut self) {
+        self.mft_ask_grant = true;
+        self.mft_never_ask = false;
     }
 
     /// 计划任务是否仍在位、且指向当前这个 exe(exe 换路径后必须重新授权)。
@@ -1124,7 +1212,10 @@ impl App {
         let _ = self.store.set_setting("mft_grant", grant.as_setting());
         self.mft_ask_grant = false;
         self.mft_declined = false;
+        self.mft_never_ask = false;
         let _ = self.store.set_setting("mft_declined", "0");
+        // 明确选了启用档位 = 撤回「不再提示」,任务丢失时还要恢复询问。
+        let _ = self.store.set_setting("mft_never_ask", "0");
         match grant {
             MftGrant::Task => self.mft_install_task_async(),
             MftGrant::Once => self.spawn_mft_indexer(std::time::Duration::from_millis(300)),
@@ -1139,6 +1230,7 @@ impl App {
             Ok(()) => {
                 let _ = self.store.set_setting("mft_task_exe", "");
                 let _ = self.store.set_setting("mft_grant", MftGrant::Unasked.as_setting());
+                let _ = self.store.set_setting("mft_never_ask", "0");
                 self.mft_task_ok = false;
                 self.status = "已删除全盘索引计划任务(下次启动会重新询问授权)".into();
             }
@@ -1157,7 +1249,7 @@ impl App {
             self.mft_task_ok = self.mft_task_current();
         }
         if grant == MftGrant::Unasked || (grant == MftGrant::Task && !self.mft_task_ok) {
-            self.mft_ask_grant = true;
+            self.mft_open_grant();
             return;
         }
         if grant == MftGrant::None {
@@ -1218,7 +1310,7 @@ impl App {
                                 .set_setting("mft_grant", MftGrant::Unasked.as_setting());
                             self.mft_task_ok = false;
                             self.mft_progress = None;
-                            self.mft_ask_grant = true;
+                            self.mft_open_grant();
                             self.status = format!("全盘索引授权未完成: {e}");
                         }
                     }
@@ -1309,7 +1401,7 @@ impl App {
                     // 没在跑也没索引 = 档位是「不更新」或还没授权:给个手动入口。
                     #[cfg(windows)]
                     if ui.button("启用全盘索引…").clicked() {
-                        self.mft_ask_grant = true;
+                        self.mft_open_grant();
                     }
                 }
                 return;
@@ -3212,6 +3304,9 @@ impl App {
                             });
                             if cur == MftGrant::Unasked {
                                 ui.small("还没选过:第一次发起全盘索引时会先弹一个说明窗问你。");
+                            }
+                            if self.store.get_setting("mft_never_ask").as_deref() == Some("1") {
+                                ui.small("已勾「不再提示」:启动不再自动询问授权,点上面任一授权方式即可恢复。");
                             }
                             if cur == MftGrant::Task && !self.mft_task_ok {
                                 ui.small("计划任务不在了(换机或程序换了路径),点「立即更新」会重新走一次授权。");
@@ -5279,21 +5374,49 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.add_space(2.0);
-                    if ui.small_button("导入文件夹…").clicked() {
+                    if ui
+                        .add(egui::ImageButton::new(toolbar_icon("folder-plus")).corner_radius(4))
+                        .on_hover_text("导入文件夹…")
+                        .clicked()
+                    {
                         self.add_folder_to_library();
                     }
-                    if ui.small_button("从设备导入…").clicked() {
+                    if ui
+                        .add(egui::ImageButton::new(toolbar_icon("smartphone")).corner_radius(4))
+                        .on_hover_text("从设备导入…")
+                        .clicked()
+                    {
                         self.open_import_devices();
                     }
                     ui.separator();
-                    if ui.small_button("幻灯片放映").clicked() {
+                    if ui
+                        .add(egui::ImageButton::new(toolbar_icon("images")).corner_radius(4))
+                        .on_hover_text("幻灯片放映")
+                        .clicked()
+                    {
                         self.start_slideshow();
                     }
                     ui.separator();
-                    if ui.selectable_label(self.fx_panel, "效果面板").clicked() {
+                    if ui
+                        .add(
+                            egui::ImageButton::new(toolbar_icon("wand-sparkles"))
+                                .selected(self.fx_panel)
+                                .corner_radius(4),
+                        )
+                        .on_hover_text("效果面板")
+                        .clicked()
+                    {
                         self.fx_panel = !self.fx_panel;
                     }
-                    if ui.selectable_label(self.props_panel, "属性面板").clicked() {
+                    if ui
+                        .add(
+                            egui::ImageButton::new(toolbar_icon("panel-right"))
+                                .selected(self.props_panel)
+                                .corner_radius(4),
+                        )
+                        .on_hover_text("属性面板")
+                        .clicked()
+                    {
                         self.props_panel = !self.props_panel;
                         let _ = self
                             .store
@@ -7260,12 +7383,55 @@ impl eframe::App for App {
         if self.mft_ask_grant {
             let mut open = self.mft_ask_grant;
             let mut decided: Option<MftGrant> = None;
+            // msgbox 式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
+            // 推荐档绿底,其余两档浅蓝/深蓝递进。
+            const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
+            const GRANT_BLUE_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x9A, 0xD2);
+            const GRANT_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x5F, 0x8A);
             egui::Window::new("启用全盘快速查找")
-                .open(&mut open)
+                .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
-                .default_width(540.0)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(560.0)
                 .show(ctx, |ui| {
+                    // 绿色标题条 + 自绘关闭钮:关窗职责归这里。
+                    let (hdr, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 36.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), GRANT_GREEN);
+                    ui.painter().text(
+                        egui::pos2(hdr.center().x, hdr.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "启用全盘快速查找",
+                        egui::FontId::proportional(17.0),
+                        egui::Color32::WHITE,
+                    );
+                    let x_rect = egui::Rect::from_center_size(
+                        egui::pos2(hdr.right() - 20.0, hdr.center().y),
+                        egui::vec2(28.0, 28.0),
+                    );
+                    let x = ui.interact(x_rect, ui.id().with("mft-grant-x"), egui::Sense::click());
+                    // ✕ 字符默认字体缺字形,直接画两笔叉更稳。
+                    let xc = x_rect.center();
+                    let xr = 5.0;
+                    let x_stroke = egui::Stroke::new(
+                        if x.hovered() { 2.2 } else { 1.6 },
+                        egui::Color32::WHITE,
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(xc.x - xr, xc.y - xr), egui::pos2(xc.x + xr, xc.y + xr)],
+                        x_stroke,
+                    );
+                    ui.painter().line_segment(
+                        [egui::pos2(xc.x - xr, xc.y + xr), egui::pos2(xc.x + xr, xc.y - xr)],
+                        x_stroke,
+                    );
+                    if x.clicked() {
+                        open = false;
+                    }
+                    ui.add_space(14.0);
                     ui.label("「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。");
                     ui.label("读卷日志属于管理员级操作,所以需要你点一次 UAC。这一步只做这些事:");
                     ui.indent("mft_grant_what", |ui| {
@@ -7273,32 +7439,94 @@ impl eframe::App for App {
                         ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
                         ui.label("· 不联网、不上传,随时可以在 选项 > 常规 撤销。");
                     });
-                    ui.add_space(8.0);
+                    ui.add_space(14.0);
+                    // 三档三色:按钮定宽对齐,说明文字跟在右侧,行距拉开。
                     ui.horizontal(|ui| {
-                        if ui.button("一次授权,以后静默").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("一次授权,以后静默(推荐)")
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                )
+                                .fill(GRANT_GREEN)
+                                .min_size(egui::vec2(200.0, 30.0))
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
                             decided = Some(MftGrant::Task);
                         }
-                        ui.small("注册一个计划任务:只有这次弹 UAC,以后每次启动自动增量更新,不再问。");
+                        ui.small("注册一个计划任务:只有这次弹 UAC,以后启动自动增量更新,不再问。");
                     });
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("每次都单独授权").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("每次都单独授权")
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(GRANT_BLUE_LIGHT)
+                                .min_size(egui::vec2(200.0, 30.0))
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
                             decided = Some(MftGrant::Once);
                         }
                         ui.small("不注册任务,但每次启动都要点一次 UAC(Windows 不提供\"记住同意\")。");
                     });
+                    ui.add_space(8.0);
                     ui.horizontal(|ui| {
-                        if ui.button("不用全盘索引").clicked() {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("不用全盘索引").color(egui::Color32::WHITE),
+                                )
+                                .fill(GRANT_BLUE_DARK)
+                                .min_size(egui::vec2(200.0, 30.0))
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
                             decided = Some(MftGrant::None);
                         }
                         ui.small("跳过:快速查找只查图库里的照片,以后可在 选项 > 常规 改。");
                     });
-                    ui.add_space(4.0);
-                    ui.strong("推荐第一档:全盘索引只在注册时打扰你一次。");
+                    ui.add_space(14.0);
+                    ui.checkbox(&mut self.mft_never_ask, "不再提示");
+                    ui.small("嫌每次启动都问就勾上:选「不用全盘索引」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
                 });
+            let checked = self.mft_never_ask;
             if let Some(g) = decided {
-                self.mft_apply_grant(g);
+                match g {
+                    // 没勾「不再提示」的拒绝不算决定:不落档位,下次启动继续问。
+                    MftGrant::None if !checked => {
+                        self.mft_ask_grant = false;
+                        self.mft_declined = false;
+                        let _ = self.store.set_setting("mft_declined", "0");
+                        self.status = "本次跳过全盘索引,下次启动会再问(勾选「不再提示」可免打扰)。".into();
+                    }
+                    g => {
+                        self.mft_apply_grant(g);
+                        if matches!(g, MftGrant::None) && checked {
+                            let _ = self.store.set_setting("mft_never_ask", "1");
+                            self.status =
+                                "已选「不再提示」:以后启动不再询问全盘索引授权(入口仍在,随时可启用)。"
+                                    .into();
+                        }
+                    }
+                }
             } else {
-                // 直接关窗口 = 还没决定:保持「未问过」,下次启动再问一次。
+                // 直接关窗口 = 还没决定:保持「未问过」,下次启动再问一次;
+                // 勾了「不再提示」则尊重,落库后启动不再弹。
+                if !open && checked {
+                    let _ = self.store.set_setting("mft_never_ask", "1");
+                    self.status =
+                        "已选「不再提示」:以后启动不再询问全盘索引授权(入口仍在,随时可启用)。"
+                            .into();
+                }
                 self.mft_ask_grant = open;
             }
         }
