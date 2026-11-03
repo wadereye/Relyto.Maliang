@@ -266,6 +266,8 @@ pub struct App {
     tags: Vec<timeline::TagInfo>,
     sel_tag: Option<String>,
     show_about: bool,
+    /// 「关于」窗口里 Markdown 更新日志的渲染缓存(egui_commonmark)。
+    about_cache: egui_commonmark::CommonMarkCache,
     show_shortcuts: bool,
     confirm_remove: bool,
     // —— 文件夹管理器 / 图库维护——
@@ -1200,6 +1202,9 @@ const ICON_DARK: &[(&str, &[u8])] = &[
     ("x", include_bytes!("../assets/icons/dark/x.svg")),
 ];
 
+/// 内置更新日志全文,「帮助 > 关于」里以 Markdown 渲染。
+const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
+
 /// 取当前主题的图标字节;URI 带主题段,切主题即重载纹理。
 fn icon_source(name: &str) -> (&'static str, &'static [u8]) {
     let table = if crate::theme::p().is_light {
@@ -1579,6 +1584,7 @@ impl App {
             tags: Vec::new(),
             sel_tag: None,
             show_about: false,
+            about_cache: Default::default(),
             show_shortcuts: false,
             confirm_remove: false,
             show_folder_mgr: false,
@@ -9577,15 +9583,41 @@ impl eframe::App for App {
             let mut open = self.show_about;
             egui::Window::new("关于 Relyto.Maliang")
                 .open(&mut open)
-                .default_width(480.0)
+                .default_width(560.0)
+                .default_height(620.0)
                 .show(ctx, |ui| {
-                    ui.heading("Relyto.Maliang");
-                    ui.label("版本 0.1.0 · Rust + egui 重写的 Picasa 风格本地图库");
+                    // 大 Logo + 标题/版本号(版本号取自 Cargo.toml)
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::Image::from_bytes(
+                                "bytes://about/icon.png",
+                                include_bytes!("../assets/icon.png"),
+                            )
+                            .fit_to_exact_size(egui::vec2(96.0, 96.0)),
+                        );
+                        ui.vertical(|ui| {
+                            ui.add_space(6.0);
+                            ui.heading("Relyto.Maliang");
+                            ui.label(format!(
+                                "版本 {} · Rust + egui 重写的 Picasa 风格本地图库",
+                                env!("CARGO_PKG_VERSION")
+                            ));
+                            ui.label("全本地、无联网;文件夹优先,绝不复制或移动原图。");
+                        });
+                    });
                     ui.separator();
                     ui.label("功能:全盘扫描索引 / 时间线 / 文件夹 / 彩色标签 / 重复检测 / GPS 地理标记(KML)/ 文件夹管理器 / 索引备份与压缩 / 烘焙保存 / 导出 / WiFi 导入 / OCR / 人脸分类");
                     ui.label("人脸:质量评分、半自动命名建议、忽略簇、算法版本迁移(见 视图 > 人脸)。");
-                    ui.label("原则:全本地、无联网;文件夹优先,绝不复制或移动原图。");
                     ui.label("菜单结构参照 Picasa 3(文件 / 编辑 / 视图 / 工具 / 帮助)。");
+                    ui.separator();
+                    ui.heading("更新日志");
+                    egui::ScrollArea::vertical()
+                        .id_salt("about_changelog")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            egui_commonmark::CommonMarkViewer::new()
+                                .show(ui, &mut self.about_cache, CHANGELOG_MD);
+                        });
                 });
             self.show_about = open;
         }
