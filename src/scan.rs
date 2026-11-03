@@ -307,9 +307,11 @@ pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
 }
 
 // 收集已完成的记录。取消后跳过未开始的候选文件。
+// on_start 让测试在取消检查后同步工作线程。
 fn collect_completed<T: Send>(
     candidates: Vec<PathBuf>,
     ctrl: &ScanControl,
+    on_start: impl Fn(&Path) + Sync + Send,
     process: impl Fn(PathBuf) -> Option<T> + Sync + Send,
 ) -> Vec<T> {
     candidates
@@ -318,6 +320,7 @@ fn collect_completed<T: Send>(
             if ctrl.is_cancelled() {
                 None
             } else {
+                on_start(&p);
                 process(p)
             }
         })
@@ -333,6 +336,15 @@ pub fn scan_dir_ctrl(
     store: &Store,
     roots: &[PathBuf],
     ctrl: &Arc<ScanControl>,
+) -> Result<ScanSummary> {
+    scan_dir_ctrl_inner(store, roots, ctrl, |_| {})
+}
+
+fn scan_dir_ctrl_inner(
+    store: &Store,
+    roots: &[PathBuf],
+    ctrl: &Arc<ScanControl>,
+    on_start: impl Fn(&Path) + Sync + Send,
 ) -> Result<ScanSummary> {
     crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
 
@@ -382,7 +394,7 @@ pub fn scan_dir_ctrl(
     let added2 = added.clone();
     let modified2 = modified.clone();
 
-    let records = collect_completed(candidates, ctrl, |p| {
+    let records = collect_completed(candidates, ctrl, on_start, |p| {
         // 快速路径:未变文件跳过 EXIF 和解码。
         let md = match std::fs::metadata(&p) {
             Ok(m) => m,
@@ -890,6 +902,13 @@ mod tests {
         let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl).unwrap();
         assert!(s.cancelled, "应标记为已取消");
         assert_eq!(s.indexed, 0, "取消后不应索引任何文件");
+        let stored: i64 = store
+            .0
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM photos", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(stored, s.indexed as i64);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -899,37 +918,36 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rk-scanpartial-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let candidates: Vec<PathBuf> = (0..5)
-            .map(|i| {
-                let path = dir.join(format!("clip-{i}.mp4"));
-                std::fs::write(&path, b"\0\0\0\x18ftypmp42").unwrap();
-                path
-            })
-            .collect();
+        for i in 0..8 {
+            std::fs::write(dir.join(format!("clip-{i}.mp4")), b"\0\0\0\x18ftypmp42")
+                .unwrap();
+        }
 
         let store = Store::open_mem().unwrap();
-        let ctrl = ScanControl::new();
-        let completed = AtomicUsize::new(0);
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
-        let records = pool.install(|| {
-            collect_completed(candidates, &ctrl, |path| {
-                let md = std::fs::metadata(&path).unwrap();
-                let mtime = md
-                    .modified()
-                    .unwrap()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as i64;
-                let record = read_record_with_meta(&path, md.len() as i64, mtime);
-                if completed.fetch_add(1, Ordering::Relaxed) == 1 {
+        let ctrl = Arc::new(ScanControl::new());
+        let entered = AtomicUsize::new(0);
+        let both_started = std::sync::Barrier::new(2);
+        let after_cancel = std::sync::Barrier::new(2);
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap();
+        let summary = pool.install(|| {
+            scan_dir_ctrl_inner(&store, &[dir.clone()], &ctrl, |_| {
+                let slot = entered.fetch_add(1, Ordering::SeqCst);
+                assert!(slot < 2, "取消后不应开始新的任务");
+                both_started.wait();
+                if slot == 0 {
                     ctrl.cancel();
                 }
-                record
+                after_cancel.wait();
             })
+            .unwrap()
         });
+        assert_eq!(entered.load(Ordering::SeqCst), 2);
         assert!(ctrl.is_cancelled());
-        assert_eq!(records.len(), 2);
-        store_insert(&store, &records).unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(summary.scanned, 8);
+        assert_eq!(summary.indexed, 2);
+        assert_eq!(summary.unchanged, 0);
+        assert_eq!(ctrl.counts(), (2, 8));
 
         let count = || -> i64 {
             store
@@ -942,13 +960,13 @@ mod tests {
         assert_eq!(count(), 2);
 
         let resumed = scan_dir(&store, &[dir.clone()]).unwrap();
-        assert_eq!(resumed.indexed, 3);
+        assert_eq!(resumed.indexed, 6);
         assert_eq!(resumed.unchanged, 2);
-        assert_eq!(count(), 5);
+        assert_eq!(count(), 8);
         let repeated = scan_dir(&store, &[dir.clone()]).unwrap();
         assert_eq!(repeated.indexed, 0);
-        assert_eq!(repeated.unchanged, 5);
-        assert_eq!(count(), 5);
+        assert_eq!(repeated.unchanged, 8);
+        assert_eq!(count(), 8);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
