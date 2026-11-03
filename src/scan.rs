@@ -514,14 +514,18 @@ pub fn scan_dir_ctrl(
     let added2 = added.clone();
     let modified2 = modified.clone();
 
-    // rayon 支持 `collect::<Result<Vec<T>, E>>()`:任一线程返回 Err 即整体短路。
-    let collected: Result<Vec<Option<Record>>, Cancelled> = candidates
+    // 取消后不再处理新文件,但已算出的记录全部保留(不丢已完成的工作)。
+    let collected: Vec<Option<Record>> = candidates
         .into_par_iter()
         .map(|p| {
+            // 取消检查:已取消就跳过剩余候选(在途记录照常保留)。
+            if ctrl2.is_cancelled() {
+                return None;
+            }
             // ---- 快速路径:指纹一致则整条跳过(不读 EXIF、不解码) ----
             let md = match std::fs::metadata(&p) {
                 Ok(m) => m,
-                Err(_) => return Ok(None),
+                Err(_) => return None,
             };
             let mtime = match md
                 .modified()
@@ -529,7 +533,7 @@ pub fn scan_dir_ctrl(
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             {
                 Some(d) => d.as_millis() as i64,
-                None => return Ok(None),
+                None => return None,
             };
             let size = md.len() as i64;
             let key = p.to_string_lossy().into_owned();
@@ -538,7 +542,7 @@ pub fn scan_dir_ctrl(
                     unchanged2.fetch_add(1, Ordering::Relaxed);
                     counter2.fetch_add(1, Ordering::Relaxed);
                     ctrl2.advance(1);
-                    return Ok(None);
+                    return None;
                 }
                 // 库里有但内容变了 → 算"修改"(P1-12 变更日志)。
                 modified2.fetch_add(1, Ordering::Relaxed);
@@ -550,18 +554,14 @@ pub fn scan_dir_ctrl(
             let n = counter2.fetch_add(1, Ordering::Relaxed);
             ctrl2.advance(1);
             if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
-                return Err(Cancelled);
+                return None;
             }
-            Ok(read_record_with_meta(&p, size, mtime))
+            read_record_with_meta(&p, size, mtime)
         })
         .collect();
 
-    let cancelled = collected.is_err();
-    let records: Vec<Record> = collected
-        .unwrap_or_default()
-        .into_iter()
-        .flatten()
-        .collect();
+    let cancelled = ctrl.is_cancelled();
+    let records: Vec<Record> = collected.into_iter().flatten().collect();
     let indexed = records.len();
     // 取消也要把已算出的记录入库(不丢已完成的工作)。
     store_insert(store, &records)?;
@@ -588,9 +588,6 @@ pub fn scan_dir_ctrl(
         cancelled,
     })
 }
-
-/// 取消标记内部类型(rayon 短路信号)。
-struct Cancelled;
 
 /// 读取一条记录(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
 fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
@@ -1095,6 +1092,51 @@ mod tests {
         let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl, None).unwrap();
         assert!(s.cancelled, "应标记为已取消");
         assert_eq!(s.indexed, 0, "取消后不应索引任何文件");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 取消时已完成记录不丢(issue #1):取消后 photos 里应能查到
+    /// 取消前处理完的记录,恢复扫描只补剩余、不产生重复。
+    #[test]
+    fn cancelled_scan_keeps_completed_records() {
+        let dir = scratch_dir("scancelkeep");
+        let n_files = 4096;
+        let mut buf: Vec<u8> = Vec::new();
+        for i in 0..n_files {
+            buf.clear();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
+                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+                .unwrap();
+            std::fs::write(dir.join(format!("a{i}.jpg")), &buf).unwrap();
+        }
+        let store = Store::open_mem().unwrap();
+        let ctrl = Arc::new(ScanControl::new());
+        // 后台线程在进度过 1/4 时请求取消,模拟用户中途停止。
+        let ctrl_bg = ctrl.clone();
+        let bg = std::thread::spawn(move || {
+            while ctrl_bg.fraction() < 0.25 {
+                std::thread::yield_now();
+            }
+            ctrl_bg.cancel();
+        });
+        let s = scan_dir_ctrl(&store, &[dir.clone()], &ctrl, None).unwrap();
+        bg.join().unwrap();
+        assert!(s.cancelled, "扫描应被取消");
+        assert!(s.indexed > 0, "取消前已完成的记录不应丢失");
+        let stored: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored as usize, s.indexed, "已完成的记录应全部入库");
+        // 恢复扫描补齐剩余文件,总数应恰好等于文件数(无重复)。
+        let s2 = scan_dir(&store, &[dir.clone()]).unwrap();
+        assert!(!s2.cancelled);
+        let stored2: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored2 as usize, n_files, "恢复扫描后应恰好入库全部文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -68,6 +68,9 @@ without importing first**, **a fully revamped gallery page**, and an
 
 ### Fixed
 
+- Fixed cancelled scans discarding already-completed records: files processed
+  before cancellation are now kept in the library, and a resumed scan only
+  picks up the remainder without creating duplicates.
 - Fixed theme styles failing entirely on light-mode systems.
 - Fixed the thumbnail list turning blank mid-scroll when continuing downward
   with many photos.
