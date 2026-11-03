@@ -280,6 +280,18 @@ pub fn generate(id: i64, src: &Path) -> Result<u64> {    // P2-17 视频:走 She
     Ok(dhash)
 }
 
+/// 原子落盘 JPEG:先写临时文件再改名。
+///
+/// UI 线程会每帧轮询读缓存文件,若直接写最终路径,读线程可能逮到只写了
+/// 一半的 JPEG —— 解码器对截断文件宽容,会解出"半张图"并缓存显示
+/// (预览窗首次打开只显示一半的原因)。改名在同一卷上是原子的,杜绝半读。
+fn save_jpeg_atomic(img: &image::DynamicImage, path: &std::path::Path) -> Result<()> {
+    let tmp = path.with_extension("jpg.tmp");
+    img.save_with_format(&tmp, image::ImageFormat::Jpeg)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// 把已缩样的图居中贴到 size×size 浅灰画布并落盘(Picasa 式 letterbox)。
 /// 目录不存在则先建。
 fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathBuf) -> Result<()> {
@@ -290,8 +302,7 @@ fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathB
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    canvas.save_with_format(path, image::ImageFormat::Jpeg)?;
-    Ok(())
+    save_jpeg_atomic(&image::DynamicImage::ImageRgb8(canvas), &path)
 }
 
 /// 用 Windows Shell 缩略图扩展解码（相机 RAW 等 image crate 解不了的格式）。
@@ -535,8 +546,7 @@ pub fn build_preview(id: i64, src: &Path) -> Result<()> {
     };
     let dir = tier_dir(Tier::Preview);
     let _ = std::fs::create_dir_all(&dir);
-    resized.to_rgb8().save_with_format(preview_path(id), image::ImageFormat::Jpeg)?;
-    Ok(())
+    save_jpeg_atomic(&resized, &preview_path(id))
 }
 
 /// 预览请求的后台结果通道类型。

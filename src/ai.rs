@@ -264,7 +264,9 @@ pub mod ocr {
     }
 }
 
-/// 人脸(M2c):SCRFD 检测 + ArcFace 识别(antelopev2,512 维向量)。
+/// 人脸(M2c):YuNet 检测 + AdaFace IR-50 识别(512 维向量)。
+/// 两者均为商业友好许可(YuNet Apache-2.0 / AdaFace MIT),
+/// 模型文件仍叫 face_det.onnx / face_rec.onnx,获取方式见 README。
 pub mod face {
     use super::{env, models_dir};
     use ort::session::Session;
@@ -288,7 +290,9 @@ pub mod face {
 
     pub struct Faces {
         det: Session,
+        det_out: String,
         rec: Session,
+        rec_out: String,
     }
 
     fn open_session(p: &std::path::Path) -> Result<Session, String> {
