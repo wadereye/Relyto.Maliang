@@ -8,7 +8,8 @@ use std::collections::HashMap;
 
 /// 人脸算法版本(写 settings;与库中记录不一致时 GUI 提示重扫)。
 /// 改动检测/聚类/嵌入算法时提升此版本号。
-pub const FACE_ALGO_VERSION: &str = "v2";
+/// v3: 修复识别裁剪图预处理(to_rgb32f 0~1 值误按 0~255 归一化)。
+pub const FACE_ALGO_VERSION: &str = "v3";
 
 pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
     store.read(|conn| {

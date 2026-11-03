@@ -447,7 +447,9 @@ pub mod face {
                 // 采样:目标像素中心 (u+0.5,v+0.5) 反变换回原图:src = s⁻¹·Rᵀ·(tgt - t2) + m_kps,t2 = m_canon - s·R·m_kps
                 let txa = nx - s * (ct * mx - st * my);
                 let tya = ny - s * (st * mx + ct * my);
-                let img_rgb = img.to_rgb32f();
+                // 注意:必须用 u8 图再转 f32(0~255)。to_rgb32f 是 0~1,
+                // 直接减 127.5 会把整张裁剪图压成常数,嵌入全部雷同。
+                let img_rgb = img.to_rgb8();
                 let (iw, ih) = (img_rgb.width(), img_rgb.height());
                 let mut crop = Vec::with_capacity(112 * 112 * 3);
                 for v in 0..112usize {
@@ -464,7 +466,7 @@ pub mod face {
                         let (fx, fy) = (sxx - x0, syy - y0);
                         let sample = |x: u32, y: u32| -> [f32; 3] {
                             let p = img_rgb.get_pixel(x as u32, y as u32);
-                            [p.0[0], p.0[1], p.0[2]]
+                            [p.0[0] as f32, p.0[1] as f32, p.0[2] as f32]
                         };
                         let p00 = sample(x0 as u32, y0 as u32);
                         let p10 = sample(x1 as u32, y0 as u32);
