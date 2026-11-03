@@ -319,6 +319,50 @@ pub fn faces_for_photo(store: &Store, photo_id: i64) -> Vec<FaceHit> {
     .unwrap_or_default()
 }
 
+/// 一张照片的人脸 + 归属(右栏人物面板用)。
+pub struct PhotoFace {
+    pub face_id: i64,
+    /// 所属簇;未聚类 = None。
+    pub cluster: Option<i64>,
+    /// 簇的姓名(未命名 = None)。
+    pub person: Option<String>,
+    pub ignored: bool,
+    pub quality: f32,
+    /// 人脸框(未旋转原图像素): (x1, y1, x2, y2)。
+    pub rect: (f32, f32, f32, f32),
+}
+
+/// 单张照片的人脸清单,连簇号与姓名(左连接 people,未命名照样返回)。
+pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
+    let conn = store.0.lock().unwrap();
+    let mut st = match conn.prepare(
+        "SELECT f.id, f.cluster, p.name, f.ignored, COALESCE(f.quality,0.5),
+                f.x1, f.y1, f.x2, f.y2
+         FROM faces f LEFT JOIN people p ON p.id = f.cluster
+         WHERE f.photo_id = ?1 ORDER BY f.id",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    st.query_map(params![photo_id], |r| {
+        Ok(PhotoFace {
+            face_id: r.get(0)?,
+            cluster: r.get(1)?,
+            person: r.get(2)?,
+            ignored: r.get::<_, i64>(3)? != 0,
+            quality: r.get::<_, f64>(4)? as f32,
+            rect: (
+                r.get::<_, f64>(5)? as f32,
+                r.get::<_, f64>(6)? as f32,
+                r.get::<_, f64>(7)? as f32,
+                r.get::<_, f64>(8)? as f32,
+            ),
+        })
+    })
+    .map(|rows| rows.filter_map(|r| r.ok()).collect())
+    .unwrap_or_default()
+}
+
 pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
     store
         .0
@@ -650,5 +694,37 @@ mod tests {
         let rows = people_overview(&store);
         assert_eq!(rows.len(), 1, "低质量异类不应撕裂簇: {:?}", rows.iter().map(|r| (r.cluster, r.count)).collect::<Vec<_>>());
         assert_eq!(rows[0].count, 3);
+    }
+
+    /// 右栏人物面板的数据口:一 photo 多脸,带簇号、姓名与忽略态。
+    #[test]
+    fn photo_faces_carries_cluster_name_and_rect() {
+        let store = test_store();
+        store
+            .0
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(7,'g.jpg','.',0,1)",
+                [],
+            )
+            .unwrap();
+        // 有名字的簇、没名字的簇、还没聚类的脸
+        insert_face(&store, 7, &[1.0, 0.0, 0.0], 0.9, Some(1));
+        insert_face(&store, 7, &[1.0, 0.0, 0.0], 0.7, Some(2));
+        insert_face(&store, 7, &[0.0, 1.0, 0.0], 0.5, None);
+        rename_cluster(&store, 1, "小明").unwrap();
+        ignore_cluster(&store, 2, true).unwrap();
+
+        let faces = photo_faces(&store, 7);
+        assert_eq!(faces.len(), 3, "未聚类的脸也要返回");
+        assert_eq!(faces[0].person.as_deref(), Some("小明"));
+        assert_eq!(faces[0].cluster, Some(1));
+        assert!(!faces[0].ignored);
+        assert_eq!(faces[0].rect, (10.0, 10.0, 50.0, 50.0));
+        assert!(faces[1].ignored, "被忽略的簇要带着标记返回");
+        assert_eq!(faces[1].person, None, "没命名的簇不该被写成空串");
+        assert_eq!(faces[2].cluster, None);
+        assert!(photo_faces(&store, 999).is_empty(), "别的照片不该混进来");
     }
 }
