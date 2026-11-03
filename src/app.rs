@@ -2724,6 +2724,7 @@ impl App {
     }
 
     /// 人物列表按「查看选项 > 给人物排序」重排(前 10 是截断显示,不是重新统计)。
+    #[cfg(feature = "ai")]
     fn sorted_people(&self) -> Vec<crate::faces::PeopleRow> {
         let mut v = self.face_people.clone();
         let by_count = |a: &crate::faces::PeopleRow, b: &crate::faces::PeopleRow| {
@@ -5014,7 +5015,9 @@ impl App {
                         #[cfg(feature = "ai")]
                         DrawerTab::People => self.drawer_people_ui(ui),
                         #[cfg(not(feature = "ai"))]
-                        DrawerTab::People => ui.small("此构建未开启人脸功能(ai 特性)。"),
+                        DrawerTab::People => {
+                            ui.small("此构建未开启人脸功能(ai 特性)。");
+                        }
                         DrawerTab::Places => self.drawer_places_ui(ui, ctx),
                     });
             });
