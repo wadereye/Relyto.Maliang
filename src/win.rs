@@ -265,8 +265,8 @@ pub fn known_dirs() -> Vec<std::path::PathBuf> {
     SHELL_DIRS.iter().filter_map(|f| known_path(*f)).collect()
 }
 
-/// 工具栏「查看选项」的壳目录快捷键(参考件 `ID_VIEW_DESKTOP` /
-/// `ID_VIEW_MYDOCS` / `ID_VIEW_MYPICTURES` / `ID_VIEW_MYCOMPUTER`)。
+/// 工具栏「查看选项」的壳目录快捷键(参考件 View 菜单里的
+/// Desktop / My Documents / My Pictures / My Computer 四项)。
 ///
 /// 我的电脑在参考 Picasa 3是浏览树根(可下探任意盘);我方左栏是图库树,
 /// 覆盖不到全盘,故路径给 `None`,由调用方给出明确说明而不是假装能跳。

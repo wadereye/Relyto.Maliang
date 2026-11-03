@@ -35,8 +35,8 @@ pub struct PhotoRow {
     pub parent: String,
 }
 
-/// 排序方式(工具栏「查看选项」> 排序;对应参考件
-/// `ID_VIEWBYDATE` / `ID_VIEWBYRECENT` / `ID_VIEWBYSIZE` / `ID_VIEWBYNAME`)。
+/// 排序方式(工具栏「查看选项」> 排序;对应原版 View 菜单里的
+/// 四个排序项:按拍摄日期 / 最近 / 按尺寸 / 按名称)。
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum SortBy {
     /// 拍摄日期(`Sort by &Creation Date`,默认,新在前)。

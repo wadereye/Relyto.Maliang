@@ -5,17 +5,16 @@
 //!   发送 flags=9(`MAPI_LOGON_UI|MAPI_DIALOG`),附件暂存 `temp\email\`,
 //!   文件名格式 `"%0*d-%s"`(序号零填充)。
 //! - **尺寸选项**:1600/1024/800。
-//! - **刻录 = IMAPI2**:走 IMAPI2 COM 文件系统映像接口
-//!   (`DDiscFormat2EraseEvents`);主程序有 IMAPI2 引擎连接失败的错误提示。
-//!   盘上卷标 "Picasa CD",JPEG 质量 85(`option_jpegquality=0x55`),
-//!   清单导出 `option_manifest`。
+//! - **刻录 = IMAPI2**:走 IMAPI2 COM 文件系统映像接口;原版有 IMAPI2
+//!   引擎连接失败的错误提示。盘上卷标 "Picasa CD",JPEG 质量 85,
+//!   并提供盘上清单导出。
 //!
 //! 与原版的差异(诚实声明,不臆造):
 //! 1. 原版用 ANSI `MAPISendMail`;我方用同 DLL 的 `MAPISendMailW`(Vista+ 标准导出),
 //!    否则中文路径在 ANSI 代码页会丢字。flags/结构体逐字段对齐。
 //! 2. 原版 Gift CD 会复制幻灯播放器到盘上并写 `autorun.inf`;
 //!    我方没有盘上播放器,故**不写 autorun.inf**,只写照片 + `manifest.txt`
-//!    (`option_manifest` 有原版语义支撑)。
+//!    (原版同样在盘上输出清单文件)。
 //! 3. 原版刻录走插件 Primo 备援;我方只用 IMAPI2(与原版主引擎一致)。
 
 use crate::effects::FilterStack;
@@ -95,8 +94,8 @@ pub fn share_file_name(index: usize, total: usize, stem: &str) -> String {
     format!("{:0width$}-{stem}", index + 1, width = width)
 }
 
-/// JPEG 编码质量(原版 `option_jpegquality=0x55`=85,刻录选项;
-/// 邮件专属质量未确认,沿用同一常量)。
+/// JPEG 编码质量(原版刻录输出为 85;
+/// 邮件专属质量暂无对应资料,沿用同一常量)。
 pub const SHARE_JPEG_QUALITY: u8 = 85;
 
 /// 把条目(原图 + 可选效果栈)重采样到 `max_px` 内并编码为 JPEG 写入 `dir`。
@@ -161,7 +160,7 @@ pub fn stage_jpegs(
     Ok(out)
 }
 
-/// 礼品光盘内容暂存:照片 + `manifest.txt` 清单(原版 `option_manifest`)。
+/// 礼品光盘内容暂存:照片 + `manifest.txt` 清单(原版同样输出盘上清单)。
 /// **不写 autorun.inf**(原版指向盘上的幻灯播放器;我方无盘上播放器)。
 pub fn stage_gift_cd(
     items: &[(PathBuf, FilterStack)],
@@ -304,8 +303,7 @@ mod win {
 
     /// IMAPI2 刻录:把 `staging` 目录构建为镜像并写入第一个光驱。
     ///
-    /// 对齐原版 IMAPI2 实现(文件系统映像接口 +
-    /// `DDiscFormat2EraseEvents`/`LIBID_IMAPILib2`);卷标参考原版
+    /// 对齐原版 IMAPI2 实现(文件系统映像接口);卷标参考原版
     /// (原版 "Picasa CD" → 我方 "Maliang CD")。
     pub fn burn_folder(staging: &Path, label: &str, client: &str) -> Result<()> {
         unsafe {
