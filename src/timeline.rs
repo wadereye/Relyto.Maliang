@@ -508,6 +508,20 @@ pub fn remove_tag(store: &Store, id: i64, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// 某目录下**已入库**的照片路径集合。
+/// 导入页用它把"已经在图库里"的行标出来 —— 列目录读的是文件系统,
+/// 不查库就分不清"新照片"和"早就索引过的"。
+pub fn indexed_paths_in(store: &Store, folder: &str) -> std::collections::HashSet<String> {
+    let conn = store.0.lock().unwrap();
+    let mut st = match conn.prepare("SELECT path FROM photos WHERE parent=?1") {
+        Ok(s) => s,
+        Err(_) => return std::collections::HashSet::new(),
+    };
+    st.query_map([folder], |r| r.get::<_, String>(0))
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+}
+
 /// 竖排列出照片的所有标签名。
 pub fn tags_of(store: &Store, id: i64) -> Result<Vec<String>> {
     let conn = store.0.lock().unwrap();

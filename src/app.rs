@@ -24,6 +24,64 @@ enum ViewKind {
     Search,
 }
 
+impl ViewKind {
+    /// 状态栏/历史提示用的一词名(左栏导航项的文案另有取舍,见导航列表)。
+    fn label(self) -> &'static str {
+        match self {
+            ViewKind::Timeline => "时间线",
+            ViewKind::Folder => "文件夹",
+            ViewKind::Duplicates => "重复照片",
+            ViewKind::Albums => "相簿",
+            ViewKind::Faces => "人物",
+            ViewKind::Tags => "标签",
+            ViewKind::Semantic => "语义搜索",
+            ViewKind::Search => "快速查找",
+        }
+    }
+}
+
+/// 整页(参考件把"看照片"和"取照片"做成两套整页面板互切:
+/// 主页是图库,导入页占满中央区并换掉左栏;菜单/工具栏/状态栏不动)。
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum PageKind {
+    /// 图库页(时间线/文件夹/相簿/人物… 都在这里)。
+    Library,
+    /// 导入页(选源 → 看清单 → 入库 → 返回)。
+    Import,
+}
+
+impl PageKind {
+    fn label(self) -> &'static str {
+        match self {
+            PageKind::Library => "图库",
+            PageKind::Import => "导入",
+        }
+    }
+}
+
+/// 导航历史的一站:后/前进按钮恢复的东西(整页 + 视图 + 左栏选中)。
+#[derive(Clone, PartialEq)]
+struct NavStop {
+    page: PageKind,
+    view: ViewKind,
+    folder: usize,
+    show_all: bool,
+}
+
+/// 导入页列出的一行(源目录还没入库,只能现读文件系统)。
+#[derive(Debug)]
+struct ImportEntry {
+    path: PathBuf,
+    name: String,
+    /// 右列:大小(读盘时一次算好,不逐帧格式化)。
+    size_s: String,
+    /// 右列:修改日期(同上)。
+    date: String,
+    is_dir: bool,
+    /// 已在图库(行灰显并标「已入库」,免得用户以为漏导又点一遍)。
+    in_library: bool,
+}
+
 /// 排序方式(`SortBy`)与视图过滤(`Filters`)定义在 `timeline`,
 /// 由 SQL 谓词一次完成 —— 大图库不在 UI 层筛全表。
 
@@ -168,6 +226,9 @@ pub struct App {
     scan_ctrl: Option<Arc<crate::scan::ScanControl>>,
     /// 扫描进度显示的文案(如"正在扫描整个图库…")。
     scan_scope: String,
+    /// 后台入库任务的动词(整库/目录扫描是「扫描」,导入页勾选取用「导入」):
+    /// 两条路共用同一个结果通道与状态栏进度,措辞得跟着任务变。
+    scan_verb: &'static str,
     status: String,
     dups: Vec<Dup>,
     /// 重复视图:包含近似重复(hamming ≤ NEAR_DUP_DIST)。
@@ -402,8 +463,22 @@ pub struct App {
     folder_tree_cache: FolderTree,
     /// 展开中的目录路径(点三角切换;选中项的祖先链自动展开)。
     tree_open: HashSet<String>,
-    /// 树行缩略图纹理缓存(按照片 id;档位固定 Small,数量有上限就整体丢弃)。
+    /// 树行缩略图纹理缓存(按照片 id;随当前档位变化,数量有上限就整体丢弃)。
     tree_texs: HashMap<i64, egui::TextureHandle>,
+    /// 当前整页(参考件是主面板与导入面板两套整页互切,不是弹窗)。
+    page: PageKind,
+    /// 导航历史栈(后/前进逐站回退;每站记住整页 + 视图 + 左栏选中)。
+    nav_hist: Vec<NavStop>,
+    /// 历史游标(指向当前站;新跳转会截断游标之后的"前进"分支)。
+    nav_at: usize,
+    /// 导入页正在浏览的源目录(None = 还没选源)。
+    import_src: Option<PathBuf>,
+    /// 导入页目录清单缓存(只在切源/点刷新时读盘,不逐帧 read_dir)。
+    import_entries: Vec<ImportEntry>,
+    /// 导入页勾选的行号(下标对应 `import_entries`)。
+    import_sel: BTreeSet<usize>,
+    /// 最近一次浏览过的导入源(历史站退回导入页时用它恢复清单)。
+    last_import_src: String,
     /// 人物列表排序方式(参考件 Sort People by Name / Amount / Top 10)。
     people_sort: PeopleSort,
     /// 工具栏「新建相册」弹窗(选中照片时把选中项一并放进新相册)。
@@ -567,6 +642,95 @@ fn folder_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// 导入页源列表的一行:图标 + 名称,选中态高亮。返回是否被点中。
+fn source_row(
+    ui: &mut egui::Ui,
+    icon: &'static str,
+    label: &str,
+    path: &Path,
+    cur: &Option<PathBuf>,
+) -> bool {
+    let active = cur.as_deref() == Some(path);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        ui.add(toolbar_icon(icon));
+        if ui.selectable_label(active, label).clicked() {
+            clicked = true;
+        }
+    });
+    clicked
+}
+
+/// 小节标题(导入页源列表分组:我的文件夹 / 设备 / 我的电脑)。
+fn muted_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(12.0)
+            .color(crate::theme::p().muted)
+            .strong(),
+    );
+}
+
+/// 列一个导入源目录:可入库的图片/RAW 文件 + 可继续下探的子目录。
+///
+/// `indexed` 是该目录已入库的文件路径集合(调用方查库得到);
+/// 只有这一步读盘,结果由 `set_import_source` 缓存,不逐帧重读。
+/// 子目录排前面、文件按名排;不递归(下探交给行点击)。
+fn list_import_dir(dir: &Path, indexed: &HashSet<String>) -> Vec<ImportEntry> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<ImportEntry> = Vec::new();
+    for e in rd.flatten() {
+        let Ok(md) = e.metadata() else {
+            continue;
+        };
+        let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        let date = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| format_ts(d.as_millis() as i64)[..10].to_string())
+            .unwrap_or_default();
+        if md.is_dir() {
+            out.push(ImportEntry {
+                path,
+                name,
+                size_s: String::new(),
+                date,
+                is_dir: true,
+                in_library: false,
+            });
+            continue;
+        }
+        if !crate::scan::is_indexable(&path) {
+            continue;
+        }
+        let kb = md.len() as f64 / 1024.0;
+        let size_s = if kb >= 1024.0 {
+            format!("{:.1} MB", kb / 1024.0)
+        } else {
+            format!("{kb:.0} KB")
+        };
+        let key = path.to_string_lossy().into_owned();
+        out.push(ImportEntry {
+            path,
+            name,
+            size_s,
+            date,
+            is_dir: false,
+            in_library: indexed.contains(&key),
+        });
+    }
+    out.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+    out
+}
+
 /// 由「装了照片的目录」列表反推目录树:链上每一层都建节点,所以中间层目录
 /// (本身没有照片)也在树里,能一路展开到底层相册;`rep` 给出每个目录的代表照片,
 /// 没有照片的中间层借用子树里第一个命中的,行上才不会是一片空位。
@@ -726,6 +890,22 @@ fn thumb_star(
 /// 主题化图标源表(Lucide,ISC 许可,见 assets/icons/LICENSE-lucide.txt):
 /// 每个图标按主题烤好两套描边色,SVG 运行时栅格化,高 DPI 不糊。
 const ICON_LIGHT: &[(&str, &[u8])] = &[
+    (
+        "arrow-left",
+        include_bytes!("../assets/icons/light/arrow-left.svg"),
+    ),
+    (
+        "arrow-right",
+        include_bytes!("../assets/icons/light/arrow-right.svg"),
+    ),
+    (
+        "hard-drive",
+        include_bytes!("../assets/icons/light/hard-drive.svg"),
+    ),
+    (
+        "download",
+        include_bytes!("../assets/icons/light/download.svg"),
+    ),
     ("folder", include_bytes!("../assets/icons/light/folder.svg")),
     (
         "folder-open",
@@ -778,6 +958,22 @@ const ICON_LIGHT: &[(&str, &[u8])] = &[
     ("x", include_bytes!("../assets/icons/light/x.svg")),
 ];
 const ICON_DARK: &[(&str, &[u8])] = &[
+    (
+        "arrow-left",
+        include_bytes!("../assets/icons/dark/arrow-left.svg"),
+    ),
+    (
+        "arrow-right",
+        include_bytes!("../assets/icons/dark/arrow-right.svg"),
+    ),
+    (
+        "hard-drive",
+        include_bytes!("../assets/icons/dark/hard-drive.svg"),
+    ),
+    (
+        "download",
+        include_bytes!("../assets/icons/dark/download.svg"),
+    ),
     ("folder", include_bytes!("../assets/icons/dark/folder.svg")),
     (
         "folder-open",
@@ -1265,6 +1461,14 @@ impl App {
             folder_tree_cache: FolderTree::default(),
             tree_open: HashSet::new(),
             tree_texs: HashMap::new(),
+            page: PageKind::Library,
+            nav_hist: Vec::new(),
+            nav_at: 0,
+            import_src: None,
+            import_entries: Vec::new(),
+            import_sel: BTreeSet::new(),
+            last_import_src: String::new(),
+            scan_verb: "扫描",
             people_sort,
             album_new_win: false,
             pending_thumbs: 0,
@@ -1899,7 +2103,7 @@ impl App {
             Some((i, _)) => {
                 self.selected_folder = i;
                 self.folder_show_all = false;
-                self.view = ViewKind::Folder;
+                self.set_view(ViewKind::Folder);
                 let p = self.folders[i].clone();
                 self.tree_reveal(&p);
                 self.status = format!("已定位到 {label}");
@@ -1913,12 +2117,34 @@ impl App {
     fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
+            // 前后导航(浏览器式历史;Alt+←/→ 同一条路)。
             if ui
-                .add(tool_button("folder-plus", false))
-                .on_hover_text("导入文件夹…(登记一个目录并扫描)")
+                .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
+                .on_hover_text("后退(Alt+←)")
                 .clicked()
             {
-                self.add_folder_to_library();
+                self.nav_back();
+            }
+            if ui
+                .add_enabled(
+                    self.nav_at + 1 < self.nav_hist.len(),
+                    tool_button("arrow-right", false),
+                )
+                .on_hover_text("前进(Alt+→)")
+                .clicked()
+            {
+                self.nav_forward();
+            }
+            ui.separator();
+            // 参考件的主「导入」按钮开的是整页导入面板(选源 → 看清单 → 入库),
+            // 直接挑文件夹的一次性入口仍在 文件 菜单里。
+            let on_import = self.page == PageKind::Import;
+            if ui
+                .add(tool_button("folder-plus", on_import))
+                .on_hover_text("导入(打开导入页:选源 → 看清单 → 入库)")
+                .clicked()
+            {
+                self.go_page(PageKind::Import);
             }
             if ui
                 .add(tool_button("smartphone", false))
@@ -2261,7 +2487,8 @@ impl App {
         let ctrl = Arc::new(crate::scan::ScanControl::new());
         self.scan_ctrl = Some(ctrl.clone());
         self.scan_scope = scope_owned.clone();
-        self.status = format!("正在扫描{scope}…");
+        self.scan_verb = "扫描";
+        self.status = format!("正在{}{scope}…", self.scan_verb);
         std::thread::spawn(move || {
             let res = crate::scan::scan_dir_ctrl(&store, &roots, &ctrl, index.as_deref());
             busy.store(false, Ordering::SeqCst);
@@ -2289,6 +2516,405 @@ impl App {
                     err: Some(e.to_string()),
                     scope: scope_owned,
                 },
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    // ===== 页面模型(图库页 ⇄ 导入页)与前后导航 =====
+
+    /// 当前状态快照(压入历史用)。
+    fn cur_stop(&self) -> NavStop {
+        NavStop {
+            page: self.page,
+            view: self.view,
+            folder: self.selected_folder,
+            show_all: self.folder_show_all,
+        }
+    }
+
+    /// 用户主动换页/换视图 → 记一站:截断游标之后的"前进"分支,
+    /// 与栈顶同形的站不重复记,栈只留最近 50 站。
+    fn push_nav(&mut self) {
+        let stop = self.cur_stop();
+        self.nav_hist.truncate(self.nav_at + 1);
+        if self.nav_hist.last() != Some(&stop) {
+            self.nav_hist.push(stop);
+        }
+        if self.nav_hist.len() > 50 {
+            // 再早的站里存的目录号多半已被增删改作废,留着也回不去。
+            let cut = self.nav_hist.len() - 50;
+            self.nav_hist.drain(..cut);
+        }
+        self.nav_at = self.nav_hist.len() - 1;
+    }
+
+    /// 整页切换(参考件把看图与取图做成两套整页面板互切,不是弹窗)。
+    fn go_page(&mut self, page: PageKind) {
+        if self.page == page {
+            return;
+        }
+        self.page = page;
+        if page == PageKind::Import && self.import_src.is_none() {
+            // 进页面先给个能用的默认源(我的图片 → 家目录 → 首个盘根),省一次点击。
+            let default = crate::win::known_dirs()
+                .into_iter()
+                .next()
+                .or_else(|| std::env::var("HOME").map(PathBuf::from).ok())
+                .or_else(|| crate::win::drive_roots().into_iter().next());
+            if let Some(d) = default {
+                self.set_import_source(d);
+            }
+        }
+        self.push_nav();
+        self.status = format!("切到{}页", page.label());
+    }
+
+    /// 选视图:分类只在图库页有,所以顺带把页面切回去并记站。
+    fn set_view(&mut self, v: ViewKind) {
+        if self.view == v && self.page == PageKind::Library {
+            return;
+        }
+        self.view = v;
+        self.page = PageKind::Library;
+        self.push_nav();
+    }
+
+    /// 后退一站(工具栏左箭头 / Alt+←)。
+    fn nav_back(&mut self) {
+        if self.nav_at == 0 {
+            return;
+        }
+        self.nav_at -= 1;
+        self.apply_nav();
+    }
+
+    /// 前进一站(工具栏右箭头 / Alt+→)。
+    fn nav_forward(&mut self) {
+        if self.nav_at + 1 >= self.nav_hist.len() {
+            return;
+        }
+        self.nav_at += 1;
+        self.apply_nav();
+    }
+
+    /// 恢复一站(不再压栈)。
+    fn apply_nav(&mut self) {
+        let Some(s) = self.nav_hist.get(self.nav_at).cloned() else {
+            return;
+        };
+        self.page = s.page;
+        self.view = s.view;
+        self.folder_show_all = s.show_all;
+        self.selected_folder = if self.folders.is_empty() {
+            0
+        } else {
+            s.folder.min(self.folders.len() - 1)
+        };
+        if s.page == PageKind::Import && self.import_src.is_none() {
+            self.set_import_source(PathBuf::from(&self.last_import_src));
+        }
+        self.status = format!("回到 {} · {}", s.page.label(), s.view.label());
+    }
+
+    // ===== 导入页 =====
+
+    /// 换导入源目录:清勾选 + 现读一次清单(只有这里碰磁盘)。
+    fn set_import_source(&mut self, dir: PathBuf) {
+        let indexed = timeline::indexed_paths_in(&self.store, &dir.to_string_lossy());
+        self.import_entries = list_import_dir(&dir, &indexed);
+        let n = self.import_entries.iter().filter(|e| !e.is_dir).count();
+        self.last_import_src = dir.to_string_lossy().into_owned();
+        self.import_src = Some(dir);
+        self.import_sel.clear();
+        self.status = format!("导入源:{n} 个可入库文件");
+    }
+
+    /// 重读当前源目录(清单按钮「刷新」;新增/删除文件后不必重开页面)。
+    fn refresh_import_entries(&mut self) {
+        let Some(dir) = self.import_src.clone() else {
+            self.import_entries.clear();
+            return;
+        };
+        self.set_import_source(dir);
+    }
+
+    /// 导入页左栏:源列表(我的文件夹 / 设备 / 盘根 / 浏览其他文件夹)。
+    ///
+    /// 占掉图库页那栏的位置 —— 参考件的导入面板同样把左侧换成源选择,
+    /// 菜单、工具栏与状态栏保持原位。
+    fn import_sources_ui(&mut self, ui: &mut egui::Ui) {
+        crate::theme::section_title(ui, "选择源");
+        let cur = self.import_src.clone();
+        let mut pick: Option<PathBuf> = None;
+
+        let shell = crate::win::known_dirs();
+        if !shell.is_empty() {
+            muted_title(ui, "我的文件夹");
+            for p in shell {
+                let name = p
+                    .file_name()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.display().to_string());
+                if source_row(ui, "folder", &name, &p, &cur) {
+                    pick = Some(p);
+                }
+            }
+        }
+        // 设备:可移动卷(U 盘 / 相机卡)。
+        let devs = crate::device::removable_volumes();
+        if !devs.is_empty() {
+            muted_title(ui, "设备");
+            for v in devs {
+                let label = crate::win::volume_label(&v)
+                    .map(|l| format!("{l} ({})", v.display()))
+                    .unwrap_or_else(|| format!("可移动磁盘 {}", v.display()));
+                if source_row(ui, "smartphone", &label, &v, &cur) {
+                    pick = Some(v);
+                }
+            }
+        }
+        // 我的电脑:本机盘根(网络盘/光驱按扫描策略不列)。
+        let roots: Vec<PathBuf> = crate::win::drive_roots()
+            .into_iter()
+            .filter(|r| {
+                matches!(
+                    crate::win::drive_type(r),
+                    Some(crate::win::DriveType::Fixed)
+                )
+            })
+            .collect();
+        if !roots.is_empty() {
+            muted_title(ui, "我的电脑");
+            for r in roots {
+                let label = crate::win::volume_label(&r)
+                    .map(|l| format!("{l} ({})", r.display()))
+                    .unwrap_or_else(|| format!("本地磁盘 {}", r.display()));
+                if source_row(ui, "hard-drive", &label, &r, &cur) {
+                    pick = Some(r);
+                }
+            }
+        }
+
+        ui.separator();
+        if ui.button("浏览其他文件夹…").clicked() {
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_title("选择导入源文件夹")
+                .pick_folder()
+            {
+                pick = Some(dir);
+            }
+        }
+        if ui.button("刷新清单").clicked() {
+            self.refresh_import_entries();
+        }
+        if let Some(d) = pick {
+            self.set_import_source(d);
+        }
+    }
+
+    /// 导入页中央区:源 + 文件清单 + 导入动作 + 「返回图库」。
+    fn import_page_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("导入照片");
+                if let Some(src) = &self.import_src {
+                    ui.small(src.display().to_string())
+                        .on_hover_text("当前导入源目录");
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("返回图库").clicked() {
+                        self.go_page(PageKind::Library);
+                    }
+                });
+            });
+            ui.separator();
+
+            if self.import_src.is_none() {
+                ui.small("左侧还没有可浏览的源:选一个文件夹,或点「浏览其他文件夹…」。");
+                return;
+            }
+
+            // 清单头:选择工具 + 计数(计数读的是缓存,不重复读盘)。
+            let pics = self.import_entries.iter().filter(|e| !e.is_dir).count();
+            let fresh = self
+                .import_entries
+                .iter()
+                .filter(|e| !e.is_dir && !e.in_library)
+                .count();
+            ui.horizontal(|ui| {
+                if ui.button("全选照片").clicked() {
+                    self.import_sel = (0..self.import_entries.len())
+                        .filter(|&i| !self.import_entries[i].is_dir)
+                        .collect();
+                }
+                if ui.button("全不选").clicked() {
+                    self.import_sel.clear();
+                }
+                ui.small(format!(
+                    "{pics} 个可入库文件(未入库 {fresh} 个),已勾选 {} 个",
+                    self.import_sel.len()
+                ));
+            });
+
+            // 清单本体:把表取出来画,画完回填 —— 逐帧 clone 大目录是白活。
+            let entries = std::mem::take(&mut self.import_entries);
+            let mut descend: Option<PathBuf> = None;
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for (i, e) in entries.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if e.is_dir {
+                                ui.add(toolbar_icon("folder-open"));
+                                let text = format!("{} \\", e.name);
+                                if ui
+                                    .selectable_label(false, &text)
+                                    .on_hover_text("进入该子目录")
+                                    .clicked()
+                                {
+                                    descend = Some(e.path.clone());
+                                }
+                            } else {
+                                ui.add(toolbar_icon("images"));
+                                let mut on = self.import_sel.contains(&i);
+                                let name = if e.in_library {
+                                    format!("{}  (已入库)", e.name)
+                                } else {
+                                    e.name.clone()
+                                };
+                                let chk =
+                                    ui.checkbox(&mut on, &name).on_hover_text(if e.in_library {
+                                        "已在图库里,导入时会跳过"
+                                    } else {
+                                        "勾选后「导入所选」只入这几张"
+                                    });
+                                if chk.changed() {
+                                    if on {
+                                        self.import_sel.insert(i);
+                                    } else {
+                                        self.import_sel.remove(&i);
+                                    }
+                                }
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.small(&e.date);
+                                        ui.small(&e.size_s);
+                                    },
+                                );
+                            }
+                        });
+                    }
+                    if entries.is_empty() {
+                        ui.small("这个目录里没有可入库的图片(或子目录)。");
+                    }
+                });
+            let sel: Vec<PathBuf> = self
+                .import_sel
+                .iter()
+                .filter_map(|&i| entries.get(i))
+                .filter(|e| !e.is_dir && !e.in_library)
+                .map(|e| e.path.clone())
+                .collect();
+            self.import_entries = entries;
+            if let Some(d) = descend {
+                self.set_import_source(d);
+            }
+
+            // 动作行。
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.small("导入 = 登记该目录进图库并建索引,不移动、不改写原文件。");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            !sel.is_empty(),
+                            egui::Button::new(format!("导入所选({})", sel.len())),
+                        )
+                        .on_hover_text("只把勾选的文件逐张入库(有进度,可取消)")
+                        .clicked()
+                    {
+                        self.import_selected(sel.clone());
+                    }
+                    if ui
+                        .button("导入整个文件夹")
+                        .on_hover_text("登记该目录并扫描(含子目录)")
+                        .clicked()
+                    {
+                        self.import_whole_folder();
+                    }
+                });
+            });
+        });
+    }
+
+    /// 「导入整个文件夹」:登记目录 + 常规扫描(进度/取消/断点续扫都复用同一套)。
+    fn import_whole_folder(&mut self) {
+        let Some(dir) = self.import_src.clone() else {
+            return;
+        };
+        if let Err(e) = self.store.upsert_watched(&dir) {
+            self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
+        }
+        let scope = dir.display().to_string();
+        self.start_scan_roots(vec![dir], &scope);
+    }
+
+    /// 「导入所选」:只入勾选的那几张(目录仍登记进监听列表,
+    /// 否则左栏看不到刚落库的图)。
+    fn import_selected(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            self.status = "没有待导入的勾选(已入库的会跳过)".into();
+            return;
+        }
+        if self.scan_busy.swap(true, Ordering::SeqCst) {
+            self.status = "已有扫描在跑,请等它结束后再导入所选".into();
+            return;
+        }
+        let Some(dir) = self.import_src.clone() else {
+            self.scan_busy.store(false, Ordering::SeqCst);
+            return;
+        };
+        let _ = self.store.upsert_watched(&dir);
+        let store = self.store.clone();
+        let busy = self.scan_busy.clone();
+        let scope = format!("所选 {} 张", paths.len());
+        self.scan_scope = scope.clone();
+        self.scan_verb = "导入";
+        let scope_owned = scope.clone();
+        let (tx, rx) = mpsc::channel();
+        self.scan_rx = Some(rx);
+        let ctrl = Arc::new(crate::scan::ScanControl::new());
+        ctrl.set_total(paths.len());
+        self.scan_ctrl = Some(ctrl.clone());
+        self.status = format!("正在{scope}…");
+        std::thread::spawn(move || {
+            let mut scanned = 0usize;
+            let mut indexed = 0usize;
+            let mut skipped = 0usize;
+            for p in &paths {
+                if ctrl.is_cancelled() {
+                    break;
+                }
+                scanned += 1;
+                match crate::scan::index_file_ctrl(&store, p, Some(&ctrl)) {
+                    Ok(true) => indexed += 1,
+                    Ok(false) => skipped += 1,
+                    Err(_) => {}
+                }
+                ctrl.advance(1);
+            }
+            let cancelled = ctrl.is_cancelled();
+            busy.store(false, Ordering::SeqCst);
+            let msg = ScanResult {
+                scanned,
+                indexed,
+                unchanged: skipped,
+                excluded_dirs: 0,
+                cancelled,
+                err: None,
+                scope: scope_owned,
             };
             let _ = tx.send(msg);
         });
@@ -4155,7 +4781,7 @@ impl App {
                     if self.face_people.is_empty() {
                         self.refresh_people_and_suggestions();
                     }
-                    self.view = ViewKind::Faces;
+                    self.set_view(ViewKind::Faces);
                     self.sel_cluster = Some(cluster);
                     self.face_hits = crate::faces::faces_for_cluster(
                         &self.store,
@@ -5221,7 +5847,7 @@ impl App {
                 self.selected_folder = slot;
                 self.tree_reveal(folder);
             }
-            self.view = ViewKind::Folder;
+            self.set_view(ViewKind::Folder);
             self.folder_show_all = false;
             if act_play {
                 // 预览停在别的文件夹时,start_slideshow 会接着放那张不相关的;
@@ -5781,6 +6407,30 @@ fn orient_rect(
 mod tests {
     use super::*;
 
+    /// 导入页清单三件事:
+    /// 1) 子目录排最前(可下探),txt 之类不可入库的文件不列;
+    /// 2) 已入库的文件带 `in_library` 标记,行上灰显;
+    /// 3) 文件按名排序。
+    #[test]
+    fn import_dir_lists_dirs_first_and_marks_indexed() {
+        let base = std::env::temp_dir().join("maliang-import-case");
+        let dir = base.join("cards");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("b.jpg"), b"x").unwrap();
+        std::fs::write(dir.join("a.jpg"), b"y").unwrap();
+        std::fs::write(dir.join("c.txt"), b"z").unwrap();
+        let mut indexed = HashSet::new();
+        indexed.insert(dir.join("b.jpg").to_string_lossy().into_owned());
+        let rows = list_import_dir(&dir, &indexed);
+        assert_eq!(rows.len(), 3, "子目录 + 两张图;txt 不列: {rows:?}");
+        assert!(rows[0].is_dir, "子目录排最前: {rows:?}");
+        assert_eq!(rows[1].name, "a.jpg", "文件按名排");
+        assert!(rows[2].in_library, "已在库的标出来");
+        assert!(!rows[1].size_s.is_empty(), "大小列要有值");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 目录树两件事必须成立,左栏的真递归树全靠它们:
     /// 1) 中间层目录(本身没有照片)也成节点,并且借到子树里的一张代表图;
     /// 2) 只有装了照片的目录带 `folder_index`,即树上只有它可选。
@@ -5920,14 +6570,14 @@ impl eframe::App for App {
                 self.scan_rx = None;
                 self.scan_ctrl = None;
                 self.status = match r.err {
-                    Some(e) => format!("扫描{}失败: {e}", r.scope),
+                    Some(e) => format!("{}{}失败: {e}", self.scan_verb, r.scope),
                     None if r.cancelled => format!(
-                        "扫描{}已取消:已索引 {} 张(已处理 {} 个文件)",
-                        r.scope, r.indexed, r.scanned
+                        "{}{}已取消:已索引 {} 张(已处理 {} 个文件)",
+                        self.scan_verb, r.scope, r.indexed, r.scanned
                     ),
                     None => format!(
-                        "扫描{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
-                        r.scope, r.scanned, r.indexed, r.unchanged, r.excluded_dirs
+                        "{}{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
+                        self.scan_verb, r.scope, r.scanned, r.indexed, r.unchanged, r.excluded_dirs
                     ),
                 };
                 self.rebuild();
@@ -6216,22 +6866,45 @@ impl eframe::App for App {
         }
         // 键盘快捷键(参照 Picasa;有文本输入焦点时不拦截)
         if !ctx.wants_keyboard_input() {
-            let (sel_all, save, esc, next, prev, page_up, page_down, home, end, rot_cw, rot_ccw) =
-                ctx.input(|i| {
-                    (
-                        i.modifiers.command && i.key_pressed(egui::Key::A),
-                        i.key_pressed(egui::Key::F2),
-                        i.key_pressed(egui::Key::Escape),
-                        i.key_pressed(egui::Key::ArrowRight),
-                        i.key_pressed(egui::Key::ArrowLeft),
-                        i.key_pressed(egui::Key::PageUp),
-                        i.key_pressed(egui::Key::PageDown),
-                        i.key_pressed(egui::Key::Home),
-                        i.key_pressed(egui::Key::End),
-                        i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::R),
-                        i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::R),
-                    )
-                });
+            let (
+                sel_all,
+                save,
+                esc,
+                next,
+                prev,
+                page_up,
+                page_down,
+                home,
+                end,
+                rot_cw,
+                rot_ccw,
+                nav_back_k,
+                nav_fwd_k,
+            ) = ctx.input(|i| {
+                let alt = i.modifiers.alt;
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::F2),
+                    i.key_pressed(egui::Key::Escape),
+                    !alt && i.key_pressed(egui::Key::ArrowRight),
+                    !alt && i.key_pressed(egui::Key::ArrowLeft),
+                    i.key_pressed(egui::Key::PageUp),
+                    i.key_pressed(egui::Key::PageDown),
+                    i.key_pressed(egui::Key::Home),
+                    i.key_pressed(egui::Key::End),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::R),
+                    i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::R),
+                    alt && i.key_pressed(egui::Key::ArrowLeft),
+                    alt && i.key_pressed(egui::Key::ArrowRight),
+                )
+            });
+            // 页面前后导航(Alt+← / Alt+→)。
+            if nav_back_k {
+                self.nav_back();
+            }
+            if nav_fwd_k {
+                self.nav_forward();
+            }
             if sel_all {
                 self.sel = self.view_ids().into_iter().collect();
             }
@@ -6246,7 +6919,7 @@ impl eframe::App for App {
                 // 没有扫描时才关闭预览窗。
                 if let Some(ctrl) = &self.scan_ctrl {
                     ctrl.cancel();
-                    self.status = "正在取消扫描…".into();
+                    self.status = format!("正在取消{}…", self.scan_verb);
                 } else {
                     self.preview = None;
                     self.preview_tex = None;
@@ -6343,6 +7016,16 @@ impl eframe::App for App {
                         ));
                         ui.separator();
                         ui.menu_button("导入(I)", |ui| {
+                            // 导入页:整页面板(选源 → 看清单 → 入库 → 返回)。
+                            if ui.button("导入页(选源入库)…").clicked() {
+                                self.go_page(PageKind::Import);
+                                ui.close();
+                            }
+                            // 直接挑文件夹的一次性入口(不开页面)。
+                            if ui.button("添加文件夹到图库…").clicked() {
+                                self.add_folder_to_library();
+                                ui.close();
+                            }
                             // P1-13:从设备导入(设备选择窗口)。
                             if ui.button("从设备(相机/手机)…").clicked() {
                                 self.open_import_devices();
@@ -6475,7 +7158,7 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Timeline, "时间线")
                             .clicked()
                         {
-                            self.view = ViewKind::Timeline;
+                            self.set_view(ViewKind::Timeline);
                             ui.close();
                         }
                         // 相簿(参考件 Album 列表)。
@@ -6483,7 +7166,7 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Albums, "相簿")
                             .clicked()
                         {
-                            self.view = ViewKind::Albums;
+                            self.set_view(ViewKind::Albums);
                             ui.close();
                         }
                         #[cfg(feature = "ai")]
@@ -6491,7 +7174,7 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Faces, "人物")
                             .clicked()
                         {
-                            self.view = ViewKind::Faces;
+                            self.set_view(ViewKind::Faces);
                             ui.close();
                         }
                         #[cfg(feature = "ai")]
@@ -6499,14 +7182,14 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Semantic, "语义搜索")
                             .clicked()
                         {
-                            self.view = ViewKind::Semantic;
+                            self.set_view(ViewKind::Semantic);
                             ui.close();
                         }
                         if ui
                             .selectable_label(self.view == ViewKind::Search, "快速查找")
                             .clicked()
                         {
-                            self.view = ViewKind::Search;
+                            self.set_view(ViewKind::Search);
                             // 首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
                             #[cfg(windows)]
                             if self.name_index.is_none()
@@ -6522,14 +7205,14 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Tags, "标签")
                             .clicked()
                         {
-                            self.view = ViewKind::Tags;
+                            self.set_view(ViewKind::Tags);
                             ui.close();
                         }
                         if ui
                             .selectable_label(self.view == ViewKind::Folder, "文件夹")
                             .clicked()
                         {
-                            self.view = ViewKind::Folder;
+                            self.set_view(ViewKind::Folder);
                             ui.close();
                         }
                         ui.separator();
@@ -6617,7 +7300,7 @@ impl eframe::App for App {
                                 )
                                 .clicked()
                             {
-                                self.view = ViewKind::Faces;
+                                self.set_view(ViewKind::Faces);
                                 self.start_face_scan();
                                 ui.close();
                             }
@@ -6646,7 +7329,7 @@ impl eframe::App for App {
                                 )
                                 .clicked()
                             {
-                                self.view = ViewKind::Semantic;
+                                self.set_view(ViewKind::Semantic);
                                 self.start_clip_index();
                                 ui.close();
                             }
@@ -6674,7 +7357,7 @@ impl eframe::App for App {
                             .selectable_label(self.view == ViewKind::Duplicates, "重复照片")
                             .clicked()
                         {
-                            self.view = ViewKind::Duplicates;
+                            self.set_view(ViewKind::Duplicates);
                             ui.close();
                         }
                         ui.separator();
@@ -6797,7 +7480,7 @@ impl eframe::App for App {
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if go || enter {
-                        self.view = ViewKind::Search;
+                        self.set_view(ViewKind::Search);
                         if !self.name_query.trim().is_empty() {
                             self.run_name_search();
                         }
@@ -6842,18 +7525,20 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
                     }
-                    // P1-8:扫描进度条 + 取消按钮(百分比照原版说法,明细挂悬停)。
+                    // P1-8:进度条 + 取消按钮(百分比照原版说法,明细挂悬停;
+                    // 扫描与导入共用通道,动词跟着任务走)。
                     if let Some(ctrl) = &self.scan_ctrl {
                         let (done, total) = ctrl.counts();
                         let frac = ctrl.fraction();
+                        let verb = self.scan_verb;
                         ui.separator();
                         let pct = (frac * 100.0).round() as i32;
-                        ui.label(format!("正在扫描… {pct}%"))
+                        ui.label(format!("正在{verb}… {pct}%"))
                             .on_hover_text(format!("{done}/{total} 张已完成"));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
-                        if ui.button("取消扫描").clicked() {
+                        if ui.button(format!("取消{verb}")).clicked() {
                             ctrl.cancel();
-                            self.status = format!("正在取消扫描{}…", self.scan_scope);
+                            self.status = format!("正在取消{verb}{}…", self.scan_scope);
                         }
                     }
                     // 人脸扫描进度(分母 = 本批待分析张数;逐张回报,不会卡在 0%)。
@@ -6871,12 +7556,12 @@ impl eframe::App for App {
 
         // ===== 右栏抽屉:可伸缩,平时收起,工具栏「属性面板」或面板头「»」收展;
         // 属性 / 标签 / 人物 / 地点 四页签共用同一张目标照片 =====
-        if self.drawer_open {
+        if self.drawer_open && self.page == PageKind::Library {
             self.drawer_ui(ctx);
         }
 
         // 右侧面板:效果系统
-        if self.fx_panel {
+        if self.fx_panel && self.page == PageKind::Library {
             egui::SidePanel::right("fx")
                 .resizable(true)
                 .default_width(300.0)
@@ -6900,6 +7585,12 @@ impl eframe::App for App {
             .width_range(196.0..=360.0)
             .frame(crate::theme::side_frame())
             .show(ctx, |ui| {
+                // 导入页:左栏换成源选择(参考件的获取面板同样换掉左栏,
+                // 右栏抽屉/效果面板也一并收起,见对应开关)。
+                if self.page == PageKind::Import {
+                    self.import_sources_ui(ui);
+                    return;
+                }
                 crate::theme::section_title(ui, "库");
                 let mut navs: Vec<(&str, ViewKind)> = vec![
                     ("最近更新", ViewKind::Timeline),
@@ -6923,7 +7614,7 @@ impl eframe::App for App {
                         egui::RichText::new(label).color(crate::theme::p().text)
                     };
                     if ui.selectable_label(active, text).clicked() && !active {
-                        self.view = v;
+                        self.set_view(v);
                         // 快速查找:首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
                         #[cfg(windows)]
                         if v == ViewKind::Search
@@ -7256,6 +7947,12 @@ impl eframe::App for App {
         // 快速查找:结果形态(任意文件/文件夹列表)与照片网格差异大,自绘面板。
         if self.view == ViewKind::Search {
             self.search_ui(ctx);
+            return;
+        }
+
+        // 导入页:中央区换成导入面板(清单 + 动作),图库布局不再画。
+        if self.page == PageKind::Import {
+            self.import_page_ui(ctx);
             return;
         }
 
@@ -8215,7 +8912,7 @@ impl eframe::App for App {
                                     }
                                 }
                                 self.sel_album = Some(aid);
-                                self.view = ViewKind::Albums;
+                                self.set_view(ViewKind::Albums);
                                 self.album_input.clear();
                                 self.status = if added == 0 {
                                     format!("已创建相簿「{name}」")

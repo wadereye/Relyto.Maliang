@@ -70,6 +70,36 @@ pub fn drive_type(root: &Path) -> Option<DriveType> {
     }
 }
 
+/// 本机可浏览的盘根(按扫描策略分流:固定盘/可移动盘/内存盘)。
+///
+/// 导入页的「我的电脑」源用它;非 Windows 返回家目录,保证列表不空。
+pub fn drive_roots() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Storage::FileSystem::GetLogicalDrives;
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        // SAFETY: GetLogicalDrives 只返回位掩码,不写内存。
+        let mask = unsafe { GetLogicalDrives() };
+        for i in 0..26u32 {
+            if mask & (1u32 << i) == 0 {
+                continue;
+            }
+            let letter = (b'A' + i as u8) as char;
+            let root = std::path::PathBuf::from(format!("{letter}:\\"));
+            if drive_type(&root).map(|t| t.scannable()).unwrap_or(false) {
+                out.push(root);
+            }
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .map(|h| vec![std::path::PathBuf::from(h)])
+            .unwrap_or_default()
+    }
+}
+
 /// 取盘符根目录的卷标(资源管理器里显示的名字)。
 /// P1-13:WPD/盘符统一设备列表用它显示「E:\ — 我的SD卡」。
 /// 取不到或为空返回 `None`。
