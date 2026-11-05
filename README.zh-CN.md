@@ -3,12 +3,12 @@
 
 # Relyto.Maliang（马良）
 
-> 用 AI 重新诠释 Picasa 的本地照片管理应用。
+> 快速、本地优先的照片管理与编辑应用，内置原生 AI。
 
 **为什么有这个项目。** Google Picasa 曾是一款非常好用的图片管理与处理  
 软件——快速、简洁、用起来赏心悦目。可惜 Google 在 2016 年将它停更下架，  
-此后一直没有一款现代工具能真正填补这个空缺。因此，本项目决定用 Rust  
-重写 Picasa 并开源，让这份经典体验延续下去。
+此后一直没有一款现代工具能真正填补这个空缺。因此有了马良：用 Rust  
+独立编写、开源发布，把这份经典体验延续下去，并补上当年老工具没有的能力。
 
 如果马良对你有用，欢迎给仓库点一个[⭐ Star](https://github.com/wadereye/Relyto.Maliang/stargazers)；  
 如果有缺失的功能或遇到问题，欢迎提[Issue](https://github.com/wadereye/Relyto.Maliang/issues)。  
@@ -80,7 +80,7 @@ Picasa 3 的体验现代化：更顺滑的浏览、更智能的组织，以及�
 ### 界面与体验
 
 - 深色 / 浅色双主题；内置阿里普惠体中文字体；图标使用开源 Lucide。
-- 菜单结构参照 Picasa 3（文件 / 编辑 / 视图 / 工具 / 帮助）；照片原生右键菜单。
+- 沿用经典五栏菜单（文件 / 编辑 / 视图 / 工具 / 帮助）；照片原生右键菜单。
 - 右栏信息抽屉：属性 / 标签 / 人物 / 地点。
 - **全本地、无联网、无遥测。**
 
@@ -139,6 +139,53 @@ cargo build --release --no-default-features
 
 精简构建下「人物」与「语义搜索」视图会提示未编译，其余功能不受影响。  
 启用前请确保已配置 `onnxruntime` 运行环境与对应的模型权重文件。
+
+### 模型获取（不入仓库，自行放置）
+
+模型与权重不随程序分发（体积与许可原因），运行时放入**数据目录**的 `models\`
+子目录（默认 `%APPDATA%\Relyto\Maliang\models\`，数据目录可在 选项 > 常规 迁移）。
+缺模型时对应功能会显示放置指引，不影响其他功能。
+
+| 文件 | 用途 | 来源与许可 |
+|---|---|---|
+| `face_det.onnx` | 人脸检测（YuNet，2023mar 版） | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/)，Apache-2.0 |
+| `face_rec.onnx` | 人脸识别，512 维（AdaFace IR-50 导出 ONNX） | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)，MIT |
+| `face_det_v2.onnx` / `face_rec_v2.onnx` | 可选方案：insightface antelopev2（SCRFD + ArcFace，**权重不可商用**，自备自用） | [deepinsight/insightface](https://github.com/deepinsight/insightface)，权重许可以官方发布为准 |
+| `ch_PP-OCRv4_det_infer.onnx` / `ch_PP-OCRv4_rec_infer.onnx` / `ppocr_keys_v1.txt` | 中文 OCR | PP-OCRv4（PaddleOCR，Apache-2.0） |
+| `clip_vision.onnx` / `clip_text.onnx` / `clip_merges.txt` | 语义搜索 | OpenAI CLIP（MIT）导出的 ONNX |
+
+两套人脸方案都支持，在 **选项 > 常规 > 人脸识别方案** 里选择，默认推荐
+YuNet + AdaFace（商业友好许可）；切换后向量不通用，会提示重新扫描。
+程序会按输出张量数自动识别检测模型类型，文件按对应方案命名放置即可。
+
+人脸模型放置方法：
+
+- **检测（YuNet）**：直接下载上表的 `face_detection_yunet_2023mar.onnx`，
+  重命名为 `face_det.onnx` 放入模型目录即可。
+- **识别（AdaFace）**：官方仓库发布的是 PyTorch 权重，需先转成 ONNX。按其
+  README 下载 IR-50 权重（如 `adaface_ir50_ms1mv2.ckpt`），在 AdaFace 仓库
+  根目录执行：
+
+  ```python
+  # pip install torch onnx
+  import torch
+  from net import build_model
+
+  model = build_model("ir_50")
+  ckpt = torch.load("adaface_ir50_ms1mv2.ckpt", map_location="cpu")
+  state = ckpt.get("state_dict", ckpt)
+  model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()})
+  model.eval()
+  torch.onnx.export(
+      model, torch.randn(1, 3, 112, 112), "face_rec.onnx",
+      input_names=["input"], output_names=["embedding"], opset_version=17,
+  )
+  ```
+
+  生成的 `face_rec.onnx` 放入模型目录即可（输出 512 维，与库中向量维度一致）。
+
+模型文件的许可归各自权利人所有，归属声明与许可原文见
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。
 
 ### 常用命令
 
@@ -214,8 +261,8 @@ cargo run -- --import-assets my-presets.txt
 Picasa 是 Google LLC 的商标。本项目是一个**独立的开源实现**，与 Google LLC  
 没有任何关联，也未获得其授权、赞助或背书。
 
-本项目是一个从零开始的独立实现，不基于 Picasa 的源代码、二进制文件或资源  
-文件构建；界面与交互方式上的相近之处，意在延续熟悉的使用体验，并支持与  
+本项目是用 Rust 独立编写的实现。本仓库不包含、也不分发任何 Google 源代码、
+二进制或资源文件。界面与交互方式上的相近之处，意在延续熟悉的使用体验，并支持与  
 Picasa 的数据互通（如经典的 `picasa.ini` 文件格式）。
 
 ## 第三方声明

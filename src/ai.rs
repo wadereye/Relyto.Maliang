@@ -264,13 +264,56 @@ pub mod ocr {
     }
 }
 
-/// 人脸(M2c):YuNet 检测 + AdaFace IR-50 识别(512 维向量)。
-/// 两者均为商业友好许可(YuNet Apache-2.0 / AdaFace MIT),
-/// 模型文件仍叫 face_det.onnx / face_rec.onnx,获取方式见 README。
+/// 人脸(M2c):两套检测+识别方案,用户在 选项 > 常规 里选择。
+/// 默认 YuNet 检测 + AdaFace IR-50 识别(均为商业友好许可);
+/// 兼容 insightface antelopev2(SCRFD + ArcFace,权重许可非商用,自备自用)。
+/// 检测模型类型按输出张量数自动识别(单输出 = YuNet,多输出 = SCRFD),
+/// 文件放错也能跑;获取方式见 README。
 pub mod face {
     use super::{env, models_dir};
     use ort::session::Session;
     use ort::value::Tensor;
+
+    /// 人脸方案:检测 + 识别模型配对(成套使用,向量不通用)。
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum FaceAlgo {
+        /// YuNet 检测 + AdaFace IR-50 识别(默认推荐,商业友好许可)。
+        AdaFace,
+        /// insightface antelopev2(SCRFD + ArcFace;权重许可非商用,自备自用)。
+        AntelopeV2,
+    }
+
+    impl FaceAlgo {
+        pub fn key(self) -> &'static str {
+            match self {
+                Self::AdaFace => "adaface",
+                Self::AntelopeV2 => "antelopev2",
+            }
+        }
+
+        pub fn from_key(k: &str) -> Self {
+            if k == Self::AntelopeV2.key() {
+                Self::AntelopeV2
+            } else {
+                Self::AdaFace
+            }
+        }
+
+        pub fn label(self) -> &'static str {
+            match self {
+                Self::AdaFace => "YuNet + AdaFace(可商用,推荐)",
+                Self::AntelopeV2 => "insightface antelopev2(不可商用)",
+            }
+        }
+
+        /// 该方案要求的模型文件名(检测, 识别),放数据目录 models\ 下。
+        pub fn files(self) -> (&'static str, &'static str) {
+            match self {
+                Self::AdaFace => ("face_det.onnx", "face_rec.onnx"),
+                Self::AntelopeV2 => ("face_det_v2.onnx", "face_rec_v2.onnx"),
+            }
+        }
+    }
 
     #[derive(Debug, Clone)]
     pub struct Det {
@@ -291,6 +334,8 @@ pub mod face {
     pub struct Faces {
         det: Session,
         det_out: String,
+        /// true = 检测模型是 YuNet(单输出);false = SCRFD(多输出,antelopev2)。
+        det_yunet: bool,
         rec: Session,
         rec_out: String,
     }
@@ -311,16 +356,119 @@ pub mod face {
     ];
 
     impl Faces {
-        pub fn load() -> Result<Self, String> {
+        pub fn load(algo: FaceAlgo) -> Result<Self, String> {
             let dir = models_dir().ok_or("无数据目录")?;
-            Ok(Self {
-                det: open_session(&dir.join("face_det.onnx"))?,
-                rec: open_session(&dir.join("face_rec.onnx"))?,
-            })
+            let (det_f, rec_f) = algo.files();
+            let det = open_session(&dir.join(det_f))?;
+            let det_out = det.outputs()[0].name().to_string();
+            // 输出张量数识别检测模型:YuNet 单输出 [1,N,15];SCRFD 多输出(9 个)。
+            let det_yunet = det.outputs().len() == 1;
+            let rec = open_session(&dir.join(rec_f))?;
+            let rec_out = rec.outputs()[0].name().to_string();
+            Ok(Self { det, det_out, det_yunet, rec, rec_out })
+        }
+
+        /// 指定方案的模型文件(检测+识别)是否已就位。
+        /// UI 据此在选项页/人物页/扫描入口给放置指引,而不是等用户点了扫描才报错。
+        pub fn models_present(algo: FaceAlgo) -> bool {
+            let dir = match models_dir() {
+                Some(d) => d,
+                None => return false,
+            };
+            let (det_f, rec_f) = algo.files();
+            dir.join(det_f).is_file() && dir.join(rec_f).is_file()
         }
 
         /// 检测所有人脸框(含 5 关键点),坐标为原图像素。
+        /// 按加载时识别的模型类型分流,YuNet / SCRFD 共用 NMS。
         fn detect(&mut self, img: &image::DynamicImage) -> Result<Vec<Det>, String> {
+            let dets = if self.det_yunet {
+                self.detect_yunet(img)?
+            } else {
+                self.detect_scrfd(img)?
+            };
+            // NMS(IoU 0.4)
+            let mut dets = dets;
+            dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            let mut keep: Vec<Det> = Vec::new();
+            for d in dets {
+                let ok = keep.iter().all(|k: &Det| {
+                    let ix = (d.x1.min(k.x1) - d.x0.max(k.x0)).max(0.0);
+                    let iy = (d.y1.min(k.y1) - d.y0.max(k.y0)).max(0.0);
+                    let inter = ix * iy;
+                    let ua = (d.x1 - d.x0) * (d.y1 - d.y0) + (k.x1 - k.x0) * (k.y1 - k.y0) - inter;
+                    ua <= 0.0 || inter / ua < 0.4
+                });
+                if ok {
+                    keep.push(d);
+                }
+            }
+            Ok(keep)
+        }
+
+        /// YuNet(2023mar 版):输入 [1,3,H,W] 动态尺寸,BGR 0~255 不归一化;
+        /// 输出单张量 [1,N,15],每行 = x,y,w,h + 5×(x,y) 关键点 + 置信度,
+        /// 像素坐标直出无需锚点解码;关键点顺序与 SCRFD 一致,对齐代码可复用。
+        fn detect_yunet(&mut self, img: &image::DynamicImage) -> Result<Vec<Det>, String> {
+            const MAXSIDE: u32 = 640;
+            let (w, h) = (img.width(), img.height());
+            let scale = (MAXSIDE as f32 / w as f32)
+                .min(MAXSIDE as f32 / h as f32)
+                .min(1.0);
+            let rw = ((w as f32 * scale).round() as u32).max(1);
+            let rh = ((h as f32 * scale).round() as u32).max(1);
+            let rs = img
+                .resize_exact(rw, rh, image::imageops::FilterType::Triangle)
+                .to_rgb8();
+            // BGR、0~255 原值入模(YuNet 内部自己处理,勿再减均值除方差)。
+            let mut data = Vec::with_capacity((rw * rh * 3) as usize);
+            for &c in &[2u8, 1, 0] {
+                for p in rs.pixels() {
+                    data.push(p.0[c as usize] as f32);
+                }
+            }
+            let input = Tensor::from_array(([1usize, 3, rh as usize, rw as usize], data))
+                .map_err(|e| e.to_string())?;
+            // 单输入模型,按位置传参,输入节点名由模型自定(不硬编码)。
+            let outputs = self
+                .det
+                .run(ort::inputs![&input])
+                .map_err(|e| format!("det 运行: {e}"))?;
+            let (_, raw): (&ort::value::Shape, &[f32]) = outputs[self.det_out.as_str()]
+                .try_extract_tensor::<f32>()
+                .map_err(|e| format!("det 输出: {e}"))?;
+            const COLS: usize = 15;
+            let n = raw.len() / COLS;
+            let mut dets: Vec<Det> = Vec::new();
+            for i in 0..n {
+                let row = &raw[i * COLS..(i + 1) * COLS];
+                let score = row[14];
+                if score < 0.5 {
+                    continue;
+                }
+                let (x, y, bw, bh) = (row[0], row[1], row[2], row[3]);
+                dets.push(Det {
+                    x0: x / scale,
+                    y0: y / scale,
+                    x1: (x + bw) / scale,
+                    y1: (y + bh) / scale,
+                    score,
+                    kps: [
+                        (row[4], row[5]),
+                        (row[6], row[7]),
+                        (row[8], row[9]),
+                        (row[10], row[11]),
+                        (row[12], row[13]),
+                    ]
+                    .map(|(kx, ky)| (kx / scale, ky / scale)),
+                });
+            }
+            Ok(dets)
+        }
+
+        /// SCRFD(antelopev2):输入 640×640 letterbox,(x-127.5)/128 归一化;
+        /// 输出 3 个 stride × (分数/框/关键点) 共 9 张量,需锚点解码。
+        fn detect_scrfd(&mut self, img: &image::DynamicImage) -> Result<Vec<Det>, String> {
             const IN: u32 = 640;
             let (w, h) = (img.width(), img.height());
             let scale = (IN as f32 / w as f32).min(IN as f32 / h as f32);
@@ -397,25 +545,11 @@ pub mod face {
                     });
                 }
             }
-            // NMS(IoU 0.4)
-            dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-            let mut keep: Vec<Det> = Vec::new();
-            for d in dets {
-                let ok = keep.iter().all(|k: &Det| {
-                    let ix = (d.x1.min(k.x1) - d.x0.max(k.x0)).max(0.0);
-                    let iy = (d.y1.min(k.y1) - d.y0.max(k.y0)).max(0.0);
-                    let inter = ix * iy;
-                    let ua = (d.x1 - d.x0) * (d.y1 - d.y0) + (k.x1 - k.x0) * (k.y1 - k.y0) - inter;
-                    ua <= 0.0 || inter / ua < 0.4
-                });
-                if ok {
-                    keep.push(d);
-                }
-            }
-            Ok(keep)
+            Ok(dets)
         }
 
-        /// 检测 + 5 点对齐 + 512 维嵌入。
+        /// 检测 + 5 点对齐 + 512 维嵌入(ArcFace 标准 5 点模板对齐,
+        /// 两方案的识别模型都输出 512 维)。
         pub fn analyze(&mut self, img: &image::DynamicImage) -> Result<Vec<Face>, String> {
             let dets = self.detect(img)?;
             let mut out = Vec::new();
@@ -453,6 +587,7 @@ pub mod face {
                 let tya = ny - s * (st * mx + ct * my);
                 // 注意:必须用 u8 图再转 f32(0~255)。to_rgb32f 是 0~1,
                 // 直接减 127.5 会把整张裁剪图压成常数,嵌入全部雷同。
+                // ArcFace / AdaFace 训练归一化均为 (x/255 - 0.5) / 0.5 = (x-127.5)/127.5。
                 let img_rgb = img.to_rgb8();
                 let (iw, ih) = (img_rgb.width(), img_rgb.height());
                 let mut crop = Vec::with_capacity(112 * 112 * 3);
@@ -483,18 +618,18 @@ pub mod face {
                                 + p01[c] * (1.0 - fx) * fy
                                 + p11[c] * fx * fy;
                         }
-                        crop.push((px[2] - 127.5) / 128.0);
-                        crop.push((px[1] - 127.5) / 128.0);
-                        crop.push((px[0] - 127.5) / 128.0);
+                        crop.push((px[2] - 127.5) / 127.5);
+                        crop.push((px[1] - 127.5) / 127.5);
+                        crop.push((px[0] - 127.5) / 127.5);
                     }
                 }
                 let input = Tensor::from_array(([1usize, 3, 112usize, 112usize], crop))
                     .map_err(|e| e.to_string())?;
                 let outputs = self
                     .rec
-                    .run(ort::inputs!["input.1" => &input])
+                    .run(ort::inputs![&input])
                     .map_err(|e| format!("rec 运行: {e}"))?;
-                let (_, vals) = outputs["1333"]
+                let (_, vals) = outputs[self.rec_out.as_str()]
                     .try_extract_tensor::<f32>()
                     .map_err(|e| format!("rec 输出: {e}"))?;
                 let dim = vals.len();
@@ -529,7 +664,8 @@ pub mod face {
                 eprintln!("无 {} 跳过", fixture.display());
                 return;
             }
-            let mut f = Faces::load().unwrap_or_else(|e| panic!("加载人脸模型失败: {e}"));
+            let mut f = Faces::load(FaceAlgo::AdaFace)
+                .unwrap_or_else(|e| panic!("加载人脸模型失败: {e}"));
             let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
             let out = f.analyze(&img).unwrap();
             eprintln!(

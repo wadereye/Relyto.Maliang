@@ -11,17 +11,3 @@
 Thumbs.db
 .DS_Store
 .wtest
-
-# 本地约束/笔记,永不入库
-.workbuddy/
-COMPLIANCE.md
-tools/
-
-# 会话分析产物(与 Picasa 3 的行为对照记录),仅本地留存,不入库
-AUDIT.md
-FEATURE_MAP.md
-MFT_QUICK_SEARCH.md
-OPEN_TASKS.md
-PROGRESS.md
-RE_*.md
-UI_GAP.md

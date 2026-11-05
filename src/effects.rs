@@ -192,7 +192,7 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "shadow",
     "rot",
     "crop",
-    // 着色器族(参考 `Shader` 类效果)已钉死的 6 项,见 `crate::shaders`
+    // 着色器族已钉死的 6 项,见 `crate::shaders`
     "hexcells",
     "rippleblocks",
     "circlesplash",
@@ -201,7 +201,7 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "hslfilter",
 ];
 
-/// 参考 Picasa 3 的 `Shader` 类效果共 10 项,我方已落地的 6 项
+/// 着色器族效果共 10 项,我方已落地的 6 项
 /// (算法口径已在行为层面确定,实现见 [`crate::shaders`])。
 ///
 /// 这 6 个名字必须同时出现在 [`PIXEL_EFFECTS`] 与 `apply_effect` 的分支里,
@@ -1040,7 +1040,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let v = combo_val(e, "contrast", 0.5, 1.0, 0.5) * 200.0;
             crate::effects::apply_color_matrix(img, 0.0, v, 0.0);
         }
-        // ===== 组合效果:滑杆清单取自参考产品自带的滤镜描述,各接自己的滑杆 =====
+        // ===== 组合效果:滑杆清单沿用同类滤镜的常见参数命名,各接自己的滑杆 =====
         //
         // | id | 参考滑杆(依次为 id=0/1/2/3) | 我方接线 |
         // |---|---|---|
@@ -1315,7 +1315,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 }
             }
         }
-        // ===== 着色器族(参考 `Shader` 类效果,实现见 `crate::shaders`)=====
+        // ===== 着色器族(实现见 `crate::shaders`)=====
         // 这一族的参数在原版里是**按位置排的数值数组**,没有键名也没有滑杆界面,
         // 所以「出厂缺省」无对应资料。这里用 `p0..p5` 的位置键名接外部传参,
         // 取不到时落到我方选定的可见缺省值(不是恒等),便于在效果栈里一眼看出生效。

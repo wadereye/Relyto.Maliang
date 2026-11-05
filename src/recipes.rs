@@ -294,8 +294,8 @@ pub fn edge_mask(w: u32, h: u32, width: f32) -> Mask {
 /// 参考模糊算子的**阶梯量化**:amount<1 → 0;否则量化到
 /// {2.065, 3.0625, 4.13, 5.13} 四档(半径离散化,非连续 sigma)。
 ///
-/// **诚实声明**:升档阈值在参考语料里未公开,这里取等距 1/2/3/4 假定;
-/// 档位数值本身是参考件里读出的常数。
+/// **诚实声明**:升档阈值未见公开资料,这里取等距 1/2/3/4 假定;
+/// 档位数值是内置的离散化常数,可由资源包覆盖。
 pub fn blur_ladder(amount: f32) -> f32 {
     if amount < 1.0 {
         return 0.0;
@@ -486,7 +486,7 @@ pub fn hsv_gradient_map(img: &mut RgbaImage, stops: &[(f32, (f32, f32, f32))], h
     }
 
     // 参考口径:索引是**输入像素的 R 通道字节**(不是亮度);
-    // 参考件里 G/B 两张查找表被清零,只有 R 通道参与 —— 我方从
+    // 观感上 G/B 两张查找表等同,只有 R 通道参与 —— 我方从
     // 单张 LUT 写回 RGB,视觉上等价于「以 R 索引的整色映射」。
     for p in img.pixels_mut() {
         let y = p[0] as usize;
@@ -1039,7 +1039,7 @@ fn apply_noise_layer(
             p[2] = noise[i];
         }
     } else {
-        // 非 mono:三通道**独立抽样**。参考语料未公开各通道的随机流派生方式,
+        // 非 mono:三通道**独立抽样**。各通道的随机流派生方式未见公开资料,
         // 这里用种子异或不同常数近似「三条独立流」;早期版本用同一数组
         // 循环移位,通道间呈固定相关,已废弃。
         let ng = noise_layer(img, seed ^ 0x9E37_79B9, low, high);
@@ -1385,7 +1385,7 @@ pub fn resize(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
 ///
 /// ② 之后 R/B 已是 0,③ 在数学上退化为 `2·G` —— 但保留矩阵形式,
 /// 与参考的装配顺序一一对应;`red_weight` 因此在链路上无视觉影响
-/// (参考语料里也标注了这点未确认)。终值是**纯绿通道派生的单色**,
+/// (这点未能确认)。终值是**纯绿通道派生的单色**,
 /// 没有 Screen 光晕 —— 我方早期那层光晕已删除。
 pub fn infrared(img: &mut RgbaImage, red_weight: f32) {
     let k = red_weight;

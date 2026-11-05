@@ -281,6 +281,10 @@ pub struct App {
     show_changes: bool,
     /// P1-12:变更历史条目 (时间戳ms, 路径, 动作)。
     change_log: Vec<(i64, String, String)>,
+    /// 坏文件台账窗口开关(方案 P3-22)。
+    show_bad_media: bool,
+    /// 台账快照(开窗与点「刷新」时重读)。
+    bad_media_rows: Vec<crate::db::BadMedia>,
     /// P1-11:uid64 查找窗口。
     show_uid_lookup: bool,
     /// uid64 查找输入框。
@@ -296,9 +300,14 @@ pub struct App {
     /// 滚动时按整形后的速度调节"本帧允许解码的缩略图数量",
     /// 滚动越快解码越少 → 大图库滚动不卡顿(限速节点的等价作用)。
     scroll_throttle: crate::scroll::ScrollSmoother,
-    /// 本帧允许解码的缩略图数量(由滚动速度决定)。
+    /// 本帧允许同步解码的缩略图**像素体积**(RGBA8 字节数)。
+    ///
+    /// 方案 P4-23③:原来是「每帧 64 张」的张数上限,在中档(256px,256KB/张)
+    /// 下约 16MB —— 没问题;但预览档(1024px,4MB/张)同样 64 张就是 256MB 的
+    /// 解码 + 纹理上传,一帧几百毫秒,「UI 永不阻塞」在大档上等于没做。
+    /// 改成字节口径后各档的每帧耗时才拉平(见 [`crate::scroll::decode_budget_for`])。
     thumb_decode_budget: usize,
-    /// 本帧已用的解码配额(每帧开头清零)。
+    /// 本帧已用的解码配额(字节;每帧开头清零)。
     thumb_decode_count: usize,
     /// 当前档位已生成缩略图的数量(状态栏用)。
     /// 只在切档 / 批次回报 / 重建图库时刷新 —— 逐帧查库会抢锁且白跑 COUNT(*)。
@@ -415,7 +424,7 @@ pub struct App {
     preview_full: Option<(i64, image::RgbaImage)>,
     /// 全图解码在途照片 id。
     zoom_pending: Option<i64>,
-    // —— 裁剪工具(参考件编辑视图的 Crop;比例预设取自其 AspectRatioList)——
+    // —— 裁剪工具(编辑视图的 Crop;比例预设取经典图库常用宽高比清单)——
     /// 裁剪框草稿(显示图像的归一化坐标 0..1;[x0, y0, x1, y1],用前归一)。
     crop_rect: Option<[f32; 4]>,
     /// 裁剪比例锁定(像素比 w / h;None = 自由)。
@@ -428,15 +437,14 @@ pub struct App {
     crop_cw: String,
     crop_ch: String,
     crop_cname: String,
-    // —— 幻灯片放映(参考件 View > Slideshow;间隔常量名 SlideshowEffectTime、
-    // 循环开关 LoopSlideshow)——
+    // —— 幻灯片放映(对应原版 视图 > 幻灯片放映:可调间隔与循环开关)——
     /// 放映中(全屏接管主区)。
     slideshow: bool,
     /// 上次自动切换时刻。
     slide_last: std::time::Instant,
     /// 暂停(空格切换)。
     slide_pause: bool,
-    /// 每张停留秒数(参考件 SlideshowEffectTime;默认值暂无对应资料,取 3 秒)。
+    /// 每张停留秒数(原版默认间隔暂无对应资料,取 3 秒)。
     slide_interval: f32,
     /// 循环放映(设置项 slideshow_loop,默认开)。
     slide_loop: bool,
@@ -455,6 +463,9 @@ pub struct App {
     show_options: bool,
     /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
     options_tab: usize,
+    /// 缓存目录占用(文件数, 字节数)+ 采样时刻。整树遍历不放在每帧里跑,
+    /// 选项页打开时按时间片刷新(迁移完立刻重采)。
+    cache_usage: Option<(usize, u64, std::time::Instant)>,
     /// 文件夹视图树形形态(参考件左栏可逐级展开的那棵树;设置项 folder_tree,缺省树形)。
     folder_tree: bool,
     /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
@@ -532,30 +543,31 @@ pub struct App {
     clip_lang: crate::clip::Lang,
     #[cfg(feature = "ai")]
     input_query: String,
-    // —— 快速查找(NTFS 名字索引) ——
-    /// 全盘名字索引(提权子进程 `--mft-scan` 产出 nameindex.bin 后载入)。
-    name_index: Option<Arc<crate::nameidx::IndexFile>>,
-    /// 索引文件后台载入结果。
-    name_index_rx: Option<mpsc::Receiver<Result<crate::nameidx::IndexFile, String>>>,
-    /// 本轮索引文件载入完成后要不要做对账重扫(索引器报告有实质变更时置位)。
-    name_index_catchup: bool,
-    /// 对账重扫因扫描忙而挂起,当前扫描结束后补发。
-    mft_catchup_armed: bool,
-    /// 索引器子进程事件(启动结果)。
-    mft_rx: Option<mpsc::Receiver<MftEvent>>,
-    /// 用户拒绝 UAC 后本次会话不再重复发起(可从搜索页手动再试)。
-    mft_declined: bool,
-    /// 索引器进度(报告里最后一条 PROGRESS 行:比例 + 文案)。
-    mft_progress: Option<(f32, String)>,
+    // —— 快速查找(索引服务管道客户端) ——
+    /// 索引服务链路状态。降级横幅、选项页、状态页都读它。
+    ///
+    /// 索引本身在服务进程里:UI 不再持有 `IndexFile`,
+    /// 也不再读 `nameindex.bin`,一切走 `\\.\pipe\maliang-idx`。
+    link: LinkInfo,
+    /// 链路线程回报(服务概况 / 掉线原因 / 重建与装卸回执)。
+    link_rx: Option<mpsc::Receiver<LinkMsg>>,
+    /// 发给链路线程的命令(重连 / 装卸服务 / 全量重建 / 落盘)。
+    link_tx: Option<mpsc::Sender<LinkCmd>>,
+    /// 用户拒绝装服务后本次会话不再自动发起(可从搜索页/选项页手动再试)。
+    link_declined: bool,
     /// 授权说明弹窗待示(没决定过就先问,问明白再动手)。
-    mft_ask_grant: bool,
+    svc_ask_grant: bool,
     /// 授权窗里「不再提示」勾选(仅窗口打开期间的临时态;拒绝/关窗且勾选才落库)。
-    mft_never_ask: bool,
-    /// 计划任务在位且指向当前 exe(启动时查一次缓存;查询是进程调用,不能逐帧问)。
-    mft_task_ok: bool,
+    svc_never_ask: bool,
+    /// 服务安装/卸载在途(提权子进程最长等 120s,期间不能重复发起)。
+    svc_busy: bool,
+    /// 首启范围对话框待示(方案 P3-18:两档单选,**无取消** —— 必须答一次)。
+    scope_ask: bool,
+    /// 对话框里当前选中的那一档。
+    scope_choice: InitialScope,
     /// 快速查找输入与结果。
     name_query: String,
-    name_results: Vec<crate::nameidx::SearchHit>,
+    name_results: Vec<NameRow>,
     /// 最近一次检索耗时(毫秒;状态栏与结果面板展示)。
     name_search_ms: f64,
     /// 类型过滤档(顶栏/搜索页共用,换档即重查)。
@@ -569,14 +581,10 @@ pub struct App {
     search_rx: Option<mpsc::Receiver<SearchResp>>,
     /// 请求代数:每次 dispatch 递增,过期响应直接丢弃。
     search_gen: u64,
-    /// 同一代数的共享副本:检索线程 stat 阶段看到代数前进就放弃本批。
-    search_abort: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// 有一批检索在途(结果面板显示"检索中…")。
     search_inflight: bool,
     /// 查询缓存:(查询, 档位) → (结果, 耗时 ms)。重复输入零成本回显。
-    name_search_cache: HashMap<(String, u8), (Vec<crate::nameidx::SearchHit>, f64)>,
-    /// size/创建时间缓存(路径 → (字节, epoch ms));后台 stat 批量回填。
-    name_stats: HashMap<String, (u64, i64)>,
+    name_search_cache: HashMap<(String, u8), (Vec<NameRow>, f64)>,
     /// 后台缩略图解码线程的收发两端。
     thumb_tx: Option<mpsc::Sender<String>>,
     thumb_rx: Option<mpsc::Receiver<(String, Option<image::DynamicImage>)>>,
@@ -584,50 +592,372 @@ pub struct App {
     thumb_inflight: std::collections::HashSet<String>,
     /// 快速查找列表当前选中行(视觉反馈;右键菜单直接作用于所在行)。
     name_sel: Option<String>,
+    /// 「屏幕上出现过、已经纳过」的目录(大写归一路径)。每个目录本进程只纳一次。
+    adopt_seen: std::collections::HashSet<String>,
+    /// 待纳入目录队列(原样路径):渲染帧只入队,`photo_grid` 每帧消化少量。
+    adopt_queue: std::collections::VecDeque<String>,
+    /// 本帧真正画在屏幕上的目录(原样路径,按出现顺序、去重)。帧首整批发给后台 worker。
+    frame_dirs: Vec<String>,
+    /// `frame_dirs` 的去重键(大写归一路径)。
+    frame_dirs_seen: std::collections::HashSet<String>,
 }
 
-/// 索引器子进程回报事件。
+/// 索引服务的链路状态(由链路线程按心跳回报)。
+#[derive(Debug, Clone)]
+struct LinkInfo {
+    /// 管道连着且握手通过 —— 有全盘快查。
+    online: bool,
+    /// 连不上的原因(降级横幅原样显示)。
+    why: String,
+    /// SCM 侧的服务状态:区分「没装」「装了没起」「正在起」。
+    svc: crate::win::ServiceState,
+    /// 索引条目总数与卷数。
+    entries: u64,
+    vols: u32,
+    /// 正在全量建库的卷数(>0 时结果面板该说"正在建库"而不是"没有命中")。
+    building: usize,
+    /// 走不了 USN/MFT 的卷 → 原因(方案 P4-30:这些卷走兼容扫描,无实时快查)。
+    compat: Vec<(char, String)>,
+    /// 索引里有未落盘的变更。
+    dirty: bool,
+    /// 服务已运行秒数。
+    uptime: u64,
+    /// 上次拿到概况的时刻(状态页显示"多久前")。
+    seen: Option<std::time::Instant>,
+}
+
+impl LinkInfo {
+    fn new() -> Self {
+        LinkInfo {
+            online: false,
+            why: String::new(),
+            svc: crate::win::ServiceState::NotInstalled,
+            entries: 0,
+            vols: 0,
+            building: 0,
+            compat: Vec::new(),
+            dirty: false,
+            uptime: 0,
+            seen: None,
+        }
+    }
+
+    /// 把服务概况并进链路状态。
+    fn apply(&mut self, s: &crate::ipc::StatusInfo) {
+        self.online = true;
+        self.why.clear();
+        self.entries = s.vols.iter().map(|v| v.entries).sum();
+        self.vols = s.vols.len() as u32;
+        self.building = s.vols.iter().filter(|v| v.building).count();
+        self.compat = s
+            .vols
+            .iter()
+            .filter(|v| !v.why.is_empty())
+            .map(|v| (v.letter, v.why.clone()))
+            .collect();
+        self.dirty = s.dirty;
+        self.uptime = s.uptime_secs;
+        self.seen = Some(std::time::Instant::now());
+    }
+}
+
+/// 链路线程 → UI 的回报。
 #[derive(Debug)]
-enum MftEvent {
-    /// 索引文件已就绪(新建或已有缓存);bool = 本轮是否有实质变更
-    /// (增量新增/更新/删除任一 >0,或发生全量重建 —— 解析自收尾报告,
-    /// 见 `nameidx::report_has_changes`)。有变更才值得做对账重扫。
-    Ready(bool),
-    /// 未成功(含 UAC 拒绝/启动失败/超时),附原因。
-    Declined(String),
-    /// 索引器进度:比例(按已完成卷数)+ 报告里的文案。
-    Progress(f32, String),
-    /// 计划任务注册结果:None=成功,Some(错误文案)=失败。
-    Installed(Option<String>),
+enum LinkMsg {
+    /// 服务在线:概况 + SCM 状态。
+    Up(crate::ipc::StatusInfo, crate::win::ServiceState),
+    /// 服务离线:连不上的原因 + SCM 状态(判「没装」还是「装了没起」)。
+    Down(String, crate::win::ServiceState),
+    /// 全量重建请求的回执(None = 已受理)。
+    Rebuild(Option<String>),
+    /// 服务动作的回执:`op` = 哪个动作(「安装」「卸载」「停止」「启动」),
+    /// 第二项 None = 成功。停/起只改进程状态,不该动用户的授权意向。
+    Service(&'static str, Option<String>),
 }
 
-/// 后台检索请求(快照式:带请求时的索引,重扫后旧快照照常出结果)。
+/// UI → 链路线程的命令。装卸与停起服务都要等 UAC(最长 120s),必须放线程里做。
+#[derive(Debug)]
+enum LinkCmd {
+    /// 立刻重连(用户点了「重试」,或服务刚装好)。
+    Retry,
+    /// 提权安装并启动索引服务 —— 本功能唯一一次 UAC。
+    Install,
+    /// 提权停止并删除索引服务。
+    Uninstall,
+    /// 提权停止服务,保留注册项(为了让程序自己换二进制/临时让磁盘歇口)。
+    Stop,
+    /// 提权启动已注册的服务,和 `Stop` 成对。
+    Start,
+    /// 请求全量重建;空列表 = 全部可扫卷。
+    Rebuild(Vec<char>),
+    /// 让服务立刻把内存索引落盘。
+    Flush,
+}
+
+/// 链路心跳间隔:在线时按这个节奏问一次 `Status`。
+const LINK_TICK: std::time::Duration = std::time::Duration::from_secs(3);
+/// 连不上时的退避上限(服务可能正在被安装,别把重连打成忙等)。
+const LINK_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 启动索引服务链路线程:维持一根管道连接、周期问 `Status`、掉线退避重连,
+/// 并代办装卸服务(要等 UAC)与全量重建。UI 只读回报,自己不碰管道。
+fn spawn_link_worker(
+    ctx: egui::Context,
+) -> (mpsc::Sender<LinkCmd>, mpsc::Receiver<LinkMsg>) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<LinkCmd>();
+    let (msg_tx, msg_rx) = mpsc::channel::<LinkMsg>();
+    std::thread::Builder::new()
+        .name("idx-link".into())
+        .spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let mut client: Option<crate::ipc::Client> = None;
+            let mut backoff = std::time::Duration::from_secs(1);
+            // 同一句失败原因只报一次:退避期间每拍都失败,逐拍刷屏没意义。
+            let mut last_down = String::new();
+            // 首拍立刻探一次,别让用户等满一个心跳才看见状态。
+            let mut tick_now = true;
+            loop {
+                if !tick_now {
+                    match cmd_rx.recv_timeout(LINK_TICK) {
+                        Ok(cmd) => {
+                            tick_now = link_cmd(cmd, &mut client, &mut backoff, &msg_tx, &ctx);
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        // 发送端随 App 一起没了 = 收工。
+                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                tick_now = false;
+                if client.is_none() {
+                    match link_connect() {
+                        Ok(c) => {
+                            client = Some(c);
+                            backoff = std::time::Duration::from_secs(1);
+                        }
+                        Err(e) => {
+                            if e != last_down {
+                                last_down = e.clone();
+                                let _ = msg_tx.send(LinkMsg::Down(e, crate::win::service_state()));
+                                ctx.request_repaint();
+                            }
+                            // 退避期间来了命令(比如刚装完服务的 Retry)要能立刻醒。
+                            match cmd_rx.recv_timeout(backoff) {
+                                Ok(cmd) => {
+                                    tick_now =
+                                        link_cmd(cmd, &mut client, &mut backoff, &msg_tx, &ctx);
+                                }
+                                Err(mpsc::RecvTimeoutError::Timeout) => tick_now = true,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                            }
+                            backoff = (backoff * 2).min(LINK_BACKOFF_MAX);
+                            continue;
+                        }
+                    }
+                }
+                // 连上了就清掉旧原因:下一句失败要如实报出来。
+                last_down.clear();
+                let c = client.as_mut().expect("上面刚确保连接在位");
+                match c.call_ok(&crate::ipc::Req::Status) {
+                    Ok(crate::ipc::Resp::Status(s)) => {
+                        let _ = msg_tx.send(LinkMsg::Up(s, crate::win::service_state()));
+                        ctx.request_repaint();
+                    }
+                    Ok(other) => {
+                        client = None;
+                        let _ = msg_tx.send(LinkMsg::Down(
+                            format!("服务对 Status 回了意外答复:{other:?}"),
+                            crate::win::service_state(),
+                        ));
+                        ctx.request_repaint();
+                    }
+                    Err(e) => {
+                        // 管道断了(服务停了/重启了):丢掉连接,下一拍重连。
+                        client = None;
+                        let _ = msg_tx.send(LinkMsg::Down(e, crate::win::service_state()));
+                        ctx.request_repaint();
+                    }
+                }
+                // tick_now 在本拍开头已置 false:落回循环顶部等一个心跳,
+                // 别把 3 秒一次的 Status 打成忙等。
+            }
+        })
+        .expect("启动索引服务链路线程失败");
+    (cmd_tx, msg_rx)
+}
+
+/// 处理一条 UI 命令。返回 true = 立刻再跑一拍心跳(重试/装卸/重建后马上看状态)。
+fn link_cmd(
+    cmd: LinkCmd,
+    client: &mut Option<crate::ipc::Client>,
+    backoff: &mut std::time::Duration,
+    msg_tx: &mpsc::Sender<LinkMsg>,
+    ctx: &egui::Context,
+) -> bool {
+    match cmd {
+        LinkCmd::Retry => {
+            *client = None;
+            *backoff = std::time::Duration::from_secs(1);
+            true
+        }
+        LinkCmd::Install => {
+            let r = crate::win::service_install_elevated();
+            let _ = msg_tx.send(LinkMsg::Service("安装", r.err()));
+            ctx.request_repaint();
+            // 装完立刻试连:服务是被安装步骤顺手起来的,不必等退避。
+            *client = None;
+            *backoff = std::time::Duration::from_secs(1);
+            true
+        }
+        LinkCmd::Uninstall => {
+            let r = crate::win::service_uninstall_elevated();
+            *client = None;
+            let _ = msg_tx.send(LinkMsg::Service("卸载", r.err()));
+            ctx.request_repaint();
+            true
+        }
+        // 停与起:提权子进程只动 SCM 里的进程状态,注册项和映像路径都不碰。
+        // 断掉管道再按 1s 退避重连 —— 停下来的服务不会应答,别等下一个心跳周期。
+        LinkCmd::Stop => {
+            let r = crate::win::service_stop_elevated();
+            *client = None;
+            *backoff = std::time::Duration::from_secs(1);
+            let _ = msg_tx.send(LinkMsg::Service("停止", r.err()));
+            ctx.request_repaint();
+            true
+        }
+        LinkCmd::Start => {
+            let r = crate::win::service_start_elevated();
+            *client = None;
+            *backoff = std::time::Duration::from_secs(1);
+            let _ = msg_tx.send(LinkMsg::Service("启动", r.err()));
+            ctx.request_repaint();
+            true
+        }
+        LinkCmd::Rebuild(letters) => {
+            let r = link_call(client, &crate::ipc::Req::Rebuild { letters });
+            let _ = msg_tx.send(LinkMsg::Rebuild(r.err()));
+            ctx.request_repaint();
+            true
+        }
+        LinkCmd::Flush => {
+            let _ = link_call(client, &crate::ipc::Req::Flush);
+            false
+        }
+    }
+}
+
+/// 借现有连接发一次请求;连接不在就先连(命令不该因为心跳没到点而失败)。
+fn link_call(
+    client: &mut Option<crate::ipc::Client>,
+    req: &crate::ipc::Req,
+) -> Result<crate::ipc::Resp, String> {
+    if client.is_none() {
+        *client = Some(link_connect()?);
+    }
+    let c = client.as_mut().expect("上面刚连上");
+    match c.call_ok(req) {
+        Ok(r) => Ok(r),
+        Err(e) => {
+            // 失败即视为这根连接不可信,丢掉让下一拍重连。
+            *client = None;
+            Err(e)
+        }
+    }
+}
+
+/// 连上管道并完成握手(协议版本对不上视为连不上)。
+fn link_connect() -> Result<crate::ipc::Client, String> {
+    let mut c = crate::ipc::Client::connect(500)?;
+    match c.call(&crate::ipc::Req::Hello {
+        proto: crate::ipc::PROTO_VERSION,
+    }) {
+        Ok(crate::ipc::Resp::Hello { .. }) => Ok(c),
+        Ok(other) => Err(format!("握手答复异常:{other:?}")),
+        Err(e) => Err(e),
+    }
+}
+
+/// 快速查找结果行。
+///
+/// 服务回的命中自带 size/mtime(这几列服务端本来就在内存里握着),
+/// 所以 UI 侧不再逐条 `stat` —— 省掉一趟 500 次文件 IO,冷目录上差别很明显。
+/// 投影在服务内完成(方案 P4-29):派生状态也由服务批量查库后随命中一起回。
+#[derive(Debug, Clone)]
+struct NameRow {
+    hit: crate::nameidx::SearchHit,
+    /// 字节数;目录为 0。
+    size: u64,
+    /// 修改时间,UNIX 秒;0 = 这卷走 USN 降级路径,索引里没有权威时间。
+    mtime: u64,
+    /// 派生状态([`crate::db::RICH_*`]);[`crate::ipc::RICH_UNKNOWN`] = 这条
+    /// 不在图库数据库里(非媒体文件、或还没落库),与「未纳入派生作用域」不是一回事。
+    rich_state: u8,
+}
+
+impl NameRow {
+    fn from_hit(h: crate::ipc::Hit) -> Self {
+        NameRow {
+            hit: crate::nameidx::SearchHit {
+                letter: h.letter,
+                idx: h.idx,
+                name: h.name,
+                path: h.path,
+                is_dir: h.is_dir,
+            },
+            size: h.size,
+            mtime: h.mtime,
+            rich_state: h.rich_state,
+        }
+    }
+
+    /// 结果表「图库」列的短标签。
+    ///
+    /// 快查是 L1(内存文件名索引)的东西,它看得见全盘;图库只收媒体且派生还受
+    /// 作用域门控。这一列就是把两者的差集讲清楚,免得用户以为「搜到了但打不开缩略图」
+    /// 是坏了。
+    fn rich_label(&self) -> &'static str {
+        if self.hit.is_dir {
+            return "—";
+        }
+        // 常量不能带 `as` 当模式用,所以把被匹配的值转成 i32(db 侧的原类型)。
+        match i32::from(self.rich_state) {
+            crate::db::RICH_OUT => "未纳入范围",
+            crate::db::RICH_PENDING => "待派生",
+            crate::db::RICH_DONE => "已入库",
+            crate::db::RICH_BAD => "读取失败",
+            _ => "非图库文件",
+        }
+    }
+}
+
+/// 后台检索请求。
 struct SearchReq {
     gen: u64,
     q: String,
     class: crate::nameidx::FileClass,
-    idx: std::sync::Arc<crate::nameidx::IndexFile>,
 }
 
-/// 后台检索结果:先回命中列表(毫秒级),再回 size/创建时间批。
+/// 后台检索结果。
 enum SearchResp {
+    /// 命中列表(毫秒级)。
     Hits {
         gen: u64,
-        hits: Vec<crate::nameidx::SearchHit>,
+        hits: Vec<NameRow>,
         ms: f64,
     },
-    /// 与 hits 等长同序;None = stat 失败(文件没了/不可达)。
-    Stats {
+    /// 服务连不上:这一轮出不来结果。UI 据此显示降级,而不是"没有命中"。
+    Down {
         gen: u64,
-        stats: Vec<Option<(u64, i64)>>,
+        why: String,
     },
 }
 
-/// 启动常驻检索线程:收请求(合并到最新)→ 内存索引毫秒级出命中 →
-/// 逐条 stat 补大小/创建时间。排队有新请求时放弃 stat 阶段(新查询马上重来)。
-fn spawn_search_worker(
-    abort: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) -> (
+/// 启动常驻检索线程:收请求(合并到最新)→ 走管道问服务 → 回报命中。
+///
+/// 线程自己持一根管道连接,与链路线程那根互不干扰(服务端每连接一线程);
+/// 断了就地重连,连不上如实回报 `Down`。
+fn spawn_search_worker() -> (
     mpsc::Sender<SearchReq>,
     mpsc::Receiver<SearchResp>,
     std::thread::JoinHandle<()>,
@@ -638,40 +968,55 @@ fn spawn_search_worker(
         .name("search".into())
         .spawn(move || {
             crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let mut client: Option<crate::ipc::Client> = None;
             while let Ok(req) = req_rx.recv() {
                 // 合并:队列里还有更新的请求就只跑最新(打字流不逐键全跑)。
                 let mut req = req;
                 while let Ok(latest) = req_rx.try_recv() {
                     req = latest;
                 }
+                if client.is_none() {
+                    if let Err(e) = link_connect().map(|c| client = Some(c)) {
+                        if res_tx.send(SearchResp::Down { gen: req.gen, why: e }).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+                let c = client.as_mut().expect("上面刚连上");
                 let t0 = std::time::Instant::now();
-                let hits = crate::nameidx::search_class(&req.idx.vols, &req.q, 500, req.class);
+                let resp = c.call_ok(&crate::ipc::Req::Search {
+                    text: req.q.clone(),
+                    limit: 500,
+                    class: crate::ipc::class_to_wire(req.class),
+                });
                 let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let hits = match resp {
+                    Ok(crate::ipc::Resp::Hits(h)) => h,
+                    Ok(other) => {
+                        client = None;
+                        let why = format!("服务对 Search 回了意外答复:{other:?}");
+                        if res_tx.send(SearchResp::Down { gen: req.gen, why }).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(e) => {
+                        client = None;
+                        if res_tx.send(SearchResp::Down { gen: req.gen, why: e }).is_err() {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                let rows: Vec<NameRow> = hits.into_iter().map(NameRow::from_hit).collect();
                 if res_tx
                     .send(SearchResp::Hits {
                         gen: req.gen,
-                        hits: hits.clone(),
+                        hits: rows,
                         ms,
                     })
                     .is_err()
-                {
-                    return;
-                }
-                // 二阶段:补 size/创建时间(stat 很便宜,但文件可能刚被删)。
-                // 共享代数已前进 → 有新请求排队,本批 stats 作废,新查询会重新出全套。
-                let mut stats = Vec::new();
-                let mut aborted = false;
-                for h in &hits {
-                    if abort.load(std::sync::atomic::Ordering::Relaxed) != req.gen {
-                        aborted = true;
-                        break;
-                    }
-                    stats.push(stat_size_ctime(Path::new(&h.path)));
-                }
-                if aborted
-                    || res_tx
-                        .send(SearchResp::Stats { gen: req.gen, stats })
-                        .is_err()
                 {
                     return;
                 }
@@ -679,18 +1024,6 @@ fn spawn_search_worker(
         })
         .expect("启动检索线程失败");
     (req_tx, res_rx, h)
-}
-
-/// 一次 stat 拿 (大小字节, 创建时间 epoch ms);失败(不存在/权限)返回 None。
-fn stat_size_ctime(p: &Path) -> Option<(u64, i64)> {
-    let md = std::fs::metadata(p).ok()?;
-    let ctime = md
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    Some((md.len(), ctime))
 }
 
 /// 字节数的短格式(与导入面板的 KB/MB 口径一致,补 GB/B 两档)。
@@ -710,12 +1043,29 @@ fn fmt_size(bytes: u64) -> String {
     }
 }
 
-/// 创建时间(epoch 毫秒)的短格式。
-fn fmt_ctime(ms: i64) -> String {
+/// 修改时间(UNIX 秒,来自 L1 索引)的短格式;0 = 这卷没有权威时间。
+fn fmt_mtime(secs: u64) -> String {
     use chrono::TimeZone;
-    match chrono::Local.timestamp_millis_opt(ms).single() {
+    if secs == 0 {
+        return "—".to_string();
+    }
+    match chrono::Local.timestamp_opt(secs as i64, 0).single() {
         Some(t) => t.format("%Y-%m-%d %H:%M").to_string(),
         None => String::new(),
+    }
+}
+
+/// 运行时长的短格式(选项页显示索引服务跑了多久)。
+fn fmt_uptime(secs: u64) -> String {
+    let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
+    if d > 0 {
+        format!("{d} 天 {h} 小时")
+    } else if h > 0 {
+        format!("{h} 小时 {m} 分")
+    } else if m > 0 {
+        format!("{m} 分")
+    } else {
+        format!("{secs} 秒")
     }
 }
 
@@ -743,41 +1093,50 @@ fn spawn_thumb_worker() -> (
     (tx, out_rx)
 }
 
-/// 全盘索引的授权档位(设置项 `mft_grant`)。
+/// 用户对口全盘索引服务的意向(设置项 `svc_wanted`)。
 ///
-/// Windows 不给"记住 runas 同意"的机制,所以每次提权都要点一次 UAC;
-/// `Task` 档把更新器注册成计划任务,由任务服务负责提权 —— 只有注册那一次
-/// 需要用户点"是",以后每次启动都是静默的。
+/// 进程模型换成常驻提权服务后,原来那三档授权
+/// (计划任务 / 每次提权 / 不做)塌成两档:装 or 不装。装服务只过一次 UAC,
+/// 之后由 SCM 自动拉起,所以"每次单独提权"这一档没有存在意义了。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MftGrant {
+enum SvcWant {
     /// 没问过(首次启动先说明再动手)。
     Unasked,
-    /// 计划任务:授权一次,以后静默。
-    Task,
-    /// 每次启动单独提权(每次都弹 UAC,系统里不留计划任务)。
-    Once,
-    /// 不做全盘索引。
-    None,
+    /// 要:装上服务,以后静默。
+    Yes,
+    /// 不要:走 walkdir 兜底,没有全盘快查。
+    No,
 }
 
-impl MftGrant {
+impl SvcWant {
     fn as_setting(self) -> &'static str {
         match self {
-            MftGrant::Unasked => "",
-            MftGrant::Task => "task",
-            MftGrant::Once => "once",
-            MftGrant::None => "none",
+            SvcWant::Unasked => "",
+            SvcWant::Yes => "1",
+            SvcWant::No => "0",
         }
     }
 
     fn from_setting(s: &str) -> Self {
         match s {
-            "task" => MftGrant::Task,
-            "once" => MftGrant::Once,
-            "none" => MftGrant::None,
-            _ => MftGrant::Unasked,
+            "1" => SvcWant::Yes,
+            "0" => SvcWant::No,
+            _ => SvcWant::Unasked,
         }
     }
+}
+
+/// 首启范围对话框的两档(方案 P3-18:全盘完整扫描 / 仅常见目录)。
+///
+/// 这一档决定的是**派生**作用域,不是库的作用域:两档都全盘发现、全盘入库,
+/// 区别只在"哪些目录的图要出缩略图 / 读 EXIF"。没进作用域的行结构列齐全、
+/// 派生列全空,网格里显示成占位,点进去才补(方案 P3-19)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitialScope {
+    /// 全盘:每个可扫卷根各落一条意图。
+    Complete,
+    /// 常用目录:我的文档 / 图片 / 桌面(不含视频,用户已拍)。
+    Limited,
 }
 
 /// 近似重复的 dHash Hamming 阈值(64 bit 中 ≤10 不同 ≈ 肉眼难辨)。
@@ -1004,6 +1363,25 @@ fn thumb_tex(
         egui::TextureOptions::default(),
     ))
 }
+
+/// 网格预取的行数(视口上下各这么多行,方案 P4-23④)。
+///
+/// 预取线程口径:滚到哪就把前后几行的缩略图先备好。
+/// 只吃当帧剩余的解码配额,不与真正可见的格子抢时间。
+const PREFETCH_ROWS: usize = 2;
+
+/// 一帧最多消化几个「屏幕上看到但还没纳入」的目录。
+///
+/// 首屏一次铺开上百个目录是常态(「最近更新」按天分组),不能让渲染帧去写上百次账;
+/// 队列下一帧继续消化,人眼看不出先后。
+const MAX_ADOPT_PER_FRAME: usize = 4;
+
+/// 「看到但还没纳入」队列的长度上限:快速滚动一屏可能铺出上百个目录,
+/// 排到 5 帧以后就没人等了 —— 后面的请求直接丢弃,那一格仍显示「未纳入范围」。
+const MAX_ADOPT_QUEUE: usize = 24;
+
+/// 一帧最多上报几个「屏幕上的目录」给后台 worker(显示优先的清单长度上限)。
+const MAX_VISIBLE_DIRS: usize = 32;
 
 /// 把任意长宽比的缩略图裁成正方形(取中间部分),用于网格瓦片。
 fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
@@ -1403,6 +1781,12 @@ impl TexCache {
         self.pending.contains(&id)
     }
 
+    /// 是否已有纹理(**不动** LRU 顺序 —— 预取路径用它判重,
+    /// 预取到的格子不该因此变得比真正可见的格子更"新")。
+    fn has(&self, id: i64) -> bool {
+        self.map.contains_key(&id)
+    }
+
     /// 标记为"等后台生成"。
     fn mark_pending(&mut self, id: i64) {
         self.pending.insert(id);
@@ -1502,7 +1886,7 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024),
         );
-        let app = Self {
+        Self {
             store,
             rows: Vec::new(),
             months: Vec::new(),
@@ -1516,7 +1900,7 @@ impl App {
             scan_ctrl: None,
             scan_scope: String::new(),
             scroll_throttle: crate::scroll::ScrollSmoother::new(600.0, 0.0),
-            thumb_decode_budget: crate::scroll::MAX_THUMB_DECODE_PER_FRAME,
+            thumb_decode_budget: crate::scroll::MAX_THUMB_DECODE_BYTES_PER_FRAME,
             thumb_decode_count: 0,
             tier_cached: 0,
             rows_gen: 0,
@@ -1594,6 +1978,8 @@ impl App {
             maint_rx: None,
             show_changes: false,
             change_log: Vec::new(),
+            show_bad_media: false,
+            bad_media_rows: Vec::new(),
             show_uid_lookup: false,
             uid_input: String::new(),
             uid_lookup_result: None,
@@ -1636,6 +2022,7 @@ impl App {
             show_props: false,
             show_options: false,
             options_tab: 0,
+            cache_usage: None,
             folder_tree,
             folder_show_all: true,
             tree_thumbs,
@@ -1688,16 +2075,15 @@ impl App {
             clip_lang: crate::clip::Lang::En,
             #[cfg(feature = "ai")]
             input_query: String::new(),
-            name_index: None,
-            name_index_rx: None,
-            name_index_catchup: false,
-            mft_catchup_armed: false,
-            mft_rx: None,
-            mft_declined: false,
-            mft_progress: None,
-            mft_ask_grant: false,
-            mft_never_ask: false,
-            mft_task_ok: false,
+            link: LinkInfo::new(),
+            link_rx: None,
+            link_tx: None,
+            link_declined: false,
+            svc_ask_grant: false,
+            svc_never_ask: false,
+            svc_busy: false,
+            scope_ask: false,
+            scope_choice: InitialScope::Complete,
             name_query: String::new(),
             name_results: Vec::new(),
             name_search_ms: 0.0,
@@ -1707,29 +2093,39 @@ impl App {
             search_tx: None,
             search_rx: None,
             search_gen: 0,
-            search_abort: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             search_inflight: false,
             name_search_cache: HashMap::new(),
-            name_stats: HashMap::new(),
             thumb_tx: None,
             thumb_rx: None,
             thumb_inflight: std::collections::HashSet::new(),
             name_sel: None,
-        };
-        app
+            adopt_seen: std::collections::HashSet::new(),
+            adopt_queue: std::collections::VecDeque::new(),
+            frame_dirs: Vec::new(),
+            frame_dirs_seen: std::collections::HashSet::new(),
+        }
     }
 
-    pub fn start_initial_tasks(&mut self) {
-        // 快速查找后台线程(即输即搜:检索毫秒级,stat 补大小/创建时间不挡 UI)。
-        let (stx, srx, _) = spawn_search_worker(self.search_abort.clone());
+    pub fn start_initial_tasks(&mut self, ctx: egui::Context) {
+        // 快速查找后台线程(即输即搜:走管道问索引服务,毫秒级回命中)。
+        let (stx, srx, _) = spawn_search_worker();
         self.search_tx = Some(stx);
         self.search_rx = Some(srx);
+        // 索引服务链路线程(心跳问 Status、掉线重连、代办装卸与重建)。
+        let (ltx, lrx) = spawn_link_worker(ctx);
+        self.link_tx = Some(ltx);
+        self.link_rx = Some(lrx);
+        // 上次拒绝过装服务 → 本次会话不自动发起(入口仍在,手动可再试)。
+        self.link_declined = self.store.get_setting("svc_declined").as_deref() == Some("1");
         // 搜索行缩略图解码线程(命中列表先出,缩略图异步补)。
         let (ttx, trx) = spawn_thumb_worker();
         self.thumb_tx = Some(ttx);
         self.thumb_rx = Some(trx);
-        // 后台缩略图补齐(持续 worker:启动时补存量,扫描后自动补新增)
-        self.thumb_bg = Some(crate::thumbs::spawn_worker(self.store.clone()));
+        // 后台缩略图补齐(持续 worker:只补派生门放行的行,可见目录优先)
+        self.thumb_bg = Some(crate::thumbs::spawn_worker(
+            self.store.clone(),
+            crate::thumbs::visible_dirs(),
+        ));
         // P1-10:预览后台 worker(解码 + 落盘 previews/ 缓存,不阻塞 UI)
         self.preview_bg = Some(crate::thumbs::spawn_preview_worker(self.store.clone()));
         // 启动时静默导入新照片的 XMP sidecar(外部工具写的星标/标签,DB 权威不覆盖)
@@ -1743,36 +2139,10 @@ impl App {
         self.device_watch = Some(crate::device::spawn_device_watcher());
         self.last_volumes = crate::device::removable_volumes();
         self.rebuild();
-        // MFT 快路前置:启动扫描要吃名字索引,必须在这里同步载入
-        // (0.5s 级 IO;异步载入赶不上下面的 start_scan_roots)。
-        #[cfg(windows)]
-        if self.name_index.is_none() {
-            let idx_path = crate::db::data_dir().join("nameindex.bin");
-            if idx_path.exists() {
-                match crate::nameidx::load(&idx_path) {
-                    Ok(f) => {
-                        let n: usize = f.vols.iter().map(|v| v.count()).sum();
-                        self.name_index = Some(std::sync::Arc::new(f));
-                        if n > 0 {
-                            self.status = format!("全盘名字索引就绪({n} 条),扫描走 MFT 快路");
-                        }
-                    }
-                    Err(_) => self.load_name_index_async(false),
-                }
-            }
-        }
         // P2-15:上次中断的扫描(持久化队列残留)自动续扫。
         // 正常完成/取消都会出队;本项目改用持久化队列,
         // 进程中途退出后仍可在下次启动时继续。
         let pending = self.store.pending_scans();
-        // 参考件首启口径:首次运行只登记壳目录(我的文档/图片/桌面)
-        // 并扫描一次,之后监听列表由用户在文件夹管理器自管。
-        if self.store.ensure_first_run_scope() && pending.is_empty() {
-            let roots = crate::db::default_roots();
-            if !roots.is_empty() {
-                self.start_scan_roots(roots, "常用目录");
-            }
-        }
         if !pending.is_empty() {
             let roots: Vec<PathBuf> = pending.iter().map(|(r, _)| PathBuf::from(r)).collect();
             let scope = if pending.len() == 1 {
@@ -1782,355 +2152,333 @@ impl App {
             };
             self.start_scan_roots(roots, &scope);
         }
-        // 快速查找:启动 3s 后(等首帧渲染与首扫错峰)处理名字索引。
-        // 有索引 → 后台载入;要更新则按授权档位发起:
-        // task = 触发计划任务(静默,不再弹 UAC)、once = 每次提权(每次都弹)、
-        // none = 不打扰、没问过 = 先弹说明窗取得同意再动手;勾过「不再提示」则不再问。
-        // 上次失败/被拒(declined)则本轮不自动发起,由页面手动重试。
-        #[cfg(windows)]
-        {
-            let declined = self.store.get_setting("mft_declined").as_deref() == Some("1");
-            let idx_path = crate::db::data_dir().join("nameindex.bin");
-            // 同步载入失败(损坏等)才退回异步重试;成功后不重复读盘。
-            if idx_path.exists() && self.name_index.is_none() {
-                self.load_name_index_async(false);
+        // 方案 P3-18:首次启动先问派生作用域(两档单选、无取消,必须答一次)。
+        // 答完才落账 `dir_intent` 并发起首扫;`skip_initial_scan` 偏好短路 ——
+        // 明确说过不要首扫的用户按保守档静默落账,不弹窗。
+        if !self.store.scope_initialized() {
+            if self.store.get_setting("skip_initial_scan").as_deref() == Some("1") {
+                self.apply_initial_scope(InitialScope::Limited, false);
+            } else {
+                self.scope_ask = true;
             }
-            let auto = self.store.get_setting("mft_auto_update").as_deref() != Some("0");
-            if auto && !declined {
-                // 任务在位与否在这里查一次,之后逐帧用缓存。
-                self.mft_task_ok = self.mft_task_current();
-                match self.mft_grant() {
-                    MftGrant::Task if self.mft_task_ok => {
-                        self.spawn_mft_indexer(std::time::Duration::from_secs(3))
-                    }
-                    // 档位是 task 但任务不在了(换机/exe 搬家/被删)→ 回来说明窗重授。
-                    MftGrant::Task | MftGrant::Unasked => {
-                        if self.store.get_setting("mft_never_ask").as_deref() != Some("1") {
-                            self.mft_open_grant();
-                        }
-                    }
-                    MftGrant::Once => self.spawn_mft_indexer(std::time::Duration::from_secs(3)),
-                    MftGrant::None => {}
+        }
+        // 方案 P3-21:上次点了「重建全部缩略图」但进程中途退出 → 续做完。
+        self.resume_force_thumb_update();
+        // 全盘快查的数据源是**索引服务**(常驻提权进程):
+        // 服务在位就由 SCM 自动拉起,UI 侧全程静默,链路线程自己会连上。
+        // 这里只处理"该不该问用户装服务":没问过 → 弹说明窗取得同意;
+        // 问过且要 → 若服务不在了(换机/被卸)直接重装,不再啰嗦;
+        // 问过且不要 / 上次装失败被拒 → 不打扰,走 walkdir 兜底。
+        #[cfg(windows)]
+        match self.svc_want() {
+            SvcWant::Unasked => {
+                if !self.link_declined
+                    && self.store.get_setting("svc_never_ask").as_deref() != Some("1")
+                {
+                    self.svc_open_grant();
                 }
             }
+            SvcWant::Yes => {
+                if crate::win::service_state() != crate::win::ServiceState::NotInstalled {
+                    // 已注册:SCM 负责拉起,链路线程退避重连即可,别抢着弹 UAC。
+                    self.link.svc = crate::win::service_state();
+                } else if !self.link_declined {
+                    self.svc_install();
+                }
+            }
+            SvcWant::No => {}
         }
     }
 
-    /// 全盘索引的当前授权档位(没存过就是「未问过」)。
-    fn mft_grant(&self) -> MftGrant {
-        MftGrant::from_setting(self.store.get_setting("mft_grant").as_deref().unwrap_or(""))
+    /// 用户对口索引服务的意向(没存过就是「未问过」)。
+    fn svc_want(&self) -> SvcWant {
+        SvcWant::from_setting(self.store.get_setting("svc_wanted").as_deref().unwrap_or(""))
     }
 
     /// 打开授权说明窗(「不再提示」勾选每次打开时复位)。
     #[cfg(windows)]
-    fn mft_open_grant(&mut self) {
-        self.mft_ask_grant = true;
-        self.mft_never_ask = false;
+    fn svc_open_grant(&mut self) {
+        self.svc_ask_grant = true;
+        self.svc_never_ask = false;
     }
 
-    /// 计划任务是否仍在位、且指向当前这个 exe(exe 换路径后必须重新授权)。
-    #[cfg(windows)]
-    fn mft_task_current(&self) -> bool {
-        let Ok(exe) = std::env::current_exe() else {
-            return false;
-        };
-        crate::win::mft_task_registered()
-            && self.store.get_setting("mft_task_exe").unwrap_or_default() == exe.to_string_lossy()
-    }
-
-    /// 后台线程载入名字索引文件(0.5s 级 IO,不阻塞 UI)。
-    /// `catchup` = 载入完成后是否做对账重扫(索引器增量报告有实质变更时置位)。
-    fn load_name_index_async(&mut self, catchup: bool) {
-        if self.name_index_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.name_index_rx = Some(rx);
-        self.name_index_catchup = catchup;
-        std::thread::spawn(move || {
-            let path = crate::db::data_dir().join("nameindex.bin");
-            let res = crate::nameidx::load(&path).map_err(|e| e.to_string());
-            let _ = tx.send(res);
-        });
-    }
-
-    /// 发起一次索引更新,载体按授权档位选:`Task` 触发计划任务(静默 —— 提权由
-    /// 计划任务服务负责,本进程不再弹 UAC,也不带控制台窗口),`Once` 用
-    /// ShellExecute runas 拉起自身子进程(每次都弹 UAC)。
+    /// 首启范围落账(方案 P3-18):写 `dir_intent` + 打标记,按需发起首扫。
     ///
-    /// 两者都以报告文件的收尾行为完成信号(nameindex.bin 对增量场景没有
-    /// "新出现"语义,不能当信号用);过程行里的 `PROGRESS <比例> <文案>`
-    /// 转成界面进度,替代原来黑控制台里滚动的计数。轮询上限 15 分钟。
-    #[cfg(windows)]
-    fn spawn_mft_indexer(&mut self, delay: std::time::Duration) {
-        if self.mft_rx.is_some() {
+    /// `scan=false` 用于 `skip_initial_scan` 偏好短路 —— 作用域照样落账
+    /// (不落账派生门是空的,谁都不出缩略图),只是不发起扫描。
+    fn apply_initial_scope(&mut self, choice: InitialScope, scan: bool) {
+        let roots = self.store.apply_initial_scope(choice == InitialScope::Complete);
+        self.scope_ask = false;
+        self.scope_choice = choice;
+        if roots.is_empty() {
             return;
         }
-        self.mft_progress = None;
-        let (tx, rx) = mpsc::channel();
-        self.mft_rx = Some(rx);
-        let data = crate::db::data_dir();
-        let via_task = matches!(self.mft_grant(), MftGrant::Task);
-        std::thread::spawn(move || {
-            std::thread::sleep(delay);
-            let report = data.join("mft_report.txt");
-            // 上一轮的报告由提权进程写下(高完整性级),这里未必删得动 ——
-            // 所以先记下 mtime,只认比它新的内容;删得掉更好,删不掉也不误判。
-            let stale = std::fs::metadata(&report).and_then(|m| m.modified()).ok();
-            let _ = std::fs::remove_file(&report);
-            let params = format!("--mft-scan --mft-report \"{}\"", report.display());
-            let started = if via_task {
-                crate::win::mft_task_run()
-            } else {
-                crate::win::launch_elevated(&params)
-            };
-            if let Err(e) = started {
-                let _ = tx.send(MftEvent::Declined(e));
-                return;
+        // 落账改变了派生门:已入库的行按新作用域重算一遍 rich_state。
+        let gate = crate::db::ScopeGate::load(&self.store);
+        let _ = self.store.reconcile_rich_state(&gate);
+        if !scan {
+            self.status = "已按偏好跳过首扫;派生作用域已落账,可在文件夹管理器里手动扫。".into();
+            return;
+        }
+        let label = match choice {
+            InitialScope::Complete => "全盘",
+            InitialScope::Limited => "常用目录",
+        };
+        self.start_scan_roots(roots, label);
+    }
+
+    /// 发起安装/启动索引服务(UAC 与等待都在链路线程里,不挡 UI 帧)。
+    #[cfg(windows)]
+    fn svc_install(&mut self) {
+        if self.svc_busy {
+            return;
+        }
+        self.svc_busy = true;
+        if let Some(tx) = &self.link_tx {
+            let _ = tx.send(LinkCmd::Install);
+        } else {
+            self.svc_busy = false;
+        }
+    }
+
+    /// 卸载索引服务(停 + 删,同样一次 UAC)。
+    #[cfg(windows)]
+    fn svc_uninstall(&mut self) {
+        if self.svc_busy {
+            return;
+        }
+        self.svc_busy = true;
+        if let Some(tx) = &self.link_tx {
+            let _ = tx.send(LinkCmd::Uninstall);
+        } else {
+            self.svc_busy = false;
+        }
+    }
+
+    /// 只停服务、保留注册项。存在的理由很实际:服务在跑就锁着自己的 exe 映像,
+    /// 程序升级/重编/搬目录全都动不了 —— 这一步必须能在界面里点到,
+    /// 而不是让用户去开 services.msc 或敲 `net stop RelytoMaliangIndex`。
+    #[cfg(windows)]
+    fn svc_stop(&mut self) {
+        if self.svc_busy {
+            return;
+        }
+        self.svc_busy = true;
+        if let Some(tx) = &self.link_tx {
+            let _ = tx.send(LinkCmd::Stop);
+        } else {
+            self.svc_busy = false;
+        }
+    }
+
+    /// 启动已注册的服务(和 `svc_stop` 成对;停过之后只有这一条回头路)。
+    #[cfg(windows)]
+    fn svc_start(&mut self) {
+        if self.svc_busy {
+            return;
+        }
+        self.svc_busy = true;
+        if let Some(tx) = &self.link_tx {
+            let _ = tx.send(LinkCmd::Start);
+        } else {
+            self.svc_busy = false;
+        }
+    }
+
+    /// 用户在说明窗/选项页定了意向之后的落地动作:落库 + 该动手的动手。
+    #[cfg(windows)]
+    fn svc_apply_want(&mut self, want: SvcWant) {
+        let _ = self.store.set_setting("svc_wanted", want.as_setting());
+        self.svc_ask_grant = false;
+        self.svc_never_ask = false;
+        self.link_declined = false;
+        let _ = self.store.set_setting("svc_declined", "0");
+        // 明确选了要装 = 撤回「不再提示」,服务丢失时还要恢复询问。
+        let _ = self.store.set_setting("svc_never_ask", "0");
+        match want {
+            SvcWant::Yes => self.svc_install(),
+            SvcWant::No => {
+                // 已经装着的服务不会因为用户改主意就自动消失:如实告知,
+                // 卸载是破坏性动作(要停服务、删注册项),交给用户自己点。
+                if crate::win::service_installed() {
+                    self.status = "已选「不用全盘索引」;服务仍在运行,要彻底移除请点「卸载索引服务」。"
+                        .into();
+                }
             }
-            let mut last_prog: Option<(f32, String)> = None;
-            for _ in 0..1800 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if stale.is_some()
-                    && std::fs::metadata(&report).and_then(|m| m.modified()).ok() <= stale
-                {
-                    // 还是上一轮那份(或本轮还没落盘),不作数。
-                    continue;
-                }
-                let Ok(s) = std::fs::read_to_string(&report) else {
-                    continue;
-                };
-                let mut prog: Option<(f32, String)> = None;
-                let mut done: Option<MftEvent> = None;
-                for l in s.lines() {
-                    if let Some(rest) = l.strip_prefix("PROGRESS ") {
-                        let mut it = rest.splitn(2, ' ');
-                        let frac = it
-                            .next()
-                            .and_then(|f| f.parse::<f32>().ok())
-                            .unwrap_or(0.0)
-                            .clamp(0.0, 1.0);
-                        prog = Some((frac, it.next().unwrap_or("").to_string()));
-                    } else if l.starts_with("成功") {
-                        done = Some(MftEvent::Ready(crate::nameidx::report_has_changes(&s)));
-                    } else if l.starts_with("失败") {
-                        done = Some(MftEvent::Declined(l.to_string()));
-                    }
-                }
-                if let Some(p) = &prog {
-                    if Some(p) != last_prog.as_ref() {
-                        last_prog = Some(p.clone());
-                        let _ = tx.send(MftEvent::Progress(p.0, p.1.clone()));
-                    }
-                }
-                if let Some(ev) = done {
-                    let _ = tx.send(ev);
-                    return;
-                }
+            SvcWant::Unasked => {}
+        }
+    }
+
+    /// 手动「启用全盘快查」(搜索页/选项页/顶栏切换入口)。
+    /// 还没定意向 → 先弹说明窗取得同意,不背着一声不响就弹 UAC;
+    /// 服务在位但管道连不上 → 只是重连,不必再问一遍。
+    #[cfg(windows)]
+    fn svc_try_start(&mut self) {
+        let want = self.svc_want();
+        if want == SvcWant::Unasked {
+            self.svc_open_grant();
+            return;
+        }
+        if want == SvcWant::No {
+            // 明确选了不用的人,切页面时不反复拉弹窗,只给一句指路。
+            self.status = "全盘快查已关闭(在 选项 > 常规 可改)".into();
+            return;
+        }
+        match self.link.svc {
+            // 没装(或被卸了)→ 重新装一次;装了没起 → 让 SCM/重连去处理,
+            // 起不来再退回安装(install 对已存在的服务是改配置 + 启动,幂等)。
+            crate::win::ServiceState::NotInstalled | crate::win::ServiceState::Stopped => {
+                self.svc_install()
             }
-            let _ = tx.send(MftEvent::Declined("索引器超时未产出".into()));
-        });
-    }
-
-    /// 一次性提权把更新器注册成计划任务 —— 这是本功能最后一次 UAC 弹窗。
-    /// 结果回 `MftEvent::Installed`,成功后的触发交给 UI 线程做(要保证档位已落库)。
-    #[cfg(windows)]
-    fn mft_install_task_async(&mut self) {
-        if self.mft_rx.is_some() {
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.mft_rx = Some(rx);
-        // 线程里 WaitForSingleObject 等 UAC 结果,期间界面总得说句话,
-        // 别让人以为卡在"正在准备索引"上。
-        self.mft_progress = Some((0.0, "等待你在 UAC 授权窗口点「是」…".to_string()));
-        let data = crate::db::data_dir();
-        std::thread::spawn(move || {
-            let res = match std::env::current_exe() {
-                Ok(exe) => crate::win::mft_task_install(&exe, &data),
-                Err(e) => Err(format!("取自身路径失败: {e}")),
-            };
-            let _ = tx.send(MftEvent::Installed(res.err()));
-        });
-    }
-
-    /// 用户在说明窗/选项页定了档位后的落地动作:落库 + 该提权的提权 + 发起更新。
-    #[cfg(windows)]
-    fn mft_apply_grant(&mut self, grant: MftGrant) {
-        let _ = self.store.set_setting("mft_grant", grant.as_setting());
-        self.mft_ask_grant = false;
-        self.mft_declined = false;
-        self.mft_never_ask = false;
-        let _ = self.store.set_setting("mft_declined", "0");
-        // 明确选了启用档位 = 撤回「不再提示」,任务丢失时还要恢复询问。
-        let _ = self.store.set_setting("mft_never_ask", "0");
-        match grant {
-            MftGrant::Task => self.mft_install_task_async(),
-            MftGrant::Once => self.spawn_mft_indexer(std::time::Duration::from_millis(300)),
-            _ => {}
-        }
-    }
-
-    /// 撤销计划任务授权(要改任务定义,所以这一步仍会弹一次 UAC)。
-    #[cfg(windows)]
-    fn mft_revoke_task(&mut self) {
-        match crate::win::mft_task_uninstall() {
-            Ok(()) => {
-                let _ = self.store.set_setting("mft_task_exe", "");
-                let _ = self
-                    .store
-                    .set_setting("mft_grant", MftGrant::Unasked.as_setting());
-                let _ = self.store.set_setting("mft_never_ask", "0");
-                self.mft_task_ok = false;
-                self.status = "已删除全盘索引计划任务(下次启动会重新询问授权)".into();
+            _ => {
+                if let Some(tx) = &self.link_tx {
+                    let _ = tx.send(LinkCmd::Retry);
+                }
+                self.status = "索引服务在运行,正在重连…".into();
             }
-            Err(e) => self.status = format!("撤销授权失败: {e}"),
         }
     }
 
-    /// 手动「更新全盘索引」(搜索页/选项页/顶栏切换入口)。
-    /// 还没定档位 → 先弹说明窗取得同意,不背着一声不响就弹 UAC;
-    /// 档位是 task 但任务不在了(换机/搬家/被删)→ 同样回到说明窗重授。
-    #[cfg(windows)]
-    fn mft_try_start(&mut self) {
-        let grant = self.mft_grant();
-        if grant == MftGrant::Task {
-            // 任务在不在位只有查了才知道(顺带刷新缓存,选项页据此显示提示)。
-            self.mft_task_ok = self.mft_task_current();
-        }
-        if grant == MftGrant::Unasked || (grant == MftGrant::Task && !self.mft_task_ok) {
-            self.mft_open_grant();
-            return;
-        }
-        if grant == MftGrant::None {
-            // 明确选了「不更新」的人,切页面时不反复拉弹窗,只给一句指路。
-            self.status = "全盘索引已关闭(在 选项 > 常规 可改授权方式)".into();
-            return;
-        }
-        self.spawn_mft_indexer(std::time::Duration::from_millis(300));
-    }
-
-    /// 非 Windows:没有全盘索引这回事,入口只负责说明。
+    /// 非 Windows:没有索引服务这回事,入口只负责说明。
     #[cfg(not(windows))]
-    fn mft_try_start(&mut self) {
-        self.status = "全盘名字索引仅 Windows 可用(NTFS USN/MFT)".into();
+    fn svc_try_start(&mut self) {
+        self.status = "全盘快查仅 Windows 可用(NTFS USN/MFT 索引服务)".into();
     }
 
-    /// 泵索引相关事件(索引器进度/完成/计划任务注册结果 + 索引文件载入)。
-    /// 放在 update 顶层而不是快速查找视图里:人在选项页也要看得到进度和失败原因。
-    fn pump_mft_events(&mut self) {
-        #[cfg(windows)]
-        if let Some(rx) = &self.mft_rx {
+    /// 进入快速查找页时的引导判定。
+    ///
+    /// 连得上就不打扰;连不上、且用户没明确拒绝过也没勾「不再提示」,才走
+    /// [`Self::svc_try_start`] —— 意向未定时它先弹说明窗,不是直接弹 UAC。
+    #[cfg(windows)]
+    fn svc_nudge_on_search_entry(&mut self) {
+        if self.link.online || self.link_declined || self.svc_busy || self.svc_ask_grant {
+            return;
+        }
+        if self.svc_want() == SvcWant::Unasked
+            && self.store.get_setting("svc_never_ask").as_deref() == Some("1")
+        {
+            return;
+        }
+        self.svc_try_start();
+    }
+
+    /// 请求全量重建索引(选项页的手动入口)。服务异步执行,立刻回受理。
+    #[cfg(windows)]
+    fn svc_rebuild(&mut self) {
+        let Some(tx) = self.link_tx.clone() else {
+            return;
+        };
+        let _ = tx.send(LinkCmd::Rebuild(Vec::new()));
+        self.status = "已请求索引服务全量重建(进度见下方状态)".into();
+    }
+
+    /// 泵索引服务链路事件(概况 / 掉线 / 重建与装卸回执)。
+    /// 放在 update 顶层而不是快速查找视图里:人在选项页也要看得到状态和失败原因。
+    fn pump_link_events(&mut self) {
+        // 接收端先摘出来:处理途中要改 self(清缓存、重发查询),不能同时借着它。
+        let Some(rx) = self.link_rx.take() else {
+            return;
+        };
+        let mut alive = true;
+        loop {
             match rx.try_recv() {
-                Ok(MftEvent::Ready(changed)) => {
-                    self.mft_rx = None;
-                    self.mft_progress = None;
-                    // 成功即清除拒绝标记:下次启动恢复自动更新。
-                    let _ = self.store.set_setting("mft_declined", "0");
-                    if self.name_index_rx.is_some() {
-                        // 理论竞态(启动时同步载入失败引发的异步轮次还没回来):
-                        // 作废在飞轮次,改发带对账标记的新轮 —— 索引器已重写
-                        // 索引文件,等旧轮载到的是过期内容。
-                        self.name_index_rx = None;
+                Ok(LinkMsg::Up(s, svc)) => {
+                    let was_down = !self.link.online;
+                    self.link.svc = svc;
+                    self.link.apply(&s);
+                    if was_down {
+                        // 刚接上:旧缓存都是降级期间攒的,清掉重查当前输入。
+                        self.name_search_cache.clear();
+                        // 这句只在「刚接上」那一刻写一次,所以不能带条数:
+                        // 条数会随建库一直涨,写死在这儿就成了过期读数
+                        // (2026-11-05 的「2 卷 0 条」就是这么来的)。
+                        self.status =
+                            format!("全盘快查已接上索引服务:{} 卷(条数见快查页)", self.link.vols);
+                        if !self.name_query.trim().is_empty() {
+                            self.dispatch_name_search();
+                        }
                     }
-                    self.load_name_index_async(changed);
                 }
-                Ok(MftEvent::Declined(e)) => {
-                    self.mft_rx = None;
-                    self.mft_progress = None;
-                    self.mft_declined = true;
-                    let _ = self.store.set_setting("mft_declined", "1");
-                    self.status =
-                        format!("快速索引未就绪: {e}(可在快速查找页或 选项 > 常规 重新发起)");
+                Ok(LinkMsg::Down(why, svc)) => {
+                    let was_up = self.link.online;
+                    self.link.online = false;
+                    self.link.why = why.clone();
+                    self.link.svc = svc;
+                    self.link.entries = 0;
+                    self.link.vols = 0;
+                    self.link.building = 0;
+                    self.link.compat.clear();
+                    if was_up {
+                        self.name_search_cache.clear();
+                        self.status = format!("索引服务断开,已降级为逐目录扫描:{why}");
+                    }
                 }
-                Ok(MftEvent::Progress(frac, text)) => {
-                    self.mft_progress = Some((frac, text));
+                Ok(LinkMsg::Rebuild(err)) => {
+                    self.status = match err {
+                        None => "索引服务已受理全量重建".into(),
+                        Some(e) => format!("请求重建失败:{e}"),
+                    };
                 }
-                Ok(MftEvent::Installed(err)) => {
-                    self.mft_rx = None;
-                    match err {
-                        None => {
-                            if let Ok(exe) = std::env::current_exe() {
-                                let _ = self
-                                    .store
-                                    .set_setting("mft_task_exe", exe.to_string_lossy().as_ref());
+                Ok(LinkMsg::Service(op, err)) => {
+                    self.svc_busy = false;
+                    // 「停止/启动」只是运维动作(换二进制、让磁盘歇口),
+                    // 不代表用户不想要全盘快查 —— 别把它记成拒绝授权。
+                    let state_only = matches!(op, "停止" | "启动");
+                    if state_only {
+                        self.status = match (&err, op) {
+                            (None, "停止") => "索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动".into(),
+                            (None, _) => "索引服务已启动,正在重连…".into(),
+                            (Some(e), _) => format!("{op}索引服务未完成:{e}(可在 选项 > 常规 重试)"),
+                        };
+                    } else {
+                        match err {
+                            None => {
+                                self.link_declined = false;
+                                let _ = self.store.set_setting("svc_declined", "0");
                             }
-                            self.mft_task_ok = true;
-                            self.status = "全盘索引计划任务已注册,以后启动不再弹授权框".into();
-                            self.spawn_mft_indexer(std::time::Duration::from_millis(200));
-                        }
-                        Some(e) => {
-                            // 注册没成就别把档位留在 task,否则每次启动都白跑。
-                            let _ = self
-                                .store
-                                .set_setting("mft_grant", MftGrant::Unasked.as_setting());
-                            self.mft_task_ok = false;
-                            self.mft_progress = None;
-                            self.mft_open_grant();
-                            self.status = format!("全盘索引授权未完成: {e}");
+                            Some(e) => {
+                                // 装不成就别把意向留在"要",否则每次启动都白跑一趟 UAC。
+                                let _ = self.store.set_setting("svc_wanted", "");
+                                self.link_declined = true;
+                                let _ = self.store.set_setting("svc_declined", "1");
+                                self.status = format!("索引服务未完成:{e}(可在 选项 > 常规 重试)");
+                            }
                         }
                     }
                 }
-                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Empty) => break,
+                // 链路线程不会先于 App 退出;真断了就不放回,免得每帧空转。
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    self.mft_rx = None;
+                    alive = false;
+                    break;
                 }
             }
         }
-        if let Some(rx) = &self.name_index_rx {
-            if let Ok(r) = rx.try_recv() {
-                self.name_index_rx = None;
-                let catchup = self.name_index_catchup;
-                self.name_index_catchup = false;
-                match r {
-                    Ok(idx) => {
-                        let n: usize = idx.vols.iter().map(|v| v.count()).sum();
-                        self.status = format!("全盘名字索引就绪:{} 卷 {n} 条", idx.vols.len());
-                        // 缓存失效 + 在输的查询立即重发(dispatch 走后台线程)。
-                        self.on_name_index_ready(idx);
-                        if catchup {
-                            self.mft_catchup_scan();
-                        }
-                    }
-                    Err(e) => {
-                        self.status = format!("名字索引加载失败: {e}");
-                    }
-                }
-            }
+        if alive {
+            self.link_rx = Some(rx);
         }
     }
 
-    /// 即输即搜:把当前输入交给后台检索线程(毫秒级内存查询,不挡 UI)。
-    /// 命中缓存直接回显;空输入清空结果。换档/重扫后缓存自动失效。
+    /// 即输即搜:把当前输入交给后台检索线程(走管道问索引服务,不挡 UI)。
+    /// 命中缓存直接回显;空输入清空结果。换档/服务重连后缓存自动失效。
     fn dispatch_name_search(&mut self) {
         let q = self.name_query.trim().to_string();
         if q.is_empty() {
             self.name_results.clear();
-            self.name_stats.clear();
             self.search_inflight = false;
             return;
         }
-        let Some(idx) = self.name_index.clone() else {
-            // 索引未就绪:搜索页有进度提示,这里不发请求。
-            return;
-        };
         let key = (q.clone(), self.name_class as u8);
         if let Some((hits, ms)) = self.name_search_cache.get(&key) {
-            // 缓存即时回显(命中列先出);仍照发一次后台请求 —— 打字途中被
-            // abort 掉的 stats 只有这条路能补齐,重跑本身毫秒级。
             self.name_results = hits.clone();
             self.name_search_ms = *ms;
         }
         self.search_gen += 1;
-        // 通知检索线程:代数前进,在跑的 stat 阶段可以放弃。
-        self.search_abort
-            .store(self.search_gen, std::sync::atomic::Ordering::Relaxed);
         if let Some(tx) = &self.search_tx {
             let _ = tx.send(SearchReq {
                 gen: self.search_gen,
                 q,
                 class: self.name_class,
-                idx,
             });
             self.search_inflight = true;
         }
@@ -2140,17 +2488,18 @@ impl App {
     fn pump_search(&mut self, ctx: &egui::Context) {
         // —— 检索结果:同代才收,过期代直接丢 ——
         if let Some(rx) = &self.search_rx {
-            let mut hits: Option<(u64, Vec<crate::nameidx::SearchHit>, f64)> = None;
-            let mut stats: Option<(u64, Vec<Option<(u64, i64)>>)> = None;
+            let mut hits: Option<(u64, Vec<NameRow>, f64)> = None;
+            let mut down: Option<(u64, String)> = None;
             while let Ok(resp) = rx.try_recv() {
                 match resp {
                     SearchResp::Hits { gen, hits: h, ms } => hits = Some((gen, h, ms)),
-                    SearchResp::Stats { gen, stats: s } => stats = Some((gen, s)),
+                    SearchResp::Down { gen, why } => down = Some((gen, why)),
                 }
             }
             if let Some((gen, h, ms)) = hits {
                 if gen == self.search_gen {
-                    // 进查询缓存(查重输入零成本回显)。
+                    self.search_inflight = false;
+                    // 进查询缓存(重复输入零成本回显)。
                     let q = self.name_query.trim().to_string();
                     if !q.is_empty() {
                         let key = (q, self.name_class as u8);
@@ -2171,18 +2520,12 @@ impl App {
                     ctx.request_repaint();
                 }
             }
-            if let Some((gen, s)) = stats {
+            if let Some((gen, why)) = down {
                 if gen == self.search_gen {
-                    // stats 与当代 hits 等长同序;失败条目(None)不进缓存。
-                    for (hit, st) in self.name_results.iter().zip(s) {
-                        if let Some((size, ctime)) = st {
-                            if self.name_stats.len() >= 4096 {
-                                self.name_stats.clear();
-                            }
-                            self.name_stats.insert(hit.path.clone(), (size, ctime));
-                        }
-                    }
                     self.search_inflight = false;
+                    self.name_results.clear();
+                    // 链路状态由链路线程维护,这里只落一句用户看得懂的原因。
+                    self.link.why = why;
                     ctx.request_repaint();
                 }
             }
@@ -2219,80 +2562,98 @@ impl App {
         }
     }
 
-    /// 索引快照到手(启动载入/重扫完成)后统一做的事:缓存失效 + 重查。
-    fn on_name_index_ready(&mut self, idx: crate::nameidx::IndexFile) {
-        self.name_index = Some(std::sync::Arc::new(idx));
-        self.name_search_cache.clear();
-        self.name_stats.clear();
-        if !self.name_query.trim().is_empty() {
-            self.dispatch_name_search();
-        }
-    }
-
-    /// 索引器增量保鲜后,用新索引对监听根做一次对账重扫。
+    /// 降级横幅:索引服务连不上时说清楚「少了什么、为什么、怎么办」。
     ///
-    /// 缺口:关机期间新建的文件不在启动扫描吃的旧快照里(MFT 快路定位不到
-    /// 它们),watch 基线又把它们当存量 —— 不补这一步,它们要等下次重启
-    /// 才进图库。未变文件走指纹快路,实际代价只有毫秒级枚举 + 新文件的
-    /// EXIF 管线。删除对账不在此做(与启动扫描同口径,事件路径才删行)。
-    fn mft_catchup_scan(&mut self) {
-        if self.scan_busy.load(Ordering::SeqCst) {
-            // 启动扫描还在跑:挂起,扫描结果泵里补发(忙时入队只惠及下次启动)。
-            self.mft_catchup_armed = true;
-            return;
+    /// 方案 P0-4 要求连接失败必须明示降级 —— 静默退化成"搜不到东西"最坑人:
+    /// 用户会以为盘上真没有这个文件。图库侧的发现/保鲜另有 walkdir + watch
+    /// 兜底(方案 P4-30),这里丢的只是"全盘按名字快查"这一项能力。
+    fn svc_degraded_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::win::ServiceState as S;
+        let svc = self.link.svc;
+        let why = self.link.why.clone();
+        let busy = self.svc_busy;
+        let head = match svc {
+            S::NotInstalled => "全盘快查未启用(索引服务未安装)",
+            S::Stopped => "索引服务已停止",
+            S::Transition(_) => "索引服务正在启动…",
+            S::Running => "索引服务在运行,但连不上它的管道",
+        };
+        ui.horizontal(|ui| {
+            // ⚠ 字形默认字体里没有,用橙色加粗文字代替图标(项目里同口径)。
+            ui.label(egui::RichText::new(head).color(egui::Color32::from_rgb(230, 145, 56)).strong());
+        });
+        ui.small("现在只有图库里的照片能按文件名查;全盘文件与文件夹的查找、以及未导入目录的实时发现都不可用。");
+        if !why.is_empty() {
+            ui.small(egui::RichText::new(format!("原因:{why}")).weak());
         }
-        let roots = self.store.list_watched();
-        if !roots.is_empty() {
-            self.start_scan_roots_ext(roots, "索引增量对账", true);
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            #[cfg(windows)]
+            {
+                let label = match svc {
+                    S::NotInstalled => "安装索引服务…",
+                    S::Stopped | S::Transition(_) => "重新安装并启动服务…",
+                    S::Running => "重试连接",
+                };
+                if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
+                    self.link_declined = false;
+                    let _ = self.store.set_setting("svc_declined", "0");
+                    if svc == S::Running {
+                        if let Some(tx) = &self.link_tx {
+                            let _ = tx.send(LinkCmd::Retry);
+                        }
+                    } else {
+                        self.svc_try_start();
+                    }
+                }
+                if busy {
+                    ui.spinner();
+                    ui.small("等待你在 UAC 授权窗口点「是」…");
+                }
+            }
+            #[cfg(not(windows))]
+            ui.small("全盘快查仅支持 Windows(NTFS USN/MFT)。");
+        });
+        if matches!(svc, S::Stopped | S::Transition(_)) {
+            ui.small("服务是「自动启动」的:停在这里通常是被手动停过或上次启动失败,重装一次即可恢复。");
         }
     }
 
     /// 快速查找视图(自绘 CentralPanel:任意文件/文件夹结果列表)。
     fn search_ui(&mut self, ctx: &egui::Context) {
-        // 索引器/索引载入事件已在 update 顶层统一泵(见 pump_mft_events),这里只画。
+        // 索引服务链路事件已在 update 顶层统一泵(见 pump_link_events),这里只画。
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("快速查找");
-            ui.small("全盘文件名索引(NTFS USN/MFT;授权一次后由计划任务静默更新)");
+            // A9:三层数据必须标来源。名字/路径/大小/日期这一路走 L1(服务内存里的
+            // 文件名索引,不经 SQLite);图库条件查询走 L2;派生列只可能来自 L3。
+            // 只有「图库」这一列是 L2 的投影,由服务批量查库后随命中一起回。
+            ui.small(
+                "结果来自 L1 内存文件名索引(NTFS USN/MFT;由常驻索引服务维护,安装一次后开机自动更新)\
+                 —— 名字、路径、大小、修改日期都在这里查,不经图库数据库;「图库」一列取自 L2。\
+                 要按拍摄时间、相机、评分等条件查,请用图库搜索(走 L2 SQL)。",
+            );
             ui.separator();
 
-            if self.name_index.is_none() {
-                if self.mft_rx.is_some() || self.name_index_rx.is_some() {
-                    // 索引器在跑:进度条 + 报告里的实时文案
-                    // (原来那串滚动计数只看得见黑控制台框,现在进界面)。
-                    let prog = self.mft_progress.clone();
-                    match &prog {
-                        Some((frac, text)) => {
-                            ui.add(
-                                egui::ProgressBar::new(*frac)
-                                    .text(text.clone())
-                                    .animate(true),
-                            );
-                        }
-                        None => {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.label("正在准备全盘名字索引…(首次约几秒,期间可先浏览图库)");
-                            });
-                        }
-                    }
-                }
-                if self.mft_declined {
-                    ui.label(
-                        "全盘索引不可用(授权被取消或索引器失败),仅图库内现有照片可按文件名查。",
-                    );
-                    if ui.button("重新发起全盘索引").clicked() {
-                        self.mft_declined = false;
-                        let _ = self.store.set_setting("mft_declined", "0");
-                        #[cfg(windows)]
-                        self.mft_try_start();
-                    }
-                } else if self.mft_rx.is_none() && self.name_index_rx.is_none() {
-                    // 没在跑也没索引 = 档位是「不更新」或还没授权:给个手动入口。
-                    #[cfg(windows)]
-                    if ui.button("启用全盘索引…").clicked() {
-                        self.mft_open_grant();
-                    }
-                }
+            // 服务连不上 = 全盘快查没有数据源:明示降级(方案 P0-4),本页只剩说明。
+            // 图库内照片仍可从顶栏的图库搜索查(那条路走 SQL,与这里无关)。
+            if !self.link.online {
+                self.svc_degraded_ui(ui);
+                return;
+            }
+            if self.link.building > 0 {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(format!(
+                        "索引服务正在建库({} 卷进行中),已建好 {} 条 —— 可以先搜,结果会越查越全",
+                        self.link.building, self.link.entries
+                    ));
+                });
+            }
+            for (letter, why) in self.link.compat.clone() {
+                ui.small(format!("{letter}: 盘走兼容扫描,无实时快查({why})"));
+            }
+            if self.link.entries == 0 {
+                ui.label("索引还是空的:服务正在扫第一轮全盘,建好后这里自动可用。");
                 return;
             }
 
@@ -2330,15 +2691,17 @@ impl App {
                 .column(egui_extras::Column::auto())
                 .column(egui_extras::Column::auto())
                 .column(egui_extras::Column::auto())
+                .column(egui_extras::Column::auto())
                 .header(26.0, |mut h| {
-                    for title in ["文件名称", "路径", "大小", "创建时间", "预览"] {
+                    for title in ["文件名称", "路径", "大小", "修改时间", "图库", "预览"] {
                         h.col(|ui| {
                             ui.strong(title);
                         });
                     }
                 })
                 .body(|mut body| {
-                    for h in &results {
+                    for r in &results {
+                        let h = &r.hit;
                         body.row(64.0, |mut row| {
                             row.set_selected(self.name_sel.as_deref() == Some(h.path.as_str()));
                             row.col(|ui| {
@@ -2348,16 +2711,34 @@ impl App {
                                 ui.small(&h.path);
                             });
                             row.col(|ui| {
-                                match self.name_stats.get(&h.path) {
-                                    Some((size, _)) => ui.label(fmt_size(*size)),
-                                    None => ui.label("…"),
-                                };
+                                // size/mtime 由服务随命中一起回,不再逐条 stat。
+                                if h.is_dir {
+                                    ui.label("");
+                                } else {
+                                    ui.label(fmt_size(r.size));
+                                }
                             });
                             row.col(|ui| {
-                                match self.name_stats.get(&h.path) {
-                                    Some((_, ctime)) => ui.label(fmt_ctime(*ctime)),
-                                    None => ui.label("…"),
+                                ui.label(fmt_mtime(r.mtime));
+                            });
+                            row.col(|ui| {
+                                // 快查看得见全盘,图库只收作用域内的媒体 —— 这一列把
+                                // 「搜到了为什么网格里没有」讲明白(方案 P4-29)。
+                                let label = r.rich_label();
+                                let why = match i32::from(r.rich_state) {
+                                    crate::db::RICH_OUT => {
+                                        "已在图库数据库里,但它所在的目录未纳入派生作用域:\
+                                         不生成缩略图与元数据。点进该目录、在「工具 → \
+                                         文件夹管理器」里添加它,或在网格里点开这张图,\
+                                         就会开始生成。"
+                                    }
+                                    crate::db::RICH_PENDING => "已纳入范围,派生还没跑到这一条。",
+                                    crate::db::RICH_DONE => "已纳入范围并完成派生,网格里能看到。",
+                                    crate::db::RICH_BAD => "文件读取失败(损坏或无权限),已隔离,不再重试。",
+                                    _ if r.hit.is_dir => "文件夹不进图库。",
+                                    _ => "不是图库收录的媒体类型,或还没被扫描入库。",
                                 };
+                                ui.label(label).on_hover_text(why);
                             });
                             row.col(|ui| {
                                 // 缩略图按需异步解码(未入库文件走纯路径入口)。
@@ -2435,13 +2816,126 @@ impl App {
     fn busy(&self) -> bool {
         self.scan_busy.load(Ordering::Relaxed)
             || self.pending_thumbs > 0
-            || self.mft_rx.is_some()
-            || self.name_index_rx.is_some()
+            // 装卸索引服务要等 UAC + 提权子进程(最长 120s),这期间算"在忙"。
+            || self.svc_busy
             || self.export_rx.is_some()
     }
 
     /// 「查看选项」里的壳目录快捷键(参考件 Desktop / My Docs / My Pictures / My Computer):
     /// 目录已在图库里 → 跳到该文件夹页;没导入 → 只给提示,不擅自扩扫描范围。
+    /// 进入一个目录(方案 P3-19 点击懒加载 + P3-20 可见优先)。
+    ///
+    /// 库里早已收录、但没落在派生作用域里的目录,点进来才补一条 `clicked`
+    /// 账,并把该目录 `rich_state=0` 的行置 1 —— 眼前的图先清晰。
+    /// 同时把该目录交给后台 worker 当"可见目录"(排序键)。
+    ///
+    /// 这一句只服务**导航帧**:点完树/列表立刻点名这个目录,不必等它被画到屏幕上
+    /// 的那一帧才进优先队列。网格自己的可见清单在帧首整批发(见 `update`)。
+    fn enter_dir(&mut self, dir: &str) -> bool {
+        let ok = self.include_dir(dir, crate::db::INTENT_CLICKED, crate::db::SRC_CLICK);
+        if ok {
+            self.publish_visible(dir);
+        }
+        ok
+    }
+
+    /// 把目录交给后台 worker 当「可见目录」(派生排序的第一优先键)。
+    ///
+    /// worker 那边是**整表替换**,所以导航时只发这一个目录;网格攒出一整帧的清单
+    /// 后在帧首发一批(`update` 里),逐目录发会把前面刚上屏的目录挤出优先。
+    fn publish_visible(&self, dir: &str) {
+        if dir.is_empty() {
+            return;
+        }
+        if let Some(w) = &self.thumb_bg {
+            w.publish_visible(vec![dir.to_string()]);
+        }
+    }
+
+    /// 记下「这一帧画在屏幕上的这个目录」(去重、限量)。
+    fn note_frame_dir(&mut self, dir: &str) {
+        if dir.is_empty() || self.frame_dirs.len() >= MAX_VISIBLE_DIRS {
+            return;
+        }
+        let key = crate::db::norm_dir(dir).to_ascii_uppercase();
+        if self.frame_dirs_seen.insert(key) {
+            self.frame_dirs.push(dir.to_string());
+        }
+    }
+
+    /// 屏幕上出现一张未纳入的图 → 把它的目录排进「纳入」队列(每个目录只排一次)。
+    ///
+    /// 不在渲染帧里直接写库:首屏一次可能铺开几十上百个目录,那就变成几十次
+    /// `UPDATE` + 回读,帧会被自己拖死。排队,由 `photo_grid` 每帧消化少量。
+    /// 去重键用大写归一路径(`adopt_seen`),队列里保留界面上那串原样大小写。
+    /// 队列排满时**不**登记去重(返回 false),这个目录下一帧还会再来敲门 ——
+    /// 登记了却不出队,就等于本进程永远不再纳它。
+    fn note_visible_out(&mut self, dir: &str) -> bool {
+        if dir.is_empty() || self.adopt_queue.len() >= MAX_ADOPT_QUEUE {
+            return false;
+        }
+        let key = crate::db::norm_dir(dir).to_ascii_uppercase();
+        if self.adopt_seen.contains(&key) {
+            return false;
+        }
+        self.adopt_seen.insert(key);
+        self.adopt_queue.push_back(dir.to_string());
+        true
+    }
+
+    /// 消化「看到但还没纳入」的队列:每帧最多 `max` 个目录。
+    ///
+    /// 口径与点进目录一致(写 `clicked` 账 + 放行该目录),只是账本来源记 `visible`,
+    /// 好跟用户亲手点进去的分开。可见清单不用在这里发:帧首按整帧上屏目录一次发完。
+    fn drain_adopts(&mut self, max: usize) {
+        for _ in 0..max {
+            let Some(dir) = self.adopt_queue.pop_front() else {
+                break;
+            };
+            self.include_dir(&dir, crate::db::INTENT_CLICKED, crate::db::SRC_VIEW);
+        }
+    }
+
+    /// 把一个目录纳进派生作用域并立即放行它的行(方案 P3-19)。
+    ///
+    /// 返回是否真的纳进去了。**被排除规则挡住的目录一律不写账本**(2026-11-05 拍板):
+    /// 系统目录、应用缓存、回收站不该因为用户滚到过、或点过一张图,就变成
+    /// 「以后这个目录的图都要派生」。
+    ///
+    /// 已纳过的目录不重写账本 —— 免得把用户显式设过的来源(首启对话框 /
+    /// 手动导入)冲成 click;但 `promote_dir` 照样跑一遍:并发扫描可能刚
+    /// 插进一批 `rich_state=0` 的新行。
+    fn include_dir(&mut self, dir: &str, state: &str, source: &str) -> bool {
+        if !self.store.adoptable_dir(dir) {
+            return false;
+        }
+        if !self.store.dir_intent(dir).is_some_and(|d| d.included()) {
+            let _ = self
+                .store
+                .set_dir_intent(&crate::db::DirIntent::new(dir, state, source));
+        }
+        if self.store.promote_dir(dir).unwrap_or(0) > 0 {
+            self.sync_dir_promoted(dir);
+        }
+        true
+    }
+
+    /// `promote_dir` 落库后,把库里的真相搬进内存视图。
+    ///
+    /// 网格每帧只读 `self.rows`,而这里的 `rich_state` 要等 `rebuild` 才跟库对齐 ——
+    /// 不搬这一趟,点进目录后整屏仍是「未纳入范围」的占位块,用户看到的就是
+    /// 「懒加载根本没动」。**真相一律回读库**(`Store::promoted_states`),界面不按
+    /// 排除名单自己再判一遍门:上一轮那么做,把库里早已派生完的 `AppData` 目录
+    /// 永远锁在占位块上(2026-11-05 现场)。
+    fn sync_dir_promoted(&mut self, dir: &str) {
+        let done = self.store.promoted_states(dir);
+        for (id, state) in done {
+            if let Some(&i) = self.id_row.get(&id) {
+                self.rows[i].rich_state = state;
+            }
+        }
+    }
+
     fn goto_known_dir(&mut self, dir: Option<std::path::PathBuf>, label: &str) {
         let Some(p) = dir else {
             self.status = format!("{label}:图库树只覆盖已导入的目录");
@@ -2469,6 +2963,7 @@ impl App {
                 self.folder_show_all = false;
                 self.set_view(ViewKind::Folder);
                 let p = self.folders[i].clone();
+                self.enter_dir(&p);
                 self.tree_reveal(&p);
                 self.status = format!("已定位到 {label}");
             }
@@ -2619,7 +3114,7 @@ impl App {
                     }
                 }
                 ui.separator();
-                // 四个可叠加的过滤开关(参考件 starsearch / facesearch / moviesearch / geotagsearch)。
+                // 四个可叠加的过滤开关(星标 / 人脸 / 视频 / 地理标记)。
                 // 右到左布局里后加的在左边,所以倒序添加,视觉顺序才是 星标·人物·视频·地理标记。
                 for i in (0..timeline::FILTER_BTNS.len()).rev() {
                     let (name, tip) = timeline::FILTER_BTNS[i];
@@ -2636,7 +3131,7 @@ impl App {
         });
     }
 
-    /// 「查看选项」下拉:条目与顺序照抄参考件的 View 菜单
+    /// 「查看选项」下拉:条目与顺序沿用经典图库的查看菜单
     /// (View 组 → 排序 → Sort People 组 → 壳目录快捷键 → 缩略图/树形选项)。
     fn view_options_menu(&mut self, ui: &mut egui::Ui) {
         if ui
@@ -2826,8 +3321,6 @@ impl App {
         }
         let _ = self.store.enqueue_scan(&roots, scope);
         let store = self.store.clone();
-        // MFT 快路:启动/续扫时索引已同步载入,这里再取一次快照。
-        let index = self.name_index.clone();
         let busy = self.scan_busy.clone();
         let scope_owned = scope.to_string();
         let (tx, rx) = mpsc::channel();
@@ -2839,7 +3332,10 @@ impl App {
         self.scan_verb = "扫描";
         self.status = format!("正在{}{scope}…", self.scan_verb);
         std::thread::spawn(move || {
-            let res = crate::scan::scan_dir_ctrl(&store, &roots, &ctrl, index.as_deref());
+            // L1 索引住在服务进程里(方案 P0 决策 5),UI 侧不再持有 `IndexFile`,
+            // 所以监听根的发现走 walkdir —— 这正是方案 P4-30 的口径:全盘发现与
+            // 结构入库由服务负责,监听根只是用户挑的那几个目录,walkdir 足够。
+            let res = crate::scan::scan_dir_ctrl(&store, &roots, &ctrl, None);
             let mut removed = 0usize;
             if reconcile {
                 if let Ok(s) = &res {
@@ -2974,6 +3470,10 @@ impl App {
         } else {
             s.folder.min(self.folders.len() - 1)
         };
+        // 前后导航同样算"进目录":该目录若没纳过派生作用域,这里补账。
+        if let Some(f) = self.folders.get(self.selected_folder).cloned() {
+            self.enter_dir(&f);
+        }
         if s.page == PageKind::Import && self.import_src.is_none() {
             self.set_import_source(PathBuf::from(&self.last_import_src));
         }
@@ -3221,6 +3721,9 @@ impl App {
             self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
         }
         let scope = dir.display().to_string();
+        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账(方案 P3-19)。
+        // 必须在起扫之前落 —— 扫描线程入库时读这份账本算 `rich_state`。
+        self.include_dir(&scope, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
         self.start_scan_roots(vec![dir], &scope);
     }
 
@@ -3240,6 +3743,12 @@ impl App {
             return;
         };
         let _ = self.store.upsert_watched(&dir);
+        // 用户挑中的这几张 = 它所在的目录该出缩略图(方案 P3-19)。
+        self.include_dir(
+            &dir.display().to_string(),
+            crate::db::INTENT_IMPORTED,
+            crate::db::SRC_IMPORT,
+        );
         let store = self.store.clone();
         let busy = self.scan_busy.clone();
         let scope = format!("所选 {} 张", paths.len());
@@ -3296,6 +3805,9 @@ impl App {
             self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
         }
         let scope = dir.display().to_string();
+        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账(方案 P3-19)。
+        // 必须在起扫之前落 —— 扫描线程入库时读这份账本算 `rich_state`。
+        self.include_dir(&scope, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
         self.start_scan_roots(vec![dir], &scope);
     }
 
@@ -3401,6 +3913,18 @@ impl App {
             self.status = "人脸扫描进行中…".into();
             return;
         }
+        // 模型缺失时直说怎么放,不进后台线程撞裸错误。
+        let algo = crate::faces::current_algo(&self.store);
+        if !crate::ai::face::Faces::models_present(algo) {
+            let dir = crate::ai::models_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default();
+            let (det_f, rec_f) = algo.files();
+            self.status = format!(
+                "缺少人脸模型:请将 {det_f} 与 {rec_f} 放入模型目录 {dir},获取方式见 README"
+            );
+            return;
+        }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.face_rx = Some(rx);
@@ -3429,17 +3953,16 @@ impl App {
         self.face_sugs = crate::faces::face_suggestions(&self.store, 0.55);
     }
 
-    /// 人脸算法版本检查(算法版本迁移):库中记录的版本与当前
-    /// 算法版本不一致时弹窗,建议清除旧人脸数据重扫。
+    /// 人脸算法版本检查(算法版本迁移):库中记录的版本+方案标识与当前
+    /// 不一致时弹窗,建议清除旧人脸数据重扫。
     #[cfg(feature = "ai")]
     fn check_face_algo_version(&mut self) {
+        let tag = crate::faces::algo_tag(&self.store);
         match self.store.get_setting("face_algo_version") {
             None => {
-                let _ = self
-                    .store
-                    .set_setting("face_algo_version", crate::faces::FACE_ALGO_VERSION);
+                let _ = self.store.set_setting("face_algo_version", &tag);
             }
-            Some(v) if v != crate::faces::FACE_ALGO_VERSION => {
+            Some(v) if v != tag => {
                 self.face_version_warn = true;
             }
             _ => {}
@@ -3941,7 +4464,7 @@ impl App {
             self.fx_draft = stored.merged_adjust();
         }
         ui.heading("效果");
-        // 标签页(参考件 CTabContainer:编辑面板按功能分页,不堆长列表)。
+        // 标签页(编辑面板按功能分页,不堆长列表)。
         ui.horizontal(|ui| {
             for (i, name) in ["调整", "曲线", "一键", "裁剪", "维护"].iter().enumerate() {
                 if ui.selectable_label(self.fx_tab == i, *name).clicked() {
@@ -4999,7 +5522,20 @@ impl App {
                 let cur = self.drawer_tab;
                 ui.horizontal(|ui| {
                     for t in DrawerTab::ALL {
-                        if ui.selectable_label(cur == t, t.label()).clicked() {
+                        // A9:抽屉里这几页的字段只可能来自 L3(派生层)—— EXIF、
+                        // 缩略图、标签、人物、地理都是逐条打开文件抽出来的,L1/L2 里
+                        // 没有。标注挂在页签的悬停上,不新增可见控件。
+                        if ui
+                            .selectable_label(cur == t, t.label())
+                            .on_hover_text(
+                                "来源 L3:派生数据(EXIF / 缩略图 / 标签 / 人物 / 地理),\
+                                 由图库按作用域门控逐条抽取。\
+                                 未纳入派生作用域的目录这里没有内容 ——\
+                                 点进该目录、在「工具 → 文件夹管理器」里添加它,\
+                                 或在网格里点开这张图即可纳入。",
+                            )
+                            .clicked()
+                        {
                             self.drawer_tab = t;
                             let _ = self.store.set_setting("drawer_tab", t.key());
                         }
@@ -5300,85 +5836,178 @@ impl App {
                             }
                         });
                         ui.separator();
-                        // 全盘索引(Windows 专属,快速查找的数据源):
-                        // 状态一览 + 授权策略 + 手动重新授权入口。
-                        ui.heading(egui::RichText::new("全盘索引(快速查找)").size(14.0));
-                        let idx_path = crate::db::data_dir().join("nameindex.bin");
-                        let declined =
-                            self.store.get_setting("mft_declined").as_deref() == Some("1");
-                        let status = if let Some(idx) = &self.name_index {
-                            let n: usize = idx.vols.iter().map(|v| v.count()).sum();
-                            format!("已就绪:{} 卷 {n} 条", idx.vols.len())
-                        } else if self.mft_rx.is_some() || self.name_index_rx.is_some() {
-                            "正在构建 / 载入…".to_string()
-                        } else if declined {
-                            "未授权(上次授权被拒绝或构建失败)".to_string()
-                        } else if idx_path.exists() {
-                            "索引文件在位,尚未载入".to_string()
+                        // 人脸识别方案:两套模型都支持,默认推荐 YuNet + AdaFace
+                        // (商业友好许可);antelopev2 权重不可商用,自备自用。
+                        // 切换即存;两方案的向量不通用,会触发重扫提示。
+                        #[cfg(feature = "ai")]
+                        {
+                            ui.heading(egui::RichText::new("人脸识别方案").size(14.0));
+                            let cur = crate::faces::current_algo(&self.store);
+                            for algo in [
+                                crate::ai::face::FaceAlgo::AdaFace,
+                                crate::ai::face::FaceAlgo::AntelopeV2,
+                            ] {
+                                ui.horizontal(|ui| {
+                                    if ui.radio(cur == algo, algo.label()).clicked() && cur != algo
+                                    {
+                                        let _ = self.store.set_setting("face_algo", algo.key());
+                                        self.refresh_people();
+                                    }
+                                });
+                                let (det_f, rec_f) = algo.files();
+                                let ready = if crate::ai::face::Faces::models_present(algo) {
+                                    "模型已就位".to_string()
+                                } else {
+                                    format!("缺少 {det_f} / {rec_f}(获取方式见 README)")
+                                };
+                                ui.small(format!("　{ready}"));
+                            }
+                            ui.separator();
+                        }
+                        // 全盘快查的数据源是常驻索引服务(Windows 专属):
+                        // 状态一览 + 启用意向 + 手动重建/卸载入口。
+                        ui.heading(egui::RichText::new("全盘快查(索引服务)").size(14.0));
+                        let link = self.link.clone();
+                        let svc_text = match link.svc {
+                            crate::win::ServiceState::NotInstalled => "未安装".to_string(),
+                            crate::win::ServiceState::Stopped => "已停止".to_string(),
+                            // 过渡态的原始码只给排障看,别当成确定结论。
+                            crate::win::ServiceState::Transition(c) => format!("过渡态(码 {c})"),
+                            crate::win::ServiceState::Running => "运行中".to_string(),
+                        };
+                        let status = if link.online {
+                            let mut s = format!("服务{svc_text} · {} 卷 {} 条", link.vols, link.entries);
+                            if link.building > 0 {
+                                s.push_str(&format!(" · {} 卷正在建库", link.building));
+                            }
+                            if link.dirty {
+                                s.push_str(" · 有未落盘的变更");
+                            }
+                            s.push_str(&format!(" · 已运行 {}", fmt_uptime(link.uptime)));
+                            if let Some(t) = link.seen {
+                                s.push_str(&format!(" · {} 秒前刷新", t.elapsed().as_secs()));
+                            }
+                            s
+                        } else if link.svc == crate::win::ServiceState::Running {
+                            format!("服务{svc_text},但连不上它的管道(全盘快查暂不可用)")
                         } else {
-                            "尚未构建".to_string()
+                            format!("服务{svc_text}:全盘快查不可用,发现与保鲜走逐目录扫描兜底")
                         };
                         ui.horizontal(|ui| {
                             ui.label("状态:");
                             ui.label(&status);
                         });
-                        // 进度在跑就把报告文案顶上来:停在选项页也看得出动静(替代黑框)。
-                        if let Some((frac, text)) = self.mft_progress.clone() {
-                            ui.add(egui::ProgressBar::new(frac).text(text).animate(true));
+                        if link.building > 0 {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.small(format!(
+                                    "{} 卷正在全量建库,期间快查结果可能不全",
+                                    link.building
+                                ));
+                            });
                         }
-                        let mut auto = self.store.get_setting("mft_auto_update").as_deref()
-                            != Some("0");
-                        if ui.checkbox(&mut auto, "每次启动自动更新索引").changed() {
-                            let _ = self
-                                .store
-                                .set_setting("mft_auto_update", if auto { "1" } else { "0" });
+                        for (letter, why) in &link.compat {
+                            ui.small(format!(
+                                "{letter}: 盘走兼容扫描(walkdir + 目录监听),无实时快查 —— {why}"
+                            ));
                         }
                         #[cfg(windows)]
                         {
-                            // 授权档位:一次授权(计划任务,之后静默)/ 每次单独提权 / 不做。
-                            // 计划任务在位与否用启动时缓存的 mft_task_ok 判,
-                            // 不能在这儿现查(schtasks 查询是进程调用,会卡 UI 帧)。
-                            let cur = self.mft_grant();
+                            let cur = self.svc_want();
                             ui.horizontal(|ui| {
-                                ui.label("授权方式:");
+                                ui.label("全盘快查:");
                                 if ui
-                                    .radio(matches!(cur, MftGrant::Task), "一次授权,以后静默(推荐)")
+                                    .radio(cur != SvcWant::No, "启用(推荐)")
                                     .clicked()
                                 {
-                                    self.mft_apply_grant(MftGrant::Task);
+                                    self.svc_apply_want(SvcWant::Yes);
                                 }
-                                if ui
-                                    .radio(cur == MftGrant::Once, "每次单独授权(每次都弹 UAC)")
-                                    .clicked()
-                                {
-                                    self.mft_apply_grant(MftGrant::Once);
-                                }
-                                if ui.radio(cur == MftGrant::None, "不更新").clicked() {
-                                    self.mft_apply_grant(MftGrant::None);
+                                if ui.radio(cur == SvcWant::No, "不用").clicked() {
+                                    self.svc_apply_want(SvcWant::No);
                                 }
                             });
-                            if cur == MftGrant::Unasked {
-                                ui.small("还没选过:第一次发起全盘索引时会先弹一个说明窗问你。");
-                            }
-                            if self.store.get_setting("mft_never_ask").as_deref() == Some("1") {
-                                ui.small("已勾「不再提示」:启动不再自动询问授权,点上面任一授权方式即可恢复。");
-                            }
-                            if cur == MftGrant::Task && !self.mft_task_ok {
-                                ui.small("计划任务不在了(换机或程序换了路径),点「立即更新」会重新走一次授权。");
+                            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默。");
+                            if self.store.get_setting("svc_never_ask").as_deref() == Some("1") {
+                                ui.small("已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。");
                             }
                             ui.horizontal(|ui| {
-                                if ui.button("立即更新全盘索引").clicked() {
-                                    self.mft_try_start();
-                                }
-                                if cur == MftGrant::Task && ui.button("撤销计划任务授权").clicked()
+                                if ui
+                                    .add_enabled(link.online, egui::Button::new("立即重建全盘索引"))
+                                    .clicked()
                                 {
-                                    self.mft_revoke_task();
+                                    self.svc_rebuild();
+                                }
+                                if ui
+                                    .add_enabled(link.online, egui::Button::new("立刻保存索引"))
+                                    .clicked()
+                                {
+                                    if let Some(tx) = &self.link_tx {
+                                        let _ = tx.send(LinkCmd::Flush);
+                                    }
+                                    self.status = "已请求索引服务把内存索引落盘".into();
+                                }
+                                if ui
+                                    .add_enabled(!self.svc_busy, egui::Button::new("重试连接"))
+                                    .clicked()
+                                {
+                                    if let Some(tx) = &self.link_tx {
+                                        let _ = tx.send(LinkCmd::Retry);
+                                    }
                                 }
                             });
+                            // 停与起必须成对出现:只给「停止」等于把人关在门外 ——
+                            // 停完之后只剩「卸载再重装」这一条回头路。
+                            let stoppable = link.svc == crate::win::ServiceState::Running;
+                            let startable = link.svc == crate::win::ServiceState::Stopped;
+                            if stoppable || startable {
+                                ui.horizontal(|ui| {
+                                    if stoppable
+                                        && ui
+                                            .add_enabled(
+                                                !self.svc_busy,
+                                                egui::Button::new("停止索引服务…"),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.svc_stop();
+                                    }
+                                    if startable
+                                        && ui
+                                            .add_enabled(
+                                                !self.svc_busy,
+                                                egui::Button::new("启动索引服务…"),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.svc_start();
+                                    }
+                                });
+                                ui.small(if stoppable {
+                                    "停一下服务能让程序自己腾出手来:升级、搬家或想把硬盘歇口气的时候用,索引记录都保留,在同一页点「启动」就接着跑。"
+                                } else {
+                                    "服务停着时全盘快查不可用,发现与保鲜退回逐目录扫描;索引文件都留在数据目录,启动后接着用。"
+                                });
+                            }
+                            if link.svc != crate::win::ServiceState::NotInstalled
+                                && ui
+                                    .add_enabled(!self.svc_busy, egui::Button::new("卸载索引服务…"))
+                                    .clicked()
+                            {
+                                self.svc_uninstall();
+                            }
+                            if link.svc != crate::win::ServiceState::NotInstalled {
+                                ui.small("卸载会停掉服务并删除注册项(需要一次 UAC);索引文件本身留在数据目录。");
+                            }
+                            if self.svc_busy {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.small("等待你在 UAC 授权窗口点「是」…");
+                                });
+                            }
                         }
                         #[cfg(not(windows))]
-                        ui.small("全盘索引仅支持 Windows(NTFS USN journal)。");
-                        ui.small("上次授权被取消或索引器失败时不再自动打扰;可在此或快速查找页重新发起。");
+                        ui.small("全盘快查仅支持 Windows(NTFS USN journal)。");
+                        ui.small("服务装卸失败后不再自动打扰;可在此或快速查找页重新发起。");
                         ui.separator();
                         // 数据目录:防 C 盘写满 —— 库/索引/模型整体迁走。
                         ui.heading(egui::RichText::new("数据目录").size(14.0));
@@ -5418,7 +6047,55 @@ impl App {
                         ui.small(
                             "更改后,数据库/全盘索引/模型在下次启动时复制到新目录(原目录文件保留);本会话继续用原目录。",
                         );
-                        ui.small("缩略图缓存不随迁(可再生),需要时用 MALIANG_CACHE_DIR 单独指定。");
+                        ui.small(
+                            "索引服务认的是安装时记下的数据目录;改过目录后要先「卸载索引服务…」再重新安装,它才会跟着搬。",
+                        );
+                        ui.separator();
+                        // 缩略图缓存:库搬到大盘时缓存跟着走,不再默默写系统盘。
+                        ui.heading(egui::RichText::new("缩略图缓存").size(14.0));
+                        let cdir = crate::db::cache_dir();
+                        let sdir = crate::db::system_cache_dir();
+                        ui.small(cdir.to_string_lossy().to_string());
+                        ui.small(if cdir == sdir {
+                            "在系统缓存目录;数据目录迁走后会自动跟随新数据目录。"
+                        } else {
+                            "跟随数据目录(可用 MALIANG_CACHE_DIR 单独指定)。"
+                        });
+                        // 整树遍历有成本:按 2 秒时间片采样,不每帧重算。
+                        let fresh = match self.cache_usage {
+                            Some((_, _, at)) => at.elapsed().as_secs_f32() < 2.0,
+                            None => false,
+                        };
+                        if !fresh {
+                            let (files, bytes) = crate::db::tree_usage(&cdir);
+                            self.cache_usage =
+                                Some((files, bytes, std::time::Instant::now()));
+                        }
+                        if let Some((files, bytes, _)) = self.cache_usage {
+                            ui.small(format!("{files} 个文件 · {}", fmt_size(bytes)));
+                        }
+                        // 旧位置还有东西就提供一次性的搬运(可再生,但省一轮重解)。
+                        if cdir != sdir && crate::db::system_cache_has_content() {
+                            if ui.button("把旧缓存搬过来").clicked() {
+                                match crate::db::migrate_cache_from(&sdir) {
+                                    Ok((0, _)) => {
+                                        self.status =
+                                            "旧缓存无新内容可搬(目标目录已是最新)".into();
+                                    }
+                                    Ok((n, cleared)) => {
+                                        self.status = format!(
+                                            "已搬动 {n} 个缓存文件{}",
+                                            if cleared { "" } else { "(旧目录尚有占用中的文件)" }
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status = format!("缓存迁移失败: {e}");
+                                    }
+                                }
+                                // 搬完立刻重采,别让面板显示旧数字。
+                                self.cache_usage = None;
+                            }
+                        }
                         ui.separator();
                         ui.small("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。");
                         ui.small("索引备份 / 压缩在「工具 > 图库维护」里。");
@@ -5440,8 +6117,8 @@ impl App {
                         }
                     }
                     _ => {
-                        // 幻灯片(参考件 Slideshow:LoopSlideshow;间隔常量
-                        // SlideshowEffectTime 的数值暂无对应资料,默认 3 秒)。
+                        // 幻灯片放映:原版同样提供循环开关与间隔设置;
+                        // 间隔的具体数值暂无对应资料,默认 3 秒。
                         let mut itv = self
                             .store
                             .get_setting("slideshow_interval")
@@ -5479,7 +6156,7 @@ impl App {
         if !self.slide_pause {
             let elapsed = self.slide_last.elapsed().as_secs_f64();
             if elapsed >= interval {
-                // 不循环时放到尾张即退出(参考件 LoopSlideshow)。
+                // 不循环时放到尾张即退出(与原版行为一致)。
                 let last = *ids.last().unwrap();
                 if !self.slide_loop && self.preview == Some(last) {
                     self.slideshow = false;
@@ -5634,8 +6311,12 @@ impl App {
         // 这条路径对应缩略图滚动事件
         // (唯一走缩略图质心位移算法质心算法的事件,滚动事件处理)。
         let vel = self.scroll_throttle.feed_offset(offset_y, content_h);
-        self.thumb_decode_budget =
-            crate::scroll::decode_budget(vel, self.last_viewport_h.max(1.0) as f64);
+        // 张数口径 → 字节口径:大档一张就是 4MB,只按张数限流会让 UI 卡死(方案 P4-23③)。
+        self.thumb_decode_budget = crate::scroll::decode_budget_for(
+            vel,
+            self.last_viewport_h.max(1.0) as f64,
+            self.thumb_tier.bytes(),
+        );
         self.last_scroll_y = offset_y;
         // 滚动停了(传 0 复位)→ 限速器复位。
         if vel == 0.0 {
@@ -5695,6 +6376,33 @@ impl App {
                 self.watched = self.store.watched_stats();
             }
             Err(e) => self.status = format!("移除失败: {e}"),
+        }
+    }
+
+    /// 强制刷新缩略图(方案 P3-21 的 `force_thumb_update` 偏好)。
+    ///
+    /// 先落偏好再动手:动作中途进程被杀,下次启动还能补做完。
+    /// 账本里每个目录挂失效位 → 子树全部退回待派生(含已派生与坏文件 ——
+    /// 用户明确要求刷新时坏文件也该再试一次)→ 清位销账。
+    fn force_thumb_update(&mut self) {
+        let _ = self.store.set_setting("force_thumb_update", "1");
+        let dirs = self.store.mark_all_dirs_needs_refresh().unwrap_or(0);
+        let rows = self.store.refresh_pending_dirs().unwrap_or(0);
+        let _ = self.store.set_setting("force_thumb_update", "0");
+        self.rebuild();
+        self.status = format!("{dirs} 个目录 / {rows} 行已退回待派生,后台正在重出缩略图");
+    }
+
+    /// 启动时续做上次没跑完的强制刷新(偏好还挂着 = 上次中途退出)。
+    fn resume_force_thumb_update(&mut self) {
+        if self.store.get_setting("force_thumb_update").as_deref() != Some("1") {
+            return;
+        }
+        let _ = self.store.mark_all_dirs_needs_refresh();
+        let rows = self.store.refresh_pending_dirs().unwrap_or(0);
+        let _ = self.store.set_setting("force_thumb_update", "0");
+        if rows > 0 {
+            self.status = format!("上次未完成的强制刷新已续做:{rows} 行退回待派生");
         }
     }
 
@@ -6090,6 +6798,7 @@ impl App {
                     Some(fi) => {
                         self.selected_folder = fi;
                         self.folder_show_all = false;
+                        self.enter_dir(&path);
                         self.tree_reveal(&path);
                     }
                     // 中间层目录本身没有照片:点名字即展开/收起,不当作选中。
@@ -6210,6 +6919,7 @@ impl App {
             // 只在点击时反查一次左栏槽位(逐帧扫 folders 列表没必要)。
             if let Some(slot) = self.folders.iter().position(|f| f == folder) {
                 self.selected_folder = slot;
+                self.enter_dir(folder);
                 self.tree_reveal(folder);
             }
             self.set_view(ViewKind::Folder);
@@ -6234,6 +6944,9 @@ impl App {
     /// P1-9:缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)。
     /// 列数按格子大小反推,保证一行铺满可用宽度。
     fn photo_grid(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
+        // 显示优先:先把屏幕上排队等纳入的目录消化掉几个(写账 + 放行 + 交给后台优先派生),
+        // 再画格子。渲染帧不一次写几十个目录的账,所以有上限。
+        self.drain_adopts(MAX_ADOPT_PER_FRAME);
         let tier = self.thumb_tier;
         let cell = tier.size() as f32;
         // 列数:按卡片外框(图片 + 4px 内边距×2)与间距反推,保证一行铺满。
@@ -6249,6 +6962,10 @@ impl App {
         // 依旧落在原来的位置;若占位段结尾就是整个网格,得多退一次间距,
         // 否则内容总高会比真实值多出一个 gap。
         let clip = ui.clip_rect();
+        // 方案 P4-23④:预取带 —— 视口上下各留这么高的一段,里面的行不建 widget,
+        // 但会用当帧**剩余**的解码配额把纹理先暖进缓存(滚动时少闪一帧占位块)。
+        let band = (card_outer + gap) * PREFETCH_ROWS as f32;
+        let ctx = ui.ctx().clone();
         ui.push_id(salt, |ui| {
             ui.spacing_mut().item_spacing.y = gap;
             // 逐行维护虚拟坐标:跳过的行不建 widget,光标不会前移,
@@ -6269,8 +6986,12 @@ impl App {
                 let row_h = card_outer + cap;
                 if y + row_h < clip.min.y || y > clip.max.y {
                     // 整行在视口外:记进占位高度,这一帧不建行。
+                    let near = y + row_h + band >= clip.min.y && y <= clip.max.y + band;
                     hidden += row_h + gap;
                     y += row_h + gap;
+                    if near {
+                        self.prefetch_row(&ctx, chunk);
+                    }
                     continue;
                 }
                 if hidden > 0.0 {
@@ -6289,6 +7010,36 @@ impl App {
                 ui.add_space(hidden - gap);
             }
         });
+    }
+
+    /// 预取一行的缩略图纹理(方案 P4-23④)。
+    ///
+    /// 用的是当帧**剩余**的解码配额:真正可见的格子先吃配额,预取只捡剩下的,
+    /// 所以它永远不会把可见格子挤成占位块。快速滚动时配额被限速器压到 0
+    /// ([`crate::scroll::decode_budget_for`]),预取自然「丢弃过期请求」——
+    /// 队列是当帧同步消费的,不留跨帧的陈旧请求。
+    fn prefetch_row(&mut self, ctx: &egui::Context, chunk: &[usize]) {
+        for &i in chunk {
+            if self.thumb_decode_count >= self.thumb_decode_budget {
+                return;
+            }
+            // 未纳入/已立案的行不吃这一帧的配额,也不 `mark_pending`(那是
+            // 「磁盘还没有,交给后台生成」的语义);排队纳入后它们自己会回到正常路径。
+            let rich = self.rows[i].rich_state;
+            if rich == crate::db::RICH_OUT || rich == crate::db::RICH_BAD {
+                continue;
+            }
+            let id = self.rows[i].id;
+            if self.texs.has(id) || self.texs.is_pending(id) {
+                continue;
+            }
+            self.thumb_decode_count += self.thumb_tier.bytes();
+            match thumb_tex(ctx, id, self.thumb_tier) {
+                Some(t) => self.texs.put(id, t),
+                // 磁盘上还没有 → 交给后台 worker 生成(与可见格子同一套语义)。
+                None => self.texs.mark_pending(id),
+            }
+        }
     }
 
     /// 照片右键上下文菜单(参照 Picasa 图片菜单的常用项)。
@@ -6398,6 +7149,24 @@ impl App {
             self.confirm_remove = true;
             ui.close();
         }
+        // 坏文件出口(方案 P3-22,对齐经典图库坏图清单的
+        // Hide / Don't Hide):立过案的文件不再每轮重试,这里给两个方向的开关。
+        let p = self.rows[idx].path.clone();
+        if self.store.is_bad_media(&p) {
+            if ui.button("不隐藏此文件(重试缩略图)").clicked() {
+                self.status = match self.store.unmark_bad_media(&p) {
+                    Ok(()) => format!("已销案,重新排队派生:{p}"),
+                    Err(e) => format!("销案失败: {e}"),
+                };
+                ui.close();
+            }
+        } else if ui.button("隐藏此文件(不再重试缩略图)").clicked() {
+            self.status = match self.store.mark_bad_media(&p, "用户手动隐藏") {
+                Ok(()) => format!("已隐藏,不再重试:{p}"),
+                Err(e) => format!("隐藏失败: {e}"),
+            };
+            ui.close();
+        }
         // 属性(参考件右键菜单含属性项,置于末项;未开预览时属性窗取选中项)。
         if ui.button("属性…").clicked() {
             let id = self.rows[idx].id;
@@ -6412,28 +7181,48 @@ impl App {
         let id = self.rows[idx].id;
         let star0 = self.rows[idx].star != 0;
         let selected = self.sel.contains(&id);
-        let tex = match self.texs.get(id) {
-            Some(t) => Some(t),
-            None if self.texs.is_pending(id) => None, // 后台正在生成,先占位
-            None => {
-                // P1-9:滚动限速 —— 本帧解码配额已用尽时,跳过同步解码,
-                // 只画灰色占位块(下一帧再补)。滚动越快配额越小 → 滚动不掉帧。
-                // 注意:此处**不能** mark_pending(那是"磁盘上还没有、交给后台生成"
-                // 的语义),否则已落盘的缩略图会被误判为待生成而不再加载。
-                if self.thumb_decode_count >= self.thumb_decode_budget {
-                    None
-                } else {
-                    self.thumb_decode_count += 1;
-                    // 只从落盘的该档缩略图读(绝不重解码原图)。
-                    match thumb_tex(ui.ctx(), id, self.thumb_tier) {
-                        Some(t) => {
-                            self.texs.put(id, t.clone());
-                            Some(t)
-                        }
-                        None => {
-                            // 磁盘上还没有 → 交给后台 worker 生成,本帧先显示占位块。
-                            self.texs.mark_pending(id);
-                            None
+        // 方案 P4-29:派生状态决定占位文案,也决定要不要去要缩略图。
+        // RICH_OUT(未纳入作用域)/ RICH_BAD(已立案失败)这两类在本帧磁盘上还没有
+        // 缩略图,不能进「交给后台生成」那条路 —— 那是白跑一趟解码再失败一次,
+        // 还会把滚动配额吃掉。(RICH_OUT 只是**这一帧**的状态:下面的排队纳入会让
+        // 它在下一帧变成待派生,显示优先。)
+        let rich = self.rows[idx].rich_state;
+        let no_derive = rich == crate::db::RICH_OUT || rich == crate::db::RICH_BAD;
+        // 显示优先(2026-11-05 拍板):屏幕上出现过的目录决定后台派生的先后;
+        // 屏幕上出现一张还没纳入的图,它的目录当场排队纳入 —— 用户看到的是图,
+        // 不是作用域账本。排队后要自己把下一帧叫回来:站着不滚动时 egui 不重绘,
+        // 队列就会空等。
+        let dir = self.rows[idx].parent.clone();
+        self.note_frame_dir(&dir);
+        if rich == crate::db::RICH_OUT && self.note_visible_out(&dir) {
+            ui.ctx().request_repaint();
+        }
+        let tex = if no_derive {
+            None
+        } else {
+            match self.texs.get(id) {
+                Some(t) => Some(t),
+                None if self.texs.is_pending(id) => None, // 后台正在生成,先占位
+                None => {
+                    // P1-9:滚动限速 —— 本帧解码配额已用尽时,跳过同步解码,
+                    // 只画灰色占位块(下一帧再补)。滚动越快配额越小 → 滚动不掉帧。
+                    // 注意:此处**不能** mark_pending(那是"磁盘上还没有、交给后台生成"
+                    // 的语义),否则已落盘的缩略图会被误判为待生成而不再加载。
+                    if self.thumb_decode_count >= self.thumb_decode_budget {
+                        None
+                    } else {
+                        self.thumb_decode_count += self.thumb_tier.bytes();
+                        // 只从落盘的该档缩略图读(绝不重解码原图)。
+                        match thumb_tex(ui.ctx(), id, self.thumb_tier) {
+                            Some(t) => {
+                                self.texs.put(id, t.clone());
+                                Some(t)
+                            }
+                            None => {
+                                // 磁盘上还没有 → 交给后台 worker 生成,本帧先显示占位块。
+                                self.texs.mark_pending(id);
+                                None
+                            }
                         }
                     }
                 }
@@ -6488,10 +7277,20 @@ impl App {
                 crate::theme::IMAGE_RADIUS,
                 crate::theme::p().placeholder,
             );
+            // 占位文案按派生状态分三种(方案 P4-29):
+            // RICH_OUT 是「作用域门挡住了」,**不是失败**,必须写成占位而不是错误;
+            // RICH_BAD 才是真的读不出来。小档格子(96px)放不下长句,退成短版,
+            // 全称挂在悬停上。
+            let ph = match rich {
+                crate::db::RICH_OUT if cell >= 100.0 => "未纳入派生作用域",
+                crate::db::RICH_OUT => "未纳入范围",
+                crate::db::RICH_BAD => "读取失败",
+                _ => "载入中…",
+            };
             ui.painter().text(
                 img_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "载入中…",
+                ph,
                 egui::FontId::proportional(11.0),
                 crate::theme::p().faint,
             );
@@ -6508,6 +7307,20 @@ impl App {
         }
         // 星标悬浮在缩略图右上角(常驻显示已加星,悬停才露出空心星)。
         let hit = ui.interact(rect, egui::Id::new(("thumb-hit", id)), egui::Sense::click());
+        // 占位格的悬停给全称与出路;正常格不挂(避免翻格子时到处弹提示)。
+        let hit = if no_derive {
+            hit.on_hover_text(if rich == crate::db::RICH_BAD {
+                "这张照片读取失败(文件损坏或无权限),已记入坏文件台账并隔离,不再重试。\
+                 在「工具 → 图库维护 → 坏文件台账…」里可以看明细或整批销案。"
+            } else {
+                "这张照片所在的目录未纳入派生作用域:图库收了它的名字与路径,\
+                 但不生成缩略图、不抽 EXIF —— 这是门控,不是失败。\
+                 点一下这张图(或点进它所在的目录)就会开始生成;\
+                 排除名单里的目录(系统目录、应用缓存、回收站一类)不会。"
+            })
+        } else {
+            hit
+        };
         thumb_star(ui, id, star0, img_rect, hovered, &mut star_clicked);
         let ring = if selected {
             crate::theme::p().accent
@@ -6539,6 +7352,19 @@ impl App {
             );
         }
         if hit.clicked() {
+            // 点到这张图 = 用户已经明确表态「我要看它」:作用域外的目录当场纳入。
+            // 但**排除名单里的目录不写账本**(系统目录 / 应用缓存 / 回收站),这种情况
+            // 给一句准话,而不是让人对着永远不亮的格子反复点。
+            // RICH_BAD 不走这条路 —— 那是已立案的读取失败,再点一次也不会好。
+            if self.rows[idx].rich_state == crate::db::RICH_OUT {
+                let dir = self.rows[idx].parent.clone();
+                if !self.enter_dir(&dir) {
+                    self.status = format!(
+                        "{dir} 属于排除名单(系统目录、应用缓存、回收站一类),图库不为它生成缩略图;\
+                         要收进来请在「工具 → 文件夹管理器」里调整「扫描时排除的目录」。"
+                    );
+                }
+            }
             if ctrl_click(ui) {
                 if !self.sel.remove(&id) {
                     self.sel.insert(id);
@@ -6903,13 +7729,24 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // P1-9:每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
         self.thumb_decode_count = 0;
-        // 全盘索引事件(进度 / 完成 / 计划任务注册结果)在顶层泵:人在哪个页面
-        // 都收得到,不要求停在快速查找页。索引在途时每 200ms 自刷一帧,进度条才动。
-        self.pump_mft_events();
-        // 即输即搜的回流(命中结果 / size·创建时间 / 缩略图)每帧非阻塞泵。
+        // 显示优先(2026-11-05 拍板):上一帧真正画在屏幕上的目录整批发给后台 worker
+        // 当第一优先 —— 用户看哪儿,缩略图就先补哪儿。在帧首发是为了拿得到「上一帧
+        // 的完整清单」:网格分多个 section 画,帧尾没有自然的收口点。
+        if !self.frame_dirs.is_empty() {
+            if let Some(w) = &self.thumb_bg {
+                w.publish_visible(self.frame_dirs.clone());
+            }
+        }
+        self.frame_dirs.clear();
+        self.frame_dirs_seen.clear();
+        // 索引服务链路事件(概况 / 掉线 / 装卸回执)在顶层泵:人在哪个页面
+        // 都收得到,不要求停在快速查找页。
+        self.pump_link_events();
+        // 即输即搜的回流(命中结果 / 搜索行缩略图)每帧非阻塞泵。
         self.pump_search(ctx);
-        if self.mft_rx.is_some() || self.name_index_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        // 服务在途(装/卸等 UAC)或正在建库时自刷一帧,状态行与指示灯才动。
+        if self.svc_busy || self.link.building > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
         }
         // 预览过程发现原文件已消失 → 先在 UI 构建前移出图库,
         // 保证本帧后续按行索引取数据时不会读到已删行。
@@ -6959,11 +7796,6 @@ impl eframe::App for App {
                     }
                 };
                 self.rebuild();
-                // 索引增量对账被这次扫描压着:现在补发。
-                if self.mft_catchup_armed {
-                    self.mft_catchup_armed = false;
-                    self.mft_catchup_scan();
-                }
             }
         }
         // P1-13:设备热插拔事件("置刷新标志 + 触发刷新")。
@@ -7573,15 +8405,8 @@ impl eframe::App for App {
                             .clicked()
                         {
                             self.set_view(ViewKind::Search);
-                            // 首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
                             #[cfg(windows)]
-                            if self.name_index.is_none()
-                                && self.mft_rx.is_none()
-                                && self.name_index_rx.is_none()
-                                && !crate::db::data_dir().join("nameindex.bin").exists()
-                            {
-                                self.mft_try_start();
-                            }
+                            self.svc_nudge_on_search_entry();
                             ui.close();
                         }
                         if ui
@@ -7629,7 +8454,7 @@ impl eframe::App for App {
                             }
                         });
                         ui.separator();
-                        // 参考件的四种排序是同一层菜单项(不套子菜单),顺序照抄。
+                        // 四种排序是同一层菜单项(不套子菜单),顺序沿用经典布局。
                         for s in timeline::SortBy::ALL {
                             if ui.selectable_label(self.sort_by == s, s.label()).clicked() {
                                 self.sort_by = s;
@@ -7772,6 +8597,17 @@ impl eframe::App for App {
                                 self.clean_missing();
                                 ui.close();
                             }
+                            // 方案 P3-21:目录级失效的用户出口。
+                            if ui.button("重建全部缩略图").clicked() {
+                                self.force_thumb_update();
+                                ui.close();
+                            }
+                            // 方案 P3-22:坏文件台账(整批销案在这里)。
+                            if ui.button("坏文件台账…").clicked() {
+                                self.bad_media_rows = self.store.bad_media();
+                                self.show_bad_media = true;
+                                ui.close();
+                            }
                             if ui
                                 .add_enabled(
                                     self.maint_rx.is_none(),
@@ -7869,15 +8705,8 @@ impl eframe::App for App {
                         } else {
                             self.set_view(ViewKind::Search);
                             self.dispatch_name_search();
-                            // 首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
                             #[cfg(windows)]
-                            if self.name_index.is_none()
-                                && self.mft_rx.is_none()
-                                && self.name_index_rx.is_none()
-                                && !crate::db::data_dir().join("nameindex.bin").exists()
-                            {
-                                self.mft_try_start();
-                            }
+                            self.svc_nudge_on_search_entry();
                         }
                     }
                 });
@@ -7889,7 +8718,15 @@ impl eframe::App for App {
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("共 {} 张", self.rows.len()));
+                    ui.label(format!("共 {} 张", self.rows.len()))
+                        // A9:图库视图是 L2(SQLite)的结果,与顶部整条快速查找(L1
+                        // 内存文件名索引)不是同一条路 —— 标出来,免得两处张数对不上时
+                        // 用户以为是丢图。
+                        .on_hover_text(
+                            "来源 L2:图库数据库(SQLite photos 表)。\
+                             星级、人物、视频、地理标记等条件过滤都在这一层查;\
+                             顶部的全盘快速查找走的是另一条路(L1 内存文件名索引)。",
+                        );
                     // 过滤开着时必须说清"这是过滤后的张数",否则看起来像丢图。
                     if !self.filters.is_none() {
                         ui.label("(视图过滤中)");
@@ -8001,15 +8838,10 @@ impl eframe::App for App {
                     };
                     if ui.selectable_label(active, text).clicked() && !active {
                         self.set_view(v);
-                        // 快速查找:首次进入且没有任何索引在途/落盘 → 立即发起(带 UAC)。
+                        // 快速查找:服务连不上就顺势引导启用(意向未定时先弹说明窗)。
                         #[cfg(windows)]
-                        if v == ViewKind::Search
-                            && self.name_index.is_none()
-                            && self.mft_rx.is_none()
-                            && self.name_index_rx.is_none()
-                            && !crate::db::data_dir().join("nameindex.bin").exists()
-                        {
-                            self.mft_try_start();
+                        if v == ViewKind::Search {
+                            self.svc_nudge_on_search_entry();
                         }
                     }
                 }
@@ -8049,6 +8881,9 @@ impl eframe::App for App {
                                     if ui.selectable_label(on, f).clicked() {
                                         self.selected_folder = i;
                                         self.folder_show_all = false;
+                                        // 平铺列表同样是「进目录」:树形那条点完会补派生账,
+                                        // 这里漏掉就让两种文件夹视图行为不一致。
+                                        self.enter_dir(f);
                                         self.tree_reveal(f);
                                     }
                                 }
@@ -8275,6 +9110,11 @@ impl eframe::App for App {
                         let models = crate::ai::available_models();
                         if models.is_empty() {
                             ui.small("模型目录还没有 .onnx 模型文件,请先放入后再索引");
+                            ui.small(
+                                crate::ai::models_dir()
+                                    .map(|d| format!("模型目录:{}", d.display()))
+                                    .unwrap_or_default(),
+                            );
                         } else {
                             ui.small(format!("已装模型:{}", models.join("、")));
                         }
@@ -8429,7 +9269,25 @@ impl eframe::App for App {
                         match self.sel_cluster {
                             None => {
                                 ui.heading("人脸");
-                                ui.label("左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。");
+                                if !crate::ai::face::Faces::models_present(
+                                    crate::faces::current_algo(&self.store),
+                                ) {
+                                    let (det_f, rec_f) =
+                                        crate::faces::current_algo(&self.store).files();
+                                    ui.label(format!(
+                                        "还没有人脸模型,无法识别:请将 {det_f} 与 {rec_f} \
+                                         放入模型目录(获取方式见 README):"
+                                    ));
+                                    ui.small(
+                                        crate::ai::models_dir()
+                                            .map(|d| d.display().to_string())
+                                            .unwrap_or_default(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        "左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。",
+                                    );
+                                }
                             }
                             Some(c) => {
                                 let cells: Vec<usize> = {
@@ -8772,7 +9630,7 @@ impl eframe::App for App {
                                     self.crop_drag = None;
                                 }
                             });
-                            // 裁剪工具行:比例预设(取自参考件 AspectRatioList)+ 应用/取消。
+                            // 裁剪工具行:比例预设(经典图库宽高比清单)+ 应用/取消。
                             if self.crop_mode {
                                 ui.horizontal(|ui| {
                                     ui.label("比例:");
@@ -9487,6 +10345,48 @@ impl eframe::App for App {
             self.show_changes = open;
         }
 
+        // 坏文件台账(方案 P3-22):派生反复失败被立案的文件,不再每轮重试。
+        // 这里给整批销案的出口 —— 网格右键只能一张一张来。
+        if self.show_bad_media {
+            let mut open = self.show_bad_media;
+            egui::Window::new("坏文件台账")
+                .open(&mut open)
+                .default_width(760.0)
+                .min_height(320.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("共 {} 条", self.bad_media_rows.len()));
+                        if ui.button("刷新").clicked() {
+                            self.bad_media_rows = self.store.bad_media();
+                        }
+                    });
+                    ui.separator();
+                    if self.bad_media_rows.is_empty() {
+                        ui.label("(台账是空的 —— 派生连续失败 3 次的文件才会立案到这里)");
+                    } else {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            for b in &self.bad_media_rows {
+                                let t = format_ts(b.since);
+                                ui.monospace(t);
+                                ui.label(&b.path);
+                                ui.small(&b.reason);
+                            }
+                        });
+                    }
+                    ui.separator();
+                    ui.small("立案的文件不再自动重试缩略图。网格右键单个文件可「不隐藏」,或在这里整批销案。");
+                    if ui.button("全部销案(重新排队派生)").clicked() {
+                        let n = self.bad_media_rows.len();
+                        for b in std::mem::take(&mut self.bad_media_rows) {
+                            let _ = self.store.unmark_bad_media(&b.path);
+                        }
+                        self.rebuild();
+                        self.status = format!("已销案 {n} 条,后台会重新尝试派生");
+                    }
+                });
+            self.show_bad_media = open;
+        }
+
         // P3-ui:属性窗口(原版 File > Properties 等价物)。
         if self.show_props {
             self.props_ui(ctx);
@@ -9599,7 +10499,7 @@ impl eframe::App for App {
                             ui.add_space(6.0);
                             ui.heading("Relyto.Maliang");
                             ui.label(format!(
-                                "版本 {} · Rust + egui 重写的 Picasa 风格本地图库",
+                                "版本 {} · Rust + egui 编写的本地照片管理应用",
                                 env!("CARGO_PKG_VERSION")
                             ));
                             ui.label("全本地、无联网;文件夹优先,绝不复制或移动原图。");
@@ -9608,7 +10508,7 @@ impl eframe::App for App {
                     ui.separator();
                     ui.label("功能:全盘扫描索引 / 时间线 / 文件夹 / 彩色标签 / 重复检测 / GPS 地理标记(KML)/ 文件夹管理器 / 索引备份与压缩 / 烘焙保存 / 导出 / WiFi 导入 / OCR / 人脸分类");
                     ui.label("人脸:质量评分、半自动命名建议、忽略簇、算法版本迁移(见 视图 > 人脸)。");
-                    ui.label("菜单结构参照 Picasa 3(文件 / 编辑 / 视图 / 工具 / 帮助)。");
+                    ui.label("经典五栏菜单(文件 / 编辑 / 视图 / 工具 / 帮助)。");
                     ui.separator();
                     ui.heading("更新日志");
                     egui::ScrollArea::vertical()
@@ -9695,7 +10595,7 @@ impl eframe::App for App {
                     let excl = crate::scan::Exclusions::from_store(&self.store);
                     ui.separator();
                     ui.label("扫描时排除的目录");
-                    ui.small("对齐 Picasa 3 的目录排除规则;可增删自定义项。");
+                    ui.small("系统目录、应用缓存、回收站一类不会被收录;可在这里增删规则。");
                     let mut to_remove: Option<String> = None;
                     egui::ScrollArea::vertical()
                         .max_height(120.0)
@@ -9716,6 +10616,15 @@ impl eframe::App for App {
                                 });
                             }
                         });
+                    // 本程序自己写缩略图的目录:它按完整路径排除,不属于上面那张
+                    // 名字表,也没有「移除」—— 用户搬了缓存位置,这里跟着变。
+                    let own = excl.own_prefixes().to_vec();
+                    if !own.is_empty() {
+                        ui.small("以下目录由本程序自己写入,始终不会收录:");
+                        for p in own {
+                            ui.small(p.display().to_string());
+                        }
+                    }
                     if let Some(rm) = to_remove {
                         self.remove_exclude_dir(&rm);
                     }
@@ -9792,16 +10701,14 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button("清除并重新扫描").clicked() {
                             let _ = crate::faces::wipe_faces(&self.store);
-                            let _ = self
-                                .store
-                                .set_setting("face_algo_version", crate::faces::FACE_ALGO_VERSION);
+                            let tag = crate::faces::algo_tag(&self.store);
+                            let _ = self.store.set_setting("face_algo_version", &tag);
                             self.face_version_warn = false;
                             self.start_face_scan();
                         }
                         if ui.button("保留旧数据").clicked() {
-                            let _ = self
-                                .store
-                                .set_setting("face_algo_version", crate::faces::FACE_ALGO_VERSION);
+                            let tag = crate::faces::algo_tag(&self.store);
+                            let _ = self.store.set_setting("face_algo_version", &tag);
                             self.face_version_warn = false;
                         }
                     });
@@ -9809,16 +10716,15 @@ impl eframe::App for App {
             self.face_version_warn = open;
         }
 
-        // 全盘索引授权说明窗:动手之前先讲清楚要干什么、要什么权限、能不能撤,
+        // 索引服务授权说明窗:动手之前先讲清楚要干什么、要什么权限、能不能撤,
         // 取得同意再发起(UAC 是系统安全桌面,不会有这些上下文,所以在这里说)。
         #[cfg(windows)]
-        if self.mft_ask_grant {
-            let mut open = self.mft_ask_grant;
-            let mut decided: Option<MftGrant> = None;
+        if self.svc_ask_grant {
+            let mut open = self.svc_ask_grant;
+            let mut decided: Option<SvcWant> = None;
             // 系统对话框式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
-            // 推荐档绿底,其余两档浅蓝/深蓝递进。
+            // 推荐档绿底,拒绝档深蓝。
             const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
-            const GRANT_BLUE_LIGHT: egui::Color32 = egui::Color32::from_rgb(0x4E, 0x9A, 0xD2);
             const GRANT_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x5F, 0x8A);
             egui::Window::new("启用全盘快速查找")
                 .title_bar(false)
@@ -9844,12 +10750,12 @@ impl eframe::App for App {
                         egui::pos2(hdr.right() - 20.0, hdr.center().y),
                         egui::vec2(28.0, 28.0),
                     );
-                    let x = ui.interact(x_rect, ui.id().with("mft-grant-x"), egui::Sense::click());
+                    let x = ui.interact(x_rect, ui.id().with("svc-grant-x"), egui::Sense::click());
                     // ✕ 字符默认字体缺字形,直接画两笔叉更稳。
                     let xc = x_rect.center();
                     let xr = 5.0;
                     let x_stroke = egui::Stroke::new(
-                        if x.hovered() { 2.2 } else { 1.6 },
+                        if x.hovered() { 2.2_f32 } else { 1.6_f32 },
                         egui::Color32::WHITE,
                     );
                     ui.painter().line_segment(
@@ -9865,19 +10771,21 @@ impl eframe::App for App {
                     }
                     ui.add_space(14.0);
                     ui.label("「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。");
-                    ui.label("读卷日志属于管理员级操作,所以需要你点一次 UAC。这一步只做这些事:");
-                    ui.indent("mft_grant_what", |ui| {
-                        ui.label("· 只读文件名与父目录关系,不读文件内容、不改任何文件;");
+                    ui.label("读卷日志属于管理员级操作,所以要装一个后台服务来干这件事 —— 这需要你点一次 UAC。");
+                    ui.indent("svc_grant_what", |ui| {
+                        ui.label("· 服务名 RelytoMaliangIndex,开机自动启动,只在本机跑;");
+                        ui.label("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;");
                         ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
-                        ui.label("· 不联网、不上传,随时可以在 选项 > 常规 撤销。");
+                        ui.label("· 界面本身不提权:它通过本地命名管道向服务问结果;");
+                        ui.label("· 不联网、不上传,随时可以在 选项 > 常规 卸载。");
                     });
                     ui.add_space(14.0);
-                    // 三档三色:按钮定宽对齐,说明文字跟在右侧,行距拉开。
+                    // 两档:按钮定宽对齐,说明文字跟在右侧,行距拉开。
                     ui.horizontal(|ui| {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("一次授权,以后静默(推荐)")
+                                    egui::RichText::new("安装并启动服务(推荐)")
                                         .color(egui::Color32::WHITE)
                                         .strong(),
                                 )
@@ -9887,34 +10795,16 @@ impl eframe::App for App {
                             )
                             .clicked()
                         {
-                            decided = Some(MftGrant::Task);
+                            decided = Some(SvcWant::Yes);
                         }
-                        ui.small("注册一个计划任务:只有这次弹 UAC,以后启动自动增量更新,不再问。");
+                        ui.small("只有这次弹 UAC。装好后开机自启、持续保鲜索引,以后不再问。");
                     });
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui
                             .add(
                                 egui::Button::new(
-                                    egui::RichText::new("每次都单独授权")
-                                        .color(egui::Color32::WHITE),
-                                )
-                                .fill(GRANT_BLUE_LIGHT)
-                                .min_size(egui::vec2(200.0, 30.0))
-                                .corner_radius(6),
-                            )
-                            .clicked()
-                        {
-                            decided = Some(MftGrant::Once);
-                        }
-                        ui.small("不注册任务,但每次启动都要点一次 UAC(Windows 不提供\"记住同意\")。");
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("不用全盘索引").color(egui::Color32::WHITE),
+                                    egui::RichText::new("不用全盘快查").color(egui::Color32::WHITE),
                                 )
                                 .fill(GRANT_BLUE_DARK)
                                 .min_size(egui::vec2(200.0, 30.0))
@@ -9922,31 +10812,31 @@ impl eframe::App for App {
                             )
                             .clicked()
                         {
-                            decided = Some(MftGrant::None);
+                            decided = Some(SvcWant::No);
                         }
-                        ui.small("跳过:快速查找只查图库里的照片,以后可在 选项 > 常规 改。");
+                        ui.small("跳过:查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 常规 改。");
                     });
                     ui.add_space(14.0);
-                    ui.checkbox(&mut self.mft_never_ask, "不再提示");
-                    ui.small("嫌每次启动都问就勾上:选「不用全盘索引」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
+                    ui.checkbox(&mut self.svc_never_ask, "不再提示");
+                    ui.small("嫌每次启动都问就勾上:选「不用全盘快查」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
                 });
-            let checked = self.mft_never_ask;
+            let checked = self.svc_never_ask;
             if let Some(g) = decided {
                 match g {
-                    // 没勾「不再提示」的拒绝不算决定:不落档位,下次启动继续问。
-                    MftGrant::None if !checked => {
-                        self.mft_ask_grant = false;
-                        self.mft_declined = false;
-                        let _ = self.store.set_setting("mft_declined", "0");
+                    // 没勾「不再提示」的拒绝不算决定:不落意向,下次启动继续问。
+                    SvcWant::No if !checked => {
+                        self.svc_ask_grant = false;
+                        self.link_declined = false;
+                        let _ = self.store.set_setting("svc_declined", "0");
                         self.status =
-                            "本次跳过全盘索引,下次启动会再问(勾选「不再提示」可免打扰)。".into();
+                            "本次跳过全盘快查,下次启动会再问(勾选「不再提示」可免打扰)。".into();
                     }
                     g => {
-                        self.mft_apply_grant(g);
-                        if matches!(g, MftGrant::None) && checked {
-                            let _ = self.store.set_setting("mft_never_ask", "1");
+                        self.svc_apply_want(g);
+                        if matches!(g, SvcWant::No) && checked {
+                            let _ = self.store.set_setting("svc_never_ask", "1");
                             self.status =
-                                "已选「不再提示」:以后启动不再询问全盘索引授权(入口仍在,随时可启用)。"
+                                "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。"
                                     .into();
                         }
                     }
@@ -9955,12 +10845,72 @@ impl eframe::App for App {
                 // 直接关窗口 = 还没决定:保持「未问过」,下次启动再问一次;
                 // 勾了「不再提示」则尊重,落库后启动不再弹。
                 if !open && checked {
-                    let _ = self.store.set_setting("mft_never_ask", "1");
+                    let _ = self.store.set_setting("svc_never_ask", "1");
                     self.status =
-                        "已选「不再提示」:以后启动不再询问全盘索引授权(入口仍在,随时可启用)。"
-                            .into();
+                        "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。".into();
                 }
-                self.mft_ask_grant = open;
+                self.svc_ask_grant = open;
+            }
+        }
+
+        // 首启范围对话框(方案 P3-18):两档单选、**无取消**。
+        // 作用域必须答一次 —— 空账本下派生门谁都不放行,网格全是占位。
+        if self.scope_ask {
+            let mut decided: Option<InitialScope> = None;
+            const SCOPE_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
+            egui::Window::new("选择照片范围")
+                .title_bar(false)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .default_width(580.0)
+                .show(ctx, |ui| {
+                    // 标题条不画关闭钮:这一窗不给跳过,答完就落账。
+                    let (hdr, _) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 36.0),
+                        egui::Sense::hover(),
+                    );
+                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), SCOPE_GREEN);
+                    ui.painter().text(
+                        egui::pos2(hdr.center().x, hdr.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "选择照片范围",
+                        egui::FontId::proportional(17.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.add_space(14.0);
+                    ui.label("整台电脑的文件名都会收进索引 —— 那一步不读文件内容,很快。");
+                    ui.label("下面这一档只决定**哪些目录要出缩略图、读拍摄信息**,不影响能不能搜到。");
+                    ui.add_space(12.0);
+                    ui.radio_value(&mut self.scope_choice, InitialScope::Complete, "全盘");
+                    ui.indent("scope_complete_why", |ui| {
+                        ui.small("所有磁盘上的图都出缩略图。补齐在后台慢慢跑,眼前的目录优先。");
+                    });
+                    ui.add_space(6.0);
+                    ui.radio_value(&mut self.scope_choice, InitialScope::Limited, "只常用目录");
+                    ui.indent("scope_limited_why", |ui| {
+                        ui.small("只给「我的文档 / 我的图片 / 桌面」出缩略图。别处的图照样在库里、照样搜得到,点进那个目录时再补。");
+                    });
+                    ui.add_space(14.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("确定").color(egui::Color32::WHITE).strong(),
+                                )
+                                .fill(SCOPE_GREEN)
+                                .min_size(egui::vec2(120.0, 30.0))
+                                .corner_radius(6),
+                            )
+                            .clicked()
+                        {
+                            decided = Some(self.scope_choice);
+                        }
+                        ui.small("以后可在 选项 > 常规 改。");
+                    });
+                });
+            if let Some(c) = decided {
+                self.apply_initial_scope(c, true);
             }
         }
 

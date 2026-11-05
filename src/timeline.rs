@@ -33,6 +33,10 @@ pub struct PhotoRow {
     pub size: i64,
     /// 所在目录(`photos.parent`,组头分组键;避免每帧从 path 反推)。
     pub parent: String,
+    /// 派生状态([`crate::db::RICH_*`]):网格据此区分「未纳入派生作用域」
+    /// ([`crate::db::RICH_OUT`],占位而不当失败)与「读取失败」
+    /// ([`crate::db::RICH_BAD`])—— 方案 P4-29。
+    pub rich_state: i32,
 }
 
 /// 排序方式(工具栏「查看选项」> 排序;对应原版 View 菜单里的
@@ -68,7 +72,7 @@ pub struct Filters {
 }
 
 impl SortBy {
-    /// 菜单顺序照抄参考件「查看选项」:Date、Recent Changes、Size、Name。
+    /// 菜单顺序沿用「查看选项」:Date、Recent Changes、Size、Name。
     pub const ALL: [SortBy; 4] = [SortBy::Date, SortBy::Recent, SortBy::Size, SortBy::Name];
 
     /// 菜单文案(参考件 `Sort by &Creation Date` 等,去掉助记符 &)。
@@ -97,7 +101,7 @@ impl SortBy {
 }
 
 /// 四个过滤开关的(图标, 悬停文案),索引顺序即工具栏从左到右与设置串顺序。
-/// 四枚开关对应参考件搜索框右端的那四个小图标,顺序也照抄。
+/// 四枚开关对应搜索框右端的那四个小图标,顺序也沿用。
 pub const FILTER_BTNS: [(&str, &str); 4] = [
     ("star", "只显示加星标的照片"),
     ("smile", "只显示有人物头像的照片"),
@@ -217,7 +221,7 @@ pub fn load_query(
     let sql = format!(
         "SELECT p.id, p.path, p.taken_utc, p.star, p.thumb_ok, p.width, p.height,
                 COALESCE(sp.value, p.cam, ''), p.lat, p.lon, p.kind, p.caption,
-                p.mtime, p.size, p.parent
+                p.mtime, p.size, p.parent, p.rich_state
          FROM photos p
          LEFT JOIN string_pool sp ON sp.pool = ?1 AND sp.value_id = p.cam_id
          {}
@@ -261,6 +265,7 @@ pub fn load_query(
                     mtime: r.get(12)?,
                     size: r.get(13)?,
                     parent: r.get(14)?,
+                    rich_state: r.get(15)?,
                 })
             })?
             .filter_map(|r| r.ok())

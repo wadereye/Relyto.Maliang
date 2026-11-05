@@ -70,13 +70,79 @@ fn parse_location(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
     (data, pending)
 }
 
+/// 机器级标记:索引服务跑在 LocalSystem 下,它的「用户目录」是
+/// `C:\Windows\System32\config\systemprofile\...`,读不到登录用户写的
+/// `data.location`,于是会悄悄把全盘库建在系统盘里(2026-11-05 排查:
+/// 服务在 systemprofile 下建出 94 MB 索引 + 86 MB 库,而 UI 读的是 D 盘
+/// 那份 —— 两边各一套,图库永远看不到服务入库的元数据)。
+/// 标记放 `ProgramData` 一份,`--install-service`(提权)写、服务读。
+fn machine_marker_path() -> PathBuf {
+    machine_default_dir().join(LOCATION_FILE)
+}
+
+/// 机器级默认数据目录。**必须与账号无关**:
+/// `dirs::config_dir()` 在 Windows 上就是 `FOLDERID_RoamingAppData`
+/// (取依赖源码坐实,dirs-sys 0.5 走的是 RoamingAppData),登录用户是
+/// `C:\Users\…\AppData\Roaming`,而 LocalSystem 服务是
+/// `C:\Windows\System32\config\systemprofile\AppData\Roaming` —— 用它当
+/// 「机器级」等于什么都没修(2026-11-05 第一次尝试就是这么翻车的)。
+/// `PROGRAMDATA` 是系统级环境变量,服务和任何账号读到的都是同一个
+/// `C:\ProgramData`。
+#[cfg(windows)]
+fn machine_default_dir() -> PathBuf {
+    let base = std::env::var_os("PROGRAMDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    base.join("Relyto").join("Maliang")
+}
+
+/// 非 Windows 没有服务形态,机器级只是给用户级兜个底。
+#[cfg(not(windows))]
+fn machine_default_dir() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("Relyto").join("Maliang")
+}
+
+fn machine_marker_dir() -> Option<PathBuf> {
+    let text = std::fs::read_to_string(machine_marker_path()).ok()?;
+    parse_location(&text).0
+}
+
+/// 本进程是否以服务形态运行(只有 `--service` 入口会置起)。
+static SERVICE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 声明「本进程是常驻服务」,让数据目录走机器级默认值。
+/// 必须在任何 [`data_dir`] 调用之前执行(服务的第一个动作)。
+pub fn enter_service_mode() {
+    SERVICE_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 本进程是否以服务形态运行(只有 `--service` 入口会置起,日志与诊断用)。
+pub fn service_mode() -> bool {
+    SERVICE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 目录选取口径(纯函数,便于把优先级钉成测试):
+/// 用户标记 > 机器标记 > 按形态的默认目录。
+fn resolve_data_dir(
+    user: Option<PathBuf>,
+    machine: Option<PathBuf>,
+    as_service: bool,
+) -> PathBuf {
+    user.or(machine)
+        .unwrap_or_else(|| if as_service { machine_default_dir() } else { default_data_dir() })
+}
+
 fn marker_data_dir() -> Option<PathBuf> {
     let text = std::fs::read_to_string(default_data_dir().join(LOCATION_FILE)).ok()?;
     parse_location(&text).0
 }
 
 /// 数据目录(索引库 + 模型)。优先级:MALIANG_DATA_DIR 环境变量 >
-/// 默认目录下的 `data.location` 标记(选项页写入)> 默认目录。
+/// 用户默认目录下的 `data.location` 标记(选项页写入)>
+/// 机器级 `data.location`(装服务时写入)> 默认目录
+/// (服务形态 = ProgramData,普通进程 = 用户 AppData)。
 pub fn data_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("MALIANG_DATA_DIR") {
         if !v.is_empty() {
@@ -85,10 +151,22 @@ pub fn data_dir() -> PathBuf {
             return p;
         }
     }
-    let p = marker_data_dir()
-        .unwrap_or_else(default_data_dir);
+    let p = resolve_data_dir(marker_data_dir(), machine_marker_dir(), service_mode());
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+/// 装服务时把**当前生效的数据目录**写进机器级标记,服务起来才找得到
+/// (只有提权进程写得动 ProgramData)。
+///
+/// 没迁过目录也照写:不写的话服务会落到机器级默认值,而 UI 落在用户
+/// AppData —— 那正是本次要根治的「各建一套库」。多账号机器上以最后一次
+/// 装服务的人为准(装服务本身就是机器级动作)。
+pub fn sync_machine_marker() -> std::io::Result<PathBuf> {
+    let marker = machine_marker_path();
+    std::fs::create_dir_all(marker.parent().unwrap())?;
+    std::fs::write(&marker, format!("data_dir={}\n", data_dir().display()))?;
+    Ok(marker)
 }
 
 /// 选项页:设定数据目录(写 marker;`None` = 恢复默认)。
@@ -220,21 +298,177 @@ fn remove_tree_best_effort(dir: &Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// 缓存目录(缩略图)。可用 MALIANG_CACHE_DIR 覆盖。
-pub fn cache_dir() -> PathBuf {
-    if let Some(v) = std::env::var_os("MALIANG_CACHE_DIR") {
-        if !v.is_empty() {
-            let p = PathBuf::from(v);
-            let _ = std::fs::create_dir_all(&p);
-            return p;
-        }
-    }
-    let p = dirs::cache_dir()
+/// 数据目录被迁走时,缓存挂在它下面的子目录名(与 `models` / `Incoming` 同级)。
+const CACHE_SUBDIR: &str = "cache";
+
+/// 系统缓存目录下的缓存位置(未设置数据目录标记时的落点,也是历史落点)。
+/// 只算路径,不建目录 —— 它常常是「待迁移来源」,不该被顺手创建。
+pub fn system_cache_dir() -> PathBuf {
+    dirs::cache_dir()
         .unwrap_or_else(|| dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")))
         .join("Relyto")
-        .join("Maliang");
+        .join("Maliang")
+}
+
+/// 系统缓存目录里是否还留着旧缓存(给「搬过来」按钮判定用)。
+/// 只看有没有条目,不做遍历 —— 面板每帧都会问到它。
+pub fn system_cache_has_content() -> bool {
+    std::fs::read_dir(system_cache_dir())
+        .map(|mut r| r.next().is_some())
+        .unwrap_or(false)
+}
+
+/// 缓存目录解析(纯函数,不含环境变量与建目录):数据目录被 `data.location`
+/// 迁走时缓存跟着走。缩略图虽然可再生,但体量不小(全库四档可达数 GB),
+/// 不该在用户把库搬到大盘之后还继续默默写满系统盘。
+fn cache_root_for(marker: Option<&Path>, system_cache: &Path) -> PathBuf {
+    match marker {
+        Some(d) => d.join(CACHE_SUBDIR),
+        None => system_cache.to_path_buf(),
+    }
+}
+
+/// 缓存目录路径(缩略图四档),优先级与 [`cache_dir`] 完全一致,但**不建目录** ——
+/// 排除规则每索引一个文件都要问一次,顺手 `create_dir_all` 会把「查路径」
+/// 变成「改磁盘」。
+pub fn cache_dir_loc() -> PathBuf {
+    if let Some(v) = std::env::var_os("MALIANG_CACHE_DIR") {
+        if !v.is_empty() {
+            return PathBuf::from(v);
+        }
+    }
+    cache_root_for(marker_data_dir().as_deref(), &system_cache_dir())
+}
+
+/// 缓存目录(缩略图四档)。见 [`cache_dir_loc`] 的优先级,附带建目录。
+pub fn cache_dir() -> PathBuf {
+    let p = cache_dir_loc();
     let _ = std::fs::create_dir_all(&p);
     p
+}
+
+/// 本应用**自己写数据**的目录候选(纯路径,不建目录),给扫描排除规则用。
+///
+/// 要列三个而不是只列 [`cache_dir_loc`],是因为「谁在写缓存」和「谁在扫盘」
+/// 是两个进程:写缩略图的是 UI 进程(读用户级 `data.location` 标记),
+/// 做全盘发现的是常驻服务(LocalSystem 读不到用户级标记,只能读到机器级)。
+/// 少了机器级那一条,服务就会把自家缩略图当照片收进库。
+pub fn own_cache_dirs() -> Vec<PathBuf> {
+    let sys = system_cache_dir();
+    let cands = [
+        cache_dir_loc(),
+        cache_root_for(machine_marker_dir().as_deref(), &sys),
+        sys,
+    ];
+    let mut out: Vec<PathBuf> = Vec::with_capacity(cands.len());
+    for p in cands {
+        if !out.iter().any(|q| q == &p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// 一棵目录树的占用(文件数 + 字节数)。目录不存在返回 (0, 0)。
+/// 软链/重入目录不做特殊处理(缓存目录里只有普通文件)。
+pub fn tree_usage(dir: &Path) -> (usize, u64) {
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                let (f, b) = tree_usage(&entry.path());
+                files += f;
+                bytes += b;
+            }
+            Ok(_) => {
+                if let Ok(m) = entry.metadata() {
+                    files += 1;
+                    bytes += m.len();
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    (files, bytes)
+}
+
+/// 缓存迁移:把 `from`(通常是 [`system_cache_dir`])整棵搬到当前 [`cache_dir`],
+/// 已存在的文件不覆盖;全部搬成功后尽力删除来源(删不掉的留着,不影响新目录生效)。
+/// 与数据目录的 pending 迁移同构:逐文件 tmp+rename,失败即保留来源,下次再点重试。
+/// 返回 (搬动的文件数, 来源是否已清空)。
+pub fn migrate_cache_from(from: &Path) -> Result<(usize, bool)> {
+    migrate_cache_to(from, &cache_dir())
+}
+
+/// 搬运的落点版本(供测试注入目标目录)。
+fn migrate_cache_to(from: &Path, to: &Path) -> Result<(usize, bool)> {
+    if same_dir(from, to) {
+        return Ok((0, false));
+    }
+    std::fs::create_dir_all(to)?;
+    let mut moved = 0usize;
+    let mut failed = false;
+    copy_cache_missing(from, to, &mut moved, &mut failed);
+    if failed {
+        return Ok((moved, false));
+    }
+    remove_tree_best_effort(from);
+    Ok((moved, !from.exists()))
+}
+
+/// 路径等价判定:两边各 canonicalize 一次(目标不存在时退回字符串比较)。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// 递归搬运(只搬目标缺失的文件),累计搬动数/失败数。
+/// 跳过 marker 本身、`*.tmp` 与瞬态报告文件。
+fn copy_cache_missing(src: &Path, dst: &Path, moved: &mut usize, failed: &mut bool) {
+    let Ok(entries) = std::fs::read_dir(src) else {
+        *failed = true;
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s == LOCATION_FILE || name_s == "mft_report.txt" || name_s.ends_with(".tmp") {
+            continue;
+        }
+        let s = entry.path();
+        let d = dst.join(&name);
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => {
+                if std::fs::create_dir_all(&d).is_err() {
+                    *failed = true;
+                } else {
+                    copy_cache_missing(&s, &d, moved, failed);
+                }
+            }
+            Ok(_) => {
+                if d.exists() {
+                    continue;
+                }
+                let tmp = d.with_extension("moving.tmp");
+                if std::fs::copy(&s, &tmp)
+                    .and_then(|_| std::fs::rename(&tmp, &d))
+                    .is_ok()
+                {
+                    *moved += 1;
+                } else {
+                    let _ = std::fs::remove_file(&tmp);
+                    *failed = true;
+                }
+            }
+            Err(_) => *failed = true,
+        }
+    }
 }
 
 const SCHEMA: &str = r#"
@@ -266,7 +500,16 @@ CREATE TABLE IF NOT EXISTS photos (
     cam_id INTEGER,
     -- P2-17 媒体类型:0=图片,1=视频(按"是否视频"二分;
     -- 子类型对应不同解码路径,我方只有 Shell 一条,无须细分)。
-    kind INTEGER NOT NULL DEFAULT 0
+    kind INTEGER NOT NULL DEFAULT 0,
+    -- 派生状态:0=未纳入作用域,1=待派生,2=已派生,3=坏文件。
+    -- 结构列(path/size/mtime/kind)全盘都有,派生列(宽高/时间/缩略图)
+    -- 只有 1/2 的目录才有;0 与 3 在网格里都是"不派生",含义不同。
+    rich_state INTEGER NOT NULL DEFAULT 0,
+    -- 小写扩展名(不含点),从 L1 索引直接落,免逐条字符串比较。
+    ext TEXT,
+    -- L1 身份:fnv1a64("<盘符>:<FRN index>")。改名/移动时不变,
+    -- 增量落库按它 upsert(path 只是属性,不是身份)。非 NTFS/历史行为 NULL。
+    frn64 INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_utc);
 CREATE INDEX IF NOT EXISTS idx_photos_parent ON photos(parent);
@@ -360,7 +603,336 @@ CREATE TABLE IF NOT EXISTS thumb_tiers (
     tier INTEGER NOT NULL,
     PRIMARY KEY (photo_id, tier)
 );
+-- 目录意图账本:派生(缩略图/EXIF/人脸)以**目录**为记账单位 —— 全盘发现的
+-- 文件都在库里,但只有落进账本的目录才打开文件做派生。
+-- state:default_root(首启默认范围)/ imported(用户主动导入)/ clicked(点开过)/
+--        never(明确不纳入)
+-- source:initial_scan_dialog / default_shell / import / click(记账来源,可解释)
+-- needs_refresh:目录级失效位(索引版本不匹配或用户强制刷新时置 1,
+--        该目录的行整体退回待派生;对齐原版按目录重做缩略图的粒度)
+CREATE TABLE IF NOT EXISTS dir_intent (
+    path           TEXT    PRIMARY KEY,  -- 目录路径(不带结尾分隔符)
+    volume         TEXT,                 -- 卷根,如 'D:\\'(全盘索引按卷记账用)
+    frn            INTEGER,              -- 该目录的文件记录号(索引侧身份,可空)
+    state          TEXT    NOT NULL DEFAULT 'default_root',
+    source         TEXT    NOT NULL DEFAULT 'default_shell',
+    since_usn      INTEGER,              -- 纳入时的日志游标(追赶用)
+    needs_refresh  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_dir_intent_state ON dir_intent(state, needs_refresh);
+-- 坏媒体台账:解码反复失败的条目在此立案,不再每轮重试同一张坏图。
+-- 网格上给「隐藏此文件 / 不隐藏」两个出口(退出后删行放回)。
+CREATE TABLE IF NOT EXISTS bad_media (
+    path   TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    since  INTEGER NOT NULL             -- Unix 毫秒
+);
 "#;
+
+/// 一条 L1 → L2 的结构行(全盘元数据入库,**不打开文件**)。
+///
+/// 只带 photos 的结构列;派生列(宽高/拍摄时间/GPS/相机)留空,
+/// 由 L3 在作用域门控通过后另行填充。身份是 `frn64`,path 只是属性。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L1Row {
+    /// `frn64_of(letter, frn)` 的结果。
+    pub frn64: i64,
+    pub path: String,
+    pub parent: String,
+    /// 修改时间,UNIX **秒**(与 photos.mtime 现有口径一致)。
+    pub mtime: i64,
+    pub size: i64,
+    /// 0 = 图片,1 = 视频(`video::kind`)。
+    pub kind: i32,
+    /// 小写扩展名(不含点);无扩展名 None。
+    pub ext: Option<String>,
+}
+
+/// `ingest_l1_rows` 的计数(报告与测试用)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct L1Ingest {
+    pub inserted: usize,
+    pub updated: usize,
+}
+
+// ===== 派生作用域账本(方案 P3-14/17/19/21/22) =====
+
+/// `photos.rich_state`:未纳入作用域 —— 结构列齐全,派生列全空,网格里是占位。
+pub const RICH_OUT: i32 = 0;
+/// `photos.rich_state`:待派生 —— 已进门,排队等缩略图/EXIF。
+pub const RICH_PENDING: i32 = 1;
+/// `photos.rich_state`:已派生。
+pub const RICH_DONE: i32 = 2;
+/// `photos.rich_state`:坏文件 —— 已在 `bad_media` 立案,不再每轮重试。
+pub const RICH_BAD: i32 = 3;
+
+/// 派生失败多少次才立案进 `bad_media`(方案 P3-22)。
+///
+/// 沿用改造前 `thumb_fail<3` 的口径:一次失败可能只是解码器/Shell 临时抽风,
+/// 三次都失败才算这个文件真解不开。
+pub const BAD_MEDIA_THRESHOLD: i64 = 3;
+
+/// `dir_intent.state`:首启默认范围(范围对话框 / 壳目录)。
+pub const INTENT_DEFAULT_ROOT: &str = "default_root";
+/// `dir_intent.state`:用户主动导入。
+pub const INTENT_IMPORTED: &str = "imported";
+/// `dir_intent.state`:在树/网格里点开过(点击懒加载)。
+pub const INTENT_CLICKED: &str = "clicked";
+
+/// `dir_intent.source`:首次启动的范围对话框。
+pub const SRC_INITIAL_DIALOG: &str = "initial_scan_dialog";
+/// `dir_intent.source`:用户导入。
+pub const SRC_IMPORT: &str = "import";
+/// `dir_intent.source`:点击展开。
+pub const SRC_CLICK: &str = "click";
+/// 来源:滚动时出现在屏幕上(显示优先),用户没有亲手点进该目录。
+pub const SRC_VIEW: &str = "visible";
+
+/// `state` 是否属于纳入组(方案 P3-17 的第三个条件)。
+pub fn intent_included(state: &str) -> bool {
+    matches!(state, INTENT_DEFAULT_ROOT | INTENT_IMPORTED | INTENT_CLICKED)
+}
+
+/// 目录意图账本的一行。
+///
+/// 记账单位是**目录**:全盘发现的文件都在 L2 里,但只有落进账本、且状态
+/// 属于纳入组的目录,其下的行才会真的打开文件做派生。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirIntent {
+    /// 归一化目录路径(不带结尾分隔符;卷根保留 `D:\` 形式,见 [`norm_dir`])。
+    pub path: String,
+    /// 卷根,如 `D:\`。
+    pub volume: Option<String>,
+    /// 该目录在索引侧的文件记录号(可空:非 NTFS 或还没对上)。
+    pub frn: Option<i64>,
+    pub state: String,
+    pub source: String,
+    /// 纳入时的日志游标(追赶用)。
+    pub since_usn: Option<i64>,
+    /// 目录级失效位(索引 blob 版本不匹配或 `force_thumb_update` 偏好为真)。
+    pub needs_refresh: bool,
+}
+
+impl DirIntent {
+    /// 造一条待落账的意图(`path` 会归一化,`since_usn`/`needs_refresh` 取默认)。
+    pub fn new(path: &str, state: &str, source: &str) -> Self {
+        DirIntent {
+            path: norm_dir(path),
+            volume: volume_of(path),
+            frn: None,
+            state: state.to_string(),
+            source: source.to_string(),
+            since_usn: None,
+            needs_refresh: false,
+        }
+    }
+
+    pub fn included(&self) -> bool {
+        intent_included(&self.state)
+    }
+}
+
+/// 坏媒体台账的一行(方案 P3-22)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadMedia {
+    pub path: String,
+    pub reason: String,
+    /// 立案时刻,Unix 毫秒。
+    pub since: i64,
+}
+
+/// 目录路径归一化:去掉结尾分隔符,但卷根保留(`D:\` → `D:\`,不是 `D:`)。
+///
+/// 裸 `D:` 在 Win32 里是「该驱动器的当前目录」,不是卷根;账本用它当键
+/// 会让同一个卷根写出两种形式,前缀匹配随之失效。
+pub fn norm_dir(p: &str) -> String {
+    let t = p.trim_end_matches(['\\', '/']);
+    if t.is_empty() {
+        return p.to_string();
+    }
+    let b = t.as_bytes();
+    if b.len() == 2 && b[1] == b':' {
+        return format!("{t}\\");
+    }
+    t.to_string()
+}
+
+/// 从任意路径取卷根(`D:\Photos\a.jpg` → `Some("D:\\")`);无盘符前缀返回 None。
+pub fn volume_of(p: &str) -> Option<String> {
+    let b = p.as_bytes();
+    if b.len() >= 2 && b[1] == b':' {
+        Some(format!("{}\\", &p[..2]))
+    } else {
+        None
+    }
+}
+
+/// 目录意图的作用域快照:全表读一次,之后逐条判定零 IO(方案 P3-17)。
+///
+/// 判定口径 = **最长前缀命中**:一条路径的状态由覆盖它的最深那条账本决定,
+/// 这样 `never`(用户显式退出)才能盖过祖先目录的纳入 —— 否则「别扫这个
+/// 文件夹」永远关不掉。
+///
+/// 键一律大写:Windows 路径大小写不敏感,而 L1 的名字取自 MFT、壳目录取自
+/// Shell API,两边的大小写不保证一致。
+#[derive(Debug, Default, Clone)]
+pub struct ScopeMap {
+    by_upper: HashMap<String, String>,
+}
+
+impl ScopeMap {
+    pub fn load(store: &Store) -> Self {
+        let rows: Vec<(String, String)> = store.read(|conn| {
+            let mut st = match conn.prepare("SELECT path,state FROM dir_intent") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        });
+        ScopeMap {
+            by_upper: rows
+                .into_iter()
+                .map(|(p, s)| (norm_dir(&p).to_ascii_uppercase(), s))
+                .collect(),
+        }
+    }
+
+    // 只有 `ScopeGate::is_empty` 用它,而那个是测试断言用的(见下)。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.by_upper.is_empty()
+    }
+
+    /// 覆盖该目录的最深那条账本的状态;一条都不覆盖时 None(= 未纳入)。
+    pub fn state_of(&self, dir: &str) -> Option<&str> {
+        if self.by_upper.is_empty() {
+            return None;
+        }
+        let up = norm_dir(dir).to_ascii_uppercase();
+        let mut end = up.len();
+        loop {
+            if let Some(st) = self.by_upper.get(&up[..end]) {
+                return Some(st.as_str());
+            }
+            // 上溯一级:切掉最后一个分隔符之后的部分。
+            let cut = match up[..end].rfind('\\') {
+                // i==0 只可能是 UNC 的 `\\host` 前缀,再上就没有卷根可言。
+                Some(i) if i > 0 => i,
+                _ => return None,
+            };
+            let parent = &up[..cut];
+            let pb = parent.as_bytes();
+            end = if pb.len() == 2 && pb[1] == b':' {
+                // 切到 `D:` 说明上一级就是卷根 `D:\`,补回分隔符再试一次;
+                // 已经在卷根上就说明到顶了。
+                if end == cut + 1 {
+                    return None;
+                }
+                cut + 1
+            } else {
+                cut
+            };
+        }
+    }
+
+    /// 该目录(或被它覆盖的祖先)是否在派生作用域内。
+    pub fn includes(&self, dir: &str) -> bool {
+        matches!(self.state_of(dir), Some(s) if intent_included(s))
+    }
+}
+
+/// 派生门(方案 P3-17):`ext 命中媒体池 && 未被三层跳过 && dir_intent ∈ 纳入组`
+/// → `rich_state=1`,否则 `0`。
+///
+/// **不比 size、不比像素** —— 去重口径里没有第三条尺寸比较门;
+/// 「小文件没必要做」是靠目录作用域天然达成的,不是靠阈值。
+/// 判定纯用 L1 已有的列(`ext` / `parent` / `path`),零 IO。
+///
+/// 三层跳过 = 硬编码 4 条 ∪ `Exclusions`(用户设置)∪ `bad_media` 台账。
+/// 前两层已由 [`crate::scan::Exclusions::default`] 并成一份名单
+/// (`from_store` 从默认值起步,用户设置只能往上加、减不掉那 4 条),
+/// 所以这里一次目录判定就覆盖了前两层。
+#[derive(Clone)]
+pub struct ScopeGate {
+    excl: crate::scan::Exclusions,
+    scope: ScopeMap,
+    /// 台账路径(大写),第三层跳过。
+    bad: std::collections::HashSet<String>,
+}
+
+impl ScopeGate {
+    /// 读一次库,之后逐行判定都不再碰库。
+    pub fn load(store: &Store) -> Self {
+        ScopeGate {
+            excl: crate::scan::Exclusions::from_store(store),
+            scope: ScopeMap::load(store),
+            bad: store.bad_media_upper(),
+        }
+    }
+
+    /// 一条 L1 结构行的派生状态([`RICH_PENDING`] / [`RICH_OUT`])。
+    pub fn rich_state(&self, r: &L1Row) -> i32 {
+        self.rich_state_of(&r.path, &r.parent, r.ext.as_deref())
+    }
+
+    /// 与 [`ScopeGate::rich_state`] 同一条判定,入参换成散列。
+    ///
+    /// walkdir 那条发现路拿到的是 `scan::Record`(没有 `L1Row`),两边必须共用
+    /// 同一个门,否则非 NTFS 卷会整个绕过作用域(方案 P3-17 / P4-30)。
+    pub fn rich_state_of(&self, path: &str, parent: &str, ext: Option<&str>) -> i32 {
+        if self.in_scope(path, parent, ext) {
+            RICH_PENDING
+        } else {
+            RICH_OUT
+        }
+    }
+
+    /// 目录是否在派生作用域内(点击懒加载与目录级失效都拿它复核)。
+    pub fn dir_in_scope(&self, dir: &str) -> bool {
+        self.scope.includes(dir)
+    }
+
+    /// 空账本 = 谁都不派生(首启对话框还没答过时的状态)。
+    ///
+    /// 产品代码不查它(门逐行判定,空账本自然谁都不放行),留着是给
+    /// `first_run_scope_seeds_once` 那条断言用的。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn is_empty(&self) -> bool {
+        self.scope.is_empty()
+    }
+
+    fn in_scope(&self, path: &str, parent: &str, ext: Option<&str>) -> bool {
+        // ① 类型级:扩展名必须落在媒体池里。
+        let Some(ext) = ext else {
+            return false;
+        };
+        if !crate::scan::is_media_ext(ext) {
+            return false;
+        }
+        // ② 坏文件台账:立过案的不再自动派生,只有「不隐藏」出口能放行。
+        if self.bad.contains(&path.to_ascii_uppercase()) {
+            return false;
+        }
+        // ③ 目录级:排除规则 + 意图账本。
+        if self.excl.excludes_dir_path(Path::new(parent)) {
+            return false;
+        }
+        self.scope.includes(parent)
+    }
+}
+
+/// L1 身份:`fnv1a64("<盘符>:<FRN index>")`。
+///
+/// 只取 FRN 的低 48 位(index)—— 高 16 位是记录序号,文件删除后记录被重用
+/// 时它会递增,拿它当身份会让「同一个槽位的不同文件」被判成同一个。
+/// 反过来,重用意味着旧文件必然先来了一条 DELETE,行已经删掉了。
+pub fn frn64_of(letter: char, frn: u64) -> i64 {
+    let idx = frn & 0x0000_FFFF_FFFF_FFFF;
+    fnv1a64(&format!("{letter}:{idx:#x}")) as i64
+}
 
 impl Store {
     pub fn open() -> Result<Arc<Store>> {
@@ -404,6 +976,17 @@ impl Store {
         );
         // P3-ui:标题(参考件 Caption;幻灯片/属性面板/缩略图说明显示)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN caption TEXT;");
+        // 派生作用域两列:rich_state 是 L3 门控的唯一开关(0 未纳入 / 1 待派生 /
+        // 2 已派生 / 3 坏文件),ext 让小写扩展名判定不必再逐条切字符串。
+        // 旧库不带这两列,靠 ALTER 补;带默认值的 NOT NULL 列,旧行自动落 0。
+        let _ = conn
+            .execute_batch("ALTER TABLE photos ADD COLUMN rich_state INTEGER NOT NULL DEFAULT 0;");
+        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN ext TEXT;");
+        // L1 身份列:frn64 = fnv1a64("<盘符>:<FRN index>")。
+        // 改名/移动时 path 变了但 FRN 不变,所以**身份走 frn64、path 只是属性** ——
+        // 这是「path 不再是唯一键」的落地方式。没有另起 uid64 的口径:uid64 的
+        // 契约是「一经分配即不变、供外部引用」(见 backfill_uid64),换算法会毁掉它。
+        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN frn64 INTEGER;");
         // P3-ui:相簿(参考件 Album;我方相簿是照片 id 的命名集合,不移动文件)。
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS albums (
@@ -429,6 +1012,21 @@ impl Store {
              );
              CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_value ON string_pool(pool, value);",
         );
+        // 建在迁移列上的索引一律排在 ALTER 之后(同上的旧库坑)。
+        // rich_state 是派生队列的取行条件,ext 是快查的过滤条件,都要走索引。
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_photos_rich_state ON photos(rich_state);
+             CREATE INDEX IF NOT EXISTS idx_photos_ext ON photos(ext);",
+        );
+        // frn64 唯一索引 = L1 增量落库的 upsert 冲突靶。
+        // **不能**做成 partial index:`ON CONFLICT(frn64)` 只认无 WHERE 的
+        // 唯一索引,带上 `WHERE frn64 IS NOT NULL` 会直接报
+        // "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"。
+        // 历史行/非 NTFS 行的 frn64 是 NULL,而 SQLite 的唯一索引允许多个 NULL,
+        // 所以它们照样共存,仍按 path 身份走。
+        let _ = conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_frn64 ON photos(frn64);",
+        );
         // 写连接兜底等待:与异步写批/其它同步写撞车时排队而不是报 BUSY。
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
         let store = Store {
@@ -445,6 +1043,10 @@ impl Store {
         let _ = store.backfill_uid64();
         // P1-14:把旧行残留的 cam TEXT 迁移进字符串池。
         let _ = store.backfill_cam_pool();
+        // 旧行补齐小写扩展名(ext IS NULL 的行;填完条件自然不再命中)。
+        let _ = store.backfill_ext();
+        // 一次性把历史库的派生状态播种进 rich_state。
+        let _ = store.seed_rich_state_once();
         Ok(store)
     }
 
@@ -567,20 +1169,48 @@ impl Store {
         Ok(())
     }
 
-    /// 首启登记默认扫描范围(壳目录)并落标记;重复调用为空操作。
+    /// 首启范围是否已落账(方案 P3-18 的对话框只答一次)。
+    pub fn scope_initialized(&self) -> bool {
+        self.get_setting("scan_initialized").is_some()
+    }
+
+    /// 落账首启范围:批量写派生意图 + 登记监听根 + 打标记,返回首扫的根。
     ///
-    /// 对应参考件首启行为:只登记「我的文档 / 图片 / 桌面」一次,
-    /// 之后监听列表完全由用户在文件夹管理器自管。
-    /// 返回是否本次执行了登记(调用方据此决定是否发起首扫)。
-    pub fn ensure_first_run_scope(&self) -> bool {
-        if self.get_setting("scan_initialized").is_some() {
-            return false;
+    /// `complete=true` = 全盘档:每个可扫卷根各落一条 `dir_intent`,
+    /// 靠最长前缀命中覆盖整卷;否则只落三个壳目录
+    /// (我的文档 / 图片 / 桌面,**不含视频** —— 用户已拍)。
+    ///
+    /// ⚠ 这一档决定的是**派生**作用域,不是库的作用域:全盘条目照样进 L2,
+    /// 没进作用域的行结构列齐全、派生列全空,网格里是占位。
+    ///
+    /// `watched` 一律只登记壳目录:整卷挂 `ReadDirectoryChangesW` 会被系统临时
+    /// 文件的写事件刷爆,全盘的保鲜归服务的 USN 日志管(方案 P0 决策 2)。
+    pub fn apply_initial_scope(&self, complete: bool) -> Vec<PathBuf> {
+        if self.scope_initialized() {
+            return Vec::new();
         }
+        let scope_roots: Vec<PathBuf> = if complete {
+            crate::win::drive_roots()
+        } else {
+            default_roots()
+        };
+        let intents: Vec<DirIntent> = scope_roots
+            .iter()
+            .map(|r| {
+                DirIntent::new(
+                    &r.to_string_lossy(),
+                    INTENT_DEFAULT_ROOT,
+                    SRC_INITIAL_DIALOG,
+                )
+            })
+            .collect();
+        let _ = self.set_dir_intents(&intents);
         for r in default_roots() {
             let _ = self.upsert_watched(&r);
         }
+        let _ = self.set_setting("initial_scope", if complete { "complete" } else { "limited" });
         let _ = self.set_setting("scan_initialized", "1");
-        true
+        scope_roots
     }
 
     /// 监听文件夹及其照片数(含子文件夹;文件夹管理器列表面板)。
@@ -1057,10 +1687,23 @@ impl Store {
     /// 因此还要按路径边界清掉库里的子项。
     pub fn drop_missing_paths(&self, paths: &[String]) -> Result<Vec<(i64, String)>> {
         // 先按磁盘筛掉仍存在的路径(事件与重命名/回滚之间的竞态兜底)。
-        let gone: Vec<&String> = paths
+        let gone: Vec<String> = paths
             .iter()
             .filter(|p| !Path::new(p.as_str()).exists())
+            .cloned()
             .collect();
+        self.drop_paths_confirmed(&gone)
+    }
+
+    /// 精确移除一批**调用方已确认不存在**的路径的索引行,返回删除的 (id, 路径)。
+    ///
+    /// 与 [`Store::drop_missing_paths`] 的差别只在「谁做存在性复核」:那个自己
+    /// 逐个 `stat`,这个把复核交给调用方 —— 监听线程问得到 L1 索引服务时,
+    /// 一次管道往返就够了,不必再摸一遍磁盘(方案 P3-26)。
+    ///
+    /// 目录被删时事件只报目录本身(子文件不一定逐个上报),
+    /// 因此还要按路径边界清掉库里的子项。
+    pub fn drop_paths_confirmed(&self, gone: &[String]) -> Result<Vec<(i64, String)>> {
         if gone.is_empty() {
             return Ok(Vec::new());
         }
@@ -1073,7 +1716,7 @@ impl Store {
                    AND substr(path, length(?1) + 1, 1) IN ('\\', '/')",
             )?;
             let mut rows: Vec<(i64, String)> = Vec::new();
-            for p in &gone {
+            for p in gone {
                 let mut hit = Vec::new();
                 if let Ok(r) = st.query_row([p.as_str()], |r| {
                     Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -1199,6 +1842,63 @@ impl Store {
         })
     }
 
+    /// 小写扩展名(不含点);无扩展名返回 None(与 `scan` 的判定口径一致:
+    /// 比较前先 `to_ascii_lowercase`)。
+    pub fn ext_of(path: &str) -> Option<String> {
+        std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+    }
+
+    /// 旧行补齐 `photos.ext`(NULL 才补,填完自然不再命中,无需额外标记)。
+    pub fn backfill_ext(&self) -> Result<usize> {
+        let rows: Vec<(i64, String)> = self.read(|conn| {
+            let mut st = match conn.prepare("SELECT id, path FROM photos WHERE ext IS NULL") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        });
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.write(move |conn| {
+            let mut n = 0usize;
+            for (id, path) in &rows {
+                if let Some(e) = Self::ext_of(path) {
+                    conn.execute(
+                        "UPDATE photos SET ext=?2 WHERE id=?1",
+                        rusqlite::params![id, e],
+                    )?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
+    }
+
+    /// 一次性播种 `rich_state`:历史库没有作用域概念,凡是已经有普通档缩略图的行
+    /// 视为「已派生」(2),其余留 0。用 settings 标记保证只跑一次 ——
+    /// 之后 rich_state 完全由派生门控管,不能被这里的规则回写。
+    pub fn seed_rich_state_once(&self) -> Result<usize> {
+        if self.get_setting("rich_state_seeded").is_some() {
+            return Ok(0);
+        }
+        let n = self.write(|conn| {
+            conn.execute(
+                "UPDATE photos SET rich_state=2 WHERE thumb_ok=1 AND rich_state<>2",
+                [],
+            )
+            .unwrap_or(0)
+        });
+        let _ = self.set_setting("rich_state_seeded", "1");
+        Ok(n)
+    }
+
     /// 按 uid64 查照片(供外部工具按持久标识引用)。
     pub fn photo_by_uid64(&self, uid: u64) -> Option<i64> {
         self.read(move |conn| {
@@ -1211,6 +1911,118 @@ impl Store {
         })
     }
 
+    // ===== S3 item 12:L1 → L2 增量落库 =====
+
+    /// 批量把 L1 结构行写进 photos(单事务,WAL/synchronous=NORMAL)。
+    ///
+    /// 身份是 `frn64`:改名/移动命中同一行 → 只改 path/parent,星标、标签、
+    /// 说明、已派生的缩略图状态全部保住。这正是「path 不再是唯一键」的意义。
+    ///
+    /// path 上仍留着建表时的 UNIQUE(一个路径同时只可能是一个文件,这条约束
+    /// 本身没错),所以 upsert 前先摘掉「同 path、不同 frn64」的陈旧行 ——
+    /// 那必然是被删除/被覆盖的旧文件,不摘就会撞约束。
+    ///
+    /// `gate` 给定时顺手把派生门(方案 P3-17)的结果写进 `rich_state`;
+    /// 给 `None` 表示调用方不参与作用域(测试/兼容扫描),新行按未纳入落。
+    /// 冲突分支**只升不降**:门说在作用域内才可能把 0 抬到 1,已派生(2)与
+    /// 坏文件(3)由 [`Store::invalidate_dir`] / [`Store::mark_bad_media`] 管;
+    /// 文件变了(mtime 不同)则退回 1 重派生,与 `thumb_ok` 的重置同一口径。
+    pub fn ingest_l1_rows(
+        &self,
+        rows: &[L1Row],
+        gate: Option<&ScopeGate>,
+    ) -> Result<L1Ingest> {
+        if rows.is_empty() {
+            return Ok(L1Ingest::default());
+        }
+        let rows = rows.to_vec();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut ins = tx.prepare_cached(
+                "INSERT INTO photos(path,parent,mtime,size,kind,ext,frn64,uid64,rich_state)
+                 VALUES(:path,:parent,:mtime,:size,:kind,:ext,:frn64,:uid64,:rich)
+                 ON CONFLICT(frn64) DO UPDATE SET
+                   path=:path, parent=:parent, mtime=:mtime, size=:size,
+                   kind=:kind, ext=:ext,
+                   thumb_ok=CASE WHEN photos.mtime<>:mtime THEN 0 ELSE photos.thumb_ok END,
+                   dhash=CASE WHEN photos.mtime<>:mtime THEN NULL ELSE photos.dhash END,
+                   rich_state=CASE
+                     WHEN :rich<>1 THEN photos.rich_state
+                     WHEN photos.mtime<>:mtime THEN 1
+                     WHEN photos.rich_state=0 THEN 1
+                     ELSE photos.rich_state
+                   END",
+            )?;
+            let mut purge = tx.prepare_cached(
+                "DELETE FROM photos WHERE path=:path AND (frn64 IS NULL OR frn64<>:frn64)",
+            )?;
+            let mut probe = tx.prepare_cached("SELECT 1 FROM photos WHERE frn64=:frn64")?;
+            let mut out = L1Ingest::default();
+            for r in &rows {
+                // 先摘陈旧占用,再 upsert;两条都在同一事务里,失败一起回滚。
+                purge.execute(rusqlite::named_params! {
+                    ":path": r.path, ":frn64": r.frn64,
+                })?;
+                let existed = probe
+                    .exists(rusqlite::named_params! { ":frn64": r.frn64 })
+                    .unwrap_or(false);
+                // uid64 只在**新建行**时分配:它的契约是「一经分配即不变」,
+                // 冲突更新分支不碰它。
+                let uid = fnv1a64(&format!("{}|{}|{}", r.path, r.size, r.mtime)) as i64;
+                let rich = gate.map(|g| g.rich_state(r)).unwrap_or(RICH_OUT);
+                ins.execute(rusqlite::named_params! {
+                    ":path": r.path, ":parent": r.parent, ":mtime": r.mtime, ":size": r.size,
+                    ":kind": r.kind, ":ext": r.ext, ":frn64": r.frn64, ":uid64": uid,
+                    ":rich": rich,
+                })?;
+                if existed {
+                    out.updated += 1;
+                } else {
+                    out.inserted += 1;
+                }
+            }
+            drop(ins);
+            drop(purge);
+            drop(probe);
+            tx.commit()?;
+            Ok(out)
+        })
+    }
+
+    /// 按 L1 身份批量删除(FRN 消失 = 文件被删,与 path 无关)。
+    /// 返回实际删掉的行数。
+    pub fn delete_l1_frn64(&self, frn64s: &[i64]) -> Result<usize> {
+        if frn64s.is_empty() {
+            return Ok(0);
+        }
+        let frn64s = frn64s.to_vec();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut st = tx.prepare_cached("DELETE FROM photos WHERE frn64=?1")?;
+            let mut n = 0usize;
+            for f in &frn64s {
+                n += st.execute(rusqlite::params![f])?;
+            }
+            drop(st);
+            tx.commit()?;
+            Ok(n)
+        })
+    }
+
+    /// L2 已落库到的 USN(每卷一个;0 = 从未落过)。
+    /// App 关着的那段时间服务侧 journal 一直在推进;UI 起来后比对
+    /// `nameidx::journal_cursors` 与此值,把差额补进 L2。
+    pub fn l2_cursor(&self, letter: char) -> i64 {
+        self.get_setting(&format!("l1_ingest_usn_{letter}"))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// 记下 L2 已落库到的 USN。
+    pub fn set_l2_cursor(&self, letter: char, usn: i64) -> Result<()> {
+        self.set_setting(&format!("l1_ingest_usn_{letter}"), &usn.to_string())
+    }
+
     // ===== P1-14 字符串池 =====
 
     /// 把一个字符串驻留进指定池,返回池 id。
@@ -1220,6 +2032,11 @@ impl Store {
     ///
     /// 落盘时**先查 `string_pool` 的唯一索引**,命中即复用,
     /// 未命中才分配新 id 并插入 —— 这就是原版的"查重"。
+    ///
+    /// 批量落库不走这里(逐条一次写事务太慢),走 [`Store::intern_batch`]
+    /// (内存 `PoolSet` 先去重,每个唯一值只发一次 SQL);
+    /// 本函数是单条入口,产品代码里没有调用点,留给测试与工具。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn intern(&self, pool: &str, value: &str) -> Result<i64> {
         let (pool, value) = (pool.to_string(), value.to_string());
         self.write(move |conn| {
@@ -1615,96 +2432,171 @@ impl Store {
     }
 
     /// 取该档**尚未生成**的照片 id + 路径(供后台 worker 批量补齐)。
-    pub fn missing_tier(&self, tier: u8, limit: usize) -> Vec<(i64, String)> {
-        // Normal 档(1)沿用 photos.thumb_ok 作为权威标记,其余走 thumb_tiers 表。
-        let (sql, params): (&str, Vec<Box<dyn rusqlite::ToSql>>) = if tier == 1 {
-            (
-                // thumb_fail 达阈值的行不再返回:生成失败的文件(如回收站
-                // 元数据、损坏图)重试也不会成功,必须放行队列,否则 worker
-                // 每轮取回同一批,整体进度永久卡死(真实事故)。
-                "SELECT id, path FROM photos WHERE thumb_ok=0 AND thumb_fail<3 LIMIT ?1",
-                vec![Box::new(limit as i64)],
-            )
-        } else {
-            (
-                "SELECT p.id, p.path FROM photos p
-                 LEFT JOIN thumb_tiers t ON t.photo_id=p.id AND t.tier=?2
-                 WHERE t.photo_id IS NULL LIMIT ?1",
-                vec![Box::new(limit as i64), Box::new(tier as i64)],
-            )
-        };
+    ///
+    /// Normal 档(tier 1)的取行条件从「所有 `thumb_ok=0`」改成派生门放行的
+    /// `rich_state=1`(方案 P3-20):不在作用域里的行根本不进队列,而不是
+    /// 进了队列再失败。排序键是**可见优先 + 全库兜底** —— `visible` 里的目录
+    /// 先出,不足 `limit` 再用全库补齐;用户眼前的图先清晰,后台最终把整个
+    /// 作用域做完。
+    ///
+    /// 反复失败的行不再靠 `thumb_fail` 阈值过滤:达到阈值即由
+    /// [`Store::mark_bad_media`] 立案、`rich_state` 置 3 出队(方案 P3-22),
+    /// 台账才是权威,`thumb_fail` 退化成计数。
+    pub fn missing_tier(&self, tier: u8, visible: &[String], limit: usize) -> Vec<(i64, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        if tier != 1 {
+            // 其余档走 thumb_tiers 表:没有该行 = 还没生成。这些档只在用户
+            // 真点开时按需回填,不参与作用域门控。
+            return self.read(move |conn| {
+                let mut st = match conn.prepare(
+                    "SELECT p.id, p.path FROM photos p
+                     LEFT JOIN thumb_tiers t ON t.photo_id=p.id AND t.tier=?2
+                     WHERE t.photo_id IS NULL ORDER BY p.id LIMIT ?1",
+                ) {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
+                st.query_map(
+                    rusqlite::params![limit as i64, tier as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+            });
+        }
+        let mut out = self.pending_rich(visible, limit, &[]);
+        if out.len() < limit {
+            let skip: Vec<i64> = out.iter().map(|r| r.0).collect();
+            out.extend(self.pending_rich(&[], limit - out.len(), &skip));
+        }
+        out
+    }
+
+    /// `rich_state=1 AND thumb_ok=0` 的行(方案 P3-20 的取行条件)。
+    ///
+    /// `dirs` 非空时只取这些目录**直属**的行(可见优先那一趟);`skip` 里的
+    /// id 不再返回(兜底那一趟要避开已经拿到的)。SQL 与参数表一起动态拼,
+    /// 但值一律走绑定,不做字符串内插。
+    fn pending_rich(&self, dirs: &[String], limit: usize, skip: &[i64]) -> Vec<(i64, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut sql = String::from("SELECT id, path FROM photos WHERE rich_state=1 AND thumb_ok=0");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        let dirs: Vec<&String> = dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .take(64)
+            .collect();
+        if !dirs.is_empty() {
+            let mut ors = Vec::with_capacity(dirs.len());
+            for d in dirs {
+                params.push(Box::new(like_escape(&norm_dir(d))));
+                ors.push(format!("parent LIKE ?{} ESCAPE '\\'", params.len()));
+            }
+            sql.push_str(&format!(" AND ({})", ors.join(" OR ")));
+        }
+        for id in skip {
+            params.push(Box::new(*id));
+            sql.push_str(&format!(" AND id<>?{}", params.len()));
+        }
+        sql.push_str(" ORDER BY id");
+        params.push(Box::new(limit as i64));
+        sql.push_str(&format!(" LIMIT ?{}", params.len()));
         self.read(move |conn| {
-            let mut st = match conn.prepare(sql) {
+            let mut st = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            let params_ref: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-            st.query_map(params_ref.as_slice(), |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
-            .ok()
-            .map(|it| it.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            st.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         })
     }
 
-    /// 缩略图生成失败记账:失败计数 +1。
+    /// 派生失败记账:失败计数 +1,返回累计值。
     ///
-    /// 计数达 3 的行会被 `missing_tier` 跳过(防坏文件无限重试)。
-    /// 文件本身变化(mtime 更新)由扫描器重置 `thumb_ok` 走正常重试路径。
-    pub fn mark_thumb_fail(&self, id: i64) {
+    /// 计数达 [`BAD_MEDIA_THRESHOLD`] 时由调用方立案(方案 P3-22):写
+    /// `bad_media` 台账并把 `rich_state` 置 3 出队,不再每轮重试同一张坏图。
+    /// 文件本身变化(mtime 更新)由落库路径重置 `thumb_ok` 并退回待派生。
+    pub fn mark_thumb_fail(&self, id: i64) -> i64 {
         self.write(move |conn| {
             let _ = conn.execute(
                 "UPDATE photos SET thumb_fail=thumb_fail+1 WHERE id=?1",
                 rusqlite::params![id],
             );
-        });
+            conn.query_row(
+                "SELECT thumb_fail FROM photos WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0)
+        })
     }
 
-    /// 按排除规则清洗已入库的行(一次性维护,配 `--purge-excluded`)。
+    /// 中档派生完成回写:派生列 + 缩略图指纹 + 状态,一条 UPDATE 落定。
     ///
-    /// 历史版本排除规则较窄,回收站/应用数据目录的文件可能已经入库;
-    /// 这些行既出不了缩略图(多数解码失败),也占着浏览网格。
-    /// 按 `parent` 目录逐组件匹配排除名,命中即整目录删除
-    /// (关联表走外键级联)。返回删除的照片行数。
-    pub fn purge_excluded(&self, excl: &crate::scan::Exclusions) -> usize {
-        // 取出全部目录,按组件判断(目录数远小于照片数)。
-        let dirs: Vec<String> = self.read(|conn| {
-            let mut st = match conn.prepare("SELECT DISTINCT parent FROM photos") {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            st.query_map([], |r| r.get::<_, String>(0))
-                .ok()
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        });
-        let bad: Vec<String> = dirs
-            .into_iter()
-            .filter(|p| {
-                Path::new(p)
-                    .components()
-                    .filter_map(|c| match c {
-                        std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                        _ => None,
-                    })
-                    .any(|seg| excl.excludes_dir(&seg))
+    /// 发现路径不读文件内容(方案 P3-25),`width/height/taken_utc/cam_id/lat/lon/rot`
+    /// 这些派生列只由这里写;`thumb_ok` / `dhash` / `rich_state` 必须同一条语句 ——
+    /// 分开写会出现 `thumb_ok=1` 而 `rich_state` 还停在待派生的中间态,
+    /// 下一轮又被取回来重做(方案 P3-20)。
+    ///
+    /// 入参 `(id, dhash, 派生列)`;`d` 为 `None` 表示这行没有派生列可写
+    /// (只推状态)。相机型号先入池再写 id(P1-14),池化必须在事务**外**做完 ——
+    /// `intern_batch` 自身要拿连接锁,不能在 tx 内重入。
+    pub fn mark_derived(&self, rows: &[(i64, u64, Option<&crate::scan::Derived>)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let cam_items: Vec<(String, String)> = rows
+            .iter()
+            .map(|(_, _, d)| {
+                (
+                    crate::timeline::CAM_POOL.to_string(),
+                    d.and_then(|d| d.cam.as_deref()).unwrap_or_default().trim().to_string(),
+                )
             })
             .collect();
-        if bad.is_empty() {
-            return 0;
-        }
+        let has_cam: Vec<bool> = cam_items.iter().map(|(_, v)| !v.is_empty()).collect();
+        let interned = self.intern_batch(&cam_items)?;
+        let cam_ids: Vec<Option<i64>> = interned
+            .iter()
+            .zip(has_cam.iter())
+            .map(|((_, id), has)| if *has { Some(*id) } else { None })
+            .collect();
         self.write(|conn| {
-            let mut n = 0usize;
-            for d in &bad {
-                if let Ok(cnt) = conn.execute(
-                    "DELETE FROM photos WHERE parent=?1",
-                    rusqlite::params![d],
-                ) {
-                    n += cnt;
-                }
+            let tx = conn.unchecked_transaction()?;
+            let mut st = tx.prepare_cached(
+                "UPDATE photos SET
+                   thumb_ok=1, dhash=?2, rich_state=?3,
+                   width=COALESCE(?4, width), height=COALESCE(?5, height),
+                   taken_utc=COALESCE(?6, taken_utc), rot=COALESCE(?7, rot),
+                   lat=COALESCE(?8, lat), lon=COALESCE(?9, lon),
+                   cam=NULL, cam_id=COALESCE(?10, cam_id)
+                 WHERE id=?1",
+            )?;
+            for (i, (id, hash, d)) in rows.iter().enumerate() {
+                st.execute(rusqlite::params![
+                    id,
+                    *hash as i64,
+                    RICH_DONE,
+                    d.and_then(|d| d.width),
+                    d.and_then(|d| d.height),
+                    d.and_then(|d| d.taken_utc.as_deref()),
+                    d.map(|d| d.rot),
+                    d.and_then(|d| d.lat),
+                    d.and_then(|d| d.lon),
+                    cam_ids[i],
+                ])?;
             }
-            n
+            drop(st);
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -1728,6 +2620,383 @@ impl Store {
             })
         }
     }
+
+    // ===== S5 派生作用域账本:dir_intent / bad_media / rich_state =====
+
+    /// 读一条目录意图(未落账返回 None)。
+    pub fn dir_intent(&self, path: &str) -> Option<DirIntent> {
+        let p = norm_dir(path);
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT path,volume,frn,state,source,since_usn,needs_refresh
+                 FROM dir_intent WHERE path=?1",
+                rusqlite::params![p],
+                dir_intent_row,
+            )
+            .ok()
+        })
+    }
+
+    /// 落账一条目录意图(方案 P3-18/19)。
+    ///
+    /// 已存在则改 `state`/`source`;`volume`/`frn`/`since_usn` 只在给了新值时
+    /// 覆盖(`COALESCE`),`needs_refresh` 由 [`Store::set_dir_needs_refresh`]
+    /// 单独管 —— 纳入动作不该顺手抹掉一个还没处理的失效位。
+    pub fn set_dir_intent(&self, d: &DirIntent) -> Result<()> {
+        let d = d.clone();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO dir_intent(path,volume,frn,state,source,since_usn,needs_refresh)
+                 VALUES(?1,?2,?3,?4,?5,?6,0)
+                 ON CONFLICT(path) DO UPDATE SET
+                   volume=COALESCE(?2, dir_intent.volume),
+                   frn=COALESCE(?3, dir_intent.frn),
+                   state=?4, source=?5,
+                   since_usn=COALESCE(?6, dir_intent.since_usn)",
+                rusqlite::params![
+                    norm_dir(&d.path),
+                    d.volume,
+                    d.frn,
+                    d.state,
+                    d.source,
+                    d.since_usn,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 批量落账(首启范围对话框一次写完整棵作用域根)。返回写入条数。
+    pub fn set_dir_intents(&self, list: &[DirIntent]) -> Result<usize> {
+        if list.is_empty() {
+            return Ok(0);
+        }
+        let list: Vec<DirIntent> = list.to_vec();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut n = 0usize;
+            {
+                let mut st = tx.prepare_cached(
+                    "INSERT INTO dir_intent(path,volume,frn,state,source,since_usn,needs_refresh)
+                     VALUES(?1,?2,?3,?4,?5,?6,0)
+                     ON CONFLICT(path) DO UPDATE SET
+                       volume=COALESCE(?2, dir_intent.volume),
+                       frn=COALESCE(?3, dir_intent.frn),
+                       state=?4, source=?5,
+                       since_usn=COALESCE(?6, dir_intent.since_usn)",
+                )?;
+                for d in &list {
+                    n += st.execute(rusqlite::params![
+                        norm_dir(&d.path),
+                        d.volume,
+                        d.frn,
+                        d.state,
+                        d.source,
+                        d.since_usn,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+    }
+
+    /// 所有待失效的目录(`needs_refresh=1`)。
+    pub fn dirs_needing_refresh(&self) -> Vec<String> {
+        self.read(|conn| {
+            let mut st = match conn
+                .prepare("SELECT path FROM dir_intent WHERE needs_refresh=1 ORDER BY path")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// 清掉全部失效位(逐目录退回待派生之后调)。返回清掉的条数。
+    pub fn clear_needs_refresh(&self) -> Result<usize> {
+        self.write(|conn| {
+            Ok(conn
+                .execute("UPDATE dir_intent SET needs_refresh=0 WHERE needs_refresh<>0", [])
+                .unwrap_or(0))
+        })
+    }
+
+    /// 给账本上**所有**目录挂失效位(方案 P3-21)。
+    ///
+    /// 两个触发点用它:索引 blob 格式版本不匹配(整库重建 → 目录账本全部作废),
+    /// 以及用户在选项里勾「强制刷新缩略图」(`force_thumb_update` 偏好)。
+    /// 只挂位,不立即改 `rich_state` —— 退回动作由 [`Store::refresh_pending_dirs`]
+    /// 在启动路径上一次性做完,免得挂位的当下正好卡住别的事务。
+    pub fn mark_all_dirs_needs_refresh(&self) -> Result<usize> {
+        self.write(|conn| {
+            Ok(conn
+                .execute("UPDATE dir_intent SET needs_refresh=1 WHERE needs_refresh=0", [])
+                .unwrap_or(0))
+        })
+    }
+
+    /// 把挂了失效位的目录逐个退回待派生,然后清位(方案 P3-21)。
+    ///
+    /// `invalidate_dir` 是"全部退回 1",含已派生(2)与坏文件(3)——
+    /// 用户要求强制刷新时坏文件也该再试一次(台账本身不动,再失败会重新立案)。
+    /// 返回退回的总行数。
+    pub fn refresh_pending_dirs(&self) -> Result<usize> {
+        let dirs = self.dirs_needing_refresh();
+        if dirs.is_empty() {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        for d in &dirs {
+            total += self.invalidate_dir(d).unwrap_or(0);
+        }
+        let _ = self.clear_needs_refresh();
+        Ok(total)
+    }
+
+    /// 这个目录能不能因为「看到 / 点到」写进派生作用域账本。
+    ///
+    /// 排除规则一票否决(2026-11-05 拍板):系统目录、应用缓存、回收站不该因为用户
+    /// 滚到过、或点过里面一张图,就变成「以后这个目录的图都要派生」。
+    /// 空路径同样不算可纳入 —— 调用方拿它的返回值决定要不要给回执。
+    pub fn adoptable_dir(&self, dir: &str) -> bool {
+        !dir.is_empty()
+            && !crate::scan::Exclusions::from_store(self)
+                .excludes_dir_path(std::path::Path::new(dir))
+    }
+
+    /// 点击懒加载(方案 P3-19):该目录子树里**未纳入**的行置为待派生。
+    ///
+    /// 只动 0 —— 已派生(2)不必重做,坏文件(3)由台账拦着,不该因为点开
+    /// 一次目录就又开始每轮重试。子树口径与 [`ScopeMap`] 的最长前缀命中一致:
+    /// 账本上写 `My Pictures` 就该覆盖 `My Pictures\2024`,否则那些行永远停在
+    /// 未纳入。返回置行数。
+    pub fn promote_dir(&self, dir: &str) -> Result<usize> {
+        let (eq, sub) = dir_like(dir);
+        self.write(move |conn| {
+            Ok(conn
+                .execute(
+                    "UPDATE photos SET rich_state=?1
+                     WHERE rich_state=0
+                       AND path NOT IN (SELECT path FROM bad_media)
+                       AND (parent LIKE ?2 ESCAPE '\\' OR parent LIKE ?3 ESCAPE '\\')",
+                    rusqlite::params![RICH_PENDING, eq, sub],
+                )
+                .unwrap_or(0))
+        })
+    }
+
+    /// 该目录子树里**已放行**的行(`rich_state<>0`),连同状态一起回读。
+    ///
+    /// `promote_dir` 改的是库,而网格每帧读的是内存里的 `PhotoRow`,那一列要等
+    /// `rebuild` 才跟库对齐。界面于是必须拿这份回读当唯一真相 —— 上一轮让它
+    /// 自己按排除名单再判一遍门,结果库里早就派生完了,屏幕上还锁着
+    /// 「未纳入范围」的占位块(2026-11-05 现场)。取满 5 万行即止,剩下的下一轮重建补。
+    pub fn promoted_states(&self, dir: &str) -> Vec<(i64, i32)> {
+        let (eq, sub) = dir_like(dir);
+        self.read(|conn| {
+            let mut st = match conn.prepare(
+                "SELECT id, rich_state FROM photos
+                 WHERE rich_state<>?1
+                   AND (parent LIKE ?2 ESCAPE '\\' OR parent LIKE ?3 ESCAPE '\\')
+                 LIMIT 50000",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map(rusqlite::params![RICH_OUT, eq, sub], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map(|it| it.filter_map(|x| x.ok()).collect())
+            .unwrap_or_default()
+        })
+    }
+
+    /// 目录级失效(方案 P3-21):该目录子树的行**全部**退回待派生,
+    /// 含已派生(2)与坏文件(3)—— 用户要求强制刷新时,坏文件也该再试一次
+    /// (台账本身不动,重试再失败会重新立案)。返回置行数。
+    pub fn invalidate_dir(&self, dir: &str) -> Result<usize> {
+        let (eq, sub) = dir_like(dir);
+        self.write(move |conn| {
+            Ok(conn
+                .execute(
+                    "UPDATE photos SET rich_state=?1
+                     WHERE rich_state<>?1
+                       AND (parent LIKE ?2 ESCAPE '\\' OR parent LIKE ?3 ESCAPE '\\')",
+                    rusqlite::params![RICH_PENDING, eq, sub],
+                )
+                .unwrap_or(0))
+        })
+    }
+
+    /// 批量按路径取派生状态;不在库里的路径**不出现在结果里**
+    /// (调用方据此区分「未纳入作用域」与「压根不是媒体/还没落库」)。
+    ///
+    /// `photos.path` 是 `TEXT UNIQUE`,SQLite 自带唯一索引,所以一次 IN 查询
+    /// 就是逐条走索引 —— 快查投影只取 top-N(≤5000,远低于 SQLite 的
+    /// 变量上限),不需要分批。
+    pub fn rich_states_by_paths(&self, paths: &[String]) -> HashMap<String, i32> {
+        if paths.is_empty() {
+            return HashMap::new();
+        }
+        let sql = format!(
+            "SELECT path, rich_state FROM photos WHERE path IN ({})",
+            vec!["?"; paths.len()].join(",")
+        );
+        self.read(|conn| {
+            let mut st = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return HashMap::new(),
+            };
+            let rows = match st.query_map(rusqlite::params_from_iter(paths.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?))
+            }) {
+                Ok(it) => it,
+                Err(_) => return HashMap::new(),
+            };
+            rows.filter_map(|r| r.ok()).collect()
+        })
+    }
+
+    /// 拿账本复核一遍已进门的行:落在作用域之外的整目录退回未纳入。
+    ///
+    /// 这是「保存时把孤儿记录清零不落盘」在 L2 的对应物 —— 那边
+    /// 清的是父级已不存在的 type-4 记录,我们清的是**已不在作用域内却还占着
+    /// rich_state 的行**。文件真被删掉的那一类由 [`Store::delete_l1_frn64`]
+    /// 直接删行,不在这里。返回退回的行数。
+    pub fn reconcile_rich_state(&self, gate: &ScopeGate) -> Result<usize> {
+        let dirs: Vec<String> = self.read(|conn| {
+            let mut st = match conn
+                .prepare("SELECT DISTINCT parent FROM photos WHERE rich_state<>0")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        });
+        let out: Vec<String> = dirs
+            .into_iter()
+            .filter(|d| !gate.dir_in_scope(d))
+            .collect();
+        if out.is_empty() {
+            return Ok(0);
+        }
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let mut n = 0usize;
+            {
+                let mut st =
+                    tx.prepare_cached("UPDATE photos SET rich_state=0 WHERE parent=?1")?;
+                for d in &out {
+                    n += st.execute(rusqlite::params![d])?;
+                }
+            }
+            tx.commit()?;
+            Ok(n)
+        })
+    }
+
+    /// 坏媒体台账全表(网格右键的「隐藏 / 不隐藏」出口要列它)。
+    pub fn bad_media(&self) -> Vec<BadMedia> {
+        self.read(|conn| {
+            let mut st = match conn
+                .prepare("SELECT path,reason,since FROM bad_media ORDER BY since DESC, path")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| {
+                Ok(BadMedia {
+                    path: r.get(0)?,
+                    reason: r.get(1)?,
+                    since: r.get(2)?,
+                })
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+    }
+
+    /// 台账路径集合(大写归一化)—— [`ScopeGate`] 的第三层跳过用。
+    pub fn bad_media_upper(&self) -> std::collections::HashSet<String> {
+        self.bad_media()
+            .into_iter()
+            .map(|b| b.path.to_ascii_uppercase())
+            .collect()
+    }
+
+    /// 立案(方案 P3-22):写台账 + 该行 `rich_state` 1→3,不再每轮重试。
+    ///
+    /// 台账按 path 记;文件改名后旧条目会失去
+    /// 目标,那时它拦不住任何东西,只是一条待清理的死账。
+    pub fn mark_bad_media(&self, path: &str, reason: &str) -> Result<()> {
+        let p = path.to_string();
+        let why = reason.to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute(
+                "INSERT INTO bad_media(path,reason,since) VALUES(?1,?2,?3)
+                 ON CONFLICT(path) DO UPDATE SET reason=?2, since=?3",
+                rusqlite::params![p, why, now],
+            )?;
+            tx.execute(
+                "UPDATE photos SET rich_state=?2 WHERE path=?1 AND rich_state=?3",
+                rusqlite::params![p, RICH_BAD, RICH_PENDING],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 销案(「不隐藏」出口):删台账 + 该行 `rich_state` 3→1 重新排队。
+    pub fn unmark_bad_media(&self, path: &str) -> Result<()> {
+        let p = path.to_string();
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute("DELETE FROM bad_media WHERE path=?1", rusqlite::params![p])?;
+            tx.execute(
+                "UPDATE photos SET rich_state=?2, thumb_fail=0 WHERE path=?1 AND rich_state=?3",
+                rusqlite::params![p, RICH_PENDING, RICH_BAD],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// 该路径是否已在坏媒体台账里。
+    pub fn is_bad_media(&self, path: &str) -> bool {
+        let p = path.to_string();
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT 1 FROM bad_media WHERE path=?1",
+                rusqlite::params![p],
+                |_| Ok(()),
+            )
+            .is_ok()
+        })
+    }
+}
+
+/// `dir_intent` 一行 → [`DirIntent`](列序与 SELECT 一致)。
+fn dir_intent_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DirIntent> {
+    Ok(DirIntent {
+        path: r.get(0)?,
+        volume: r.get(1)?,
+        frn: r.get(2)?,
+        state: r.get(3)?,
+        source: r.get(4)?,
+        since_usn: r.get(5)?,
+        needs_refresh: r.get::<_, i64>(6)? != 0,
+    })
 }
 
 impl Drop for Store {
@@ -1755,6 +3024,21 @@ pub fn fnv1a64(s: &str) -> u64 {
 /// LIKE 通配符转义(\、%、_ 在路径名里出现时避免被当作模式符)。
 fn like_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// 目录子树匹配用的两条 LIKE 模式:(直属该目录, 该目录子树)。
+///
+/// 一律走 LIKE 而不是 `=`:`photos.parent` 是普通 TEXT,`=` 大小写敏感,
+/// 而 L1 的名字取自 MFT、账本里的路径可能来自 Shell API 或用户输入,
+/// 大小写不保证一致;SQLite 的 LIKE 对 ASCII 天然折叠大小写。
+///
+/// 转义口径:`ESCAPE '\'` 下字面反斜杠要写两遍,而结尾那个 `%` 必须**裸着**
+/// 才是通配符。所以子树模式 = 转义后的目录 + 转义后的分隔符 + 裸 `%`;
+/// 卷根要先去掉结尾分隔符,否则会多转义出一个字面反斜杠。
+fn dir_like(dir: &str) -> (String, String) {
+    let d = norm_dir(dir);
+    let base = d.trim_end_matches('\\');
+    (like_escape(&d), format!("{}\\\\%", like_escape(base)))
 }
 
 /// 扫描根目录候选(按盘符枚举)。
@@ -1812,6 +3096,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 缓存目录解析:数据目录被 `data.location` 迁走时缓存跟到大盘
+    /// (缺陷:库在 D:,缩略图却默默写满 C:)。
+    #[test]
+    fn cache_root_follows_relocated_data_dir() {
+        let sys = Path::new("C:\\Users\\x\\AppData\\Local\\Relyto\\Maliang");
+        // 没迁库:保持历史落点,既有缓存不失效。
+        assert_eq!(cache_root_for(None, sys), sys.to_path_buf());
+        // 迁了库:落到数据目录下的 cache 子目录,与 models/Incoming 同级。
+        assert_eq!(
+            cache_root_for(Some(Path::new("D:\\maliang")), sys),
+            PathBuf::from("D:\\maliang").join(CACHE_SUBDIR)
+        );
+    }
+
+    /// 数据目录优先级:用户标记 > 机器标记 > 按进程形态的默认目录。
+    /// 钉住的是 2026-11-05 那次分裂事故的口径 —— 服务(LocalSystem)读不到
+    /// 登录用户的标记,必须能从机器级标记拿到同一个目录,而不是各建一套库。
+    #[test]
+    fn data_dir_prefers_user_marker_then_machine_marker() {
+        let user = PathBuf::from("D:\\maliang");
+        let machine = PathBuf::from("E:\\svc");
+        assert_eq!(
+            resolve_data_dir(Some(user.clone()), Some(machine.clone()), true),
+            user,
+            "登录用户迁过目录时,服务也跟着迁"
+        );
+        assert_eq!(
+            resolve_data_dir(None, Some(machine.clone()), true),
+            machine,
+            "用户标记读不到(服务正是这样)时用机器级标记"
+        );
+        // 两个标记都没有:服务落机器级,普通进程落自己的 AppData。
+        assert_eq!(resolve_data_dir(None, None, true), machine_default_dir());
+        assert_eq!(resolve_data_dir(None, None, false), default_data_dir());
+        #[cfg(windows)]
+        {
+            // 钉住「与账号无关」:服务绝不能落进 systemprofile(那是 LocalSystem
+            // 的「用户目录」),也不能和用户级默认值撞成同一个目录。
+            let root = std::env::var_os("PROGRAMDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+            assert_eq!(
+                machine_default_dir(),
+                root.join("Relyto").join("Maliang"),
+                "机器级目录必须挂在 ProgramData 下"
+            );
+            assert_ne!(
+                machine_default_dir(),
+                default_data_dir(),
+                "机器级默认值不能等于用户 AppData,否则服务照样各建一套库"
+            );
+        }
+    }
+
+    /// 缓存搬运:只补缺、不覆盖、瞬态文件不跟,成功后清来源。
+    #[test]
+    fn migrate_cache_to_keeps_existing_and_clears_source() {
+        let base = std::env::temp_dir().join(format!("rk-cache-migr-{}", std::process::id()));
+        let from = base.join("old");
+        let to = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(from.join("smallthumbs")).unwrap();
+        std::fs::create_dir_all(from.join("thumbs")).unwrap();
+        std::fs::create_dir_all(to.join("thumbs")).unwrap();
+        std::fs::write(from.join("smallthumbs").join("1.jpg"), b"NEW").unwrap();
+        std::fs::write(from.join("thumbs").join("2.jpg"), b"OLD").unwrap();
+        std::fs::write(from.join("junk.tmp"), b"t").unwrap();
+        // 目标已有同档同名文件 → 不覆盖(目标侧是更新的那份)。
+        std::fs::write(to.join("thumbs").join("2.jpg"), b"KEPT").unwrap();
+
+        let (moved, cleared) = migrate_cache_to(&from, &to).unwrap();
+        assert_eq!(moved, 1, "只有缺失的一档被搬: {moved}");
+        assert_eq!(
+            std::fs::read(to.join("thumbs").join("2.jpg")).unwrap(),
+            b"KEPT"
+        );
+        assert_eq!(
+            std::fs::read(to.join("smallthumbs").join("1.jpg")).unwrap(),
+            b"NEW"
+        );
+        assert!(cleared, "搬完来源应清空");
+        assert!(!from.exists());
+        assert!(!to.join("junk.tmp").exists(), "瞬态文件不跟迁");
+
+        // 同目录再点一次:空操作,绝不把自己搬进自己再删掉。
+        let (moved2, _) = migrate_cache_to(&to, &to).unwrap();
+        assert_eq!(moved2, 0);
+        assert!(
+            to.join("thumbs").join("2.jpg").exists(),
+            "自迁移不能删掉目标"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 新库:派生记账的两张表 + 两列建齐,默认值落对。
+    #[test]
+    fn derivation_ledger_tables_and_columns_exist() {
+        let store = Store::open_mem().unwrap();
+        let c = store.test_conn();
+        c.execute(
+            "INSERT INTO dir_intent(path,volume,frn,state,source,since_usn)
+             VALUES('D:\\Photos','D:\\',12345,'imported','import',987654)",
+            [],
+        )
+        .unwrap();
+        let (state, source, needs): (String, String, i64) = c
+            .query_row(
+                "SELECT state,source,needs_refresh FROM dir_intent WHERE path='D:\\Photos'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((state.as_str(), source.as_str()), ("imported", "import"));
+        assert_eq!(needs, 0, "新建账本默认不需要刷新");
+
+        c.execute(
+            "INSERT INTO bad_media(path,reason,since) VALUES('D:\\bad.jpg','decode',1)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            c.query_row("SELECT COUNT(*) FROM bad_media", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        // 派生队列按 rich_state 取行、快查按 ext 过滤 —— 两者都建在迁移列上,
+        // 索引必须存在(否则 S5 起每轮回填都是全表扫)。
+        for idx in [
+            "idx_photos_rich_state",
+            "idx_photos_ext",
+            "idx_dir_intent_state",
+        ] {
+            let n: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                    [idx],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "缺索引:{idx}");
+        }
+    }
+
+    /// 批量按路径取派生状态(快查投影用,方案 P4-29)。
+    ///
+    /// 钉两件事:**不在库里的路径不出现在结果里**(调用方靠这个把
+    /// 「未纳入作用域」和「压根不是媒体」分开),以及空输入不生成
+    /// `IN ()` 这种非法 SQL。
+    #[test]
+    fn rich_states_by_paths_only_returns_rows_that_exist() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute_batch(
+                "INSERT INTO photos(path,parent,mtime,size,rich_state) VALUES
+                    ('D:/Pictures/a.jpg','D:/Pictures',0,1,0),
+                    ('D:/Pictures/b.jpg','D:/Pictures',0,2,2),
+                    ('D:/Pictures/c.jpg','D:/Pictures',0,3,3);",
+            )
+            .unwrap();
+        }
+        let q = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        let got = store.rich_states_by_paths(&q(&[
+            "D:/Pictures/a.jpg",
+            "D:/Pictures/c.jpg",
+            "D:/Pictures/nope.jpg",
+        ]));
+        assert_eq!(got.len(), 2, "不存在的路径不该出现在结果里");
+        assert_eq!(got["D:/Pictures/a.jpg"], RICH_OUT);
+        assert_eq!(got["D:/Pictures/c.jpg"], RICH_BAD);
+        assert!(!got.contains_key("D:/Pictures/nope.jpg"));
+        // b.jpg 没问就不回:结果只覆盖请求里的路径。
+        assert!(!got.contains_key("D:/Pictures/b.jpg"));
+        assert_eq!(store.rich_states_by_paths(&q(&["D:/Pictures/b.jpg"]))["D:/Pictures/b.jpg"], RICH_DONE);
+        assert!(store.rich_states_by_paths(&[]).is_empty());
+    }
+
+    /// 固化两件事 —— 迁移列的索引排在 ALTER 之后建(写在 SCHEMA 里会直接失败),
+    /// 以及已有缩略图的旧行被认作「已派生」。
+    #[test]
+    fn legacy_db_upgrades_rich_state_and_ext() {
+        let conn = Connection::open_in_memory().unwrap();
+        // P1-11 之前的形状:无 uid64/cam_id/kind/thumb_fail/caption/rich_state/ext。
+        conn.execute_batch(
+            "CREATE TABLE photos (
+                id INTEGER PRIMARY KEY,
+                path TEXT UNIQUE NOT NULL,
+                parent TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                width INTEGER,
+                height INTEGER,
+                taken_utc TEXT,
+                cam TEXT,
+                rot INTEGER NOT NULL DEFAULT 0,
+                thumb_ok INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO photos(id,path,parent,mtime,size,thumb_ok) VALUES
+                (1,'D:/Pictures/a.JPG','D:/Pictures',0,1,1),
+                (2,'D:/Pictures/b.png','D:/Pictures',0,2,0),
+                (3,'D:/Videos/c','D:/Videos',0,3,0);",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        let c = store.test_conn();
+        let rows: Vec<(String, i64, Option<String>)> = {
+            let mut st = c
+                .prepare("SELECT path,rich_state,ext FROM photos ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                // 已有缩略图 → 播种成「已派生」;扩展名统一小写。
+                ("D:/Pictures/a.JPG".into(), 2, Some("jpg".into())),
+                ("D:/Pictures/b.png".into(), 0, Some("png".into())),
+                // 无扩展名留 NULL(而不是空串)。
+                ("D:/Videos/c".into(), 0, None),
+            ]
+        );
+        // 播种只跑一次:之后 rich_state 归派生门控管,不能再被这里回写。
+        c.execute("UPDATE photos SET rich_state=1 WHERE id=1", [])
+            .unwrap();
+        assert_eq!(store.seed_rich_state_once().unwrap(), 0);
+        let still: i64 = c
+            .query_row("SELECT rich_state FROM photos WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, 1, "播种标记已置,二次调用不得回写");
+    }
+
+    #[test]
+    fn ext_of_lowercases_and_none_without_extension() {
+        assert_eq!(Store::ext_of("D:\\a\\PICS.JpG").as_deref(), Some("jpg"));
+        assert_eq!(Store::ext_of("D:\\a\\no-ext").as_deref(), None);
+        assert_eq!(Store::ext_of("D:\\a.tar.gz").as_deref(), Some("gz"));
+    }
+
     #[test]
     fn remove_tree_best_effort_deletes_all_and_survives_locked_file() {
         let base = std::env::temp_dir().join(format!("rk-rmbe-{}", std::process::id()));
@@ -1850,15 +3376,127 @@ mod tests {
         }
     }
 
-    /// 参考件首启行为:默认范围只登记一次,之后由用户在文件夹管理器自管。
+    /// 参考件首启行为:范围只落账一次,之后由用户在文件夹管理器自管。
     #[test]
     fn first_run_scope_seeds_once() {
         let store = Store::open_mem().unwrap();
         assert!(store.watched_stats().is_empty());
-        assert!(store.ensure_first_run_scope());
+        assert!(!store.scope_initialized());
+        // 保守档:派生作用域 = 三个壳目录(不含视频),监听根也是它们。
+        let roots = store.apply_initial_scope(false);
+        assert_eq!(roots, default_roots(), "首扫根应等于落账的作用域根");
         assert!(!store.watched_stats().is_empty());
+        assert!(store.scope_initialized());
+        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("limited"));
+        let gate = ScopeGate::load(&store);
+        assert!(!gate.is_empty(), "落账后门不该再是空的");
         // 第二次调用是空操作(已初始化)。
-        assert!(!store.ensure_first_run_scope());
+        assert!(store.apply_initial_scope(true).is_empty());
+        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("limited"));
+    }
+
+    /// 全盘档:每个可扫卷根各落一条意图,靠最长前缀命中覆盖卷内任意子目录;
+    /// 但监听根仍只有壳目录(整卷挂监听会被系统临时文件刷爆)。
+    #[test]
+    fn initial_scope_complete_ledgers_volume_roots_only() {
+        let store = Store::open_mem().unwrap();
+        let roots = store.apply_initial_scope(true);
+        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("complete"));
+        for r in &roots {
+            let s = r.to_string_lossy().into_owned();
+            assert_eq!(
+                store.dir_intent(&s).map(|d| d.state),
+                Some(INTENT_DEFAULT_ROOT.to_string()),
+                "卷根 {s} 应已落账"
+            );
+            assert_eq!(
+                store.dir_intent(&s).map(|d| d.source),
+                Some(SRC_INITIAL_DIALOG.to_string())
+            );
+        }
+        if let Some(v) = roots.first() {
+            let deep = v.join("Users").join("me").join("Pictures").join("2026");
+            let gate = ScopeGate::load(&store);
+            assert!(
+                gate.dir_in_scope(&deep.to_string_lossy()),
+                "卷内任意深度都应被卷根那条意图覆盖:{deep:?}"
+            );
+        }
+        // 监听根不跟着变:仍是壳目录那一组。
+        let watched: Vec<String> = store.watched_stats().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(watched.len(), default_roots().len());
+    }
+
+    /// 「看到 / 点到」能不能把目录写进作用域账本:排除规则一票否决(2026-11-05 拍板)。
+    #[test]
+    fn adoptable_dir_refuses_excluded_and_empty() {
+        let store = Store::open_mem().unwrap();
+        assert!(
+            store.adoptable_dir("D:\\4.Photos\\coco"),
+            "普通照片目录该放行"
+        );
+        assert!(!store.adoptable_dir(""), "空路径不是一条目录");
+        for d in [
+            "D:\\$RECYCLE.BIN\\S-1-5-21-1",
+            "C:\\Users\\me\\AppData\\Roaming\\someapp",
+            "D:\\maliang\\cache\\thumbs",
+            "E:\\proj\\node_modules\\pkg",
+        ] {
+            assert!(!store.adoptable_dir(d), "{d} 属于排除名单,不该因为被看到就进账本");
+        }
+        store.set_setting("exclude_dirs", "mytmp").unwrap();
+        assert!(
+            !store.adoptable_dir("D:\\mytmp\\sub"),
+            "用户自己加的排除项同样要拦住"
+        );
+    }
+
+    /// 放行与回读必须是同一条口径(2026-11-05 现场:`AppData` 里早已派生完的图,
+    /// 屏幕上仍锁在「未纳入范围」—— 因为界面按排除名单自己又判了一遍门)。
+    ///
+    /// `promote_dir` 只改库;界面拿 `promoted_states` 回读真相。判定只留库里这一份。
+    #[test]
+    fn promoted_states_reads_back_exactly_what_promote_dir_flipped() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
+                 (1,'D:\\p\\a.jpg','D:\\p',0,0,0),
+                 (2,'D:\\p\\sub\\b.jpg','D:\\p\\sub',0,0,0),
+                 (3,'D:\\q\\c.jpg','D:\\q',0,0,0),
+                 (4,'D:\\p\\d.jpg','D:\\p',0,0,3),
+                 (6,'D:\\pi\\f.jpg','D:\\pi',0,0,0)",
+                [],
+            )
+            .unwrap();
+        }
+        // 已立案、但状态还停在 0 的行(台账拦放行,回读也不该把它说成已放行)。
+        store.mark_bad_media("D:\\p\\e.jpg", "立案").unwrap();
+        store
+            .test_conn()
+            .execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES(5,'D:\\p\\e.jpg','D:\\p',0,0,0)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.promote_dir("D:\\p").unwrap(),
+            2,
+            "只放行本目录与子树里未纳入且未立案的行"
+        );
+        let mut got = store.promoted_states("D:\\p");
+        got.sort();
+        assert_eq!(
+            got,
+            vec![(1, RICH_PENDING), (2, RICH_PENDING), (4, RICH_BAD)],
+            "回读给界面的就是库里的现状:5 号在台账里、没被放行,也就不在这份名单里"
+        );
+        assert!(
+            store.promoted_states("D:\\q").is_empty(),
+            "不该串到别的目录"
+        );
     }
 
     /// P0 修复固化:新库 photos 表必须带 star 列
@@ -2209,67 +3847,95 @@ mod tests {
     }
 
     #[test]
-    fn purge_excluded_removes_system_dir_rows() {
-        // 历史版本把回收站/应用数据扫进了索引(--purge-excluded 清洗)。
+    fn missing_tier_takes_scoped_rows_and_ledger_removes_bad_ones() {
+        // 方案 P3-20:回填队列的取行条件是派生门放行的 `rich_state=1`,
+        // 不再是"所有 thumb_ok=0" —— 不在作用域里的行根本不进队列。
+        // 方案 P3-22:反复失败的行由坏媒体台账立案后置 3 出队,
+        // 出队靠台账而不是 thumb_fail 阈值(否则一批坏文件会让 worker
+        // 永远空转在开头,真实事故:回收站 $I*.jpg 元数据)。
         let store = Store::open_mem().unwrap();
         {
             let c = store.test_conn();
-            for (id, parent) in [
-                (1, r"D:\4.Photos\2026 旅行"),
-                (2, r"D:\$RECYCLE.BIN\S-1-5-21"),
-                (3, r"C:\Users\me\AppData\Local\Temp\cache"),
-                (4, r"C:\proj\.git\hooks"),
-            ] {
+            // 1:已进门待派生 → 该出队。
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                 VALUES(1,'/x/a.jpg','/x',0,0,1)",
+                [],
+            )
+            .unwrap();
+            // 2:未纳入作用域 → 不该出队(哪怕 thumb_ok=0)。
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                 VALUES(2,'/x/b.jpg','/x',0,0,0)",
+                [],
+            )
+            .unwrap();
+            // 3:已派生 → 不该出队。
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state,thumb_ok)
+                 VALUES(3,'/x/c.jpg','/x',0,0,2,1)",
+                [],
+            )
+            .unwrap();
+        }
+        let ids = |s: &Store| -> Vec<i64> {
+            s.missing_tier(1, &[], 10)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&store), vec![1], "只有 rich_state=1 的行进队列");
+
+        // 失败记账:每次 +1,并回传累计值供调用方判断是否到阈值。
+        assert_eq!(store.mark_thumb_fail(1), 1);
+        assert_eq!(store.mark_thumb_fail(1), 2);
+        assert_eq!(ids(&store), vec![1], "没到阈值仍在队列里");
+
+        // 到阈值 → 立案:台账建行 + rich_state 1→3 + 出队。
+        assert_eq!(store.mark_thumb_fail(1), BAD_MEDIA_THRESHOLD);
+        store.mark_bad_media("/x/a.jpg", "decode failed").unwrap();
+        assert!(store.is_bad_media("/x/a.jpg"));
+        assert!(ids(&store).is_empty(), "立案后不再每轮重试同一张坏图");
+
+        // 「不隐藏」出口:销案 → 台账删行 + rich_state 3→1 + 计数归零 + 重新排队。
+        store.unmark_bad_media("/x/a.jpg").unwrap();
+        assert!(!store.is_bad_media("/x/a.jpg"));
+        assert_eq!(ids(&store), vec![1], "销案后放回队列");
+        let f: i64 = store
+            .test_conn()
+            .query_row("SELECT thumb_fail FROM photos WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(f, 0);
+    }
+
+    #[test]
+    fn missing_tier_prefers_visible_dirs_then_falls_back() {
+        // 方案 P3-20 的排序键(用户已拍):可见区域命中优先 + 其余全库兜底。
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            for (id, parent) in [(1, "/far"), (2, "/near"), (3, "/near")] {
                 c.execute(
-                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
-                    rusqlite::params![id, format!("{parent}/a.jpg"), parent],
+                    "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                     VALUES(?1,?2 || '/' || ?1 || '.jpg',?2,0,0,1)",
+                    rusqlite::params![id, parent],
                 )
                 .unwrap();
             }
         }
-        let n = store.purge_excluded(&crate::scan::Exclusions::default());
-        assert_eq!(n, 3, "回收站/AppData/.git 三行应被清除");
-        let left: Vec<i64> = {
-            let c = store.test_conn();
-            let mut st = c.prepare("SELECT id FROM photos ORDER BY id").unwrap();
-            st.query_map([], |r| r.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
-        };
-        assert_eq!(left, vec![1], "正常照片目录必须保留");
-    }
-
-    #[test]
-    fn missing_tier_skips_repeatedly_failed_photos() {
-        // 缩略图生成失败要记账:失败满 3 次不再进回填队列。
-        // 否则一批坏文件(如回收站元数据)会让 worker 永远空转(真实事故)。
-        let store = Store::open_mem().unwrap();
-        {
-            let c = store.test_conn();
-            c.execute(
-                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'/x/a.jpg','/x',0,0)",
-                [],
-            )
-            .unwrap();
-            c.execute(
-                "INSERT INTO photos(id,path,parent,mtime,size,thumb_fail) VALUES(2,'/x/b.jpg','/x',0,0,3)",
-                [],
-            )
-            .unwrap();
-        }
+        let vis = vec!["/near".to_string()];
         let ids: Vec<i64> = store
-            .missing_tier(1, 10)
+            .missing_tier(1, &vis, 2)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, vec![1], "连续失败 3 次的照片不应再进回填队列");
-        // 记账接口:每次失败计数 +1
-        store.mark_thumb_fail(1);
-        let f: i64 = store.test_conn()
-            .query_row("SELECT thumb_fail FROM photos WHERE id=1", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(f, 1);
+        assert_eq!(ids, vec![2, 3], "先补眼前的");
+        let ids: Vec<i64> = store
+            .missing_tier(1, &vis, 3)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1], "可见的拿完了,不足一批用全库补齐且不重复");
     }
 
     #[test]
@@ -2651,24 +4317,200 @@ mod tests {
             c.last_insert_rowid()
         };
         // 未生成时 missing_tier 应返回该照片。
-        let missing = store.missing_tier(TIER_BIG, 10);
+        let missing = store.missing_tier(TIER_BIG, &[], 10);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, pid);
 
         store.mark_tier_done(pid, TIER_BIG).unwrap();
-        assert!(store.missing_tier(TIER_BIG, 10).is_empty());
+        assert!(store.missing_tier(TIER_BIG, &[], 10).is_empty());
         assert_eq!(store.tier_count(TIER_BIG), 1);
         // 重复标记幂等。
         store.mark_tier_done(pid, TIER_BIG).unwrap();
         assert_eq!(store.tier_count(TIER_BIG), 1);
 
-        // Normal 档走 photos.thumb_ok,不走 thumb_tiers。
-        assert_eq!(store.missing_tier(TIER_NORMAL, 10).len(), 1);
+        // Normal 档走 photos.thumb_ok,不走 thumb_tiers;取行还要过派生门
+        // (方案 P3-20):rich_state=0 的行压根不排队。
+        assert!(
+            store.missing_tier(TIER_NORMAL, &[], 10).is_empty(),
+            "未纳入作用域的行不进回填队列"
+        );
+        store
+            .test_conn()
+            .execute("UPDATE photos SET rich_state=1 WHERE id=?1", [pid])
+            .unwrap();
+        assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
         store.test_conn()
             .execute("UPDATE photos SET thumb_ok=1 WHERE id=?1", [pid])
             .unwrap();
-        assert!(store.missing_tier(TIER_NORMAL, 10).is_empty());
+        assert!(store.missing_tier(TIER_NORMAL, &[], 10).is_empty());
         assert_eq!(store.tier_count(TIER_NORMAL), 1);
+    }
+
+    /// 造一条 L1 结构行(frn64 由盘符 + FRN 算)。
+    fn row(letter: char, frn: u64, path: &str, mtime: i64, size: i64) -> L1Row {
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let ext = match path.rfind('.') {
+            Some(p) if p + 1 < path.len() => Some(path[p + 1..].to_ascii_lowercase()),
+            _ => None,
+        };
+        L1Row {
+            frn64: frn64_of(letter, frn),
+            path: path.into(),
+            parent,
+            mtime,
+            size,
+            kind: 0,
+            ext,
+        }
+    }
+
+    #[test]
+    fn frn64_ignores_sequence_bits() {
+        // 高 16 位是记录序号,重建/重用后递增 —— 身份不能跟着变。
+        assert_eq!(frn64_of('C', 0x0001_0000_0000_0234), frn64_of('C', 0x0234));
+        // 不同卷、不同 index 必须分开。
+        assert_ne!(frn64_of('C', 0x234), frn64_of('D', 0x234));
+        assert_ne!(frn64_of('C', 0x234), frn64_of('C', 0x235));
+    }
+
+    #[test]
+    fn l1_ingest_inserts_then_updates_same_identity() {
+        let store = Store::open_mem().unwrap();
+        let c = store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
+        assert_eq!(c, L1Ingest { inserted: 1, updated: 0 });
+        let id: i64 = store
+            .test_conn()
+            .query_row("SELECT id FROM photos WHERE path=?1", [r"C:\pics\a.jpg"], |r| r.get(0))
+            .unwrap();
+        // 同 FRN 改名 + 变大 → 命中同一行,身份与外部引用都不换。
+        let c = store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\albums\b.jpg", 2000, 8192)], None)
+            .unwrap();
+        assert_eq!(c, L1Ingest { inserted: 0, updated: 1 });
+        let conn = store.test_conn();
+        let (n, path, size, mtime): (i64, String, i64, i64) = conn
+            .query_row("SELECT COUNT(*), MAX(path), MAX(size), MAX(mtime) FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(n, 1, "改名不该多出一行");
+        assert_eq!(path, r"C:\albums\b.jpg");
+        assert_eq!((size, mtime), (8192, 2000));
+        let same_id: i64 = conn
+            .query_row("SELECT id FROM photos WHERE path=?1", [r"C:\albums\b.jpg"], |r| r.get(0))
+            .unwrap();
+        assert_eq!(same_id, id, "行 id 不变 → 星标/标签/说明都还在");
+    }
+
+    #[test]
+    fn l1_ingest_rename_keeps_uid64_and_stars() {
+        let store = Store::open_mem().unwrap();
+        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
+        let uid_before: i64 = store
+            .test_conn()
+            .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
+            .unwrap();
+        store.test_conn().execute("UPDATE photos SET star=5", []).unwrap();
+        store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\renamed.jpg", 1000, 4096)], None)
+            .unwrap();
+        let (uid_after, star): (i64, i64) = store
+            .test_conn()
+            .query_row("SELECT uid64, star FROM photos", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(uid_after, uid_before, "uid64 的契约是一经分配即不变");
+        assert_eq!(star, 5, "用户数据不因改名丢失");
+    }
+
+    #[test]
+    fn l1_ingest_mtime_change_resets_derived_state() {
+        let store = Store::open_mem().unwrap();
+        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
+        store
+            .test_conn()
+            .execute("UPDATE photos SET thumb_ok=1, dhash=123", [])
+            .unwrap();
+        // 内容变了(mtime 前进)→ 缩略图与感知哈希必须作废重派生。
+        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 2000, 5000)], None).unwrap();
+        let (thumb, dhash): (i64, Option<i64>) = store
+            .test_conn()
+            .query_row("SELECT thumb_ok, dhash FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(thumb, 0);
+        assert_eq!(dhash, None);
+        // mtime 没动 → 派生态保留。
+        store
+            .test_conn()
+            .execute("UPDATE photos SET thumb_ok=1, dhash=999", [])
+            .unwrap();
+        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a2.jpg", 2000, 5000)], None).unwrap();
+        let (thumb, dhash): (i64, Option<i64>) = store
+            .test_conn()
+            .query_row("SELECT thumb_ok, dhash FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((thumb, dhash), (1, Some(999)));
+    }
+
+    #[test]
+    fn l1_ingest_purges_stale_path_holder() {
+        let store = Store::open_mem().unwrap();
+        // 旧文件占着目标路径(身份不同,frn64=NULL 的历史行也算)。
+        store
+            .test_conn()
+            .execute(
+                "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'/p',0,0)",
+                [r"C:\pics\slot.jpg"],
+            )
+            .unwrap();
+        let c = store
+            .ingest_l1_rows(&[row('C', 0x200, r"C:\pics\slot.jpg", 10, 20)], None)
+            .unwrap();
+        assert_eq!(c, L1Ingest { inserted: 1, updated: 0 });
+        let n: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "path 上的 UNIQUE 仍成立:陈旧占用被摘掉");
+    }
+
+    #[test]
+    fn l1_delete_by_frn64_ignores_unknown() {
+        let store = Store::open_mem().unwrap();
+        store
+            .ingest_l1_rows(
+                &[
+                    row('C', 0x100, r"C:\pics\a.jpg", 1, 1),
+                    row('C', 0x101, r"C:\pics\b.jpg", 1, 1),
+                ],
+                None,
+            )
+            .unwrap();
+        let n = store.delete_l1_frn64(&[frn64_of('C', 0x100), frn64_of('C', 0xdead)]).unwrap();
+        assert_eq!(n, 1, "不认识的 FRN 不算删除");
+        let left: String = store
+            .test_conn()
+            .query_row("SELECT path FROM photos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, r"C:\pics\b.jpg");
+        assert_eq!(store.delete_l1_frn64(&[]).unwrap(), 0);
+    }
+
+    #[test]
+    fn l2_cursor_roundtrips_per_volume() {
+        let store = Store::open_mem().unwrap();
+        assert_eq!(store.l2_cursor('C'), 0, "从未落过 → 0");
+        store.set_l2_cursor('C', 0x1a2b_3c4d).unwrap();
+        store.set_l2_cursor('D', 7).unwrap();
+        assert_eq!(store.l2_cursor('C'), 0x1a2b_3c4d);
+        assert_eq!(store.l2_cursor('D'), 7);
+        assert_eq!(store.l2_cursor('E'), 0, "各卷互不串");
     }
 }
 

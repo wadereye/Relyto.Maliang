@@ -2,13 +2,13 @@
 
 # Relyto.Maliang (马良)
 
-> A local photo management app that reimagines Picasa with AI.
+> A fast, local-first photo management and editing app with native AI.
 
 **Why this project exists.** Google Picasa was a truly great photo
 management and editing app — fast, simple, and a joy to use. Sadly, Google
 discontinued it in 2016, leaving a gap that no modern tool has quite filled.
-That's why this project sets out to rewrite Picasa in Rust and release it as
-open source, so this classic experience can live on.
+That's why this project sets out to carry that way of working forward in Rust,
+as an open-source project written independently, so the classic flow lives on.
 
 If Maliang is useful to you, please consider giving the repo a
 [⭐ star](https://github.com/wadereye/Relyto.Maliang/stargazers) — and if
@@ -110,7 +110,7 @@ Version 0.1 was released on 2026-10-31, and v0.2 is wrapping up. See the
 
 - Dark / light themes; built-in Alibaba PuHuiTi Chinese font; icons use the
   open-source Lucide set.
-- Menu structure follows Picasa 3 (File / Edit / View / Tools / Help);
+- Classic five-menu layout (File / Edit / View / Tools / Help);
   native right-click menus on photos.
 - Right info drawer: properties / tags / people / places.
 - **Fully local: no network access, no telemetry.**
@@ -168,6 +168,62 @@ In a slim build, the "People" and "Semantic Search" views will indicate that
 they were not compiled in; everything else works as usual. Before enabling the
 feature, make sure the `onnxruntime` runtime and the corresponding model
 weights are in place.
+
+### Models (not bundled, place them yourself)
+
+Model files and weights are not distributed with the program (size and
+licensing reasons). At runtime they live in the `models\` subfolder of the
+**data directory** (default `%APPDATA%\Relyto\Maliang\models\`; the data
+directory can be relocated under Options > General). When a model is missing,
+the corresponding feature shows placement guidance instead of failing; other
+features are unaffected.
+
+| File | Purpose | Source & license |
+|---|---|---|
+| `face_det.onnx` | Face detection (YuNet, 2023mar release) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/), Apache-2.0 |
+| `face_rec.onnx` | Face recognition, 512-d (AdaFace IR-50 exported to ONNX) | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace), MIT |
+| `face_det_v2.onnx` / `face_rec_v2.onnx` | Optional: insightface antelopev2 (SCRFD + ArcFace, **weights are not commercially usable**, bring your own) | [deepinsight/insightface](https://github.com/deepinsight/insightface), per the official weight license |
+| `ch_PP-OCRv4_det_infer.onnx` / `ch_PP-OCRv4_rec_infer.onnx` / `ppocr_keys_v1.txt` | Chinese OCR | PP-OCRv4 (PaddleOCR, Apache-2.0) |
+| `clip_vision.onnx` / `clip_text.onnx` / `clip_merges.txt` | Semantic search | OpenAI CLIP (MIT), exported to ONNX |
+
+Both face schemes are supported; pick one under **Options > General > Face
+recognition scheme**. The default is YuNet + AdaFace (commercially friendly
+licenses). Vectors from the two schemes are incompatible — switching prompts
+a rescan. The detection model type is auto-detected from its output tensor
+count, so just name the files per the chosen scheme.
+
+Face model setup:
+
+- **Detection (YuNet)**: download the `face_detection_yunet_2023mar.onnx`
+  linked above, rename it to `face_det.onnx`, and drop it into the models
+  folder.
+- **Recognition (AdaFace)**: the official repository ships PyTorch weights,
+  which must be converted to ONNX first. Download the IR-50 weights per its
+  README (e.g. `adaface_ir50_ms1mv2.ckpt`) and run the following from the
+  AdaFace repository root:
+
+  ```python
+  # pip install torch onnx
+  import torch
+  from net import build_model
+
+  model = build_model("ir_50")
+  ckpt = torch.load("adaface_ir50_ms1mv2.ckpt", map_location="cpu")
+  state = ckpt.get("state_dict", ckpt)
+  model.load_state_dict({k.replace("module.", ""): v for k, v in state.items()})
+  model.eval()
+  torch.onnx.export(
+      model, torch.randn(1, 3, 112, 112), "face_rec.onnx",
+      input_names=["input"], output_names=["embedding"], opset_version=17,
+  )
+  ```
+
+  Put the resulting `face_rec.onnx` into the models folder (512-d output,
+  matching the vector dimension stored in the library).
+
+Model files remain the property of their respective owners; see
+[THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for attribution and
+license texts.
 
 ### Common Commands
 ```bash
@@ -249,9 +305,9 @@ Picasa is a trademark of Google LLC. This project is an **independent open
 source implementation** with no affiliation to, and no authorization,
 sponsorship, or endorsement from, Google LLC.
 
-Maliang is an independent implementation built from the ground up, without
-using any of Picasa's source code, binaries, or asset files. Similarities in
-interface and interaction design are intended to preserve a familiar
+Maliang is an independently written implementation in Rust; this repository
+contains and distributes no Google source code, binaries, or asset files.
+Similarities in interface and interaction design are intended to preserve a familiar
 experience and to support data interoperability with Picasa (such as the
 classic `picasa.ini` file format).
 

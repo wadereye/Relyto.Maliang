@@ -31,10 +31,14 @@ use walkdir::WalkDir;
 /// 目录快照:排序后的 (路径, mtime_ms, size) 列表,只含**可索引**的媒体文件
 /// (图片 + RAW + 视频 —— 判定统一走 `crate::scan::is_indexable`,
 /// 避免此处与事件路径收录范围不一致)。
+///
+/// `excl` 用于**整目录剪枝**(修 A1):被排除的目录连进都不进。此前快照不看
+/// 排除规则,回收站 / 应用数据目录里的条目会进基线,再被兜底扫描写进库。
 /// 首轮调用建立基线(不触发扫描)。降级轮询路径使用。
-pub fn snapshot(root: &Path) -> Vec<(String, i64, u64)> {
+pub fn snapshot(root: &Path, excl: &crate::scan::Exclusions) -> Vec<(String, i64, u64)> {
     let mut v: Vec<(String, i64, u64)> = WalkDir::new(root)
         .into_iter()
+        .filter_entry(|e| !prune(e, excl))
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
         .filter(|e| crate::scan::is_indexable(e.path()))
@@ -53,28 +57,51 @@ pub fn snapshot(root: &Path) -> Vec<(String, i64, u64)> {
     v
 }
 
-/// 快照差异:(新增数, 修改数)。
+/// WalkDir 剪枝判定:是目录且命中排除规则 → 整棵子树不进。
+///
+/// `depth() > 0` 是刻意的:**监听根本身永不剪**。用户显式把 `D:\Temp`
+/// 加进监听,那是明确意图,不该被出厂排除名单一票否决;剪的是它下面的子目录。
+fn prune(e: &walkdir::DirEntry, excl: &crate::scan::Exclusions) -> bool {
+    e.depth() > 0
+        && e.file_type().is_dir()
+        && e.file_name()
+            .to_str()
+            .is_some_and(|n| excl.excludes_dir(n))
+}
+
+/// 快照差异 → (新增数, 修改数, 变化的文件路径)。
 ///
 /// 删除**不计**:轮询快照分不清"重命名"与"删除+新增",
 /// 自动删行会丢星标/标签等元数据(原版靠改名配对保住,见点 4)。
 /// 删除对账只走事件驱动路径(事件源已把改名配对成 Modify)。
-pub fn diff_counts(old: &[(String, i64, u64)], new: &[(String, i64, u64)]) -> (usize, usize) {
+///
+/// 连路径一起返回是为了让 30s 兜底能**只处理变化的那些目录**(方案 P3-26):
+/// 把路径喂给 [`affected_dirs`],而不是拿整个监听根去重扫一遍。
+pub fn diff(
+    old: &[(String, i64, u64)],
+    new: &[(String, i64, u64)],
+) -> (usize, usize, Vec<PathBuf>) {
     let old_m: HashMap<&str, (i64, u64)> = old
         .iter()
         .map(|(p, m, s)| (p.as_str(), (*m, *s)))
         .collect();
     let (mut added, mut modified) = (0usize, 0usize);
+    let mut paths = Vec::new();
     for (p, m, s) in new {
         match old_m.get(p.as_str()) {
-            None => added += 1,
+            None => {
+                added += 1;
+                paths.push(PathBuf::from(p));
+            }
             Some(&(om, os)) => {
                 if om != *m || os != *s {
                     modified += 1;
+                    paths.push(PathBuf::from(p));
                 }
             }
         }
     }
-    (added, modified)
+    (added, modified, paths)
 }
 
 /// 监听器的运行模式(降级门控的结果)。
@@ -188,7 +215,10 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                             let n = if dirs.is_empty() {
                                 0
                             } else {
-                                scan_dirs(&store, &dirs)
+                                // 事件路径与兜底路径共用同一份排除规则
+                                // (方案 P3-25/26):快路慢路不许各判一套。
+                                let excl = crate::scan::Exclusions::from_store(&store);
+                                scan_dirs(&store, &dirs, &excl)
                             };
                             if n == 0 && removed == 0 {
                                 continue;
@@ -213,30 +243,10 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                                 base.clear();
                                 continue;
                             }
-                            let mut changed: Vec<PathBuf> = Vec::new();
-                            let (mut added, mut modified) = (0usize, 0usize);
-                            for r in &roots {
-                                let snap = snapshot(r);
-                                match base.get(r) {
-                                    None => {
-                                        base.insert(r.clone(), snap);
-                                    }
-                                    Some(old) => {
-                                        let (a, m) = diff_counts(old, &snap);
-                                        if a + m > 0 {
-                                            changed.push(r.clone());
-                                            added += a;
-                                            modified += m;
-                                        }
-                                        base.insert(r.clone(), snap);
-                                    }
-                                }
-                            }
-                            base.retain(|k, _| roots.contains(k));
-                            if !changed.is_empty() {
-                                let _ = crate::scan::scan_dir(&store, &changed);
+                            let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
+                            if ndirs > 0 {
                                 let _ = tx.send(format!(
-                                    "监听:{added} 张新照片、{modified} 张变更,已增量扫描(轮询兜底)"
+                                    "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)"
                                 ));
                             }
                         }
@@ -262,30 +272,10 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                         continue;
                     }
                     let roots = store.list_watched();
-                    let mut changed: Vec<PathBuf> = Vec::new();
-                    let (mut added, mut modified) = (0usize, 0usize);
-                    for r in &roots {
-                        let snap = snapshot(r);
-                        match base.get(r) {
-                            None => {
-                                base.insert(r.clone(), snap);
-                            }
-                            Some(old) => {
-                                let (a, m) = diff_counts(old, &snap);
-                                if a + m > 0 {
-                                    changed.push(r.clone());
-                                    added += a;
-                                    modified += m;
-                                }
-                                base.insert(r.clone(), snap);
-                            }
-                        }
-                    }
-                    base.retain(|k, _| roots.contains(k));
-                    if !changed.is_empty() {
-                        let _ = crate::scan::scan_dir(&store, &changed);
+                    let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
+                    if ndirs > 0 {
                         let _ = tx.send(format!(
-                            "监听:{added} 张新照片、{modified} 张变更,已增量扫描(轮询模式)"
+                            "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)"
                         ));
                     }
                 }
@@ -343,10 +333,77 @@ fn affected_dirs(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {    let 
     out
 }
 
+/// 逐文件入库(事件驱动的粒度:原版 `FindNextFileW` 一次一个目录项)。
+/// 返回新增/变更的文件数。被排除的目录整棵剪掉(与 [`snapshot`] 同一份规则)。
+fn scan_dirs(store: &Store, dirs: &[PathBuf], excl: &crate::scan::Exclusions) -> usize {
+    let mut n = 0usize;
+    for d in dirs {
+        let it = WalkDir::new(d)
+            .into_iter()
+            .filter_entry(|e| !prune(e, excl))
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| crate::scan::is_indexable(e.path()));
+        for e in it {
+            if crate::scan::index_file(store, e.path()).unwrap_or(false) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// 30s 基线比对兜底的一轮:逐根做快照 diff,只把**变化的目录**交给增量扫描。
+///
+/// 事件驱动与降级轮询两条路共用这一段(方案 P3-26):兜底不再是"整根重扫",
+/// 而是 diff 出变化的文件 → [`affected_dirs`] → 只扫这些目录。
+///
+/// 返回 `(新增数, 修改数, 实际扫描的目录数)`;首轮只建基线,目录数为 0。
+fn poll_once(
+    store: &Store,
+    roots: &[PathBuf],
+    base: &mut HashMap<PathBuf, Vec<(String, i64, u64)>>,
+) -> (usize, usize, usize) {
+    // 每轮重读一次排除规则:用户在设置里改了名单,下一轮兜底就该生效。
+    let excl = crate::scan::Exclusions::from_store(store);
+    let (mut added, mut modified) = (0usize, 0usize);
+    let mut changed: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        let snap = snapshot(r, &excl);
+        match base.get(r) {
+            // 首轮只建基线,不触发扫描(否则每次开监听都等于全量重扫)。
+            None => {
+                base.insert(r.clone(), snap);
+            }
+            Some(old) => {
+                let (a, m, paths) = diff(old, &snap);
+                added += a;
+                modified += m;
+                changed.extend(paths);
+                base.insert(r.clone(), snap);
+            }
+        }
+    }
+    // 监听集合缩了 → 对应基线也丢掉,免得下次重新加回来时拿陈旧基线比对。
+    base.retain(|k, _| roots.contains(k));
+    if changed.is_empty() {
+        return (added, modified, 0);
+    }
+    let dirs = affected_dirs(&changed, roots);
+    let n = dirs.len();
+    scan_dirs(store, &dirs, &excl);
+    (added, modified, n)
+}
+
 /// 删除事件 → 移出图库(删除索引行 + 清缩略图缓存),返回实际移出的张数。
 ///
-/// 只处理监听根之内的路径;是否真的删除以磁盘为准(`drop_missing_paths`
-/// 会跳过仍存在的路径),避免去抖期间"删除后又恢复"造成误删索引。
+/// 只处理监听根之内的路径。是否真被删了**先问 L1 再问磁盘**(方案 P3-26
+/// 的省 IO + 竞态兜底两者兼得):
+/// 服务在线且那一卷建了索引时,L1 说「还在」的路径直接跳过,一次 `stat`
+/// 都不做;L1 说「不在」的还要落盘复核一次 —— 因为 L1 是**滞后快照**,
+/// 它对「刚删掉」和「刚建好还没扫进索引」两种情况给的是同一个答案,
+/// 只凭它会把毫秒前刚写好的文件从图库里抹掉(2026-11-05 服务装起来后
+/// 单测就是这么稳定复现的)。磁盘才是当场的事实。
 fn drop_removed(store: &Store, items: &[(PathBuf, bool)], roots: &[PathBuf]) -> usize {
     let mut paths: Vec<String> = Vec::new();
     for (p, removed) in items {
@@ -361,7 +418,27 @@ fn drop_removed(store: &Store, items: &[(PathBuf, bool)], roots: &[PathBuf]) -> 
     if paths.is_empty() {
         return 0;
     }
-    match store.drop_missing_paths(&paths) {
+    match l1_gone(&paths) {
+        Some(gone) => {
+            if gone.is_empty() {
+                return 0;
+            }
+            let real: Vec<String> = gone
+                .into_iter()
+                .filter(|p| !Path::new(p).exists())
+                .collect();
+            if real.is_empty() {
+                return 0;
+            }
+            drop_and_purge(store.drop_paths_confirmed(&real))
+        }
+        None => drop_and_purge(store.drop_missing_paths(&paths)),
+    }
+}
+
+/// 删行 + 清缩略图缓存,返回移出的张数。
+fn drop_and_purge(r: anyhow::Result<Vec<(i64, String)>>) -> usize {
+    match r {
         Ok(rows) => {
             for (id, _) in &rows {
                 crate::thumbs::purge_cached(*id);
@@ -372,23 +449,48 @@ fn drop_removed(store: &Store, items: &[(PathBuf, bool)], roots: &[PathBuf]) -> 
     }
 }
 
-/// 逐文件入库(事件驱动的粒度:原版 `FindNextFileW` 一次一个目录项)。
-/// 返回新增/变更的文件数。
-fn scan_dirs(store: &Store, dirs: &[PathBuf]) -> usize {
-    let mut n = 0usize;
-    for d in dirs {
-        let it = WalkDir::new(d)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-            .filter(|e| crate::scan::is_indexable(e.path()));
-        for e in it {
-            if crate::scan::index_file(store, e.path()).unwrap_or(false) {
-                n += 1;
+/// 问 L1 索引服务:这批路径里哪些**可能**已经不在了(候选,调用方仍需落盘复核)。
+///
+/// 返回 `None` = 不能拿 L1 当权威,调用方退回磁盘复核。两种情况会给 `None`:
+/// 管道连不上/协议失败,以及**该路径所在卷不在服务的可信索引里** ——
+/// 服务对没有索引的卷一律回 `exists=false`,把那个当"文件没了"会整卷误删
+/// (非 NTFS 卷、还没建完的卷都属此类,方案 P4-30 要求它们走兼容路径)。
+///
+/// 同理,任何一条问答失败就把**整批**交回磁盘复核:宁可多几次 `stat`,
+/// 也不能因为一次管道抖动把还在的文件移出图库。
+fn l1_gone(paths: &[String]) -> Option<Vec<String>> {
+    let mut c = crate::ipc::Client::connect(200).ok()?;
+    // 先问一次概况,拿到"哪些卷真的建了索引"。
+    let trusted: std::collections::HashSet<char> = match c.call(&crate::ipc::Req::Status) {
+        Ok(crate::ipc::Resp::Status(s)) => s
+            .vols
+            .iter()
+            .filter(|v| v.entries > 0 && !v.building)
+            .map(|v| v.letter)
+            .collect(),
+        _ => return None,
+    };
+    let mut gone = Vec::new();
+    for p in paths {
+        let letter = p
+            .trim()
+            .chars()
+            .next()
+            .map(|ch| ch.to_ascii_uppercase())
+            .unwrap_or('\0');
+        if !trusted.contains(&letter) {
+            return None;
+        }
+        match c.call(&crate::ipc::Req::Stat { path: p.clone() }) {
+            Ok(crate::ipc::Resp::Stat(si)) => {
+                if !si.exists {
+                    gone.push(p.clone());
+                }
             }
+            _ => return None,
         }
     }
-    n
+    Some(gone)
 }
 
 #[cfg(test)]
@@ -406,29 +508,65 @@ mod tests {
         std::fs::write(&a, b"1").unwrap();
         std::fs::write(&b, b"22").unwrap();
         std::fs::write(&c, b"skip").unwrap();
-        let s1 = snapshot(&dir);
+        let excl = crate::scan::Exclusions::default();
+        let s1 = snapshot(&dir, &excl);
         assert_eq!(s1.len(), 2, "只应收录 2 张图像");
 
         // 基线 → 无变化
-        assert_eq!(diff_counts(&s1, &s1), (0, 0));
+        let (a0, m0, p0) = diff(&s1, &s1);
+        assert_eq!((a0, m0), (0, 0));
+        assert!(p0.is_empty());
 
         // 新增一张 + 修改一张内容(内容变了 size 也变)
         std::fs::write(&a, b"longer-content").unwrap();
         std::fs::write(dir.join("c.webp"), b"333").unwrap();
-        let s2 = snapshot(&dir);
-        let (add, modif) = diff_counts(&s1, &s2);
+        let s2 = snapshot(&dir, &excl);
+        let (add, modif, paths) = diff(&s1, &s2);
         assert_eq!(add, 1, "应检出 1 张新增");
         assert_eq!(modif, 1, "应检出 1 张修改");
         assert_eq!(s2.len(), 3);
+        // 变化的路径要一并给出:30s 兜底靠它算出「只扫哪些目录」。
+        assert_eq!(paths.len(), 2, "新增 + 修改各一条");
+        assert!(paths.iter().any(|p| p == &a), "被改的那张要在里面");
+        assert!(
+            paths.iter().any(|p| p.file_name().is_some_and(|n| n == "c.webp")),
+            "新增的那张要在里面"
+        );
 
         // 空目录快照为空
         let empty = std::env::temp_dir().join(format!("rk-watch-empty-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&empty);
         std::fs::create_dir_all(&empty).unwrap();
-        assert!(snapshot(&empty).is_empty());
+        assert!(snapshot(&empty, &excl).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+
+    /// 快照要按排除规则**整目录剪枝**(修 A1),但监听根本身不剪。
+    #[test]
+    fn snapshot_prunes_excluded_dirs_but_not_the_root() {
+        let dir = std::env::temp_dir().join(format!("rk-watch-excl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // 回收站旧名在硬编码 4 条里,不可关。
+        std::fs::create_dir_all(dir.join("RECYCLER")).unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("keep.jpg"), b"1").unwrap();
+        std::fs::write(dir.join("sub").join("deep.jpg"), b"2").unwrap();
+        std::fs::write(dir.join("RECYCLER").join("$I001.jpg"), b"3").unwrap();
+        let excl = crate::scan::Exclusions::default();
+        let s = snapshot(&dir, &excl);
+        assert_eq!(s.len(), 2, "排除目录里的条目不该进快照:{s:?}");
+        assert!(
+            !s.iter().any(|(p, _, _)| p.contains("RECYCLER")),
+            "RECYCLER 整棵子树应被剪掉:{s:?}"
+        );
+
+        // 用户显式把被排除的目录加进监听 → 根自己照样扫(剪的是它下面的子目录)。
+        let rec = dir.join("RECYCLER");
+        assert_eq!(snapshot(&rec, &excl).len(), 1, "监听根本身永不剪");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 事件路径 → 受影响目录:只取父目录,且必须在监听根之内。
@@ -446,6 +584,8 @@ mod tests {
     }
 
     /// 删除事件 → 只处理监听根之内、且磁盘上确实已消失的路径。
+    /// 装了索引服务的开发机上这条会走 L1 分支:索引里还没有 `kept.jpg`
+    /// (刚落盘,保鲜还没扫到),不许因此把它当成已删除。
     #[test]
     fn drop_removed_filters_roots_and_checks_disk() {
         let store = crate::db::Store::open_mem().unwrap();

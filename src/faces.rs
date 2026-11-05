@@ -9,7 +9,19 @@ use std::collections::HashMap;
 /// 人脸算法版本(写 settings;与库中记录不一致时 GUI 提示重扫)。
 /// 改动检测/聚类/嵌入算法时提升此版本号。
 /// v3: 修复识别裁剪图预处理(to_rgb32f 0~1 值误按 0~255 归一化)。
-pub const FACE_ALGO_VERSION: &str = "v3";
+/// v4: 检测/识别切换 YuNet + AdaFace IR-50(替换非商用 antelopev2)为默认方案;
+///     antelopev2 保留为可选方案,版本号连同方案名一起比对。
+pub const FACE_ALGO_VERSION: &str = "v4";
+
+/// 当前人脸方案(选项 > 常规 选择,默认 YuNet + AdaFace)。
+pub fn current_algo(store: &Store) -> crate::ai::face::FaceAlgo {
+    crate::ai::face::FaceAlgo::from_key(&store.get_setting("face_algo").unwrap_or_default())
+}
+
+/// 算法标识 = 版本 + 方案:两者任一变化,库中向量都不通用,提示重扫。
+pub fn algo_tag(store: &Store) -> String {
+    format!("{}-{}", FACE_ALGO_VERSION, current_algo(store).key())
+}
 
 pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
     store.read(|conn| {
@@ -474,7 +486,7 @@ pub fn scan_batch(
     let done = photo_ids_done(store);
     let todo = photos_todo(store, cap);
     let total = todo.len();
-    let mut faces_engine = match Faces::load() {
+    let mut faces_engine = match Faces::load(current_algo(store)) {
         Ok(e) => e,
         Err(e) => return Err(anyhow::anyhow!(e)),
     };
