@@ -11,17 +11,3 @@
 Thumbs.db
 .DS_Store
 .wtest
-
-# 本地约束/笔记,永不进入版本库
-.workbuddy/
-COMPLIANCE.md
-tools/
-
-# 会话过程产物(与 Picasa 3 的过程笔记记录),仅留在本地,不进入版本库
-过程笔记
-过程笔记.md
-过程笔记.md
-过程笔记.md
-过程笔记
-RE_*.md
-过程笔记.md

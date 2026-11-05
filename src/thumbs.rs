@@ -3,7 +3,7 @@ use image::imageops::FilterType;
 use rayon::prelude::*;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// 缩略图档位(P1-9)。
@@ -97,9 +97,6 @@ impl Tier {
 /// 全部档位(小 → 预览)。
 pub const ALL_TIERS: [Tier; 4] = [Tier::Small, Tier::Normal, Tier::Big, Tier::Preview];
 
-/// 网格默认档(原版主力档 256px)。
-pub const THUMB_SIZE: u32 = 256;
-
 /// 该档的缓存目录。
 pub fn tier_dir(tier: Tier) -> PathBuf {
     crate::db::cache_dir().join(tier.dir_name())
@@ -108,10 +105,6 @@ pub fn tier_dir(tier: Tier) -> PathBuf {
 /// 该档某张照片的缓存文件路径。
 pub fn tier_path(tier: Tier, id: i64) -> PathBuf {
     tier_dir(tier).join(format!("{id}.jpg"))
-}
-
-fn thumb_path(id: i64) -> PathBuf {
-    tier_path(Tier::Normal, id)
 }
 
 /// 清掉某张照片在**所有档位**留下的缩略图缓存文件。
@@ -124,62 +117,154 @@ pub fn purge_cached(id: i64) {
     }
 }
 
-/// 若磁盘缩略图存在则返回路径;否则在哪生成由调用方决定（后台线程）。
-#[allow(dead_code)]
-pub fn existing(id: i64) -> Option<PathBuf> {
-    let p = thumb_path(id);
-    if p.exists() { Some(p) } else { None }
-}
-
-/// 读取已落盘的缩略图（不解码原图）。
-///
-/// P1-9 起 UI 走 `load_cached_tier`(按档位读);本函数是"默认档"的便捷包装,
-/// 保留给测试与工具代码。
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn load_cached(id: i64) -> Option<image::DynamicImage> {
-    load_cached_tier(Tier::Normal, id)
-}
-
 /// 按档位读取已落盘的缩略图（不解码原图）。
 pub fn load_cached_tier(tier: Tier, id: i64) -> Option<image::DynamicImage> {
     let p = tier_path(tier, id);
     image::open(&p).ok()
 }
 
-/// 预览大图的**统一取图入口**。
+// ===================== 解码基底与缩放(方案 P4-23①②) =====================
+
+/// 内嵌预览够不够格当某一档的基底(方案 P4-23②:按目标尺寸取图)。
+///
+/// 边长达到目标的一半就收:上采样只会糊,但比整图解码省一个数量级的时间;
+/// 达不到一半宁可整图解码,也不要糊成马赛克。
+///
+/// ⚠ 旧实现是硬编码的「≥128px」,于是 160px 的 EXIF 缩略图会被拿去喂
+/// 512 / 1024 档 —— 大档看着就是一团糊。这里按该档的实际尺寸判。
+fn embedded_ok(w: u32, h: u32, target: u32) -> bool {
+    w.max(h).saturating_mul(2) >= target
+}
+
+/// 等比缩到 `size`×`size` 以内该用的目标宽高(与 `image::resize` 同一口径)。
+fn fit_dims(w: u32, h: u32, size: u32) -> (u32, u32) {
+    let long = w.max(h).max(1) as f64;
+    let f = (size as f64 / long).min(1.0);
+    (
+        ((w as f64 * f).round() as u32).max(1),
+        ((h as f64 * f).round() as u32).max(1),
+    )
+}
+
+/// 缩到 `size` 内(保持宽高比;小图照旧放大,与网格铺满格子的观感一致)。
+///
+/// 缩小比例 ≥8× 时先用 `thumbnail`(内部 Nearest,按整数倍跳采样)粗缩到
+/// 2×目标再精缩一趟 —— 4000×3000 的原图直接 Triangle 到 256,每个输出
+/// 像素都要在十几万个源像素上加权,粗缩能省掉绝大部分采样。
+fn downscale(img: image::DynamicImage, size: u32) -> image::DynamicImage {
+    let (w, h) = (img.width(), img.height());
+    if w == 0 || h == 0 || size == 0 {
+        return img;
+    }
+    if w.max(h) >= size.saturating_mul(8) {
+        let (mw, mh) = fit_dims(w, h, size.saturating_mul(2).max(1));
+        return img.thumbnail(mw, mh).resize(size, size, FilterType::Triangle);
+    }
+    img.resize(size, size, FilterType::Triangle)
+}
+
+/// 缩到 `size` 内,**再**按 EXIF 方向摆正(方案 P4-23②)。
+///
+/// 顺序是刻意的:先缩后转。90°/270° 旋转是纯像素置换,
+/// 「缩到 S 再转」与「转完再缩到 S」结果逐像素一致(dHash 也不变),
+/// 而在 4000×3000 的原图上先转一次要多花十几倍的时间与内存。
+///
+/// 方案里说的「orientation 6/8 时交换请求宽高」在我方是恒等变换:
+/// `image` crate 不支持缩放解码,而各档的目标框都是正方形,交换宽高不变 ——
+/// 能省的只有**顺序**这一项。
+fn fit_oriented(
+    img: image::DynamicImage,
+    size: u32,
+    orient: u32,
+) -> image::DynamicImage {
+    apply_exif_rotation(downscale(img, size), orient)
+}
+
+/// 解码基底 + 还需施加的 EXIF 方向(1 = 已摆正,不用再转)。
 ///
 /// 取值顺序(快的优先,能不出全图就不出):
 ///
 /// 1. 视频 → Shell 抽帧(`image` crate 解不了容器格式);
-/// 2. JPEG 内嵌 EXIF 缩略图(≥128px)—— 相机原图几乎都有,免整图解码;
-/// 3. 相机 RAW → 借 Windows Shell 已安装的解码扩展;
-/// 4. 其余格式走 `image::open`。
+/// 2. JPEG 内嵌 EXIF 缩略图 —— 相机原图几乎都有,免整图解码;
+/// 3. 相机 RAW → **内嵌 JPEG 预览优先**(方案 P4-23①),Shell 只作最后兜底;
+/// 4. 其余格式走 `image::open`,方向随图一起交给调用方。
 ///
-/// 第二个返回值 `from_thumb` 表示**图像已由解码器按 EXIF 方向摆正**
-/// (内嵌缩略图 / Shell 出图都是摆正过的),调用方不应再旋一次;
-/// 只有第 4 条路线返回 false,需要调用方自己摆正。
-///
-/// 四条路线全部失败时返回 `None`(预览窗显示"加载失败")。
-pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImage, bool)> {
-    // 1) 视频:Shell 抽帧。
+/// 1/2 出的图都已按相机方向摆正(内嵌缩略图与 Shell 缩略图都是),返回 1;
+/// RAW 内嵌预览是个例外:各家相机写预览时转不转不一致,见 [`raw_embedded_preview`]。
+fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
+    // 1) 视频:走系统 Shell 视频缩略提供程序(系统 DirectShow 系后端),
+    //    进程内完成解码,免外部进程往返。
     if crate::video::is_video(src) {
-        return decode_via_shell_sized(src, max_side).map(|i| (i, true));
+        return decode_via_shell_sized(src, target)
+            .map(|i| (i, 1))
+            // Shell 拿不到帧(解码器缺失等)→ 显式失败,与原版
+            // "missing/loading movie" 占位语义一致(媒体类型判定)。
+            .ok_or_else(|| {
+                anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display())
+            });
     }
-    // 2) 内嵌 EXIF 缩略图(小于 128px 的不够看,不如解原图)。
+    // 2) 内嵌 EXIF 缩略图(对应原版 "Use EXIF thumbnails")。
     if let Some(t) = crate::exif::read_jpeg_embedded_thumb(src)
         .and_then(|b| image::load_from_memory(&b).ok())
-        .filter(|t| t.width() >= 128 || t.height() >= 128)
+        .filter(|t| embedded_ok(t.width(), t.height(), target))
     {
-        return Some((t, true));
+        return Ok((t, 1));
     }
-    // 3) 相机 RAW:借系统解码扩展。
+    // 3) 相机 RAW:内嵌预览优先,Shell 兜底。
     if crate::scan::is_raw(src) {
-        if let Some(t) = decode_via_shell_sized(src, max_side) {
-            return Some((t, true));
+        if let Some((img, orient)) = raw_embedded_preview(src, target) {
+            return Ok((img, orient));
+        }
+        if let Some(t) = decode_via_shell_sized(src, target) {
+            return Ok((t, 1));
         }
     }
-    // 4) 常规格式。
-    image::open(src).ok().map(|i| (i, false))
+    // 4) 常规格式:EXIF 只解析一次,方向随图一起返回(不再让调用方重解一遍)。
+    let img = image::open(src)?;
+    Ok((img, read_rotation(src)))
+}
+
+/// RAW 的内嵌 JPEG 预览(方案 P4-23①)。
+///
+/// 相机在 TIFF 容器里塞了一张全尺寸 JPEG,直接取它比走 Shell 解码器快一个
+/// 量级,也不依赖厂商 RAW 解码扩展装没装。返回(图, 还需施加的方向)。
+///
+/// 摆正判定:90° 类方向(5..=8)要求宽高互换 —— 若预览自身的宽高比与
+/// IFD0 声明的**相反**,说明相机写预览时已经转过了;一致(或缺 IFD0 宽高
+/// 标签)则按 Orientation 转。
+fn raw_embedded_preview(src: &Path, target: u32) -> Option<(image::DynamicImage, u32)> {
+    for p in crate::exif::read_tiff_previews(src, crate::exif::MAX_PREVIEW_CANDIDATES) {
+        let Some(img) = image::load_from_memory(&p.bytes).ok() else {
+            continue; // 漏网的无损 JPEG 之类:试下一个候选
+        };
+        let (w, h) = (img.width(), img.height());
+        if !embedded_ok(w, h, target) {
+            continue; // 太小,喂这一档会糊 → 落回 Shell / 整图解码
+        }
+        let orient = preview_orient(&p, w, h);
+        return Some((img, orient));
+    }
+    None
+}
+
+/// 内嵌预览还需不需要转(判定说明见 [`raw_embedded_preview`])。
+fn preview_orient(p: &crate::exif::TiffPreview, w: u32, h: u32) -> u32 {
+    if !matches!(p.orient, 5..=8) || p.base_w == 0 || p.base_h == 0 {
+        return p.orient; // 不涉及换向,或无从判定 → 按 EXIF 方向转
+    }
+    if (p.base_w > p.base_h) != (w > h) {
+        1 // 宽高比已反 → 相机写预览时已经转过了
+    } else {
+        p.orient
+    }
+}
+
+/// 预览大图的**统一取图入口**。
+///
+/// 返回(图, 还需施加的 EXIF 方向);方向为 1 表示已摆正。
+/// 取值顺序见 [`decode_base`];四条路线全失败返回 `None`(预览窗显示"加载失败")。
+pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImage, u32)> {
+    decode_base(src, max_side).ok()
 }
 
 /// 生成指定档位的缩略图;返回 dHash。
@@ -188,96 +273,23 @@ pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImag
 /// 没必要每档重算(原版 dHash/uid64 也只算一次存在 DB 列里)。
 /// 其余档位返回 0。
 pub fn generate_tier(tier: Tier, id: i64, src: &Path) -> Result<u64> {
-    if tier == Tier::Normal {
-        return generate(id, src);
-    }
-    // P2-17 视频:各档位同样走 Shell 抽帧(与 Normal 同源,仅尺寸不同)。
-    if crate::video::is_video(src) {
-        return match decode_via_shell_sized(src, tier.size()) {
-            Some(img) => {
-                let fit = img.resize(tier.size(), tier.size(), FilterType::Triangle);
-                save_letterboxed(tier.size(), &fit, tier_path(tier, id))?;
-                Ok(0)
-            }
-            None => Err(anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display())),
-        };
-    }
-    // 优先复用更小档的缓存?不 —— 各档独立生成,避免低档糊了大档。
-    let (img, from_thumb) = match crate::exif::read_jpeg_embedded_thumb(src)
-        .and_then(|b| image::load_from_memory(&b).ok())
-        .filter(|t| t.width() >= 128 || t.height() >= 128)
-    {
-        Some(t) => (t, true),
-        None => {
-            if crate::scan::is_raw(src) {
-                match decode_via_shell_sized(src, tier.size()) {
-                    Some(t) => (t, true),
-                    None => (image::open(src)?, false),
-                }
-            } else {
-                (image::open(src)?, false)
-            }
-        }
-    };
-    let flat = if from_thumb {
-        img
-    } else {
-        apply_exif_rotation(img, read_rotation(src))
-    };
     let size = tier.size();
-    let fit = flat.resize(size, size, FilterType::Triangle);
+    let (img, orient) = decode_base(src, size)?;
+    let fit = fit_oriented(img, size, orient);
+    // 各档独立生成,不复用更小档的缓存 —— 免得低档糊了大档。
+    let dhash = if tier == Tier::Normal {
+        crate::hash::dhash_u64(&fit)
+    } else {
+        0
+    };
     save_letterboxed(size, &fit, tier_path(tier, id))?;
-    Ok(0)
+    Ok(dhash)
 }
 
 /// 等比缩样到 256x256 内,居中贴浅灰画布(Picasa 式 letterbox)。
 /// 返回 (dHash):由缩样图(letterbox 之前)计算,避免边框干扰梯度。
-pub fn generate(id: i64, src: &Path) -> Result<u64> {    // P2-17 视频:走 Shell 视频缩略提供程序(系统 DirectShow 系后端)。
-    // 走系统 Shell 视频缩略提供程序,进程内完成解码,免外部进程往返。
-    if crate::video::is_video(src) {
-        return match decode_via_shell(src) {
-            Some(img) => {
-                let fit = img.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle);
-                let dhash = crate::hash::dhash_u64(&fit);
-                save_letterboxed(THUMB_SIZE, &fit, thumb_path(id))?;
-                Ok(dhash)
-            }
-            // Shell 拿不到帧(解码器缺失等)→ 显式失败,与原版
-            // "missing/loading movie" 占位语义一致(媒体类型判定)。
-            None => Err(anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display())),
-        };
-    }
-    // 加速(对应原版 "Use EXIF thumbnails"):有 JPEG 内嵌 EXIF 缩略图且
-    // 足够大(>=128px)时直接用作基底,免全图解码;内嵌预览已应用相机方向,
-    // 不再二次旋转。dHash 与全图解码路径同一公式,结果一致。
-    let (img, from_thumb) = match crate::exif::read_jpeg_embedded_thumb(src)
-        .and_then(|b| image::load_from_memory(&b).ok())
-        .filter(|t| t.width() >= 128 || t.height() >= 128)
-    {
-        Some(t) => (t, true),
-        None => {
-            // RAW 等 image crate 解不了的格式 → 借 Windows Shell 缩略图扩展出图
-            // (与原版一致的 COM 路线)。Shell 缩略图已按
-            // 方向摆正,故与内嵌预览同样不再二次旋转。
-            if crate::scan::is_raw(src) {
-                match decode_via_shell(src) {
-                    Some(t) => (t, true),
-                    None => (image::open(src)?, false),
-                }
-            } else {
-                (image::open(src)?, false)
-            }
-        }
-    };
-    let flat = if from_thumb {
-        img
-    } else {
-        apply_exif_rotation(img, read_rotation(src))
-    };
-    let fit = flat.resize(THUMB_SIZE, THUMB_SIZE, FilterType::Triangle);
-    let dhash = crate::hash::dhash_u64(&fit);
-    save_letterboxed(THUMB_SIZE, &fit, thumb_path(id))?;
-    Ok(dhash)
+pub fn generate(id: i64, src: &Path) -> Result<u64> {
+    generate_tier(Tier::Normal, id, src)
 }
 
 /// 原子落盘 JPEG:先写临时文件再改名。
@@ -305,15 +317,10 @@ fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathB
     save_jpeg_atomic(&image::DynamicImage::ImageRgb8(canvas), &path)
 }
 
-/// 用 Windows Shell 缩略图扩展解码（相机 RAW 等 image crate 解不了的格式）。
+/// 用 Windows Shell 缩略图扩展解码到指定尺寸（相机 RAW 等 image crate 解不了的格式）。
 ///
 /// 与原版一致的做法:走 COM `IThumbnailProvider`,
 /// 借系统已安装的相机厂商 RAW 解码器出图。Shell 未就绪时返回 None。
-fn decode_via_shell(src: &Path) -> Option<image::DynamicImage> {
-    decode_via_shell_sized(src, THUMB_SIZE)
-}
-
-/// 用 Windows Shell 缩略图扩展解码到指定尺寸。
 fn decode_via_shell_sized(src: &Path, size: u32) -> Option<image::DynamicImage> {
     let (bgra, w, h) = crate::win::shell_thumbnail(src, size)?;
     // GDI 32bpp 是 BGRA，且自下而上；转成 image crate 的 RGBA8。
@@ -354,57 +361,108 @@ pub fn apply_exif_rotation(img: image::DynamicImage, orient: u32) -> image::Dyna
 /// 注意:生成过程**不持有数据库锁**(只锁一小会儿取 id/path 列表),
 /// 否则解码大图会长时间阻塞 UI 的数据库访问。
 pub fn backfill(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
-    backfill_tier(store, Tier::Normal, limit)
+    backfill_tier(store, Tier::Normal, &[], limit)
 }
 
 /// 批量生成指定档位缺失的缩略图(P1-9)。
 ///
-/// 返回成功生成的 id 列表。Normal 档会顺带回写 `thumb_ok=1` 与 `dhash`;
-/// 其余档位只记 `thumb_tiers` 表(对应原版的三张缓存表各自独立记账)。
-pub fn backfill_tier(store: &crate::db::Store, tier: Tier, limit: usize) -> Result<Vec<i64>> {
-    let rows = store.missing_tier(tier as u8, limit);
+/// 返回成功生成的 id 列表。Normal 档会顺带回写 `thumb_ok=1`、`dhash` 与
+/// `rich_state=2`;其余档位只记 `thumb_tiers` 表(对应原版的三张缓存表各自
+/// 独立记账)。
+///
+/// `visible` 是当前可见目录清单,只影响 Normal 档的取行顺序
+/// (可见优先 + 全库兜底,见 [`crate::db::Store::missing_tier`])。
+pub fn backfill_tier(
+    store: &crate::db::Store,
+    tier: Tier,
+    visible: &[String],
+    limit: usize,
+) -> Result<Vec<i64>> {
+    let rows = store.missing_tier(tier as u8, visible, limit);
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    let (ok, failed): (Vec<(i64, u64)>, Vec<i64>) = rows
+    let (ok, failed): (
+        Vec<(i64, u64, Option<crate::scan::Derived>)>,
+        Vec<(i64, &String, String)>,
+    ) = rows
         .par_iter()
         .partition_map(|(id, path)| match generate_tier(tier, *id, Path::new(path)) {
-            Ok(h) => rayon::iter::Either::Left((*id, h)),
+            Ok(h) => {
+                // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读(方案 P3-25):
+                // 发现路径不打开文件内容,这里是唯一读它的地方。
+                // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
+                let d = (tier == Tier::Normal)
+                    .then(|| crate::scan::read_derived(Path::new(path)));
+                rayon::iter::Either::Left((*id, h, d))
+            }
             // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
             // worker 永远空转在开头(真实事故:回收站 $I*.jpg 元数据)。
-            Err(_) => rayon::iter::Either::Right(*id),
+            Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
         });
-    for id in &failed {
-        store.mark_thumb_fail(*id);
+    for (id, path, why) in &failed {
+        escalate_failure(store, *id, path, why);
     }
     // 删除竞态:生成期间照片可能已被移出图库(监听对账),
     // 刚落盘的缩略图必须清掉,否则 rowid 复用时会被当成新照片的缓存。
     let alive: std::collections::HashMap<i64, String> = rows.iter().cloned().collect();
-    let (ok, stale): (Vec<(i64, u64)>, Vec<(i64, u64)>) = ok
+    let (ok, stale): (
+        Vec<(i64, u64, Option<crate::scan::Derived>)>,
+        Vec<(i64, u64, Option<crate::scan::Derived>)>,
+    ) = ok
         .into_iter()
-        .partition(|(id, _)| alive.get(id).is_some_and(|p| store.photo_alive(*id, p)));
-    for (id, _) in &stale {
+        .partition(|(id, _, _)| alive.get(id).is_some_and(|p| store.photo_alive(*id, p)));
+    for (id, _, _) in &stale {
         purge_cached(*id);
     }
     if ok.is_empty() {
         return Ok(Vec::new());
     }
     if tier == Tier::Normal {
-        // Normal 档额外回写 thumb_ok + dhash(dhash 只在中档算)。
-        store.write(|conn| -> anyhow::Result<()> {
-            for (id, h) in &ok {
-                conn.execute(
-                    "UPDATE photos SET thumb_ok=1, dhash=?2 WHERE id=?1",
-                    rusqlite::params![id, *h as i64],
-                )?;
-            }
-            Ok(())
-        })?;
+        // 派生列 + thumb_ok + dhash + rich_state 一条 UPDATE 落定(见 `mark_derived`)。
+        let batch: Vec<(i64, u64, Option<&crate::scan::Derived>)> = ok
+            .iter()
+            .map(|(id, h, d)| (*id, *h, d.as_ref()))
+            .collect();
+        store.mark_derived(&batch)?;
     }
-    for (id, _) in &ok {
+    for (id, _, _) in &ok {
         let _ = store.mark_tier_done(*id, tier as u8);
     }
-    Ok(ok.into_iter().map(|(id, _)| id).collect())
+    Ok(ok.into_iter().map(|(id, _, _)| id).collect())
+}
+
+/// 派生失败记账,累计到阈值就立案进坏媒体台账(方案 P3-22)。
+///
+/// 立案后 `rich_state` 变 3、行出队,不再每轮重试同一张坏图;
+/// 网格右键给「隐藏此文件 / 不隐藏」两个出口(对齐参考件
+/// 坏图清单的 Hide / Don't Hide 两态),后者删台账并把行放回待派生。
+fn escalate_failure(store: &crate::db::Store, id: i64, path: &str, why: &str) {
+    if store.mark_thumb_fail(id) < crate::db::BAD_MEDIA_THRESHOLD {
+        return;
+    }
+    let _ = store.mark_bad_media(path, why);
+}
+
+/// 台账里存的原因串:截断到一行,免得 anyhow 的因果链把台账撑成日志。
+fn short_reason(e: &anyhow::Error) -> String {
+    let s = format!("{e:#}");
+    let mut t: String = s.chars().take(160).collect();
+    if t.len() < s.len() {
+        t.push('…');
+    }
+    t
+}
+
+/// UI 发布的「当前可见目录」清单:worker 每轮取行前读一次。
+///
+/// 派生队列的排序键是**可见优先 + 全库兜底**(方案 P3-20,用户已拍):
+/// 眼前的图先清晰,但后台最终会把整个作用域做完 —— 这不是「只补看得见的」。
+pub type VisibleDirs = Arc<Mutex<Vec<String>>>;
+
+/// 造一份空的可见目录句柄(UI 与 worker 各持一个 `Arc`)。
+pub fn visible_dirs() -> VisibleDirs {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
 /// 常驻后台缩略图 worker 的对外句柄。
@@ -418,24 +476,28 @@ pub struct ThumbWorker {
     pub done: mpsc::Receiver<Vec<i64>>,
     /// 当前要补齐的档位(P1-9:UI 切档 → worker 改补那一档)。
     pub tier: Arc<AtomicU8>,
+    /// UI 发布的可见目录清单(P3-20:可见优先 + 全库兜底)。
+    /// 用 [`ThumbWorker::publish_visible`] 写,worker 每轮取行前读一次快照。
+    visible: VisibleDirs,
 }
 
-/// 启动**常驻**缩略图后台线程(P0-1 + P1-9 多档)。
+/// 启动**常驻**缩略图后台线程(P0-1 + P1-9 多档 + P3-20 作用域队列)。
 ///
 /// 行为(对齐原版 Picasa 的"缩略图缓存后台生成"):
-/// - 启动时先补齐存量(所有 `thumb_ok=0` 的照片);
+/// - 补齐的是**派生门放行的行**(`rich_state=1`),不再是"所有 `thumb_ok=0`";
 /// - 之后每 2 秒查一次库,发现新增/变更照片就继续补(扫描后自动补齐);
 /// - 每批完成后通过 `done` 通道通知 UI,UI 据此清掉对应纹理缓存并重绘网格;
 /// - **档位可变**:UI 改 `tier` 后,worker 下一轮就改补那一档
 ///   (原版切档时按需从对应档位的缓存取,缺则生成 —— 三档各自独立记账)。
 ///
 /// 线程优先级降为 BelowNormal,不与 UI 抢核(与原版一致的做法)。
-pub fn spawn_worker(store: Arc<crate::db::Store>) -> ThumbWorker {
+pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> ThumbWorker {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
     let tier = Arc::new(AtomicU8::new(Tier::Normal as u8));
     let tier2 = tier.clone();
+    let visible2 = visible.clone();
     let handle = std::thread::spawn(move || {
         crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
         // 每批规模随核数缩放:批内是 rayon 并行的,单核机器给小批
@@ -449,7 +511,9 @@ pub fn spawn_worker(store: Arc<crate::db::Store>) -> ThumbWorker {
             if t != last_tier {
                 last_tier = t;
             }
-            let ids = backfill_tier(&store, t, batch).unwrap_or_default();
+            // 可见清单每轮取一次快照:锁只在这一瞬间持有,生成期间不碰它。
+            let vis: Vec<String> = visible2.lock().unwrap().clone();
+            let ids = backfill_tier(&store, t, &vis, batch).unwrap_or_default();
             if !ids.is_empty() {
                 let _ = tx.send(ids);
                 // 立刻继续下一批,直到这一轮补完。
@@ -464,10 +528,22 @@ pub fn spawn_worker(store: Arc<crate::db::Store>) -> ThumbWorker {
         stop,
         done: rx,
         tier,
+        visible,
     }
 }
 
 impl ThumbWorker {
+    /// 发布当前可见目录(网格所在目录 / 搜索结果覆盖的目录)。
+    ///
+    /// worker 下一轮取行时就先补这些目录里的行,不足一批再用全库兜底。
+    /// 清单没变就不写锁,免得逐帧调用白白抢一次互斥。
+    pub fn publish_visible(&self, dirs: Vec<String>) {
+        let mut g = self.visible.lock().unwrap();
+        if *g != dirs {
+            *g = dirs;
+        }
+    }
+
     /// 停止 worker(UI 退出时调用)。
     pub fn stop(mut self) {
         self.shutdown();
@@ -523,26 +599,18 @@ pub fn load_preview_cached(id: i64) -> Option<image::DynamicImage> {
 
 /// 生成预览图并落盘(后台线程调用)。返回是否成功。
 ///
-/// 取图统一走 `load_for_preview`(内嵌缩略图 → RAW Shell 扩展 → 全图解码),
+/// 取图统一走 `load_for_preview`(内嵌缩略图 → RAW 内嵌预览 → Shell → 全图解码),
 /// 再等比缩到 1024 内、按 EXIF 方向摆正、存 jpeg。
 ///
 /// **不计算 dHash** —— dHash 是全图感知哈希,中档已算过,预览档复用即可。
 pub fn build_preview(id: i64, src: &Path) -> Result<()> {
-    let (img, from_thumb) = load_for_preview(src, PREVIEW_SIZE)
+    let (img, orient) = load_for_preview(src, PREVIEW_SIZE)
         .ok_or_else(|| anyhow::anyhow!("预览解码失败: {}", src.display()))?;
-    let flat = if from_thumb {
-        img
+    // 预览**不放大**:小图原样摆正即可(缩略图那一路才需要铺满格子)。
+    let resized = if img.width().max(img.height()) > PREVIEW_SIZE {
+        fit_oriented(img, PREVIEW_SIZE, orient)
     } else {
-        apply_exif_rotation(img, read_rotation(src))
-    };
-    let resized = if flat.width().max(flat.height()) > PREVIEW_SIZE {
-        flat.resize(
-            PREVIEW_SIZE,
-            PREVIEW_SIZE,
-            image::imageops::FilterType::Triangle,
-        )
-    } else {
-        flat
+        apply_exif_rotation(img, orient)
     };
     let dir = tier_dir(Tier::Preview);
     let _ = std::fs::create_dir_all(&dir);
@@ -718,7 +786,8 @@ mod tests {
         tiff.extend_from_slice(b"II");
         tiff.extend_from_slice(&42u16.to_le_bytes());
         tiff.extend_from_slice(&8u32.to_le_bytes());
-        let ifd1_at = 8 + 2 + 0 * 12 + 4;
+        // IFD0 是空的:8(TIFF 头)+ 2(计数=0)+ 0 条目录项 + 4(next 指针)。
+        let ifd1_at = 8 + 2 + 4;
         tiff.extend_from_slice(&0u16.to_le_bytes()); // IFD0 空
         tiff.extend_from_slice(&(ifd1_at as u32).to_le_bytes()); // next=IFD1
         tiff.extend_from_slice(&3u16.to_le_bytes()); // IFD1:3 条
@@ -752,12 +821,15 @@ mod tests {
         purge_cache(tid);
         let h = generate(tid, &src).expect("内嵌缩略图路径应成功");
         assert!(h != 0, "dHash 不应为 0");
-        assert!(existing(tid).is_some(), "应落盘缩略图");
+        assert!(
+            tier_path(Tier::Normal, tid).exists(),
+            "应落盘缩略图"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P0-1:`load_cached` 读的是落盘的 256px 小图,不解码原图。
-    /// 生成后应能读回,且尺寸为 256×256(letterbox 画布)。
+    /// P0-1:读回落盘缩略图不走原图解码。
+    /// 生成后应能读回,且尺寸为默认档的 256×256(letterbox 画布)。
     #[test]
     fn load_cached_returns_256_canvas() {
         let dir = std::env::temp_dir().join(format!("rk-thumblog-{}", std::process::id()));
@@ -777,43 +849,56 @@ mod tests {
         let _guard = CacheGuard(id);
         purge_cache(id);
         generate(id, &src).expect("应生成缩略图");
-        let cached = load_cached(id).expect("应能读回落盘缩略图");
-        assert_eq!(cached.width(), THUMB_SIZE);
-        assert_eq!(cached.height(), THUMB_SIZE);
+        let cached = load_cached_tier(Tier::Normal, id).expect("应能读回落盘缩略图");
+        assert_eq!(cached.width(), Tier::Normal.size());
+        assert_eq!(cached.height(), Tier::Normal.size());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 生成失败要记账:同一张反复失败达阈值后,不再进入回填队列。
+    /// 生成失败要记账:同一张反复失败达阈值后立案进坏媒体台账并出队。
     /// 否则一批坏文件(如回收站元数据)会让 worker 永远空转(真实事故)。
     #[test]
-    fn backfill_marks_repeated_failures_then_skips() {
+    fn backfill_marks_repeated_failures_then_ledgers_them() {
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
         let photo_id = unique_id();
         {
             let conn = store.test_conn();
             conn.execute(
-                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'/x',0,0)",
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                 VALUES(?1,?2,'/x',0,0,1)",
                 rusqlite::params![photo_id, "/nonexistent/rk-fail/bad.jpg"],
             )
             .unwrap();
         }
-        // 每轮:取到这张 → 生成失败 → 记账。三轮后 thumb_fail 达 3。
+        // 每轮:取到这张 → 生成失败 → 记账。三轮后达阈值立案(方案 P3-22)。
         for round in 1..=3 {
-            let ids = backfill_tier(&store, Tier::Normal, 10).unwrap();
+            let ids = backfill_tier(&store, Tier::Normal, &[], 10).unwrap();
             assert!(ids.is_empty(), "第 {round} 轮不应有成功产出");
         }
-        let f: i64 = store.test_conn().query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
+        let (f, rs): (i64, i64) = store
+            .test_conn()
+            .query_row(
+                "SELECT thumb_fail, rich_state FROM photos WHERE id=?1",
+                [photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(f, 3, "三次失败应各记一笔");
-        // 之后 missing_tier 不再返回它,worker 得以推进到后续照片。
+        assert_eq!(rs, crate::db::RICH_BAD as i64, "达阈值即立案为坏文件");
         assert!(
-            store.missing_tier(1, 10).is_empty(),
-            "失败满阈值后应被队列跳过"
+            store.is_bad_media("/nonexistent/rk-fail/bad.jpg"),
+            "台账里要有这一条"
+        );
+        // 出队:worker 得以推进到后续照片,不再每轮重试同一张坏图。
+        assert!(
+            store.missing_tier(1, &[], 10).is_empty(),
+            "立案后应离开回填队列"
         );
     }
 
-    /// P0-1:后台 worker 会把 `thumb_ok=0` 的照片补上缩略图,并回报 id。
+    /// P0-1 + P3-20:后台 worker 会把**派生门放行**(`rich_state=1`)的照片补上
+    /// 缩略图,回报 id,并把状态推到已派生。
     #[test]
     fn worker_backfills_missing_thumbs() {
         let dir = std::env::temp_dir().join(format!("rk-thumbworker-{}", std::process::id()));
@@ -827,20 +912,20 @@ mod tests {
         std::fs::write(&src, &buf).unwrap();
 
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
-        // 手动插一行(thumb_ok=0),模拟"扫描已入库但缩略图未生成"。
-        // id 走 unique_id():两个各自开 in-memory 库的测试若都用自增 id 1,
-        // 会同时往同一批缓存文件上写。
+        // 手动插一行(thumb_ok=0 + rich_state=1),模拟"扫描已入库、派生门已放行、
+        // 缩略图还没生成"。id 走 unique_id():两个各自开 in-memory 库的测试
+        // 若都用自增 id 1,会同时往同一批缓存文件上写。
         let photo_id = unique_id();
         let _guard = CacheGuard(photo_id);
         {
             let conn = store.test_conn();
             conn.execute(
-                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES(?1,?2,?3,0,0,1)",
                 rusqlite::params![photo_id, src.to_string_lossy(), dir.to_string_lossy()],
             )
             .unwrap();
         }
-        let worker = spawn_worker(store.clone());
+        let worker = spawn_worker(store.clone(), visible_dirs());
         // 等待 worker 回报(最多 5s)
         let mut done = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -852,13 +937,50 @@ mod tests {
             }
         }
         assert!(!done.is_empty(), "worker 应回报生成成功的 id");
-        // 库里应已置 thumb_ok=1
-        let ok: i64 = store.test_conn().query_row("SELECT thumb_ok FROM photos WHERE path=?1", [&src.to_string_lossy()], |r| r.get(0))
+        // 库里应已置 thumb_ok=1,且派生状态推到已派生。
+        let (ok, rs): (i64, i64) = store
+            .test_conn()
+            .query_row(
+                "SELECT thumb_ok, rich_state FROM photos WHERE path=?1",
+                [&src.to_string_lossy()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(ok, 1, "应回写 thumb_ok=1");
+        assert_eq!(rs, crate::db::RICH_DONE as i64, "应回写 rich_state=2");
 
         worker.stop();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未纳入作用域(`rich_state=0`)的行不进队列 —— worker 不该去打开它。
+    #[test]
+    fn worker_skips_rows_out_of_scope() {
+        let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
+        let photo_id = unique_id();
+        let _guard = CacheGuard(photo_id);
+        {
+            let conn = store.test_conn();
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                 VALUES(?1,'/nonexistent/rk-oos/a.jpg','/nonexistent/rk-oos',0,0,0)",
+                rusqlite::params![photo_id],
+            )
+            .unwrap();
+        }
+        assert!(
+            backfill_tier(&store, Tier::Normal, &[], 10)
+                .unwrap()
+                .is_empty(),
+            "作用域外的行不该被派生"
+        );
+        let f: i64 = store
+            .test_conn()
+            .query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(f, 0, "没进队列就不该记失败");
     }
 
     // ===== P1-9 多档缩略图 =====
@@ -948,7 +1070,7 @@ mod tests {
         }
 
         // Big 档(2):不写 thumb_ok,只写 thumb_tiers。
-        let ids = backfill_tier(&store, Tier::Big, 10).unwrap();
+        let ids = backfill_tier(&store, Tier::Big, &[], 10).unwrap();
         assert_eq!(ids, vec![photo_id], "应生成 Big 档");
         let ok: i64 = store.test_conn().query_row("SELECT thumb_ok FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
             .unwrap();
@@ -956,7 +1078,7 @@ mod tests {
         assert_eq!(store.tier_count(Tier::Big as u8), 1, "应记入 thumb_tiers");
 
         // 再调一次 → 没有缺失的了(幂等)。
-        let again = backfill_tier(&store, Tier::Big, 10).unwrap();
+        let again = backfill_tier(&store, Tier::Big, &[], 10).unwrap();
         assert!(again.is_empty(), "已生成的档不应重复生成");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -998,7 +1120,7 @@ mod tests {
     }
 
     /// `build_preview` 现在统一走 `load_for_preview`,这里锁住该入口的取值约定:
-    /// 常规格式 → 需要调用方自己摆正(`from_thumb=false`);
+    /// 常规格式 → 返回还需施加的 EXIF 方向(无 EXIF 的 PNG 是 1);
     /// 四条路线全失败 → `None`(预览窗显示"加载失败",而不是 panic)。
     #[test]
     fn load_for_preview_routes() {
@@ -1009,14 +1131,116 @@ mod tests {
         image::RgbImage::from_pixel(300, 200, image::Rgb([10, 20, 30]))
             .save(&src)
             .unwrap();
-        let (img, from_thumb) = load_for_preview(&src, PREVIEW_SIZE).expect("常规格式应能解码");
+        let (img, orient) = load_for_preview(&src, PREVIEW_SIZE).expect("常规格式应能解码");
         assert_eq!(img.width(), 300);
-        // 常规路线出的是未摆正的图 → 由 build_preview 按 EXIF 旋正
-        assert!(!from_thumb, "常规解码应标记需摆正");
+        // 无 EXIF 的 PNG:方向 1 = 没什么可转的,build_preview 直接落盘。
+        assert_eq!(orient, 1, "无 EXIF → 方向应为 1");
         // 不存在/无法解码的文件:视频/内嵌/RAW/常规四条路线全落空 → None
         assert!(load_for_preview(&dir.join("nope.png"), PREVIEW_SIZE).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 内嵌预览的**按档尺寸门**(方案 P4-23②)。
+    ///
+    /// 旧实现是硬编码 128px,于是 160px 的 EXIF 缩略图会被拿去喂 512/1024 档,
+    /// 大档看着就是一团糊 —— 这条锁住"边长要达到目标的一半"。
+    #[test]
+    fn embedded_preview_is_gated_by_tier_size() {
+        assert!(embedded_ok(160, 120, Tier::Small.size()), "96 档:160px 够用");
+        assert!(embedded_ok(160, 120, Tier::Normal.size()), "256 档:160×2=320 ≥ 256");
+        assert!(!embedded_ok(160, 120, Tier::Big.size()), "512 档:160px 不够,得整图解码");
+        assert!(!embedded_ok(160, 120, Tier::Preview.size()), "1024 档同上");
+        assert!(embedded_ok(1600, 1200, Tier::Preview.size()));
+        // 取的是**长边**:竖幅预览同样按长边判
+        assert!(embedded_ok(120, 160, Tier::Normal.size()));
+        assert!(!embedded_ok(0, 0, Tier::Small.size()));
+    }
+
+    /// 先缩后转:90° 旋转是纯像素置换,「缩到 S 再转」与「转完再缩到 S」
+    /// 结果一致 —— 顺序换了但缩略图不能变(否则新旧库的重复图判定会对不上)。
+    #[test]
+    fn fit_oriented_matches_rotate_then_resize() {
+        let mut src = image::RgbImage::from_pixel(400, 300, image::Rgb([0, 0, 0]));
+        // 画几条不对称的横带,旋转后能被区分出来
+        for y in 0..300u32 {
+            for x in 0..400u32 {
+                src.put_pixel(x, y, image::Rgb([(x / 8) as u8, (y / 4) as u8, 200]));
+            }
+        }
+        let img = image::DynamicImage::ImageRgb8(src);
+        for orient in [1u32, 3, 6, 8] {
+            let a = fit_oriented(img.clone(), 96, orient);
+            let b = downscale(apply_exif_rotation(img.clone(), orient), 96);
+            assert_eq!(a.width(), b.width(), "orient={orient} 宽应一致");
+            assert_eq!(a.height(), b.height(), "orient={orient} 高应一致");
+            // 重采样的定点舍入可能差一两个色阶,但绝不能是"转错了方向"那种量级。
+            let (pa, pb) = (a.to_rgb8(), b.to_rgb8());
+            let max_diff = pa
+                .pixels()
+                .zip(pb.pixels())
+                .map(|(x, y)| {
+                    x.0.iter()
+                        .zip(y.0.iter())
+                        .map(|(u, v)| (*u as i32 - *v as i32).abs())
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(max_diff <= 2, "orient={orient} 换顺序后像素应一致,最大差 {max_diff}");
+        }
+        // 90° 类方向要把宽高换过来:横图 → 竖图
+        let r = fit_oriented(img, 96, 6);
+        assert!(r.height() > r.width(), "横图转 90° 后应变成竖图");
+    }
+
+    /// 大比例缩小走粗缩 + 精缩,尺寸口径必须与直接 resize 一致。
+    #[test]
+    fn downscale_keeps_aspect_and_fits_box() {
+        let big = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2400,
+            1800,
+            image::Rgb([9, 9, 9]),
+        ));
+        let got = downscale(big.clone(), 256);
+        assert_eq!(
+            (got.width(), got.height()),
+            (256, 192),
+            "4:3 应缩成 256×192"
+        );
+        let direct = big.resize(256, 256, FilterType::Triangle);
+        assert_eq!(
+            (got.width(), got.height()),
+            (direct.width(), direct.height()),
+            "粗缩一趟不得改变尺寸口径"
+        );
+        // 小图照旧放大(网格要铺满格子)
+        let small = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 30, image::Rgb([9, 9, 9])));
+        let up = downscale(small, 256);
+        assert_eq!((up.width(), up.height()), (256, 192));
+        assert_eq!(fit_dims(4000, 3000, 512), (512, 384));
+        assert_eq!(fit_dims(0, 0, 512), (1, 1), "退化尺寸不得为 0");
+    }
+
+    /// RAW 内嵌预览的摆正判定:宽高比与 IFD0 声明相反 → 相机已经转过了。
+    #[test]
+    fn preview_orient_uses_aspect_to_detect_pre_rotated() {
+        let mk = |orient: u32, bw: u32, bh: u32| crate::exif::TiffPreview {
+            bytes: Vec::new(),
+            base_w: bw,
+            base_h: bh,
+            orient,
+        };
+        // IFD0 声明横幅 + Orientation=6(要转成竖) + 预览本身已是竖幅 → 不用再转
+        assert_eq!(preview_orient(&mk(6, 6000, 4000), 4000, 6000), 1);
+        // 预览还是横幅 → 必须转
+        assert_eq!(preview_orient(&mk(6, 6000, 4000), 6000, 4000), 6);
+        // 缺 IFD0 宽高标签 → 无从判定,保守按 EXIF 方向转
+        assert_eq!(preview_orient(&mk(8, 0, 0), 4000, 6000), 8);
+        // 不涉及换向的方向原样透传
+        assert_eq!(preview_orient(&mk(3, 6000, 4000), 6000, 4000), 3);
+        assert_eq!(preview_orient(&mk(1, 6000, 4000), 6000, 4000), 1);
     }
 
     /// 各档位的缓存路径必须两两不同 —— 否则相邻档位互相覆盖,

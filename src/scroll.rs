@@ -70,6 +70,14 @@ pub const EVENT_SCROLL_THUMB: &str = "scroll/thumb";
 /// 滚动停止时的缩略图解码满额(每帧最多解码多少张)。
 pub const MAX_THUMB_DECODE_PER_FRAME: usize = 64;
 
+/// 滚动停止时每帧允许同步解码的**像素体积**(RGBA8 字节数,方案 P4-23③)。
+///
+/// 与 [`MAX_THUMB_DECODE_PER_FRAME`] 是同一个满额点的两种口径:
+/// 64 张 × 中档 256×256×4 = 16MB。张数口径在中档没问题,但预览档
+/// (1024×1024×4 = 4MB/张)同样 64 张就是 256MB 的解码 + 纹理上传,
+/// 一帧几百毫秒 —— 「让 UI 永不阻塞」在大档上等于没做。
+pub const MAX_THUMB_DECODE_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
+
 /// 阻尼计算的浮点常量(取自内置资源包 `scroll.damp`)。
 mod consts {
     use crate::assets::scroll_damp;
@@ -369,6 +377,22 @@ pub fn decode_budget(velocity_px: f64, scale_px: f64) -> usize {
     budget.clamp(0.0, MAX_THUMB_DECODE_PER_FRAME as f64) as usize
 }
 
+/// 按档位体积折算后的每帧解码张数上限(方案 P4-23③)。
+///
+/// 同时受两道约束,取较小者:滚动限速给出的张数上限 [`decode_budget`],
+/// 以及「每帧字节预算 ÷ 单张体积」。`item_bytes` 见 `thumbs::Tier::bytes`。
+///
+/// 中档(256px)下两道约束在满额点重合(64 张 = 16MB),行为与旧实现一致;
+/// 预览档(1024px)会被字节预算压到 4 张,小档(96px)则仍按张数封顶在 64。
+pub fn decode_budget_for(velocity_px: f64, scale_px: f64, item_bytes: usize) -> usize {
+    let n = decode_budget(velocity_px, scale_px);
+    if n == 0 || item_bytes == 0 {
+        return n;
+    }
+    let bytes = MAX_THUMB_DECODE_BYTES_PER_FRAME * n / MAX_THUMB_DECODE_PER_FRAME;
+    (bytes / item_bytes).clamp(1, n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +666,49 @@ mod tests {
         }
         // scale 非法时退回满额
         assert_eq!(decode_budget(100.0, 0.0), MAX_THUMB_DECODE_PER_FRAME);
+    }
+
+    /// 两种满额口径必须重合:64 张中档 = 16MB。
+    #[test]
+    fn byte_budget_matches_count_budget_at_normal_tier() {
+        let normal = 256 * 256 * 4;
+        assert_eq!(
+            MAX_THUMB_DECODE_PER_FRAME * normal,
+            MAX_THUMB_DECODE_BYTES_PER_FRAME
+        );
+    }
+
+    /// 按档位体积折算(方案 P4-23③):中档与旧口径一致,大档被字节预算压低,
+    /// 小档仍按张数封顶。否则预览档一帧要解 64 × 4MB = 256MB,UI 直接卡死。
+    #[test]
+    fn decode_budget_for_scales_with_tier_size() {
+        let small = 96 * 96 * 4;
+        let normal = 256 * 256 * 4;
+        let preview = 1024 * 1024 * 4;
+        assert_eq!(
+            decode_budget_for(0.0, 600.0, normal),
+            MAX_THUMB_DECODE_PER_FRAME
+        );
+        assert_eq!(decode_budget_for(0.0, 600.0, preview), 4);
+        assert_eq!(
+            decode_budget_for(0.0, 600.0, small),
+            MAX_THUMB_DECODE_PER_FRAME
+        );
+        // 极快滚动:任何档位都是 0(只画灰块)
+        for b in [small, normal, preview] {
+            assert_eq!(decode_budget_for(1e9, 600.0, b), 0);
+            // 半速滚动时不得被舍入成 0,否则滚动中永远补不上图
+            assert!(decode_budget_for(300.0, 600.0, b) >= 1);
+        }
+        // 单调不增 + 永不超过张数满额
+        for b in [small, normal, preview] {
+            let mut prev = usize::MAX;
+            for v in [0.0, 60.0, 300.0, 600.0, 3000.0] {
+                let n = decode_budget_for(v, 600.0, b);
+                assert!(n <= prev, "预算应单调不增: v={v} b={b} n={n} prev={prev}");
+                assert!(n <= MAX_THUMB_DECODE_PER_FRAME);
+                prev = n;
+            }
+        }
     }
 }

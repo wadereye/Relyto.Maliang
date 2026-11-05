@@ -47,7 +47,7 @@
 //! - **`grain` 的 low/high/seed 默认值**:没有可靠来源 → 提供一组
 //!   可用的预设(见 `grain_preset`)。
 //! - **`sepia` 灰度→棕色的精确映射**:用**双色调插值**近似,并在此明确标注。
-//! - **`sat` 的曲线表索引方向**:存在栈布局特征歧义,按正向实现(见
+//! - **`sat` 的曲线表索引方向**:存在下标读法歧义,按正向实现(见
 //!   [`apply_saturation`] 的诚实声明)。
 //! - **`glow` 的合成混合模式**:按线性不透明度混合实现(见 [`apply_glow`])。
 //! - **`rainbow` 的渐变段数/各段颜色**:段数据未逐段展开,
@@ -845,7 +845,7 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
         (weights[2] / sum * 256.0).round() as i32,
     ];
     let a = amount as i32;
-    // ⚠️ 早前的写法是 `p[0]·w[2] + p[1]·w[1] + p[2]·w[0]` —— 把参考素材里
+    // ⚠️ 早前的写法是 `p[0]·w[2] + p[1]·w[1] + p[2]·w[0]` —— 把外部资料里
     // **BGRA 下标**直接套到了 RGBA 缓冲上,红蓝权重互换,红偏向的灰度一律算反。
     // 权重与缓冲同为 RGBA 语义,必须按下标 0/1/2 对应 R/G/B。
     let luma16 = |p: &image::Rgba<u8>| {
@@ -893,7 +893,7 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
 ///
 /// 因为 `k ≥ 0`,该支路**只会把通道推离亮度**(增饱和),不会去饱和;
 /// 滑块的去饱和方向走另一条支路。**诚实声明**:曲线表的索引方向在
-/// 参考素材里存在栈布局特征歧义,未能确认;此处按正向实现。
+/// 该处下标读法有两种可能,未能确认;此处按正向实现。
 pub fn apply_saturation(img: &mut image::RgbaImage, s: f32) {
     let s = if s.is_nan() { 1.0 } else { s };
     let lum8 = |r: i32, g: i32, b: i32| 5 * g + 2 * r + b;
@@ -1666,7 +1666,7 @@ mod tests {
     /// B4:`ansel` 的亮度权重必须按缓冲的 R/G/B 顺序落到红绿蓝上。
     ///
     /// 参考的确切权重是 `(0.3086, 0.6094, 0.082)` —— 红色对亮度的贡献约为蓝色的
-    /// 3.8 倍,因此**纯红必须比纯蓝亮**。权重按参考素材的 BGRA 下标套到 RGBA
+    /// 3.8 倍,因此**纯红必须比纯蓝亮**。权重按外部资料的 BGRA 下标套到 RGBA
     /// 缓冲上时(红用 w[2]、蓝用 w[0])会整体反过来,这里锁定正确方向。
     #[test]
     fn ansel_luma_weights_follow_rgb_order() {

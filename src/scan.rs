@@ -52,10 +52,23 @@ pub fn is_raw(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// 小写扩展名(不含点)是否落在媒体池里(图片 ∪ RAW ∪ 视频)。
+///
+/// 派生门拿到的是 L1 已经存好的 `ext` 列,不必为了判一次类型再拼出 `Path`。
+pub fn is_media_ext(ext: &str) -> bool {
+    IMG_EXTS.contains(&ext) || RAW_EXTS.contains(&ext) || crate::video::MOVIE_EXTS.contains(&ext)
+}
+
+/// 初始化时依次入集的 4 条排除,**不可关**(方案 P3-25)。
+///
+/// 单独成组而不是混进 [`Exclusions::default`]:这 4 条是参考件的硬编码口径,
+/// 用户设置只能往上加、不能减;把它们命名出来,快路(MFT 展开)与慢路
+/// (walkdir)才可能共用同一份判定而不各自抄一遍。
+pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picasaoriginals"];
+
 /// 扫描排除规则(目录名匹配,大小写不敏感)。
 ///
-/// 参考件的默认排除列表只有 4 项(初始化函数依次入集):
-/// `thumbs / RECYCLER / Originals / .picasaoriginals`。
+/// 参考件的默认排除列表只有 4 项(见 [`HARD_EXCLUDES`])。
 /// 它不踩系统目录的真正原因是**默认扫描范围极窄**(只登记
 /// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
 /// 而非靠排除规则拦截。
@@ -66,35 +79,45 @@ pub fn is_raw(p: &Path) -> bool {
 /// 手动把宽范围加进监听,也能挡住最常见的数据垃圾。
 /// 另有点开头的隐藏目录一律排除(见 `excludes_dir`)。
 /// 用户自定义项来自 `settings` 表的 `exclude_dirs`(每行一个目录名)。
+///
+/// 还有一类**不能按名字排**的:[`own_prefixes`](自有数据目录前缀)。缩略图缓存
+/// 落在哪儿取决于用户把数据目录 / 缓存位置设成了什么,把它写死成
+/// `smallthumbs` 这类名字会误伤同名的用户相册(2026-11-05 拍板:自己生成缩略图的
+/// 目录必须排除)。所以缓存目录走**整级路径前缀**命中,且跟着 `MALIANG_CACHE_DIR`
+/// / `data.location` 走 —— 用户搬缓存,排除项跟着搬。
 #[derive(Debug, Clone)]
 pub struct Exclusions {
     names: Vec<String>,
+    /// 自有目录前缀(整级命中才算,`D:\maliang\cache` 不罩 `D:\maliang\cached`)。
+    own_prefixes: Vec<PathBuf>,
 }
 
 impl Default for Exclusions {
     fn default() -> Self {
+        let mut names: Vec<String> = HARD_EXCLUDES.iter().map(|s| s.to_string()).collect();
+        // —— 我方扩充:现代系统对应物与常见数据垃圾(纵深防御) ——
+        names.extend(
+            [
+                "$RECYCLE.BIN",
+                "System Volume Information",
+                "Recovery",
+                "$WINDOWS.~BT",
+                "$WINDOWS.~WS",
+                "windows",
+                "winnt",
+                "temp",
+                "Program Files",
+                "Program Files (x86)",
+                "AppData",
+                "node_modules",
+                "npm-cache",
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
         Exclusions {
-            names: vec![
-                // —— 参考件默认 4 项(原样口径;RECYCLER 为旧版回收站目录名) ——
-                "thumbs".into(),
-                "RECYCLER".into(),
-                "Originals".into(),
-                ".picasaoriginals".into(),
-                // —— 我方扩充:现代系统对应物与常见数据垃圾(纵深防御) ——
-                "$RECYCLE.BIN".into(),
-                "System Volume Information".into(),
-                "Recovery".into(),
-                "$WINDOWS.~BT".into(),
-                "$WINDOWS.~WS".into(),
-                "windows".into(),
-                "winnt".into(),
-                "temp".into(),
-                "Program Files".into(),
-                "Program Files (x86)".into(),
-                "AppData".into(),
-                "node_modules".into(),
-                "npm-cache".into(),
-            ],
+            names,
+            own_prefixes: Vec::new(),
         }
     }
 }
@@ -110,6 +133,11 @@ impl Exclusions {
                     e.names.push(t.to_string());
                 }
             }
+        }
+        // 自家写缩略图的目录:跟着 `MALIANG_CACHE_DIR` / `data.location` 走,
+        // 用户搬缓存,排除项跟着搬(2026-11-05 拍板)。
+        for p in crate::db::own_cache_dirs() {
+            e = e.with_own_prefix(p);
         }
         e
     }
@@ -130,23 +158,117 @@ impl Exclusions {
         &self.names
     }
 
+    /// 当前自有目录前缀(给 UI 展示「自家缓存目录」)。
+    pub fn own_prefixes(&self) -> &[PathBuf] {
+        &self.own_prefixes
+    }
+
+    /// 链式追加一个自有前缀 —— 单测用它注入固定路径,免得断言跟着
+    /// 用户的 `data.location` 漂移。
+    pub fn with_own_prefix(mut self, p: impl AsRef<Path>) -> Self {
+        self.own_prefixes.push(p.as_ref().to_path_buf());
+        self
+    }
+
+    /// 粗筛:该目录名是否**可能**是某个自有目录的最后一级。
+    ///
+    /// 整级前缀判定要完整路径,而 MFT 快路里完整路径得沿父链现拼 ——
+    /// 每个目录都拼一次会把百万级开销加在快路上。先按名筛一遍,
+    /// 只有撞上自有目录最后一级同名的才值得去拼路径核对。
+    pub fn own_leaf_may_match(&self, name: &str) -> bool {
+        if self.own_prefixes.is_empty() {
+            return false;
+        }
+        let key = name.to_ascii_uppercase();
+        self.own_prefixes.iter().any(|p| {
+            p.file_name()
+                .map(|f| f.to_string_lossy().to_ascii_uppercase() == key)
+                .unwrap_or(false)
+        })
+    }
+
+    /// 该**字符串**路径是否落在某个自有目录内(整级命中)。
+    pub fn under_own_prefix_str(&self, path: &str) -> bool {
+        let up = path_key(path);
+        self.own_prefixes
+            .iter()
+            .any(|b| under_key(&up, &path_key(&b.to_string_lossy())))
+    }
+
+    /// [`Exclusions::under_own_prefix_str`] 的 `Path` 版。
+    fn under_own_prefix(&self, p: &Path) -> bool {
+        self.under_own_prefix_str(&p.to_string_lossy())
+    }
+
     /// 路径的**任意一级父目录**命中排除规则则返回 true
     /// (事件驱动时单个文件的路径里可能嵌着被排除的目录名)。
     pub fn excludes_path(&self, p: &Path) -> bool {
-        p.ancestors()
-            .skip(1) // 跳过文件名本身
-            .filter_map(|d| d.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .any(|n| self.excludes_dir(&n))
+        self.under_own_prefix(p)
+            || p.ancestors()
+                .skip(1) // 跳过文件名本身
+                .filter_map(|d| d.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .any(|n| self.excludes_dir(&n))
+    }
+
+    /// **目录**路径的每一级(含自身)命中排除规则则返回 true。
+    ///
+    /// 与 [`Exclusions::excludes_path`] 的差别只在 `skip(1)`:那个是给文件路径
+    /// 用的(要跳过文件名本身),这个是给目录路径用的 —— 派生门拿到的是
+    /// `photos.parent`,自身那一级恰恰是最该判的一级。
+    pub fn excludes_dir_path(&self, dir: &Path) -> bool {
+        self.under_own_prefix(dir)
+            || dir
+                .ancestors()
+                .filter_map(|d| d.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .any(|n| self.excludes_dir(&n))
     }
 }
 
+/// 路径比较用的键:ASCII 大写归一 + 剥尾分隔符。
+/// 只做 ASCII 归一,字节长度不变 —— 下面的整级判断要按字节取下一字符。
+fn path_key(s: &str) -> String {
+    let mut k = s.to_ascii_uppercase();
+    while k.ends_with('\\') || k.ends_with('/') {
+        k.pop();
+    }
+    k
+}
+
+/// `up` 是否**整级**落在 `base` 之内:相等,或 `base` 之后紧跟一个分隔符。
+/// 「整级」是硬要求 —— `D:\maliang\cache` 可以罩 `D:\maliang\cache\thumbs`,
+/// 但不该顺手罩住用户的 `D:\maliang\cached_photos`。
+fn under_key(up: &str, base: &str) -> bool {
+    if base.is_empty() {
+        return false;
+    }
+    if up == base {
+        return true;
+    }
+    up.len() > base.len() && up.starts_with(base) && matches!(up.as_bytes()[base.len()], b'\\' | b'/')
+}
+
+/// 一条**结构**记录:发现路径只写这些列(方案 P3-25)。
+///
+/// 宽高 / 拍摄时间 / GPS / 机身属于**派生列**,只在派生时读一次
+/// ([`read_derived`]),由 [`crate::db::Store::mark_derived`] 回写 ——
+/// 全盘发现动辄百万行,逐行解 EXIF 会把"列目录"拖成"读全库"。
 #[derive(Clone)]
 pub struct Record {
     pub path: String,
     pub parent: String,
     pub mtime: i64,
     pub size: i64,
+    /// 媒体类型:`video::kind::PHOTO`(0)=图片,`video::kind::MOVIE`(1)=视频。
+    /// 对齐原版记录类型的"是否视频"二分(原版 7 种子类型对应不同解码路径,
+    /// 我方只有一条 Shell 路径,无须细分)。
+    pub kind: i32,
+}
+
+/// 派生列:EXIF / 尺寸 / GPS / 机身(方案 P3-25)。
+#[derive(Debug, Clone)]
+pub struct Derived {
     pub width: Option<i32>,
     pub height: Option<i32>,
     pub taken_utc: Option<String>,
@@ -156,10 +278,6 @@ pub struct Record {
     pub lon: Option<f64>,
     /// 相机型号(Make+Model)。
     pub cam: Option<String>,
-    /// 媒体类型:`video::kind::PHOTO`(0)=图片,`video::kind::MOVIE`(1)=视频。
-    /// 对齐原版记录类型的"是否视频"二分(原版 7 种子类型对应不同解码路径,
-    /// 我方只有一条 Shell 路径,无须细分)。
-    pub kind: i32,
 }
 
 pub struct ScanSummary {
@@ -333,6 +451,7 @@ pub fn mft_candidates(
     vols: &[crate::nameidx::VolumeIndex],
     root: &Path,
     excl: &Exclusions,
+    ctrl: Option<&ScanControl>,
 ) -> Option<MftCandidates> {
     use std::path::Component;
     let mut letter = None;
@@ -355,48 +474,55 @@ pub fn mft_candidates(
     }
     let letter = letter?;
     let v = vols.iter().find(|v| v.letter == letter)?;
-    let n = v.count();
-    // parent 下标 → 子条目邻接表;槽位 n 是「卷根直属」虚拟桶
-    // (parent 列的 PARENT_ROOT 哨兵统一落进去,孤儿跳过)。
-    let mut children: Vec<Vec<u32>> = vec![Vec::new(); n + 1];
-    for i in 0..n {
-        let p = v.parent_of(i);
-        let slot = if p == crate::nameidx::PARENT_ROOT {
-            n as u32
-        } else if (p as usize) < n {
-            p
-        } else {
-            continue; // PARENT_ORPHAN
-        };
-        children[slot as usize].push(i as u32);
-    }
+    // 子项邻接表用索引自带的 CSR(建库/载入/增量时一次构建),这里只切片;
+    // 槽位 count() 是「卷根直属」虚拟桶,PARENT_ROOT 哨兵统一落进去。
     // 从卷根逐级下钻定位根目录(名字比较口径与折叠池一致:ASCII 不区分大小写)。
-    let mut level: Vec<u32> = children[n].clone();
+    let mut level: &[u32] = v.children_of(v.count());
     for comp in &comps {
-        let mut next = None;
-        for &ci in &level {
-            if v.is_dir(ci as usize) && v.name(ci as usize).eq_ignore_ascii_case(comp) {
-                next = Some(ci);
-                break;
-            }
-        }
-        level = match next {
-            Some(ci) => children[ci as usize].clone(),
+        let hit = level.iter().copied().find(|&ci| {
+            v.is_dir(ci as usize) && v.name(ci as usize).eq_ignore_ascii_case(comp)
+        });
+        level = match hit {
+            Some(ci) => v.children_of(ci as usize),
             None => return None,
         };
     }
     // level 即根目录直属条目(comps 为空时 = 卷根直属)。
     let mut paths = Vec::new();
     let mut excluded_dirs = 0usize;
-    let mut stack: Vec<u32> = level;
+    let mut stack: Vec<u32> = level.to_vec();
+    // 已经取消就别开工:直接交回空结果(仍是 Some,理由同下)。
+    if ctrl.is_some_and(|c| c.is_cancelled()) {
+        return Some(MftCandidates {
+            paths: Vec::new(),
+            excluded_dirs: 0,
+        });
+    }
+    // 展开可能覆盖整棵子树(百万级),每 4096 项查一次取消(修 A5):
+    // 取消时返回**已收集的部分**而不是 None —— None 会让调用方回退 walkdir,
+    // 那正是用户想中止的慢路径。调用方随后自己的 is_cancelled 会终止整轮扫描。
+    let mut since_check = 0usize;
     while let Some(i) = stack.pop() {
+        since_check += 1;
+        if since_check >= 4096 {
+            since_check = 0;
+            if let Some(c) = ctrl {
+                if c.is_cancelled() {
+                    break;
+                }
+            }
+        }
         let name = v.name(i as usize);
         if v.is_dir(i as usize) {
-            if excl.excludes_dir(&name) {
+            // 自家缓存目录走整级路径前缀(见 `Exclusions::own_prefixes`);
+            // 拼完整路径有成本,所以先按目录名粗筛。
+            let own = excl.own_leaf_may_match(&name)
+                && excl.under_own_prefix_str(&v.path_of(i as usize));
+            if excl.excludes_dir(&name) || own {
                 excluded_dirs += 1;
                 continue;
             }
-            stack.extend(children[i as usize].iter().copied());
+            stack.extend(v.children_of(i as usize).iter().copied());
         } else if is_indexable(Path::new(&name)) {
             paths.push(PathBuf::from(v.path_of(i as usize)));
         }
@@ -465,7 +591,7 @@ pub fn scan_dir_ctrl(
     'outer: for r in roots {
         // MFT 快路:索引在位且根可定位 → 免逐目录枚举;定位失败回退 walkdir。
         if let Some(vs) = vols {
-            if let Some(mc) = mft_candidates(vs, r, &excl) {
+            if let Some(mc) = mft_candidates(vs, r, &excl, Some(ctrl.as_ref())) {
                 excluded_dirs += mc.excluded_dirs;
                 candidates.extend(mc.paths);
                 if ctrl.is_cancelled() {
@@ -480,7 +606,8 @@ pub fn scan_dir_ctrl(
                 // 目录级排除:命中即整棵子树跳过(对齐原版做法)
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
-                    if excl.excludes_dir(&name) {
+                    let own = excl.under_own_prefix(e.path());
+                    if excl.excludes_dir(&name) || own {
                         excluded_dirs += 1;
                         return false;
                     }
@@ -556,7 +683,7 @@ pub fn scan_dir_ctrl(
             if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
                 return None;
             }
-            read_record_with_meta(&p, size, mtime)
+            Some(read_record(&p, size, mtime))
         })
         .collect();
 
@@ -589,10 +716,31 @@ pub fn scan_dir_ctrl(
     })
 }
 
-/// 读取一条记录(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
-fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
+/// 读一条**结构**记录:只碰文件系统元数据,不打开文件内容(方案 P3-25)。
+fn read_record(p: &Path, size: i64, mtime: i64) -> Record {
+    Record {
+        path: p.to_string_lossy().into_owned(),
+        parent: p
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        mtime,
+        size,
+        kind: if crate::video::is_video(p) {
+            crate::video::kind::MOVIE
+        } else {
+            crate::video::kind::PHOTO
+        },
+    }
+}
+
+/// 读派生列(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
+///
+/// 只在派生时调用 —— 缩略图那一趟已经把文件打开了,顺手读一次 EXIF
+/// 比在发现路径上逐行解要省得多(方案 P3-25)。
+pub fn read_derived(p: &Path) -> Derived {
     // 视频不解析 EXIF、也不起 COM 抽帧:容器里没有 Orientation / 机身信息,
-    // bulk 扫描时逐个拉 Shell 缩略图更是拖垮整次扫描。尺寸留空,
+    // 逐个拉 Shell 缩略图更是拖垮整趟派生。尺寸留空,
     // 显示时由 `crate::thumbs` 的抽帧路径按需补齐。
     let is_vid = crate::video::is_video(p);
     let meta = if is_vid {
@@ -610,14 +758,7 @@ fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
         w = w.or(dims.map(|d| d.0));
         h = h.or(dims.map(|d| d.1));
     }
-    Some(Record {
-        path: p.to_string_lossy().into_owned(),
-        parent: p
-            .parent()
-            .map(|d| d.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        mtime,
-        size,
+    Derived {
         width: w,
         height: h,
         taken_utc: meta.taken,
@@ -625,12 +766,7 @@ fn read_record_with_meta(p: &Path, size: i64, mtime: i64) -> Option<Record> {
         lat: meta.gps.map(|g| g.0),
         lon: meta.gps.map(|g| g.1),
         cam: meta.cam,
-        kind: if is_vid {
-            crate::video::kind::MOVIE
-        } else {
-            crate::video::kind::PHOTO
-        },
-    })
+    }
 }
 
 /// 只读图片头拿宽高(不解码整图)。
@@ -715,10 +851,7 @@ pub fn index_file_ctrl(
         None => return Ok(false),
     };
 
-    let rec = match read_record_with_meta(path, size, mtime) {
-        Some(r) => r,
-        None => return Ok(false),
-    };
+    let rec = read_record(path, size, mtime);
     store_insert(store, &[rec])?;
     // P1-12:事件驱动路径也要写变更日志(否则只有扫描会记,监听发现的变化会丢)。
     let _ = store.log_change(
@@ -729,56 +862,49 @@ pub fn index_file_ctrl(
     Ok(true)
 }
 
+/// 结构入库:发现路径只写结构列,**派生列一律不动**(方案 P3-25)。
+///
+/// 派生列归 [`crate::db::Store::mark_derived`] 所有 —— 一条记录被重扫时
+/// 若在这里覆盖,已派生的 EXIF 会在下一趟发现里被抹成 NULL。
+/// 内容变了(mtime 不同)只清 `thumb_ok` / `dhash` 并退回待派生,让队列重跑。
+///
+/// 顺手按派生门(方案 P3-17)算 `rich_state`:walkdir 与 MFT 两条发现路必须
+/// 共用同一个门,否则非 NTFS 卷会整个绕过作用域(方案 P4-30)。
 fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
     }
-    // P1-14 字符串池:相机型号先驻留进 `photos_cam` 池,拿到整数 id。
-    // 对齐原版的池化列 —— 行记录只存 32 位 id,不存字符串本体
-    // (落盘前原地替换:字符串入池)。
-    // 用 `intern_batch` 而非逐条 `intern`:内存池先去重,一万行只发几次 SQL。
-    // 池化在事务**外**先做完:intern 自身要拿连接锁,不能在 tx 内重入。
-    let cam_items: Vec<(String, String)> = records
-        .iter()
-        .map(|r| {
-            (
-                crate::timeline::CAM_POOL.to_string(),
-                r.cam.clone().unwrap_or_default().trim().to_string(),
-            )
-        })
-        .collect();
-    let has_cam: Vec<bool> = cam_items.iter().map(|(_, v)| !v.is_empty()).collect();
-    let interned = store.intern_batch(&cam_items)?;
-    let cam_ids: Vec<Option<i64>> = interned
-        .iter()
-        .zip(has_cam.iter())
-        .map(|((_, id), has)| if *has { Some(*id) } else { None })
-        .collect();
+    // 门读一次库,之后逐行判定纯内存(百万行落库不能被逐行查库拖成 IO 密集)。
+    let gate = crate::db::ScopeGate::load(store);
     // 注意:必须用 execute_batch —— rusqlite 的 `execute` 只接受单条语句,
     // 传多条会报 "Multiple statements provided"。
     store.write(|conn| -> Result<()> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
         let tx = conn.unchecked_transaction()?;
         let mut st = tx.prepare_cached(
-            "INSERT INTO photos(path,parent,mtime,size,width,height,taken_utc,cam,cam_id,rot,star,thumb_ok,lat,lon,uid64,kind)
-             VALUES(:path,:parent,:mtime,:size,:w,:h,:taken,NULL,:cam_id,:rot,0,0,:lat,:lon,:uid,:kind)
+            "INSERT INTO photos(path,parent,mtime,size,star,thumb_ok,uid64,kind,ext,rich_state)
+             VALUES(:path,:parent,:mtime,:size,0,0,:uid,:kind,:ext,:rich)
              ON CONFLICT(path) DO UPDATE SET
-               mtime=:mtime, size=:size, width=:width, height=:height,
-               taken_utc=:taken, cam=NULL, cam_id=:cam_id, lat=:lat, lon=:lon, kind=:kind,
+               mtime=:mtime, size=:size, kind=:kind,
                uid64=COALESCE(photos.uid64, :uid),
                thumb_ok=CASE WHEN photos.mtime<>:mtime THEN 0 ELSE photos.thumb_ok END,
-               dhash=CASE WHEN photos.mtime<>:mtime THEN NULL ELSE photos.dhash END",
+               dhash=CASE WHEN photos.mtime<>:mtime THEN NULL ELSE photos.dhash END,
+               rich_state=CASE
+                 WHEN :rich<>1 THEN photos.rich_state
+                 WHEN photos.mtime<>:mtime THEN 1
+                 WHEN photos.rich_state=0 THEN 1
+                 ELSE photos.rich_state END",
         )?;
-        for (i, r) in records.iter().enumerate() {
+        for r in records {
             // P1-11:uid64 = fnv1a64(path|size|mtime)。
             // 用 `COALESCE(photos.uid64, :uid)` —— 已有 uid64 的行**保持不变**
             // (标识是持久的,不应随内容变化而变;重新索引不应改变外部引用)。
             let uid = crate::db::fnv1a64(&format!("{}|{}|{}", r.path, r.size, r.mtime));
+            let ext = crate::db::Store::ext_of(&r.path);
+            let rich = gate.rich_state_of(&r.path, &r.parent, ext.as_deref());
             st.execute(rusqlite::named_params! {
                 ":path": r.path, ":parent": r.parent, ":mtime": r.mtime, ":size": r.size,
-                ":w": r.width, ":h": r.height, ":taken": r.taken_utc, ":rot": r.rot,
-                ":cam_id": cam_ids[i], ":lat": r.lat, ":lon": r.lon,
-                ":uid": uid as i64, ":kind": r.kind,
+                ":uid": uid as i64, ":kind": r.kind, ":ext": ext, ":rich": rich,
             })?;
         }
         drop(st);
@@ -1035,6 +1161,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ===== 自有目录按整级路径前缀排除 =====
+
+    /// 自家缓存目录走**路径前缀**而不是目录名:同名用户相册不受误伤,
+    /// 前缀也不会罩住名字前缀相同的兄弟目录(`cache` 不罩 `cached_photos`)。
+    #[test]
+    fn own_prefix_excludes_whole_subtree_by_path() {
+        let e = Exclusions::default().with_own_prefix(r"D:\maliang\cache");
+        assert!(
+            e.excludes_dir_path(Path::new(r"D:\maliang\cache")),
+            "缓存目录自身就该排除"
+        );
+        assert!(e.excludes_dir_path(Path::new(r"D:\maliang\cache\smallthumbs")));
+        assert!(e.excludes_path(Path::new(r"D:\maliang\cache\thumbs\a.jpg")));
+        assert!(
+            e.excludes_dir_path(Path::new(r"d:\Maliang\CACHE\X")),
+            "路径比较大小写不敏感"
+        );
+        assert!(
+            !e.excludes_dir_path(Path::new(r"D:\maliang\cached_photos")),
+            "整级命中才算:名字前缀相同不算"
+        );
+        assert!(
+            !e.excludes_dir_path(Path::new(r"D:\maliang")),
+            "前缀不能反向罩住自己的父目录"
+        );
+        assert!(
+            !e.excludes_dir_path(Path::new(r"C:\Users\me\Pictures\cache")),
+            "别的卷/别的父路径下同名目录不算"
+        );
+        assert!(e.own_leaf_may_match("cache") && e.own_leaf_may_match("CACHE"));
+        assert!(!e.own_leaf_may_match("smallthumbs"));
+    }
+
+    /// 尾分隔符与不同分隔符写法不能改变判定。
+    #[test]
+    fn own_prefix_matching_ignores_trailing_and_mixed_separators() {
+        let e = Exclusions::default().with_own_prefix(r"D:\maliang\cache\");
+        assert!(e.excludes_dir_path(Path::new(r"D:\maliang\cache")));
+        assert!(e.excludes_dir_path(Path::new(r"D:\maliang\cache\previews")));
+        let fwd = Exclusions::default().with_own_prefix("/own/cache/");
+        assert!(fwd.excludes_dir_path(Path::new("/own/cache/thumbs")));
+        assert!(!fwd.excludes_dir_path(Path::new("/own/cached")));
+    }
+
+    /// 默认构造不带任何自有前缀 —— 老调用点(纯名字判定)行为不变。
+    #[test]
+    fn default_exclusions_have_no_own_prefixes() {
+        let e = Exclusions::default();
+        assert!(e.own_prefixes().is_empty());
+        assert!(!e.own_leaf_may_match("cache"));
+        assert!(!e.excludes_dir_path(Path::new(r"D:\anything\cache\x")));
+    }
+
+    /// 生产入口确实把当前缓存位置注入了进来(不写死路径,跟着解析走)。
+    #[test]
+    fn from_store_injects_the_resolved_cache_dir() {
+        let store = Store::open_mem().unwrap();
+        let e = Exclusions::from_store(&store);
+        let loc = crate::db::cache_dir_loc();
+        assert!(
+            e.own_prefixes().iter().any(|p| *p == loc),
+            "排除项里必须有当前缓存目录 {loc:?}"
+        );
+        assert!(e.excludes_dir_path(&loc));
+    }
+
     // ===== P1-8 进度与取消 =====
 
     /// 进度:预计算倒数 + 乘法(原版扫描进度的核心优化)。
@@ -1233,19 +1425,33 @@ mod tests {
         use crate::nameidx::VolumeIndexBuilder;
         // 0x10 = FILE_ATTRIBUTE_DIRECTORY(nameidx 私有常量,这里用字面量)。
         const DIR: u32 = 0x10;
+        /// 测试用的简化入口:按 USN 记录形态追加(元数据列全 0)。
+        fn push(b: &mut VolumeIndexBuilder, frn: u64, parent: u64, attrs: u32, name: &str) {
+            let units: Vec<u16> = name.encode_utf16().collect();
+            b.push_usn(&crate::mft::UsnEntry {
+                frn,
+                parent_frn: parent,
+                attrs,
+                reason: 0,
+                usn: 0,
+                timestamp: 0,
+                name: &units,
+            });
+        }
         let mut b = VolumeIndexBuilder::new('C');
-        b.push(0x1000, 5, DIR, &"Pics".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x1001, 0x1000, 0x20, &"IMG_0001.JPG".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x2000, 0x1000, DIR, &"RAW".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x2001, 0x2000, 0x20, &"DSC.NEF".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x3000, 0x1000, DIR, &"thumbs".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x3001, 0x3000, 0x20, &"cache.jpg".encode_utf16().collect::<Vec<u16>>());
-        b.push(0x1002, 0x1000, 0x20, &"notes.txt".encode_utf16().collect::<Vec<u16>>());
+        push(&mut b, 0x1000, 5, DIR, "Pics");
+        push(&mut b, 0x1001, 0x1000, 0x20, "IMG_0001.JPG");
+        push(&mut b, 0x2000, 0x1000, DIR, "RAW");
+        push(&mut b, 0x2001, 0x2000, 0x20, "DSC.NEF");
+        push(&mut b, 0x3000, 0x1000, DIR, "thumbs");
+        push(&mut b, 0x3001, 0x3000, 0x20, "cache.jpg");
+        push(&mut b, 0x1002, 0x1000, 0x20, "notes.txt");
         let v = b.finish();
         let excl = Exclusions::default();
 
         // 子树根可定位:只收 JPG/NEF,排除 thumbs 整棵,notes.txt 不收。
-        let mc = mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\Pics"), &excl).unwrap();
+        let mc =
+            mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\Pics"), &excl, None).unwrap();
         assert_eq!(mc.paths.len(), 2, "实际: {:?}", mc.paths);
         assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\IMG_0001.JPG")));
         assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\RAW\DSC.NEF")));
@@ -1253,16 +1459,33 @@ mod tests {
 
         // 根目录大小写不敏感(与折叠池口径一致)。
         let mc2 =
-            mft_candidates(std::slice::from_ref(&v), Path::new(r"c:\pics"), &excl).unwrap();
+            mft_candidates(std::slice::from_ref(&v), Path::new(r"c:\pics"), &excl, None).unwrap();
         assert_eq!(mc2.paths.len(), 2);
 
         // 逐级失配 / 盘不在索引 → None(调用方回退 walkdir)。
-        assert!(mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\NoSuchDir"), &excl).is_none());
-        assert!(mft_candidates(&[], Path::new(r"C:\Pics"), &excl).is_none());
+        assert!(
+            mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\NoSuchDir"), &excl, None)
+                .is_none()
+        );
+        assert!(mft_candidates(&[], Path::new(r"C:\Pics"), &excl, None).is_none());
 
         // 卷根直扫:整卷候选(排除 thumbs 子树)。
-        let mc3 = mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\"), &excl).unwrap();
+        let mc3 =
+            mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\"), &excl, None).unwrap();
         assert_eq!(mc3.paths.len(), 2, "实际: {:?}", mc3.paths);
         assert_eq!(mc3.excluded_dirs, 1);
+
+        // 取消已置位 → 立即收手,但返回 Some(部分结果)而不是 None:
+        // None 会让调用方回退 walkdir,那正是用户想中止的慢路径。
+        let ctrl = ScanControl::new();
+        ctrl.cancel();
+        let mc4 = mft_candidates(
+            std::slice::from_ref(&v),
+            Path::new(r"C:\Pics"),
+            &excl,
+            Some(&ctrl),
+        )
+        .expect("取消不该退化成 walkdir 回退");
+        assert!(mc4.paths.is_empty(), "第一次检查就该停,不收任何候选");
     }
 }

@@ -298,7 +298,7 @@ pub fn known_dirs() -> Vec<std::path::PathBuf> {
 /// 工具栏「查看选项」的壳目录快捷键(参考件 View 菜单里的
 /// Desktop / My Documents / My Pictures / My Computer 四项)。
 ///
-/// 我的电脑在参考 Picasa 3是浏览树根(可下探任意盘);我方左栏是图库树,
+/// 「我的电脑」在经典图库里是浏览树根(可下探任意盘);我方左栏是图库树,
 /// 覆盖不到全盘,故路径给 `None`,由调用方给出明确说明而不是假装能跳。
 pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     vec![
@@ -430,7 +430,7 @@ pub fn set_wallpaper(path: &Path) -> bool {
 ///
 /// P2-17 视频播放的**等效替代**:原版在库内用 DirectShow filter graph
 /// 渲染到一个视频子窗口,我方不内嵌视频管线,改为交给系统默认播放器 ——
-/// 与原版「能看」的目标一致,管线体量差异在 过程笔记 十八节诚实标注。
+/// 与原版「能看」的目标一致,差异在于不内嵌视频管线,特效与体量从简。
 ///
 /// 返回是否成功(ShellExecuteW 返回值 > 32 视为成功)。
 pub fn shell_open(path: &Path) -> bool {
@@ -538,9 +538,9 @@ fn shell_execute_elevated(
 
 /// 用 UAC 提权拉起**自身**子进程(runas 动词),发后即忘。
 ///
-/// 每次调用都要过一次 UAC(Windows 不给"记住"runas 同意),现在只服务
-/// 「每次单独授权」这一档;默认档走计划任务 [`mft_task_install`]。
-/// `params` 是完整命令行参数串(如 `--mft-scan --mft-report <文件>`)。
+/// 每次调用都要过一次 UAC(Windows 不给"记住"runas 同意),所以只用在
+/// 「本次单独授权跑一轮全盘扫描」这一档;常驻档走服务 [`service_install_elevated`]。
+/// `params` 是完整命令行参数串(如 `--mft-scan`)。
 pub fn launch_elevated(params: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -554,279 +554,424 @@ pub fn launch_elevated(params: &str) -> Result<(), String> {
     }
 }
 
-/// 全盘索引更新器的计划任务名(注册一次,以后静默触发)。
-pub const MFT_TASK_NAME: &str = "RelytoMaliangIndexer";
-/// 计划任务固定执行的参数:不带报告路径(由子进程自己按数据目录推导),
-/// 这样数据目录改了也不用重注册;`--mft-task` 让子进程摘掉自己的控制台。
-pub const MFT_TASK_ARGS: &str = "--mft-scan --mft-task";
+// 全盘索引服务的安装/查询/卸载(P0-3:替掉原先「计划任务 + 每次一次性拉起子进程」)。
+//
+// 索引引擎必须常驻:USN 保鲜是挂在内核里阻塞读 journal 的活进程,不是跑完就退的
+// 批处理。所以进程模型换成拆进程 —— 一个自动启动的提权服务 + 非提权 UI
+// 客户端。`CreateServiceW`/`DeleteService` 都要管理员,于是安装与卸载各走一次
+// 「提权重启自己 + 子命令」([`service_install_elevated`] / [`service_uninstall_elevated`]),
+// 这是本功能唯一需要用户点"是"的地方;之后由 SCM 自动拉起,UI 侧全程静默。
 
-/// 隐藏窗口运行命令行工具并等它结束,返回退出码(schtasks 专用,不闪黑框)。
-pub fn run_hidden(program: &str, args: &[&str]) -> Result<i32, String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use std::process::Stdio;
-        // CREATE_NO_WINDOW:子进程不分配控制台。
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let status = std::process::Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| format!("启动 {program} 失败: {e}"))?
-            .wait()
-            .map_err(|e| format!("等待 {program} 结束失败: {e}"))?;
-        Ok(status.code().unwrap_or(-1))
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (program, args);
-        Err("仅支持 Windows".into())
+/// 服务当前状态(查询不需要管理员)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    /// 从未注册,或已被卸载。
+    NotInstalled,
+    /// 已注册但没在跑 —— UI 该给"启动服务"的出口,而不是引导用户重装。
+    Stopped,
+    Running,
+    /// 启动中/停止中等过渡态。原始码留给日志,别当成确定结论。
+    Transition(u32),
+}
+
+/// SCM 句柄的 RAII 包装:`CloseServiceHandle` 在每条返回路径上都要调,手写必漏。
+#[cfg(windows)]
+struct ScHandle(windows::Win32::System::Services::SC_HANDLE);
+
+#[cfg(windows)]
+impl Drop for ScHandle {
+    fn drop(&mut self) {
+        // SAFETY: 句柄由本包装独占;关闭失败(已无效)只返回 FALSE,无副作用。
+        unsafe {
+            let _ = windows::Win32::System::Services::CloseServiceHandle(self.0);
+        }
     }
 }
 
-/// 当前用户 SID 字符串(计划任务 `<UserId>` 用 SID,比 `域\别名` 无歧义:
-/// 微软账户、Entra 加入的机器上别名都不等于登录名)。
-#[cfg(windows)]
-fn current_user_sid() -> Result<String, String> {
-    use windows::core::PWSTR;
-    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
-    use windows::Win32::Security::{
-        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
-        TOKEN_USER,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+/// 查服务状态。SCM 都打不开(极罕见)按未注册处理,让 UI 直接走降级路径。
+pub fn service_state() -> ServiceState {
+    #[cfg(windows)]
+    {
+        use windows::core::{HRESULT, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SERVICE_DOES_NOT_EXIST;
+        use windows::Win32::System::Services::{
+            OpenSCManagerW, OpenServiceW, QueryServiceStatus, SC_MANAGER_CONNECT,
+            SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STOPPED,
+        };
 
-    let mut token = HANDLE::default();
-    // SAFETY: 打开的是本进程令牌,TOKEN_QUERY 只读,句柄由本函数负责关闭。
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
-        .map_err(|e| format!("打开进程令牌失败: {e}"))?;
-    let mut len = 0u32;
-    // SAFETY: 第一次传空缓冲只问所需长度,是 Win32 约定用法。
-    unsafe {
-        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
-    }
-    let mut buf = vec![0u8; len.max(1) as usize];
-    // SAFETY: buf 长度即上一步问到的长度;输出结构里的 SID 指针指向 buf 内部。
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
-            len,
-            &mut len,
-        )
-    };
-    if ok.is_err() {
-        // SAFETY: 令牌句柄在两条路径上都要关。
-        unsafe {
-            let _ = CloseHandle(token);
-        }
-        return Err("读取令牌用户失败".to_string());
-    }
-    // SAFETY: GetTokenInformation 成功 ⇒ buf 头部是一个合法 TOKEN_USER。
-    let sid = unsafe { (&*(buf.as_ptr() as *const TOKEN_USER)).User.Sid };
-    let mut sid_str = PWSTR::null();
-    // SAFETY: sid 来自上一步的令牌查询;转换出的字符串由 LocalFree 释放。
-    let res = unsafe { ConvertSidToStringSidW(sid, &mut sid_str) };
-    let mut out = String::new();
-    unsafe {
-        if res.is_ok() && !sid_str.is_null() {
-            // 转换结果是 NUL 结尾宽串,自己找终止符(PWSTR 无现成的读取方法)。
-            let mut n = 0usize;
-            while *sid_str.0.add(n) != 0 {
-                n += 1;
+        let name = to_wide(crate::service::SERVICE_NAME);
+        // SAFETY: 前两个参数传 null 是 SCM 约定(本机 + 默认数据库);
+        // name 是 NUL 结尾宽串,存活到调用结束。
+        let scm = match unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        {
+            Ok(h) => ScHandle(h),
+            Err(_) => return ServiceState::NotInstalled,
+        };
+        let svc = match unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) } {
+            Ok(h) => ScHandle(h),
+            Err(e) => {
+                return if e.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) {
+                    ServiceState::NotInstalled
+                } else {
+                    // 打得开 SCM 却开不了这个服务:多半是权限被组策略收走。
+                    // 报 Stopped 而非 NotInstalled,免得 UI 引导用户去重装一个已存在的服务。
+                    ServiceState::Stopped
+                };
             }
-            out = String::from_utf16_lossy(std::slice::from_raw_parts(sid_str.0, n));
-            let _ = LocalFree(HLOCAL(sid_str.0 as *mut std::ffi::c_void));
+        };
+        let mut st = SERVICE_STATUS::default();
+        // SAFETY: st 是本栈上的完整结构,由 QueryServiceStatus 填写。
+        if unsafe { QueryServiceStatus(svc.0, &mut st) }.is_err() {
+            return ServiceState::Stopped;
         }
-        let _ = CloseHandle(token);
-    }
-    if out.is_empty() {
-        Err("SID 转换失败".to_string())
-    } else {
-        Ok(out)
-    }
-}
-
-/// `schtasks.exe` 的绝对路径(靠 PATH 找在提权环境里不总可靠)。
-#[cfg(windows)]
-fn schtasks_exe() -> String {
-    std::env::var("SystemRoot")
-        .map(|root| format!(r"{}\System32\schtasks.exe", root))
-        .unwrap_or_else(|_| r"C:\Windows\System32\schtasks.exe".to_string())
-}
-
-fn xml_esc(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// 计划任务定义 XML(UTF-16 编码由调用方落盘时处理)。
-///
-/// `InteractiveToken` + `HighestAvailable`:任务由计划任务服务负责提权,
-/// 所以**非提权的本程序调用 `/Run` 不会再看到 UAC 弹窗** —— 这就是
-/// "授权一次、以后静默"的机制;同时任务是服务拉起的,不挂控制台。
-/// `ExecutionTimeLimit` 兜底,免得子进程挂死后留一个永动任务实例。
-pub fn mft_task_xml(sid: &str, exe: &Path) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>Relyto.Maliang 全盘文件名索引更新(快速查找数据源,只读 NTFS 卷日志)</Description>
-  </RegistrationInfo>
-  <Triggers />
-  <Principals>
-    <Principal id="Author">
-      <UserId>{sid}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>HighestAvailable</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{cmd}</Command>
-      <Arguments>{args}</Arguments>
-    </Exec>
-  </Actions>
-</Task>"#,
-        sid = xml_esc(sid),
-        cmd = xml_esc(&exe.to_string_lossy()),
-        args = xml_esc(MFT_TASK_ARGS),
-    )
-}
-
-/// 一次性提权,把索引更新器注册成「按需启动 + 最高权限」的计划任务。
-/// 这是本功能唯一需要用户点"是"的地方;之后每次启动都静默。
-/// `tmp_dir` 用来落任务定义 XML(schtasks `/XML` 只吃 UTF-16 文件)。
-pub fn mft_task_install(exe: &Path, tmp_dir: &Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let xml = mft_task_xml(&current_user_sid()?, exe);
-        let def = tmp_dir.join("mft_task.xml");
-        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
-        bytes.extend(xml.encode_utf16().flat_map(|u| u.to_le_bytes()));
-        std::fs::write(&def, &bytes).map_err(|e| format!("写任务定义失败: {e}"))?;
-        let params = format!("/Create /F /TN {MFT_TASK_NAME} /XML \"{}\"", def.display());
-        let res = shell_execute_elevated(&schtasks_exe(), &params, Some(90_000));
-        let _ = std::fs::remove_file(&def);
-        match res? {
-            Some(0) => Ok(()),
-            Some(code) => Err(format!("计划任务注册失败(schtasks 退出码 {code})")),
-            None => Err("计划任务注册未返回结果".to_string()),
+        if st.dwCurrentState == SERVICE_RUNNING {
+            ServiceState::Running
+        } else if st.dwCurrentState == SERVICE_STOPPED {
+            ServiceState::Stopped
+        } else {
+            ServiceState::Transition(st.dwCurrentState.0)
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = (exe, tmp_dir);
-        Err("仅支持 Windows".into())
+        ServiceState::NotInstalled
     }
 }
 
-/// 计划任务是否已注册(查询不需要管理员)。
-pub fn mft_task_registered() -> bool {
-    #[cfg(windows)]
-    {
-        matches!(
-            run_hidden(&schtasks_exe(), &["/Query", "/TN", MFT_TASK_NAME]),
-            Ok(0)
-        )
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+/// 服务是否已注册(含停着的)。
+pub fn service_installed() -> bool {
+    service_state() != ServiceState::NotInstalled
 }
 
-/// 触发计划任务更新索引:静默(不弹 UAC、不弹窗口),结果由子进程写报告文件。
-pub fn mft_task_run() -> Result<(), String> {
+/// 提权进程内执行:注册服务(自动启动 + LocalSystem)+ 写描述 + 立刻启动。
+/// 服务已存在时改配置指向当前 exe(升级/搬目录后能自愈),而不是报"已存在"。
+pub fn service_install(exe: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
-        match run_hidden(&schtasks_exe(), &["/Run", "/TN", MFT_TASK_NAME]) {
-            Ok(0) => Ok(()),
-            Ok(code) => Err(format!("计划任务启动失败(schtasks 退出码 {code})")),
-            Err(e) => Err(e),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        Err("仅支持 Windows".into())
-    }
-}
+        use windows::core::{HRESULT, PCWSTR, PWSTR};
+        use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+        use windows::Win32::System::Services::{
+            ChangeServiceConfig2W, ChangeServiceConfigW, CreateServiceW, OpenSCManagerW,
+            OpenServiceW, StartServiceW, ENUM_SERVICE_TYPE, SC_MANAGER_CONNECT,
+            SC_MANAGER_CREATE_SERVICE, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
+            SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTIONW, SERVICE_ERROR, SERVICE_ERROR_NORMAL,
+            SERVICE_NO_CHANGE, SERVICE_START_TYPE, SERVICE_WIN32_OWN_PROCESS,
+        };
 
-/// 撤销授权 = 删除计划任务(改任务定义要提权,所以这一步仍会弹一次 UAC)。
-pub fn mft_task_uninstall() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let params = format!("/Delete /F /TN {MFT_TASK_NAME}");
-        match shell_execute_elevated(&schtasks_exe(), &params, Some(90_000))? {
-            Some(0) => Ok(()),
-            Some(code) => Err(format!("计划任务删除失败(schtasks 退出码 {code})")),
-            None => Err("计划任务删除未返回结果".to_string()),
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        Err("仅支持 Windows".into())
-    }
-}
+        let name = to_wide(crate::service::SERVICE_NAME);
+        let display = to_wide(crate::service::SERVICE_DISPLAY);
+        let desc = to_wide(crate::service::SERVICE_DESC);
+        // 路径必须带引号:安装目录常含空格。
+        let bin = to_wide(&format!("\"{}\" --service", exe.display()));
 
-/// 摘掉进程自己的控制台。
-///
-/// 被计划任务拉起时(debug 构建是控制台子系统)系统会给一个新控制台,
-/// 那就是用户看到的黑框;release 是 GUI 子系统、本来没有控制台,调用无副作用。
-pub fn hide_console() {
-    #[cfg(windows)]
-    {
-        // SAFETY: FreeConsole 只解除本进程与控制台的关联,无参数无返回值风险。
+        // SAFETY: null = 本机 + 默认数据库;CREATE_SERVICE 是注册所需的最小附加权限。
+        let scm = ScHandle(
+            unsafe {
+                OpenSCManagerW(
+                    PCWSTR::null(),
+                    PCWSTR::null(),
+                    SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
+                )
+            }
+            .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+        );
+
+        // SAFETY: 已存在 → 拿全权限句柄改配置;不存在 → 走 CreateServiceW。
+        let existing =
+            unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_ALL_ACCESS) }.ok();
+        let svc = match existing {
+            Some(h) => {
+                let h = ScHandle(h);
+                // SAFETY: 只改二进制路径与显示名,其余字段用 SERVICE_NO_CHANGE / null 保持原值;
+                // 各宽串在本函数内存活。
+                unsafe {
+                    ChangeServiceConfigW(
+                        h.0,
+                        ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+                        SERVICE_START_TYPE(SERVICE_NO_CHANGE),
+                        SERVICE_ERROR(SERVICE_NO_CHANGE),
+                        PCWSTR(bin.as_ptr()),
+                        PCWSTR::null(),
+                        None,
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        PCWSTR(display.as_ptr()),
+                    )
+                }
+                .map_err(|e| format!("更新服务配置失败: {e}"))?;
+                h
+            }
+            None => {
+                // SAFETY: lpServiceStartName 传 NULL ⇒ 服务跑在 LocalSystem 下,
+                // 读 $MFT / USN 日志正好需要这个账户;lpdwTagId/lpDependencies 不需要。
+                let h = unsafe {
+                    CreateServiceW(
+                        scm.0,
+                        PCWSTR(name.as_ptr()),
+                        PCWSTR(display.as_ptr()),
+                        SERVICE_ALL_ACCESS,
+                        SERVICE_WIN32_OWN_PROCESS,
+                        SERVICE_AUTO_START,
+                        SERVICE_ERROR_NORMAL,
+                        PCWSTR(bin.as_ptr()),
+                        PCWSTR::null(),
+                        None,
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                    )
+                }
+                .map_err(|e| format!("注册服务失败(需要管理员): {e}"))?;
+                ScHandle(h)
+            }
+        };
+
+        // 描述写在服务的"描述"列 —— 用户在 services.msc 里要能看出它是干什么的、
+        // 停掉会失去什么,否则只会被当成可疑的常驻提权进程卸掉。
+        let d = SERVICE_DESCRIPTIONW {
+            lpDescription: PWSTR(desc.as_ptr() as *mut u16),
+        };
+        // SAFETY: d 指向本栈上的 desc 宽串;lpInfo 按 SERVICE_CONFIG_DESCRIPTION 解释。
         unsafe {
-            let _ = windows::Win32::System::Console::FreeConsole();
+            ChangeServiceConfig2W(
+                svc.0,
+                SERVICE_CONFIG_DESCRIPTION,
+                Some(&d as *const SERVICE_DESCRIPTIONW as *const std::ffi::c_void),
+            )
         }
+        .map_err(|e| format!("写服务描述失败: {e}"))?;
+
+        // SAFETY: 不带参数启动(--service 已写在二进制路径里)。
+        match unsafe { StartServiceW(svc.0, None) } {
+            Ok(()) => Ok(()),
+            // 已在跑就是成功:重复安装不该报错。
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => Ok(()),
+            Err(e) => Err(format!("服务已注册但启动失败: {e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        Err("仅支持 Windows".into())
     }
 }
 
-/// 在资源管理器中定位文件(`explorer /select,"路径"`)。
-pub fn reveal_in_explorer(path: &Path) -> bool {
+/// Win32 的通用 DELETE 访问权(WinNT.h),服务句柄上就是"可删除"。
+/// windows crate 没导出这个名字,按裸值落常量;`service_delete_right_is_win32_value` 钉住。
+#[cfg(windows)]
+const SERVICE_DELETE: u32 = 0x0001_0000;
+
+/// 发停止命令并等到 STOPPED(尽力而为):返回是否真看到了停干净。
+///
+/// 凡是要动服务的动作都得先过这一关 —— 进程还活着时它锁着自己的 exe 映像,
+/// 新二进制覆盖不上,删注册也只会被 SCM 标成"待删除"。
+/// 返回 `false` 不代表失败:卸载方照样往下删(句柄一放就生效),
+/// 只有"只停不删"的入口需要把它当错误告诉用户。
+#[cfg(windows)]
+fn stop_and_wait(svc: &ScHandle) -> bool {
+    use windows::Win32::System::Services::{
+        ControlService, QueryServiceStatus, SERVICE_CONTROL_STOP, SERVICE_STATUS, SERVICE_STOPPED,
+    };
+    let mut st = SERVICE_STATUS::default();
+    // SAFETY: st 由 ControlService / QueryServiceStatus 填写。
+    // ControlService 在服务已停时会失败,那不是错误 —— 后面的等待循环按实际状态判。
+    unsafe {
+        let _ = ControlService(svc.0, SERVICE_CONTROL_STOP, &mut st);
+    }
+    // 最多等 10s:保鲜线程可能正挂在内核的 USN 阻塞读里,收到 STOP 后要自己收尾。
+    for _ in 0..50 {
+        // SAFETY: 同上。
+        // 查不到状态 = 句柄已经作废(注册项没了),没什么可停的,按停干净算。
+        if unsafe { QueryServiceStatus(svc.0, &mut st) }.is_err() {
+            return true;
+        }
+        if st.dwCurrentState == SERVICE_STOPPED {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    false
+}
+
+/// 提权进程内执行:**只停服务,注册项原样留着**。
+///
+/// 为什么要有这一步:服务在跑就锁着自己的 exe,重编/升级/搬目录全都动不了它。
+/// 让用户去 services.msc 里翻一个陌生名字、或敲 `net stop RelytoMaliangIndex`,
+/// 等于把这个能力做在了产品外面 —— 停与起都必须在本程序的选项页里点得到。
+pub fn service_stop() -> Result<(), String> {
     #[cfg(windows)]
     {
         use windows::core::PCWSTR;
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-        let args = format!("/select,\"{}\"", path.display());
-        let file_w = to_wide("explorer.exe");
-        let args_w = to_wide(&args);
-        // SAFETY: 均为合法 NUL 结尾宽串;动词 "open" 为静态常量。
-        let ret = unsafe {
-            ShellExecuteW(
-                None,
-                windows::core::w!("open"),
-                PCWSTR(file_w.as_ptr()),
-                PCWSTR(args_w.as_ptr()),
-                None,
-                SW_SHOWNORMAL,
-            )
+        use windows::Win32::System::Services::{
+            OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS, SERVICE_STOP,
         };
-        (ret.0 as isize) > 32
+        let name = to_wide(crate::service::SERVICE_NAME);
+        // SAFETY: null = 本机 + 默认数据库。
+        let scm = ScHandle(
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+        );
+        // SAFETY: name 是 NUL 结尾宽串;停服务要 STOP + QUERY_STATUS 两个权限。
+        let svc = match unsafe {
+            OpenServiceW(
+                scm.0,
+                PCWSTR(name.as_ptr()),
+                SERVICE_STOP | SERVICE_QUERY_STATUS,
+            )
+        } {
+            Ok(h) => ScHandle(h),
+            // 压根没注册 = 没有可停的东西,和卸载一样保持幂等。
+            Err(_) => return Ok(()),
+        };
+        if stop_and_wait(&svc) {
+            Ok(())
+        } else {
+            Err("索引服务 10 秒内没停下来(可能正卡在磁盘读上),稍后再点一次".into())
+        }
     }
     #[cfg(not(windows))]
     {
-        let _ = path;
-        false
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 提权进程内执行:**只启动已注册的服务**,不碰配置、不改映像路径。
+///
+/// 停过的服务不会自己回来(SCM 只在开机按启动类型拉),所以「停」必须在产品里
+/// 配一个「起」,否则用户点完停就只有重装这一条回头路,还得多花一次 UAC。
+pub fn service_start() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::core::{HRESULT, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+        use windows::Win32::System::Services::{
+            OpenSCManagerW, OpenServiceW, StartServiceW, SC_MANAGER_CONNECT, SERVICE_START,
+        };
+        let name = to_wide(crate::service::SERVICE_NAME);
+        // SAFETY: null = 本机 + 默认数据库。
+        let scm = ScHandle(
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+        );
+        // SAFETY: name 是 NUL 结尾宽串。
+        let svc = unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_START) }
+            .map_err(|_| "索引服务尚未安装,请先点「安装索引服务…」")?;
+        let svc = ScHandle(svc);
+        // SAFETY: 不带参数启动(--service 已写在二进制路径里)。
+        match unsafe { StartServiceW(svc.0, None) } {
+            Ok(()) => Ok(()),
+            // 已经在跑(比如开机自动起来了)就是成功:重复点不该报错。
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => Ok(()),
+            Err(e) => Err(format!("启动索引服务失败: {e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 提权进程内执行:停服务 → 等它真停 → 删注册。
+///
+/// 删除前必须等到 STOPPED:服务还在跑就删,SCM 只标记"待删除",
+/// 同名服务在我们的句柄关掉前既查不到也重建不了,用户看到的是一团乱。
+/// 等满 10s 仍没停也照删(标记待删除,句柄一放就生效)—— 卸载失败卡住比多等一轮更糟。
+pub fn service_uninstall() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Services::{
+            DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,
+            SERVICE_STOP,
+        };
+
+        let name = to_wide(crate::service::SERVICE_NAME);
+        // SAFETY: null = 本机 + 默认数据库。
+        let scm = ScHandle(
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+        );
+        // SAFETY: name 是 NUL 结尾宽串;要停、要查、要删,所以三个权限都拿。
+        let svc = match unsafe {
+            OpenServiceW(
+                scm.0,
+                PCWSTR(name.as_ptr()),
+                SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_DELETE,
+            )
+        } {
+            Ok(h) => ScHandle(h),
+            // 打不开就当已卸载:卸载要幂等,重复点不该报错。
+            Err(_) => return Ok(()),
+        };
+        let _ = stop_and_wait(&svc);
+        // SAFETY: 删注册。
+        unsafe { DeleteService(svc.0) }.map_err(|e| format!("删除服务失败: {e}"))
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 从非提权 UI 触发安装:提权重启自己跑 `--install-service`,等它退出并读退出码。
+/// 整个功能唯一一次 UAC 弹窗就在这儿;装完服务自动启动,以后不再弹。
+pub fn service_install_elevated() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        elevated_self("--install-service")
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 撤销授权 = 卸载服务(改服务注册要提权,所以这一步仍会弹一次 UAC)。
+pub fn service_uninstall_elevated() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        elevated_self("--uninstall-service")
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 从非提权 UI 触发「只停服务」:停服务句柄要 SERVICE_STOP,也只有提权进程拿得到。
+pub fn service_stop_elevated() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        elevated_self("--stop-service")
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 从非提权 UI 触发「只启动服务」(StartService 同样要 SERVICE_START)。
+pub fn service_start_elevated() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        elevated_self("--start-service")
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅支持 Windows".into())
+    }
+}
+
+/// 提权重启自身跑一条子命令并等结果。子进程的具体失败原因在它自己的日志里,
+/// 这里只有退出码可用(release 是 GUI 子系统,stdout 无处可去,不指望它)。
+#[cfg(windows)]
+fn elevated_self(flag: &str) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+    match shell_execute_elevated(&exe.to_string_lossy(), flag, Some(120_000))? {
+        Some(0) => Ok(()),
+        Some(code) => Err(format!("提权子进程退出码 {code}(详见数据目录 index-service.log)")),
+        None => Err("提权子进程未返回结果".to_string()),
     }
 }
 
@@ -1046,7 +1191,7 @@ unsafe fn shell_context_menu_inner(wide: &[u16]) -> bool {
 }
 
 #[cfg(windows)]
-fn to_wide(s: &str) -> Vec<u16> {
+pub fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
@@ -1086,19 +1231,49 @@ mod tests {
         assert!(cpu_count() >= 1);
     }
 
+    /// SERVICE_DELETE 是裸常量(windows crate 没导出这个名字),钉住 WinNT.h 的值。
+    #[cfg(windows)]
     #[test]
-    fn mft_task_xml_points_at_exe_and_stays_silent_about_privileges() {
-        // 任务定义必须:跑当前 exe + 固定的 --mft-scan --mft-task(不带可变的报告
-        // 路径,否则数据目录一改就永远等不到信号)+ 最高权限 + 交互登录型。
-        let xml = mft_task_xml("S-1-5-21-1&2", Path::new(r"D:\Some Dir\maliang.exe"));
-        assert!(xml.contains(r#"<Command>D:\Some Dir\maliang.exe</Command>"#));
-        assert!(xml.contains(&format!("<Arguments>{MFT_TASK_ARGS}</Arguments>")));
-        assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
-        assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
-        // 非提权调用方要靠它免 UAC,前提就是这条:注册成最高权限的按需任务。
-        assert!(xml.contains("<Triggers />"));
-        // 身份里的 & 必须转义,否则整份 XML 解析失败(schtasks 报"格式不正确")。
-        assert!(xml.contains("S-1-5-21-1&amp;2"));
-        assert!(!xml.contains("mft_report"));
+    fn service_delete_right_is_win32_value() {
+        assert_eq!(SERVICE_DELETE, 0x0001_0000);
+        // 与 crate 导出的同类访问权不重叠,避免"或"上去其实没拿到删除权。
+        use windows::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STOP};
+        assert_eq!(SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_DELETE, 0x0001_0024);
+        assert_ne!(SERVICE_DELETE, SERVICE_START);
+        // 「停止索引服务…」只要停 + 查两项:少一项 SCM 直接拒绝,
+        // 多要删除权就等于把「停止」偷偷做成「卸载」。
+        assert_eq!(SERVICE_STOP | SERVICE_QUERY_STATUS, 0x0000_0024);
+        // 「启动索引服务…」只要 SERVICE_START(0x10),它不碰注册项。
+        assert_eq!(SERVICE_START, 0x0000_0010);
+    }
+
+    /// 服务名/显示名/描述不能为空,也不能带会破坏命令行拼接的引号。
+    #[test]
+    fn service_metadata_is_usable() {
+        use crate::service::{SERVICE_DESC, SERVICE_DISPLAY, SERVICE_NAME};
+        for s in [SERVICE_NAME, SERVICE_DISPLAY, SERVICE_DESC] {
+            assert!(!s.trim().is_empty());
+        }
+        // 服务名是 SCM 的键,不能含空格/引号,也不该跟着显示名一起改。
+        assert!(!SERVICE_NAME.contains(|c: char| c.is_whitespace() || c == '"'));
+        assert!(!SERVICE_DESC.contains('"'));
+        // 描述要说清停掉的后果,否则用户只看到一个常驻提权进程。
+        assert!(SERVICE_DESC.contains("降级"));
+    }
+
+    /// 未注册服务时状态必须是 NotInstalled(而不是误报 Stopped/Running),
+    /// UI 靠它决定给"安装服务"还是"启动服务"。
+    #[test]
+    fn service_state_is_queryable_without_admin() {
+        let st = service_state();
+        // 本机可能真装了这个服务,所以只钉"查询不 panic、结论自洽"这一层。
+        assert_eq!(service_installed(), st != ServiceState::NotInstalled);
+        assert!(matches!(
+            st,
+            ServiceState::NotInstalled
+                | ServiceState::Stopped
+                | ServiceState::Running
+                | ServiceState::Transition(_)
+        ));
     }
 }

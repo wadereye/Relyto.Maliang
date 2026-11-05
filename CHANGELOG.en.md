@@ -4,6 +4,29 @@ All user-visible changes are documented here, newest first.
 中文版见 [CHANGELOG.md](./CHANGELOG.md)；the full feature list is in
 [README.md](./README.md).
 
+## Unreleased
+
+### Changed
+
+- Face recognition now offers **two selectable schemes** under Options >
+  General > Face recognition scheme:
+  - The default is **YuNet detection + AdaFace IR-50 recognition**
+    (Apache-2.0 / MIT, commercially friendly), replacing the previously used
+    insightface antelopev2, which is not commercially usable;
+  - **antelopev2** (SCRFD + ArcFace) remains available as an optional scheme —
+    its weights are not commercially usable, bring your own at your own
+    discretion.
+- Embeddings remain 512-d and the library schema is unchanged; the face
+  algorithm tag moves to v4 and is compared together with the scheme name,
+  so switching schemes (or first launch) prompts for a face rescan. The
+  detection model type is auto-detected from its output tensor count; files
+  are named per scheme (default `face_det.onnx` / `face_rec.onnx`,
+  antelopev2 uses `face_det_v2.onnx` / `face_rec_v2.onnx`) — see the
+  "Models" section of the README for how to get them.
+- The People and Semantic Search pages now show the models folder location
+  and placement guidance when models are missing, and the options page shows
+  per-scheme readiness, instead of failing only when a scan/index is started.
+
 ## 0.2.0 (2026-11-03)
 
 This release focuses on three things: **searching the whole disk instantly
@@ -63,7 +86,7 @@ without importing first**, **a fully revamped gallery page**, and an
   automatically to avoid two confusing copies of the data; entries that
   cannot be deleted (still in use) are kept and do not prevent the new
   directory from taking effect.
-- Folder view defaults to tree display (matching the reference's left
+- Folder view defaults to tree display (with an expandable left
   sidebar; can be switched back to flat in the view toggles).
 
 ### Fixed

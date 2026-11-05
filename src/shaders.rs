@@ -1,4 +1,4 @@
-//! 着色器族效果:参考 Picasa 3 的 `Shader` 类效果共 10 项,本轮落地算法口径明确的 6 项。
+//! 着色器族效果:同族效果共 10 项,本轮落地算法口径明确的 6 项。
 //!
 //! 六项共用三条约定(与参考件一致):
 //!
@@ -113,7 +113,7 @@ pub fn hexcells(img: &mut RgbaImage, cell: f32) {
 /// `ph_x`/`ph_y` 是相位(弧度)。位移公式:
 /// `sx = x + ax·sin(x/bx + ph_x)`、`sy = y + ay·cos(y/by + ph_y)`。
 ///
-/// 名字里的「块」在参考 Picasa 3只是频率的分母,并没有真的分块。
+/// 名字里的「块」只是频率的分母,并没有真的分块。
 pub fn ripple_blocks(img: &mut RgbaImage, ax: f32, ay: f32, bx: f32, by: f32, ph_x: f32, ph_y: f32) {
     let (w, h) = img.dimensions();
     let src = img.clone();
@@ -270,7 +270,7 @@ pub fn waterfall(img: &mut RgbaImage, fx: f32, fy: f32, angle: f32) {
 /// `sat` 是饱和度百分比偏移(钳进 ±100,乘性:`S' = S·(1 + sat/100)`),
 /// `lum` 是亮度百分比偏移(钳进 ±100,加性:`L' = L + lum/100`)。
 ///
-/// 换算走参考件那套标准 60° 扇区的 HSL,不引入我方其它效果的色彩模型;
+/// 换算走标准 60° 扇区的 HSL,不引入我方其它效果的色彩模型;
 /// 透明度原样透传,四个通道各自钳回 `[0,1]` 后取整回 8 位。
 pub fn hsl_filter(img: &mut RgbaImage, hue: f32, sat: f32, lum: f32) {
     let hue = clamp_sym(hue, 180.0);
@@ -333,7 +333,7 @@ pub fn hsl_filter(img: &mut RgbaImage, hue: f32, sat: f32, lum: f32) {
     }
 }
 
-/// 把色相分量绕回一圈(参考件只补/减一次,不是取模)。
+/// 把色相分量绕回一圈(只补/减一次,不是取模)。
 fn wrap(t: f32) -> f32 {
     if t >= 0.0 {
         if t > 1.0 {
