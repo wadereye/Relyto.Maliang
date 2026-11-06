@@ -415,10 +415,15 @@ pub fn scan_volume(
 
 /// 增量读取关心的原因位:只处理影响「存在/名字/位置」的变更,
 /// 内容修改(DATA_OVERWRITE 等)不进名字索引。
-pub const USN_REASON_FILE_CREATE: u32 = 0x0000_0001;
-pub const USN_REASON_FILE_DELETE: u32 = 0x0000_0002;
-/// 内容被改写。名字索引不关心它 —— 列出来只是为了让「不进索引」这件事可测。
-pub const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0004;
+/// (2026-11-06 修正:FILE_CREATE/FILE_DELETE 此前误写成 0x1/0x2 ——
+/// 那两位其实是 DATA_OVERWRITE/DATA_EXTEND,导致新建文件的 CLOSE
+/// 记录被 collect_close_op 错折成 Delete,增量新建永远进不了索引。)
+pub const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
+pub const USN_REASON_DATA_EXTEND: u32 = 0x0000_0002;
+pub const USN_REASON_DATA_TRUNCATION: u32 = 0x0000_0004;
+/// 名字索引不关心这三个内容位 —— 列出来只是为了让「不进索引」这件事可测。
+pub const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
+pub const USN_REASON_FILE_DELETE: u32 = 0x0000_0200;
 pub const USN_REASON_RENAME_OLD_NAME: u32 = 0x0000_1000;
 pub const USN_REASON_RENAME_NEW_NAME: u32 = 0x0000_2000;
 /// 关闭位:`ReturnOnlyOnClose = TRUE` 时内核只吐带此位的终态记录
@@ -549,6 +554,101 @@ pub fn read_journal(
     {
         let _ = (letter, journal_id, start_usn, &mut on_record);
         Err(anyhow!("USN 增量读取仅支持 Windows"))
+    }
+}
+
+/// `--usn-dump <卷字母> <输出文件> [回看字节数]`:提权诊断入口。
+///
+/// 与 [`read_journal`] 的差异:掩码全开(0xFFFF_FFFF)、不限 CLOSE ——
+/// 把内核**真的返回了什么**原样写进文件,用来对照服务增量路径,
+/// 判定「某文件的记录是内核没回,还是我们没收」。GUI 子系统下 stdout
+/// 无处可去,结果只能落盘。
+pub fn cli_usn_dump(letter: char, out_path: &str, tail_bytes: u64) -> Result<()> {
+    #[cfg(windows)]
+    {
+        use imp::{open_volume, query_journal, USN_BUF_SIZE};
+        let h = open_volume(letter)?;
+        let j = query_journal(&h)?;
+        let start = (j.next_usn - tail_bytes as i64).max(j.first_usn);
+        let mut out = format!(
+            "journal_id={:x} first_usn={:x} head={:x} start={:x}\r\n",
+            j.journal_id, j.first_usn, j.next_usn, start
+        );
+        let mut buf = vec![0u8; USN_BUF_SIZE];
+        let mut usn = start;
+        let data_bytes = std::mem::size_of::<READ_USN_JOURNAL_DATA_V0>() as u32;
+        loop {
+            let data = READ_USN_JOURNAL_DATA_V0 {
+                StartUsn: usn,
+                ReasonMask: 0xFFFF_FFFF,
+                ReturnOnlyOnClose: 0,
+                Timeout: 0,
+                BytesToWaitFor: 0,
+                UsnJournalID: j.journal_id,
+            };
+            let mut ret = 0u32;
+            let res = unsafe {
+                DeviceIoControl(
+                    h.handle,
+                    FSCTL_READ_USN_JOURNAL,
+                    Some(&data as *const _ as *const std::ffi::c_void),
+                    data_bytes,
+                    Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+                    buf.len() as u32,
+                    Some(&mut ret),
+                    None,
+                )
+            };
+            match res {
+                Ok(()) => {}
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_JOURNAL_ENTRY_DELETED.0) => {
+                    return Err(anyhow::Error::new(JournalInvalidated));
+                }
+                Err(e) => return Err(anyhow!("FSCTL_READ_USN_JOURNAL({letter}:) 失败: {e}")),
+            }
+            let end = ret as usize;
+            if end < 8 {
+                break;
+            }
+            let next = rd_u64(&buf, 0) as i64;
+            if end == 8 || next <= usn {
+                break;
+            }
+            let mut off = 8usize;
+            while off + 60 <= end {
+                let Some(rec) = parse_record(&buf[off..end]) else {
+                    break;
+                };
+                let nb = rec.name_off..(rec.name_off + rec.name_len);
+                let name: Vec<u16> = buf[off + nb.start..off + nb.end]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_le_bytes(*c))
+                    .collect();
+                out.push_str(&format!(
+                    "usn={:x} reason={:#010x} frn={} pfrn={} {}\r\n",
+                    rec.usn,
+                    rec.reason,
+                    rec.frn,
+                    rec.parent_frn,
+                    String::from_utf16_lossy(&name)
+                ));
+                off += rec.len;
+            }
+            usn = next;
+            // 防御上限:8 MB 输出足够任何诊断场景。
+            if out.len() > 8_000_000 {
+                break;
+            }
+        }
+        std::fs::write(out_path, out)?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (letter, out_path, tail_bytes);
+        Err(anyhow!("USN 诊断仅支持 Windows"))
     }
 }
 

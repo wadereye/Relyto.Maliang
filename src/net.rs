@@ -218,7 +218,7 @@ fn sanitize_name(raw: &str) -> (PathBuf, bool) {
     let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
     let ok = matches!(
         ext.as_str(),
-        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "gif"
+        "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "gif" | "psd" | "psb"
     );
     (PathBuf::from(name), ok)
 }

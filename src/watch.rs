@@ -1,4 +1,5 @@
-//! 监听文件夹:事件驱动(`ReadDirectoryChangesW`)+ 降级轮询。
+//! 监听文件夹:事件驱动(自研 `ReadDirectoryChangesW`,见 [`crate::fswatch`])
+//! + 降级轮询。
 //!
 //! 对齐原版 Picasa3 的两段参考结论:
 //! - 目录监视初始化 + 目录变更事件源:动态加载 `ReadDirectoryChangesW`,
@@ -6,19 +7,22 @@
 //! - 目录项枚举:变更后按 `FindNextFileW` 的粒度逐个文件取属性入库,
 //!   而不是整目录重扫(本模块的 `scan::index_file` 就是这个粒度)。
 //!
-//! 实现:`notify-debouncer-full`(Windows 后端即 `ReadDirectoryChangesWatcher`,
-//! 与原版同款内核 API)。若 watcher 建立/监听失败(网络盘、不支持的文件系统、
-//! 权限不足),自动回落到原来的 30s 轮询路径 —— 即原版的"降级门控"。
+//! 实现:自研 `fswatch`(与原版同款内核 API)。此前用 notify-debouncer-full,
+//! 其 Windows 后端在监听目录里删文件时偶发进程级硬崩溃(2026-11-06 曾观察
+//! 到复现;上游修复只在 9.0-rc),故换成自研实现。若监听失败(网络盘、
+//! 不支持的文件系统、权限不足),自动回落到原来的 30s 轮询路径 ——
+//! 即原版的"降级门控"。
 //!
 //! 事件粒度:收到变更事件后只处理**受影响的目录**(其父目录),逐文件入库,
 //! 避免整棵子树重扫(扫描本身已有"未变文件快速路径",但仍要走目录树)。
 //!
-//! 删除是例外:不做重扫,而是即时对账 —— 事件源已把改名配对成 `Modify`,
-//! 剩下的 `Remove` 就是真删除,直接把索引行与缩略图缓存清掉(移出图库)。
+//! 删除是例外:不做重扫,而是即时对账 —— 改名在 fswatch 层已配对成
+//! `Renamed{from,to}`(原位改行,元数据全保留),剩下的 `Removed` 就是
+//! 真删除,直接把索引行与缩略图缓存清掉(移出图库)。
 //! 降级轮询路径不自动删行:快照分不清重命名与"删除+新增",误删会丢元数据。
 use crate::db::Store;
-use notify_debouncer_full::notify::{EventKind, RecursiveMode};
-use notify_debouncer_full::{new_debouncer, DebounceEventResult};
+#[cfg(windows)]
+use crate::fswatch::{FsEvent, Fswatch};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -132,7 +136,9 @@ pub struct Watcher {
 }
 
 /// 模式在 `Watcher.mode` 中的编码(原子字节,便于跨线程读)。
+#[cfg_attr(not(windows), allow(dead_code))]
 const MODE_EVENT: u8 = 0;
+#[cfg_attr(windows, allow(dead_code))]
 const MODE_POLL: u8 = 1;
 
 /// 启动监听线程。`on` 开关控制是否扫描(关闭时清空基线,恢复后重建,避免惊群)。
@@ -143,141 +149,130 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
     let mode2 = mode.clone();
     std::thread::spawn(move || {
         // ---- 建立事件源(降级门控:目录变更事件源的"拿不到就轮询") ----
-        // 载荷带 `removed` 标记:删除事件要即时对账(移出图库),
-        // 这与"有文件变更 → 重扫目录"是两条不同的处理路径。
-        let (evt_tx, evt_rx) = mpsc::channel::<Vec<(PathBuf, bool)>>();
-        let watcher = new_debouncer(
-            Duration::from_millis(800), // 去抖窗口
-            None,
-            move |res: DebounceEventResult| {
-                if let Ok(events) = res {
-                    let items: Vec<(PathBuf, bool)> = events
-                        .into_iter()
-                        .flat_map(|e| {
-                            let removed = matches!(e.event.kind, EventKind::Remove(_));
-                            e.event
-                                .paths
-                                .iter()
-                                .map(move |p| (p.clone(), removed))
-                                .collect::<Vec<_>>()
-                        })
-                        .collect();
-                    if !items.is_empty() {
-                        let _ = evt_tx.send(items);
+        // fswatch 已在内部做 800ms 去抖和改名配对;这里拿到的批次里
+        // Removed = 真删除(即时对账),Changed = 新增/变更(重扫目录),
+        // Renamed = 改名对(原位改行,元数据保留)。
+        #[cfg(windows)]
+        {
+            let fsw = Fswatch::spawn();
+            mode2.store(MODE_EVENT, Ordering::SeqCst);
+            // 已监听的根目录集合(用于增删 watch)。
+            let mut watched: Vec<PathBuf> = Vec::new();
+            let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
+            // 上次基线比对的时间(30s 周期)。
+            let mut last_poll = std::time::Instant::now();
+            loop {
+                // 同步监听集合(用户随时可能增删文件夹)。
+                let roots = store.list_watched();
+                let (to_add, to_remove) = sync_plan(&watched, &roots);
+                // 新增:挂上 watch
+                for r in &to_add {
+                    if fsw.watch(r) {
+                        watched.push(r.clone());
                     }
+                    // 挂不上(网络盘/不支持的文件系统)也不致命:
+                    // 超时分支的基线轮询仍会覆盖这些根目录。
                 }
-            },
-        );
+                // 移除:已从图库删掉的目录
+                for r in &to_remove {
+                    fsw.unwatch(r);
+                    watched.retain(|w| w != r);
+                }
 
-        match watcher {
-            Ok(mut debouncer) => {
-                // 已监听的根目录集合(用于增删 watch)。
-                let mut watched: Vec<PathBuf> = Vec::new();
-                let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
-                // 上次基线比对的时间(30s 周期)。
-                let mut last_poll = std::time::Instant::now();
-                loop {
-                    // 同步监听集合(用户随时可能增删文件夹)。
-                    let roots = store.list_watched();
-                    let (to_add, to_remove) = sync_plan(&watched, &roots);
-                    // 新增:挂上 watch
-                    for r in &to_add {
-                        if debouncer.watch(r, RecursiveMode::Recursive).is_ok() {
-                            watched.push(r.clone());
+                // 等待事件(短超时,便于及时感知 watched 表变化;
+                // 原版的变更检测是秒级的(约 1000ms 一次))。
+                // **基线比对兜底**仍按 30s 周期做(见下面的 poll 计时)。
+                match fsw.recv_batch(Duration::from_millis(1000)) {
+                    Ok(items) => {
+                        if !on.load(Ordering::SeqCst) {
+                            base.clear();
+                            continue;
                         }
-                        // 挂不上(网络盘/不支持的文件系统)也不致命:
-                        // 超时分支的基线轮询仍会覆盖这些根目录。
-                    }
-                    // 移除:已从图库删掉的目录
-                    for r in &to_remove {
-                        let _ = debouncer.unwatch(r);
-                        watched.retain(|w| w != r);
-                    }
-
-                    // 等待事件(短超时,便于及时感知 watched 表变化;
-                    // 原版的变更检测是秒级的(约 1000ms 一次))。
-                    // **基线比对兜底**仍按 30s 周期做(见下面的 poll 计时)。
-                    match evt_rx.recv_timeout(Duration::from_millis(1000)) {
-                        Ok(items) => {
-                            if !on.load(Ordering::SeqCst) {
-                                base.clear();
-                                continue;
-                            }
-                            // 删除对账:事件源里改名已被配对成 Modify,
-                            // 能走到这里的 Remove 就是真删除 → 直接从图库移出。
-                            let removed = drop_removed(&store, &items, &roots);
-                            let touched: Vec<PathBuf> = items
-                                .iter()
-                                .filter(|(_, rm)| !rm)
-                                .map(|(p, _)| p.clone())
-                                .collect();
-                            let dirs = affected_dirs(&touched, &roots);
-                            let n = if dirs.is_empty() {
-                                0
-                            } else {
-                                // 事件路径与兜底路径共用同一份排除规则
-                                // (方案 P3-25/26):快路慢路不许各判一套。
-                                let excl = crate::scan::Exclusions::from_store(&store);
-                                scan_dirs(&store, &dirs, &excl)
-                            };
-                            if n == 0 && removed == 0 {
-                                continue;
-                            }
-                            let mut msg = format!("监听:{n} 张照片变更,已增量入库(事件驱动)");
-                            if removed > 0 {
-                                msg.push_str(&format!(";{removed} 个已删除文件移出图库"));
-                            }
-                            let _ = tx.send(msg);
-                            last_poll = std::time::Instant::now();
-                        }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            // 1s 未收到事件 → 检查是否到了 30s 的基线比对周期。
-                            // (短暂超时是常态,不代表出问题了)
-                            if last_poll.elapsed() < Duration::from_secs(30) {
-                                continue;
-                            }
-                            last_poll = std::time::Instant::now();
-                            // 30s 无事件:做一次基线比对,兜住漏掉的事件
-                            // (某些网络盘/虚拟文件系统不保证事件完整)。
-                            if !on.load(Ordering::SeqCst) {
-                                base.clear();
-                                continue;
-                            }
-                            let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
-                            if ndirs > 0 {
-                                let _ = tx.send(format!(
-                                    "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)"
-                                ));
+                        let mut removed_paths: Vec<PathBuf> = Vec::new();
+                        let mut touched: Vec<PathBuf> = Vec::new();
+                        let mut renames: Vec<(PathBuf, PathBuf)> = Vec::new();
+                        for e in items {
+                            match e {
+                                FsEvent::Removed(p) => removed_paths.push(p),
+                                FsEvent::Changed(p) => touched.push(p),
+                                FsEvent::Renamed { from, to } => renames.push((from, to)),
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        // 删除对账:能走到这里的 Removed 就是真删除 →
+                        // 直接从图库移出(L1 在线时先问索引,省逐条 stat)。
+                        let removed = drop_removed(&store, &removed_paths, &roots);
+                        // 改名对:原位改行(id 不变,元数据保留);目标已存在
+                        // 等回退情形返回待重扫目录。
+                        let renamed = apply_renames(&store, &renames, &roots);
+                        touched.extend(renamed.iter().cloned());
+                        let dirs = affected_dirs(&touched, &roots);
+                        let n = if dirs.is_empty() {
+                            0
+                        } else {
+                            // 事件路径与兜底路径共用同一份排除规则
+                            // (方案 P3-25/26):快路慢路不许各判一套。
+                            let excl = crate::scan::Exclusions::from_store(&store);
+                            scan_dirs(&store, &dirs, &excl)
+                        };
+                        if n == 0 && removed == 0 && renamed.is_empty() {
+                            continue;
+                        }
+                        let mut msg = format!("监听:{n} 张照片变更,已增量入库(事件驱动)");
+                        if removed > 0 {
+                            msg.push_str(&format!(";{removed} 个已删除文件移出图库"));
+                        }
+                        if !renamed.is_empty() {
+                            msg.push_str(&format!(";{} 个改名已原位更新", renamed.len()));
+                        }
+                        let _ = tx.send(msg);
+                        last_poll = std::time::Instant::now();
                     }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // 1s 未收到事件 → 检查是否到了 30s 的基线比对周期。
+                        // (短暂超时是常态,不代表出问题了)
+                        if last_poll.elapsed() < Duration::from_secs(30) {
+                            continue;
+                        }
+                        last_poll = std::time::Instant::now();
+                        // 30s 无事件:做一次基线比对,兜住漏掉的事件
+                        // (某些网络盘/虚拟文件系统不保证事件完整)。
+                        if !on.load(Ordering::SeqCst) {
+                            base.clear();
+                            continue;
+                        }
+                        let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
+                        if ndirs > 0 {
+                            let _ = tx.send(format!(
+                                "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)"
+                            ));
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-            Err(_) => {
-                // ---- 降级:事件通道不可用 → 纯轮询(原版的回落路径) ----
-                mode2.store(MODE_POLL, Ordering::SeqCst);
-                let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
-                let mut last_poll = std::time::Instant::now();
-                loop {
-                    // 短睡眠 + 30s 计时:与事件驱动模式的节奏一致,
-                    // 保证"新增监听目录"最迟 30s 内被感知。
-                    std::thread::sleep(Duration::from_millis(1000));
-                    if last_poll.elapsed() < Duration::from_secs(30) {
-                        continue;
-                    }
-                    last_poll = std::time::Instant::now();
-                    if !on.load(Ordering::SeqCst) {
-                        base.clear();
-                        continue;
-                    }
-                    let roots = store.list_watched();
-                    let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
-                    if ndirs > 0 {
-                        let _ = tx.send(format!(
-                            "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)"
-                        ));
-                    }
+        }
+        #[cfg(not(windows))]
+        {
+            // 非 Windows 没有 fswatch:直接走纯轮询(原版的回落路径)。
+            mode2.store(MODE_POLL, Ordering::SeqCst);
+            let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
+            let mut last_poll = std::time::Instant::now();
+            loop {
+                std::thread::sleep(Duration::from_millis(1000));
+                if last_poll.elapsed() < Duration::from_secs(30) {
+                    continue;
+                }
+                last_poll = std::time::Instant::now();
+                if !on.load(Ordering::SeqCst) {
+                    base.clear();
+                    continue;
+                }
+                let roots = store.list_watched();
+                let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
+                if ndirs > 0 {
+                    let _ = tx.send(format!(
+                        "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)"
+                    ));
                 }
             }
         }
@@ -404,10 +399,10 @@ fn poll_once(
 /// 它对「刚删掉」和「刚建好还没扫进索引」两种情况给的是同一个答案,
 /// 只凭它会把毫秒前刚写好的文件从图库里抹掉(2026-11-05 服务装起来后
 /// 单测就是这么稳定复现的)。磁盘才是当场的事实。
-fn drop_removed(store: &Store, items: &[(PathBuf, bool)], roots: &[PathBuf]) -> usize {
+fn drop_removed(store: &Store, removed: &[PathBuf], roots: &[PathBuf]) -> usize {
     let mut paths: Vec<String> = Vec::new();
-    for (p, removed) in items {
-        if !*removed || !roots.iter().any(|r| p.starts_with(r)) {
+    for p in removed {
+        if !roots.iter().any(|r| p.starts_with(r)) {
             continue;
         }
         let s = p.to_string_lossy().into_owned();
@@ -449,6 +444,50 @@ fn drop_and_purge(r: anyhow::Result<Vec<(i64, String)>>) -> usize {
     }
 }
 
+/// 改名对 → 原位改行(id 不变,星标/标签/相册/缩略图全保留)。
+///
+/// 返回**需要重扫的目录**:目录改名走「旧前缀摘行 + 新子树重录」
+/// (行的路径串全变,原位更新不划算);目标路径已有行的覆盖式改名
+/// 同样交给重扫。只处理监听根之内的事件。
+fn apply_renames(
+    store: &Store,
+    renames: &[(PathBuf, PathBuf)],
+    roots: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut rescan: Vec<PathBuf> = Vec::new();
+    for (from, to) in renames {
+        if !roots.iter().any(|r| from.starts_with(r) && to.starts_with(r)) {
+            continue;
+        }
+        if Path::new(to).is_dir() {
+            // 目录改名:旧前缀(含子树)整棵摘掉;新子树由重扫补齐。
+            let f = from.to_string_lossy().into_owned();
+            drop_and_purge(store.drop_paths_confirmed(&[f]));
+            rescan.push(to.clone());
+            continue;
+        }
+        let parent = match to.parent() {
+            Some(d) => d.to_string_lossy().into_owned(),
+            None => continue,
+        };
+        match store.rename_photo(
+            from.to_string_lossy().as_ref(),
+            to.to_string_lossy().as_ref(),
+            &parent,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                // 目标已有行(覆盖式改名):该目录交给重扫去对账。
+                if let Some(d) = to.parent() {
+                    rescan.push(d.to_path_buf());
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    rescan
+}
+
 /// 问 L1 索引服务:这批路径里哪些**可能**已经不在了(候选,调用方仍需落盘复核)。
 ///
 /// 返回 `None` = 不能拿 L1 当权威,调用方退回磁盘复核。两种情况会给 `None`:
@@ -459,6 +498,13 @@ fn drop_and_purge(r: anyhow::Result<Vec<(i64, String)>>) -> usize {
 /// 同理,任何一条问答失败就把**整批**交回磁盘复核:宁可多几次 `stat`,
 /// 也不能因为一次管道抖动把还在的文件移出图库。
 fn l1_gone(paths: &[String]) -> Option<Vec<String>> {
+    // 用户关掉全盘快查时,监听对账也不该偷偷连服务 —— 与 UI 的降级门
+    // (`app::SVC_LINK_ENABLED`,管心跳/重连/装卸)同一口径。返回 None
+    // 让调用方走纯磁盘复核;顺带省掉逐条 Stat 的管道往返,批量删除
+    // 不会再被服务的查询排队拖到秒级(2026-11-06 观察到 20 张 12.6s)。
+    if !crate::app::SVC_LINK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     let mut c = crate::ipc::Client::connect(200).ok()?;
     // 先问一次概况,拿到"哪些卷真的建了索引"。
     let trusted: std::collections::HashSet<char> = match c.call(&crate::ipc::Req::Status) {
@@ -570,6 +616,7 @@ mod tests {
     }
 
     /// 事件路径 → 受影响目录:只取父目录,且必须在监听根之内。
+    #[cfg(windows)]
     #[test]
     fn affected_dirs_takes_parent_and_filters_roots() {
         let roots = vec![PathBuf::from("C:\\pics")];
@@ -581,6 +628,21 @@ mod tests {
         let dirs = affected_dirs(&paths, &roots);
         assert_eq!(dirs.len(), 1, "重复路径应去重,根外应过滤");
         assert_eq!(dirs[0], PathBuf::from("C:\\pics\\sub"));
+    }
+
+    /// 同一条口径在 POSIX 路径上的对偶:只取父目录,且必须在监听根之内。
+    #[cfg(not(windows))]
+    #[test]
+    fn affected_dirs_takes_parent_and_filters_roots_posix() {
+        let roots = vec![PathBuf::from("/pics")];
+        let paths = vec![
+            PathBuf::from("/pics/sub/a.jpg"),
+            PathBuf::from("/pics/sub/a.jpg"), // 重复
+            PathBuf::from("/other/b.jpg"),    // 根之外,应被过滤
+        ];
+        let dirs = affected_dirs(&paths, &roots);
+        assert_eq!(dirs.len(), 1, "重复路径应去重,根外应过滤");
+        assert_eq!(dirs[0], PathBuf::from("/pics/sub"));
     }
 
     /// 删除事件 → 只处理监听根之内、且磁盘上确实已消失的路径。
@@ -608,10 +670,9 @@ mod tests {
         }
         let outside = std::env::temp_dir().join("outside-root.jpg");
         let items = vec![
-            (gone.clone(), true),
-            (kept.clone(), true),     // 仍存在 → 必须跳过
-            (outside, true),          // 根之外 → 必须跳过
-            (root.join("new.jpg"), false), // 非删除事件 → 不在这里处理
+            gone.clone(),
+            kept.clone(),   // 仍存在 → 必须跳过
+            outside,        // 根之外 → 必须跳过
         ];
         assert_eq!(drop_removed(&store, &items, &[root.clone()]), 1);
 
@@ -630,47 +691,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 回归:Windows 后端必须把"文件被删除"报成 `EventKind::Remove` ——
-    /// 这是删除对账的唯一触发条件(改名会被去抖器配对成 `Modify`)。
+    /// 回归:fswatch 必须把"文件被删除"报成 `Removed`、改名配对成
+    /// `Renamed` —— 这是删除对账与改名保元的触发条件。
     #[test]
-    fn delete_is_reported_as_remove_event() {
+    #[cfg(windows)]
+    fn fswatch_reports_remove_and_rename() {
         let dir = std::env::temp_dir().join(format!("rk-watch-kind-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (tx, rx) = mpsc::channel::<Vec<(EventKind, Vec<PathBuf>)>>();
-        let mut d = new_debouncer(
-            Duration::from_millis(200),
-            None,
-            move |res: DebounceEventResult| {
-                if let Ok(events) = res {
-                    let v = events
-                        .into_iter()
-                        .map(|e| (e.event.kind, e.event.paths))
-                        .collect::<Vec<_>>();
-                    if !v.is_empty() {
-                        let _ = tx.send(v);
-                    }
-                }
-            },
-        )
-        .unwrap();
-        d.watch(&dir, RecursiveMode::Recursive).unwrap();
+        let fsw = Fswatch::spawn();
+        assert!(fsw.watch(&dir), "挂监听失败");
         let f = dir.join("x.jpg");
         std::fs::write(&f, b"1").unwrap();
-        // 先让创建事件的一批过去,避免与删除事件混在同一批里。
-        let _ = rx.recv_timeout(Duration::from_secs(3));
-        std::fs::remove_file(&f).unwrap();
+        // 先让创建事件的一批过去,避免与后续事件混在同一批里。
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let mut seen_remove = false;
         while std::time::Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(500)) {
+            match fsw.recv_batch(Duration::from_millis(500)) {
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        // 改名:应配对成 Renamed。
+        let g = dir.join("y.jpg");
+        std::fs::rename(&f, &g).unwrap();
+        let mut seen_rename = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match fsw.recv_batch(Duration::from_millis(500)) {
                 Ok(batch) => {
-                    if batch.iter().any(|(k, ps)| {
-                        matches!(k, EventKind::Remove(_))
-                            && ps.iter().any(|p| {
-                                p.file_name().map(|n| n == "x.jpg").unwrap_or(false)
-                            })
-                    }) {
+                    if batch.iter().any(|e| matches!(e,
+                        FsEvent::Renamed { from, to }
+                        if from.file_name().map(|n| n == "x.jpg").unwrap_or(false)
+                            && to.file_name().map(|n| n == "y.jpg").unwrap_or(false)
+                    )) {
+                        seen_rename = true;
+                        break;
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        // 删除:应报成 Removed。
+        std::fs::remove_file(&g).unwrap();
+        let mut seen_remove = false;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match fsw.recv_batch(Duration::from_millis(500)) {
+                Ok(batch) => {
+                    if batch.iter().any(|e| matches!(e,
+                        FsEvent::Removed(p)
+                        if p.file_name().map(|n| n == "y.jpg").unwrap_or(false)
+                    )) {
                         seen_remove = true;
                         break;
                     }
@@ -678,8 +749,10 @@ mod tests {
                 Err(_) => continue,
             }
         }
+        fsw.unwatch(&dir);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(seen_remove, "Windows 后端未把删除报成 Remove 事件");
+        assert!(seen_rename, "fswatch 未把改名配对成 Renamed");
+        assert!(seen_remove, "fswatch 未把删除报成 Removed 事件");
     }
 
     /// v5 审计:watcher 启动后新增监听目录,下一轮同步就要挂上

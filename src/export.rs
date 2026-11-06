@@ -2,13 +2,14 @@
 //! 导出是显式用户操作,与"库内不复制原图"原则不冲突。
 use std::path::{Path, PathBuf};
 
+/// 导出只复制原文件字节,不解码不改写:只读预览格式照样可以带走原文件。
 fn is_image(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| {
             matches!(
                 e.to_ascii_lowercase().as_str(),
-                "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff"
+                "jpg" | "jpeg" | "png" | "webp" | "bmp" | "tiff" | "gif" | "psd" | "psb"
             )
         })
         .unwrap_or(false)

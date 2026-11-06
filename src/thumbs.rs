@@ -117,10 +117,142 @@ pub fn purge_cached(id: i64) {
     }
 }
 
+/// 孤儿缩略图 GC:清掉「盘上有缓存文件、库里已无对应行」的文件。
+///
+/// 孤儿来自不走 `purge_cached` 的历史删除(旧版本清行、崩溃窗口、
+/// 手动动过缓存目录)。id 复用后孤儿会被当成新照片的缓存显示成别的图,
+/// 所以这些文件必须清。返回删除的文件数。
+///
+/// 逐档 `read_dir` 后分块查库:百万级缓存文件一次拉全表 id 会吃几百 MB,
+/// 分块 `id IN (...)` 每块只带回命中的行。只删确认无主的,宁滥勿缺。
+pub fn gc_orphans(store: &crate::db::Store, cache_root: &std::path::Path) -> usize {
+    let mut removed = 0usize;
+    for tier in ALL_TIERS {
+        let dir = cache_root.join(tier.dir_name());
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut candidates: Vec<i64> = Vec::new();
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            let stem = name.strip_suffix(".jpg").unwrap_or(&name);
+            if let Ok(id) = stem.parse::<i64>() {
+                candidates.push(id);
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        for chunk in candidates.chunks(500) {
+            let alive: std::collections::HashSet<i64> = store.read(|conn| {
+                let mut sql =
+                    String::from("SELECT id FROM photos WHERE id IN (");
+                for k in 0..chunk.len() {
+                    sql.push_str(&if k == 0 {
+                        format!("?{}", k + 1)
+                    } else {
+                        format!(",?{}", k + 1)
+                    });
+                }
+                sql.push(')');
+                let mut st = match conn.prepare(&sql) {
+                    Ok(s) => s,
+                    Err(_) => return Default::default(),
+                };
+                let params: Vec<i64> = chunk.to_vec();
+                st.query_map(rusqlite::params_from_iter(params.iter()), |r| r.get::<_, i64>(0))
+                    .map(|it| it.filter_map(|r| r.ok()).collect())
+                    .unwrap_or_default()
+            });
+            for id in chunk {
+                if !alive.contains(id)
+                    && std::fs::remove_file(cache_root.join(tier.dir_name()).join(format!("{id}.jpg"))).is_ok()
+                {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// 台账对账(文件缺失侧的反向 GC):`thumb_tiers` 说「已生成」、盘上文件却
+/// 不在的行,摘掉台账让回填重新生成。
+///
+/// 缓存目录被外部清空 / 搬移 / 磁盘清理工具扫掉后,格子会永远停在灰色占位
+/// —— 台账不摘,回填队列永远取不到它们。只在启动时跑一轮(带设置门控),
+/// 运行中的增删都走 `purge_cached` / `clear_tier_row`,台账与文件保持同步。
+/// 返回摘掉的台账数。
+pub fn gc_missing_tiers(store: &crate::db::Store, cache_root: &std::path::Path) -> usize {
+    let mut cleared = 0usize;
+    let mut last_id = 0i64;
+    loop {
+        let chunk: Vec<(i64, u8)> = store.read(|conn| {
+            let mut st = match conn.prepare(
+                "SELECT photo_id, tier FROM thumb_tiers WHERE photo_id > ?1
+                 ORDER BY photo_id LIMIT 20000",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([last_id], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u8))
+            })
+            .map(|it| it.flatten().collect())
+            .unwrap_or_default()
+        });
+        if chunk.is_empty() {
+            break;
+        }
+        last_id = chunk.last().map(|(id, _)| *id).unwrap_or(last_id);
+        let dead: Vec<(i64, u8)> = chunk
+            .iter()
+            .filter(|(id, tier)| {
+                !cache_root
+                    .join(Tier::from_u8(*tier).map(|t| t.dir_name()).unwrap_or_default())
+                    .join(format!("{id}.jpg"))
+                    .exists()
+            })
+            .cloned()
+            .collect();
+        if !dead.is_empty() {
+            store.clear_tier_rows(&dead);
+            cleared += dead.len();
+        }
+    }
+    cleared
+}
+
 /// 按档位读取已落盘的缩略图（不解码原图）。
+/// 纯读档(不做自愈);生产路径已换 [`load_tier_repair`],这里留给测试断言用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn load_cached_tier(tier: Tier, id: i64) -> Option<image::DynamicImage> {
     let p = tier_path(tier, id);
     image::open(&p).ok()
+}
+
+/// 带自愈的缓存读取(UI 装载路径专用):文件在、解不开(损坏 / 半截)时
+/// 删掉坏文件并摘掉该档台账,后台回填会重新生成 —— 不然台账说「已生成」,
+/// 坏文件永远占着位子,格子只能显示灰色占位块。
+///
+/// 只有「文件存在但解码失败」才算损坏:文件不存在是正常未生成,直接返回。
+pub fn load_tier_repair(
+    store: &crate::db::Store,
+    tier: Tier,
+    id: i64,
+) -> Option<image::DynamicImage> {
+    let p = tier_path(tier, id);
+    if !p.exists() {
+        return None;
+    }
+    match image::open(&p) {
+        Ok(img) => Some(img),
+        Err(_) => {
+            let _ = std::fs::remove_file(&p);
+            store.clear_tier_row(id, tier as u8);
+            None
+        }
+    }
 }
 
 // ===================== 解码基底与缩放(方案 P4-23①②) =====================
@@ -187,7 +319,8 @@ fn fit_oriented(
 /// 1. 视频 → Shell 抽帧(`image` crate 解不了容器格式);
 /// 2. JPEG 内嵌 EXIF 缩略图 —— 相机原图几乎都有,免整图解码;
 /// 3. 相机 RAW → **内嵌 JPEG 预览优先**(方案 P4-23①),Shell 只作最后兜底;
-/// 4. 其余格式走 `image::open`,方向随图一起交给调用方。
+/// 4. PSD / PSB → 只读文件里的合成图,解不了再借系统缩略图;
+/// 5. 其余格式走 `image`(按魔数分派),方向随图一起交给调用方。
 ///
 /// 1/2 出的图都已按相机方向摆正(内嵌缩略图与 Shell 缩略图都是),返回 1;
 /// RAW 内嵌预览是个例外:各家相机写预览时转不转不一致,见 [`raw_embedded_preview`]。
@@ -199,9 +332,7 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
             .map(|i| (i, 1))
             // Shell 拿不到帧(解码器缺失等)→ 显式失败,与原版
             // "missing/loading movie" 占位语义一致(媒体类型判定)。
-            .ok_or_else(|| {
-                anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display())
-            });
+            .ok_or_else(|| anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display()));
     }
     // 2) 内嵌 EXIF 缩略图(对应原版 "Use EXIF thumbnails")。
     if let Some(t) = crate::exif::read_jpeg_embedded_thumb(src)
@@ -219,8 +350,31 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
             return Ok((t, 1));
         }
     }
-    // 4) 常规格式:EXIF 只解析一次,方向随图一起返回(不再让调用方重解一遍)。
-    let img = image::open(src)?;
+    // 4) PSD / PSB:只读文件里已合并好的合成图,不解析图层、不写回。
+    //    合成图缺失(保存时未带上兼容性数据)或色彩模式暂不支持时,
+    //    Windows 上再借系统缩略图提供程序兜底;都没有就明确失败立案。
+    if crate::psd_preview::is_psd_path(src) {
+        if let Some(img) = crate::psd_preview::decode(src) {
+            return Ok((img, 1));
+        }
+        if let Some(t) = decode_via_shell_sized(src, target) {
+            return Ok((t, 1));
+        }
+        return Err(anyhow::anyhow!("无可用预览(合成图缺失或色彩模式暂不支持): {}", src.display()));
+    }
+    // 5) 常规格式:按**魔数**分派解码器,不是按扩展名。
+    //    `image::open` 是照扩展名挑解码器的:2026-11-05 现场台账里 3,340 条
+    //    "Illegal start bytes:8950" 就是把 PNG(0x89 'P')喂给了 JPEG 解码器 ——
+    //    扩展名写着 .jpg、内容其实是 PNG / WebP 的文件到处都是(下载站、客户端
+    //    缓存、批量转档都这么干),按扩展名解会把它们全判成坏图立案。
+    //    口径与 `scan::image_dimensions` 一致:先猜格式再解;猜不出来才回退扩展名。
+    let img = match image::ImageReader::open(src)?
+        .with_guessed_format()?
+        .decode()
+    {
+        Ok(i) => i,
+        Err(e) => image::open(src).map_err(|_| e)?,
+    };
     Ok((img, read_rotation(src)))
 }
 
@@ -304,13 +458,35 @@ fn save_jpeg_atomic(img: &image::DynamicImage, path: &std::path::Path) -> Result
     Ok(())
 }
 
+/// JPEG 缓存没有 alpha 通道:先把透明像素合成到浅灰底,免得 GIF / PNG / PSD
+/// 的透明区在缩略图里变成黑块(`to_rgb8()` 会直接丢掉 alpha)。
+fn flatten_on_bg(img: &image::DynamicImage, bg: image::Rgb<u8>) -> image::RgbImage {
+    let rgba = img.to_rgba8();
+    let mut out = image::RgbImage::from_pixel(rgba.width(), rgba.height(), bg);
+    for (x, y, px) in rgba.enumerate_pixels() {
+        let a = px.0[3] as u32;
+        if a == 255 {
+            *out.get_pixel_mut(x, y) = image::Rgb([px.0[0], px.0[1], px.0[2]]);
+        } else if a > 0 {
+            let mix = |s: u8, d: u8| ((s as u32 * a + d as u32 * (255 - a)) / 255) as u8;
+            *out.get_pixel_mut(x, y) = image::Rgb([
+                mix(px.0[0], bg.0[0]),
+                mix(px.0[1], bg.0[1]),
+                mix(px.0[2], bg.0[2]),
+            ]);
+        }
+    }
+    out
+}
+
 /// 把已缩样的图居中贴到 size×size 浅灰画布并落盘(Picasa 式 letterbox)。
 /// 目录不存在则先建。
 fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathBuf) -> Result<()> {
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([248, 248, 248]));
     let x = ((size - fit.width()) as i64) / 2;
     let y = ((size - fit.height()) as i64) / 2;
-    image::imageops::overlay(&mut canvas, &fit.to_rgb8(), x, y);
+    let flat = flatten_on_bg(fit, image::Rgb([248, 248, 248]));
+    image::imageops::overlay(&mut canvas, &flat, x, y);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -387,19 +563,28 @@ pub fn backfill_tier(
         Vec<(i64, &String, String)>,
     ) = rows
         .par_iter()
-        .partition_map(|(id, path)| match generate_tier(tier, *id, Path::new(path)) {
-            Ok(h) => {
-                // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读(方案 P3-25):
-                // 发现路径不打开文件内容,这里是唯一读它的地方。
-                // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
-                let d = (tier == Tier::Normal)
-                    .then(|| crate::scan::read_derived(Path::new(path)));
-                rayon::iter::Either::Left((*id, h, d))
+        .filter_map(|(id, path)| {
+            // 云盘占位文件(OneDrive / SeaFile 按需下载):生成缩略图要打开
+            // 内容,会把占位文件整个拉下来。跳过且**不记账**——这不是坏文件,
+            // 用户以后打开/钉住文件后,行还在缺失队列里自然补上。
+            if crate::win::is_cloud_placeholder(Path::new(path)) {
+                return None;
             }
-            // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
-            // worker 永远空转在开头(真实事故:回收站 $I*.jpg 元数据)。
-            Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
-        });
+            Some(match generate_tier(tier, *id, Path::new(path)) {
+                Ok(h) => {
+                    // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读(方案 P3-25):
+                    // 发现路径不打开文件内容,这里是唯一读它的地方。
+                    // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
+                    let d = (tier == Tier::Normal)
+                        .then(|| crate::scan::read_derived(Path::new(path)));
+                    rayon::iter::Either::Left((*id, h, d))
+                }
+                // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
+                // worker 永远空转在开头(真实事故:回收站 $I*.jpg 元数据)。
+                Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
+            })
+        })
+        .partition_map(|either| either);
     for (id, path, why) in &failed {
         escalate_failure(store, *id, path, why);
     }
@@ -481,6 +666,31 @@ pub struct ThumbWorker {
     visible: VisibleDirs,
 }
 
+/// 一次性给**误判**的坏图销案(2026-11-05 现场:台账 3,427 条里 3,340 条写着
+/// "Illegal start bytes:8950" —— 那是 0x89 'P',PNG 的头被喂给了 JPEG 解码器)。
+///
+/// 判据不看台账里的原因串(那是历史文案,改一次措辞就对不上),而是**现在**拿
+/// 魔数重认一次格式:认得出来 = 改成按魔数分派之后能解,该销案重排队;
+/// 认不出来 = 真坏或格式不支持,留在台账里不折腾。
+/// 文件已经不存在的行也不动:那是另一件事(缺失清理),不在这一刀的范围里。
+///
+/// 标记带版本号:解码口径再改一次就往前推一格,老台账要重新过一遍。
+fn reset_misfiled_bad_media_once(store: &crate::db::Store) {
+    const MARK: &str = "bad_media_resniffed";
+    const VERSION: &str = "v1";
+    if store.get_setting(MARK).as_deref() == Some(VERSION) {
+        return;
+    }
+    let clear: Vec<String> = store
+        .bad_media()
+        .into_iter()
+        .map(|b| b.path)
+        .filter(|p| image::ImageFormat::from_path(Path::new(p)).is_ok())
+        .collect();
+    let _ = store.unmark_bad_media_batch(&clear);
+    let _ = store.set_setting(MARK, VERSION);
+}
+
 /// 启动**常驻**缩略图后台线程(P0-1 + P1-9 多档 + P3-20 作用域队列)。
 ///
 /// 行为(对齐原版 Picasa 的"缩略图缓存后台生成"):
@@ -500,6 +710,9 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
     let visible2 = visible.clone();
     let handle = std::thread::spawn(move || {
         crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+        // 误判坏图的一次性销案放在 worker 线程里做:几千个文件要各读一次头,
+        // 挂在 UI 线程上会卡住第一帧。
+        reset_misfiled_bad_media_once(&store);
         // 每批规模随核数缩放:批内是 rayon 并行的,单核机器给小批
         // (一次补太多会长时间占住 DB 锁、拖慢 UI),多核机器给大批(少几轮往返)。
         let batch = (crate::win::cpu_count() * 8).clamp(16, 128);
@@ -566,9 +779,8 @@ impl Drop for ThumbWorker {
 
 /// 重新生成单张缩略图并回写 dhash/thumb_ok(烘培保存后调用)。
 pub fn regen(store: &crate::db::Store, id: i64) -> Result<()> {
-    let path: String = store.read(|conn| {
-        conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
-    })?;
+    let path: String = store
+        .read(|conn| conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0)))?;
     let h = generate(id, Path::new(&path))?;
     store.write(|conn| -> anyhow::Result<()> {
         conn.execute(
@@ -976,14 +1188,101 @@ mod tests {
         );
         let f: i64 = store
             .test_conn()
-            .query_row("SELECT thumb_fail FROM photos WHERE id=?1", [photo_id], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT thumb_fail FROM photos WHERE id=?1",
+                [photo_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(f, 0, "没进队列就不该记失败");
     }
 
     // ===== P1-9 多档缩略图 =====
+
+    /// 损坏缓存自愈:文件在但解不开 → 删文件 + 摘台账;中档还要把
+    /// 已派生的行退回「待派生」,回填队列才会重新生成。
+    #[test]
+    fn load_tier_repair_heals_corrupt_cache() {
+        let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
+        let photo_id = unique_id();
+        let _guard = CacheGuard(photo_id);
+        {
+            let conn = store.test_conn();
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state,thumb_ok)
+                 VALUES(?1,'/x/a.jpg/anything.jpg','/x',0,0,2,0)",
+                rusqlite::params![photo_id],
+            )
+            .unwrap();
+        }
+        // 中档坏文件:写一段不是 JPEG 的字节占位。
+        let p = tier_path(Tier::Normal, photo_id);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"not a jpeg").unwrap();
+        assert!(
+            load_tier_repair(&store, Tier::Normal, photo_id).is_none(),
+            "坏文件应返回 None"
+        );
+        assert!(!p.exists(), "坏文件应被删掉");
+        let (ok, rs): (i64, i64) = store
+            .test_conn()
+            .query_row(
+                "SELECT thumb_ok, rich_state FROM photos WHERE id=?1",
+                [photo_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ok, 0, "中档自愈应把 thumb_ok 退回 0");
+        assert_eq!(rs, crate::db::RICH_PENDING as i64, "应退回待派生");
+        // 好文件不被误删。
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
+        img.save(&p).unwrap();
+        assert!(
+            load_tier_repair(&store, Tier::Normal, photo_id).is_some(),
+            "好文件应正常读回"
+        );
+        assert!(p.exists(), "好文件不该被动");
+    }
+
+    /// 孤儿 GC:盘上有文件、库里无行 → 删;有行的 → 留。
+    #[test]
+    fn gc_orphans_removes_only_dead_files() {
+        let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
+        let alive_id = unique_id();
+        let dead_id = unique_id();
+        let _g1 = CacheGuard(alive_id);
+        let _g2 = CacheGuard(dead_id);
+        {
+            let conn = store.test_conn();
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,'/x/alive.jpg','/x',0,0)",
+                rusqlite::params![alive_id],
+            )
+            .unwrap();
+        }
+        let root = std::env::temp_dir().join(format!("ml-gc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // gc_orphans 的根由调用方给:生产传 cache_dir(),测试传临时目录,
+        // 绝不能拿真实缓存目录当试验场(会当成孤儿全清)。
+        let moved = |tier: Tier, id: i64| root.join(tier.dir_name()).join(format!("{id}.jpg"));
+        for (tier, id) in [(Tier::Normal, alive_id), (Tier::Normal, dead_id), (Tier::Small, dead_id)] {
+            let p = moved(tier, id);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        let removed = gc_orphans(&store, &root);
+        assert!(removed >= 2, "至少应清掉无主的两枚,实际 {removed}");
+        assert!(
+            moved(Tier::Normal, alive_id).exists(),
+            "有行的缓存不该被清"
+        );
+        assert!(
+            !moved(Tier::Normal, dead_id).exists(),
+            "无主的缓存应被清"
+        );
+        assert!(!moved(Tier::Small, dead_id).exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// 档位元数据:像素尺寸、目录、LRU 上限。
     #[test]
@@ -1072,7 +1371,11 @@ mod tests {
         // Big 档(2):不写 thumb_ok,只写 thumb_tiers。
         let ids = backfill_tier(&store, Tier::Big, &[], 10).unwrap();
         assert_eq!(ids, vec![photo_id], "应生成 Big 档");
-        let ok: i64 = store.test_conn().query_row("SELECT thumb_ok FROM photos WHERE id=?1", [photo_id], |r| r.get(0))
+        let ok: i64 = store
+            .test_conn()
+            .query_row("SELECT thumb_ok FROM photos WHERE id=?1", [photo_id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(ok, 0, "Big 档不应改 thumb_ok(Normal 档专用)");
         assert_eq!(store.tier_count(Tier::Big as u8), 1, "应记入 thumb_tiers");
@@ -1261,5 +1564,32 @@ mod tests {
                 "{a:?} 与 {b:?} 的缓存路径不能相同"
             );
         }
+    }
+
+    /// 回归:扩展名骗人时按**魔数**认格式(2026-11-05 现场:坏文件台账 3,427 条里
+    /// 3,340 条写着 "Illegal start bytes:8950" —— 0x89 'P' 是 PNG 的头,
+    /// 被喂给了 JPEG 解码器;那些文件其实好得很)。
+    #[test]
+    fn decode_base_sniffs_magic_bytes_not_extension() {
+        let dir = std::env::temp_dir().join(format!("maliang-decode-{}", unique_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lying = dir.join("actually-png.jpg");
+        image::DynamicImage::new_rgb8(40, 30)
+            .save_with_format(&lying, image::ImageFormat::Png)
+            .unwrap();
+        let (img, orient) = decode_base(&lying, 256).unwrap();
+        assert_eq!(
+            (img.width(), img.height()),
+            (40, 30),
+            ".jpg 壳里的 PNG 也该解出来"
+        );
+        assert_eq!(orient, 1, "PNG 不带 EXIF 方向");
+
+        // 真坏的文件仍要报错:这一刀改的是「怎么认格式」,不是「认不出就放过」。
+        let junk = dir.join("junk.jpg");
+        std::fs::write(&junk, b"this is not an image at all").unwrap();
+        assert!(decode_base(&junk, 256).is_err(), "垃圾内容必须仍然失败");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

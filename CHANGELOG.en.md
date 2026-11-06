@@ -4,7 +4,64 @@ All user-visible changes are documented here, newest first.
 中文版见 [CHANGELOG.md](./CHANGELOG.md)；the full feature list is in
 [README.md](./README.md).
 
-## Unreleased
+## 0.3.0 (2026-11-06)
+
+This release focuses on four things: a **full-page single-photo editor**,
+**animated-image and PSD previews**, an **in-app self-updater**, and the
+**Recently Updated home album**.
+
+### Added
+
+**Full-page single-photo editor**
+
+- Double-click a photo to enter a full-page editing view modeled after
+  classic photo managers: top bar with back-to-library, previous/next,
+  slideshow, compare and zoom; left tool panel with category pages
+  (Basic Fixes / Tuning / Effects / Curves / Crop / Info, each tool shown
+  as an icon with a label) where tools apply on click instead of hiding
+  in menus; persistent undo / redo; the panel bottom hosts an RGB
+  histogram plus camera info and EXIF details.
+- A persistent properties panel on the right with four tabs
+  (Properties / Captions / Tags / Effects) showing file name, location,
+  size, dimensions, capture date and EXIF details.
+- A bottom filmstrip of neighboring photos (4 on each side); click a
+  thumbnail to jump to that photo.
+- A / B / AA comparison modes: view the edited result, the original, or
+  both side by side.
+- Tools with a strength slider (Fill Light / Sharpen / Vignette / Grain
+  and friends) preview live; "Apply" commits, "Cancel" discards, and
+  every step is undoable.
+
+**Animated images and PSD previews**
+
+- GIF and animated WebP now play back frame by frame with proper delays
+  in the single-photo preview (read-only; files are never modified and
+  baking/export are unaffected); indexing and thumbnails still use the
+  first frame.
+- PSD files now render their embedded composite image for thumbnails and
+  previews instead of a placeholder icon.
+
+**In-app self-updater**
+
+- "Help > Check for Updates" on demand, plus optional idle-time automatic
+  checks driven by configuration.
+- Downloads over HTTPS in ranged chunks with streaming SHA-256
+  verification and resume support; after verification an elevated helper
+  performs the install (one UAC prompt stops the service, swaps the
+  executable and restarts it); the new version takes effect on next
+  launch, and failures roll back to the previous executable.
+- Update server URL, check interval, proxy and chunk size are all
+  configurable via `update.ini` (a commented template is generated on
+  first launch; the server manifest format ships as an example file).
+- When auto-download is off, a new version is only announced and the
+  user decides when to update.
+
+**Recently Updated home album**
+
+- The home view is now a virtual album of photos that already have
+  on-disk thumbnails, ordered by update time with a member cap that
+  evicts the oldest; the album header offers slideshow and manual
+  refresh.
 
 ### Changed
 
@@ -26,6 +83,43 @@ All user-visible changes are documented here, newest first.
 - The People and Semantic Search pages now show the models folder location
   and placement guidance when models are missing, and the options page shows
   per-scheme readiness, instead of failing only when a scan/index is started.
+
+### Improved
+
+- The first-run "quick find service" and "photo scope" prompts are now a
+  single two-step wizard window instead of two stacked dialogs.
+- A deletion reconciliation pass runs at startup: photos deleted externally
+  while the app was closed leave the library (and their thumbnails are
+  purged); offline roots are skipped entirely to avoid false removals.
+- Thumbnail cache health loop: a background startup pass removes orphan
+  cache files with no library row; tiers whose ledger says "generated" but
+  whose file went missing (cache folder wiped or moved externally) are
+  unlisted and rebuilt automatically; a single corrupt cache file is
+  deleted and regenerated on load.
+- The disk-wide name index now skips the app's own output folders, the
+  recycle bin and system folders: such files no longer enter the index,
+  dominate the Recently Updated wall, or generate self-inflicted watch
+  events.
+- Index refreshing now merges new entries incrementally into the ordered
+  view instead of re-sorting everything.
+- When a photo moves to the recycle bin, stale index rows are removed by
+  file identifier so search no longer lists deleted files.
+- Folder index states are now explicit: deliberate import / ask no more /
+  never index are recorded in layers, and mistakenly excluded folders can
+  be purged from the library in one click.
+
+### Fixed
+
+- Fix uncommitted edits bleeding into the next photo when switching
+  inside the editor.
+- Fix style filters and one-click effects whose strength slider did not
+  affect the preview until "Apply" was pressed.
+- Fix the "show original" mode displaying the edited image after zooming
+  in.
+- Fix repeated full-image decode retries causing stalls after a failed
+  zoom decode.
+- Fix stale edits lingering in the preview after undo / redo / clear
+  effects.
 
 ## 0.2.0 (2026-11-03)
 

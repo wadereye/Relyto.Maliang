@@ -1,4 +1,4 @@
-﻿//! 全盘扫描与索引 upsert(只读原文件,不复制不移动)
+//! 全盘扫描与索引 upsert(只读原文件,不复制不移动)
 //!
 //! 扫描策略(与 Picasa 3 的行为一致):
 //! 1. **未变文件快速路径**:按 path+size+mtime 命中库内记录即跳过,不重解码 EXIF。
@@ -7,6 +7,7 @@
 //!    + 用户自定义排除目录。
 //! 4. **线程优先级**:扫描线程降为 BelowNormal,不与 UI 抢核。
 //! 5. **RAW 支持**:白名单含相机 RAW;image crate 解不了的走 Windows Shell 缩略图。
+//! 6. **只读速看预览**:GIF 与动图 WebP 逐帧播放、PSD/PSB 出合成图,都不进改写链路。
 use crate::db::Store;
 use anyhow::Result;
 use image::ImageReader;
@@ -17,8 +18,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use walkdir::WalkDir;
 
-/// 可解码的常见图片格式(image crate 支持)。
-pub const IMG_EXTS: [&str; 6] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff"];
+/// 可由 `image` crate 出图的常见格式。缩略图只取首帧,动图逐帧播放交给单图预览。
+pub const IMG_EXTS: [&str; 7] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "gif"];
 
 /// 相机 RAW 格式(image crate 解不了,缩略图走 Windows Shell 扩展;
 /// 索引仍照常收录,可按 EXIF 时间/相机/GPS 检索)。
@@ -31,9 +32,42 @@ fn is_image(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| {
             let e = e.to_ascii_lowercase();
-            IMG_EXTS.contains(&e.as_str()) || RAW_EXTS.contains(&e.as_str())
+            IMG_EXTS.contains(&e.as_str())
+                || RAW_EXTS.contains(&e.as_str())
+                || crate::psd_preview::is_psd_ext(&e)
         })
         .unwrap_or(false)
+}
+
+/// 只读速看预览的格式:可以索引、可以出缩略图与预览,但绝不进入会改写原图的
+/// 链路。GIF / 动图 WebP 的帧序列与二值透明、PSD 的图层与色彩模式都经不起
+/// JPEG 重编码。静态 WebP 仍按普通图片对待。
+pub fn is_readonly_media(p: &Path) -> bool {
+    p.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            let e = e.to_ascii_lowercase();
+            matches!(e.as_str(), "gif" | "psd" | "psb")
+                || (e == "webp" && is_animated_webp(p))
+        })
+        .unwrap_or(false)
+}
+
+/// 动图 WebP 的 VP8X 扩展头里,flags 的第 1 位表示含动画块。
+/// 只读 30 字节:这个判定会在打开预览时反复调用,不能整文件解码。
+fn is_animated_webp(p: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return false;
+    };
+    let mut head = [0u8; 30];
+    if f.read_exact(&mut head).is_err() {
+        return false;
+    }
+    head.starts_with(b"RIFF")
+        && &head[8..12] == b"WEBP"
+        && &head[12..16] == b"VP8X"
+        && (head[20] & 0x02) != 0
 }
 
 /// 事件驱动用:是否为可索引的媒体文件(图片 + RAW + 视频)。
@@ -56,7 +90,10 @@ pub fn is_raw(p: &Path) -> bool {
 ///
 /// 派生门拿到的是 L1 已经存好的 `ext` 列,不必为了判一次类型再拼出 `Path`。
 pub fn is_media_ext(ext: &str) -> bool {
-    IMG_EXTS.contains(&ext) || RAW_EXTS.contains(&ext) || crate::video::MOVIE_EXTS.contains(&ext)
+    IMG_EXTS.contains(&ext)
+        || RAW_EXTS.contains(&ext)
+        || crate::psd_preview::is_psd_ext(ext)
+        || crate::video::MOVIE_EXTS.contains(&ext)
 }
 
 /// 初始化时依次入集的 4 条排除,**不可关**(方案 P3-25)。
@@ -66,6 +103,52 @@ pub fn is_media_ext(ext: &str) -> bool {
 /// (walkdir)才可能共用同一份判定而不各自抄一遍。
 pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picasaoriginals"];
 
+/// 我方扩充的**硬**排除:按定义里面不会有用户的照片,任何入口都不放行,
+/// 而且**根本不进库**(见 `db::Store::purge_hard_excluded_once`)。
+///
+/// `RECYCLER` 的现代对应物 `$RECYCLE.BIN` 继承同一档硬度:回收站里的东西是
+/// 用户已经判了死刑的,不该因为「显式导入」就变成照片库。系统目录、程序目录、
+/// 依赖目录同理 —— 它们的内容 mtime 永远最新,收进来只会让「最近更新」被
+/// 永远不亮的灰格子占满(2026-11-05 现场:首屏 200 张里 190 张是自家 thumbs)。
+///
+/// 硬层的门槛是「**按定义**不可能是用户的照片」。`temp` 不满足这条(微信把
+/// 收藏图片放在 `xwechat_files\...\favorite\temp` 里),所以它在软层。
+pub const HARD_EXCLUDES_OURS: [&str; 11] = [
+    "$RECYCLE.BIN",
+    "System Volume Information",
+    "Recovery",
+    "$WINDOWS.~BT",
+    "$WINDOWS.~WS",
+    "windows",
+    "winnt",
+    "Program Files",
+    "Program Files (x86)",
+    "node_modules",
+    // 构建/测试用的夹具目录:里面是程序自己批量造的假图,不是素材。
+    "rk-scratch",
+];
+
+/// 我方扩充的**软**排除:默认不派生,但用户亲手指向(导入页选中它、对着占位格
+/// 右键「纳入此目录」)时放行。
+///
+/// 2026-11-05 拍板:`AppData` 不能一刀切 —— 微信 / QQ / 网盘客户端的接收目录
+/// 都在那儿,里面确实有用户要的图。软层的意思是「不主动收,但给出口」。
+pub const SOFT_EXCLUDES: [&str; 4] = ["AppData", "temp", "npm-cache", "local-cache"];
+
+/// 排除规则的层次(决定「用户亲手指向一个目录」能不能压过它,
+/// 以及这一行要不要留在库里)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcludeLayer {
+    /// 任何入口都不放行,而且不进库:参考件那 4 条硬编码 +
+    /// [`HARD_EXCLUDES_OURS`] + 点开头的隐藏目录 + 自家产出目录。
+    Hard,
+    /// [`SOFT_EXCLUDES`] 与用户自定义排除项 —— **用户亲手指向时让路**。
+    ///
+    /// 被动命中(全盘发现、滚到过、屏幕上出现过)照样挡住,但行留在库里
+    /// 当占位,右键菜单里有「纳入此目录」这个出口。
+    Soft,
+}
+
 /// 扫描排除规则(目录名匹配,大小写不敏感)。
 ///
 /// 参考件的默认排除列表只有 4 项(见 [`HARD_EXCLUDES`])。
@@ -73,12 +156,12 @@ pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picas
 /// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
 /// 而非靠排除规则拦截。
 ///
-/// 我方默认表是参考件口径的**刻意超集**:除回收站(旧名 RECYCLER,
-/// 现代系统为 $RECYCLE.BIN,内含 $I*.jpg 删除记录,不是图片)与
-/// Originals 外,另加系统 / 应用数据目录作纵深防御 —— 万一用户
-/// 手动把宽范围加进监听,也能挡住最常见的数据垃圾。
-/// 另有点开头的隐藏目录一律排除(见 `excludes_dir`)。
-/// 用户自定义项来自 `settings` 表的 `exclude_dirs`(每行一个目录名)。
+/// 我方默认表是参考件口径的**刻意超集**,并分两档(见 [`ExcludeLayer`]):
+/// [`HARD_EXCLUDES_OURS`] 里的目录(回收站现代名 $RECYCLE.BIN、系统与程序
+/// 目录、依赖目录)按定义不会有用户的照片 —— 连库都不进;
+/// [`SOFT_EXCLUDES`] 里的(`AppData` 一类)默认不派生,但用户亲手指向时放行。
+/// 另有点开头的隐藏目录一律排除,归硬档(见 [`Exclusions::exclude_layer_dir`])。
+/// 用户自定义项来自 `settings` 表的 `exclude_dirs`(每行一个目录名),归软档。
 ///
 /// 还有一类**不能按名字排**的:[`own_prefixes`](自有数据目录前缀)。缩略图缓存
 /// 落在哪儿取决于用户把数据目录 / 缓存位置设成了什么,把它写死成
@@ -95,25 +178,12 @@ pub struct Exclusions {
 impl Default for Exclusions {
     fn default() -> Self {
         let mut names: Vec<String> = HARD_EXCLUDES.iter().map(|s| s.to_string()).collect();
-        // —— 我方扩充:现代系统对应物与常见数据垃圾(纵深防御) ——
+        // —— 我方扩充:硬层(不进库)与软层(不主动派生,但用户表态可放行) ——
         names.extend(
-            [
-                "$RECYCLE.BIN",
-                "System Volume Information",
-                "Recovery",
-                "$WINDOWS.~BT",
-                "$WINDOWS.~WS",
-                "windows",
-                "winnt",
-                "temp",
-                "Program Files",
-                "Program Files (x86)",
-                "AppData",
-                "node_modules",
-                "npm-cache",
-            ]
-            .iter()
-            .map(|s| s.to_string()),
+            HARD_EXCLUDES_OURS
+                .iter()
+                .chain(SOFT_EXCLUDES.iter())
+                .map(|s| s.to_string()),
         );
         Exclusions {
             names,
@@ -211,18 +281,45 @@ impl Exclusions {
                 .any(|n| self.excludes_dir(&n))
     }
 
-    /// **目录**路径的每一级(含自身)命中排除规则则返回 true。
+    /// 目录路径的每一级(含自身)命中排除规则则返回 true。
     ///
-    /// 与 [`Exclusions::excludes_path`] 的差别只在 `skip(1)`:那个是给文件路径
-    /// 用的(要跳过文件名本身),这个是给目录路径用的 —— 派生门拿到的是
-    /// `photos.parent`,自身那一级恰恰是最该判的一级。
+    /// 只是 [`Exclusions::exclude_layer_dir`] 的布尔视图:生产代码要看**层**
+    /// (硬层不可覆盖),测试只问「有没有命中」。判定逻辑只留一份 ——
+    /// 2026-11-05 加软层覆盖时,两处各自走一遍名单正是漏判的来源。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn excludes_dir_path(&self, dir: &Path) -> bool {
-        self.under_own_prefix(dir)
-            || dir
-                .ancestors()
-                .filter_map(|d| d.file_name())
-                .map(|n| n.to_string_lossy().into_owned())
-                .any(|n| self.excludes_dir(&n))
+        self.exclude_layer_dir(dir).is_some()
+    }
+
+    /// 目录路径命中的排除**层**;`None` = 不命中任何规则。
+    ///
+    /// 硬层优先返回(它是「谁都不能放行、也不进库」的那一档),否则取软层命中。
+    /// 派生门、双向对账与「能不能纳入」判定都走这里,不再各自抄一遍名单。
+    pub fn exclude_layer_dir(&self, dir: &Path) -> Option<ExcludeLayer> {
+        if self.under_own_prefix(dir) {
+            return Some(ExcludeLayer::Hard);
+        }
+        let mut soft = None;
+        for n in dir
+            .ancestors()
+            .filter_map(|d| d.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+        {
+            // 点开头的隐藏目录(.git / .config / .workbuddy…)算硬层:
+            // 工具与版本库的内部数据按定义不是照片集,表态也不该收进来。
+            if n.starts_with('.')
+                || HARD_EXCLUDES
+                    .iter()
+                    .chain(HARD_EXCLUDES_OURS.iter())
+                    .any(|h| h.eq_ignore_ascii_case(&n))
+            {
+                return Some(ExcludeLayer::Hard);
+            }
+            if self.excludes_dir(&n) {
+                soft = Some(ExcludeLayer::Soft);
+            }
+        }
+        soft
     }
 }
 
@@ -479,9 +576,10 @@ pub fn mft_candidates(
     // 从卷根逐级下钻定位根目录(名字比较口径与折叠池一致:ASCII 不区分大小写)。
     let mut level: &[u32] = v.children_of(v.count());
     for comp in &comps {
-        let hit = level.iter().copied().find(|&ci| {
-            v.is_dir(ci as usize) && v.name(ci as usize).eq_ignore_ascii_case(comp)
-        });
+        let hit = level
+            .iter()
+            .copied()
+            .find(|&ci| v.is_dir(ci as usize) && v.name(ci as usize).eq_ignore_ascii_case(comp));
         level = match hit {
             Some(ci) => v.children_of(ci as usize),
             None => return None,
@@ -769,8 +867,12 @@ pub fn read_derived(p: &Path) -> Derived {
     }
 }
 
-/// 只读图片头拿宽高(不解码整图)。
+/// 只读图片头拿宽高(不解码整图)。PSD / PSB 自备头解析,不走 `image` crate。
 fn image_dimensions(p: &Path) -> Option<(i32, i32)> {
+    if crate::psd_preview::is_psd_path(p) {
+        let (w, h) = crate::psd_preview::dimensions(p)?;
+        return Some((w as i32, h as i32));
+    }
     let (a, b) = ImageReader::open(p)
         .ok()?
         .with_guessed_format()
@@ -967,14 +1069,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// 测试暂存目录。固定在 `target/rk-scratch/` 下,不能用系统 temp:
+    /// 测试暂存目录。固定在 `target/ml-scratch/` 下,不能用系统 temp:
     /// Windows 的 temp 落在 `...\AppData\Local\Temp`,路径里同时命中默认排除表的
     /// `AppData` 与 `temp` 两项,`excludes_path` 逐级祖先匹配会把待测文件判成排除,
     /// 使 `index_file` 恒返回 false(换台机器 TMP 不在 AppData 下就复现不了)。
+    /// 也不能叫 `rk-scratch`:那是硬排除名单里登记的构建夹具目录名。
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
-            .join("rk-scratch")
+            .join("ml-scratch")
             .join(format!("{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1023,10 +1126,38 @@ mod tests {
         assert!(is_image(Path::new("a.CR2")));
         assert!(is_image(Path::new("a.arw")));
         assert!(is_image(Path::new("a.RAF")));
+        assert!(is_image(Path::new("a.gif")), "GIF 首帧应进索引");
+        assert!(is_image(Path::new("a.PSD")), "PSD 只读预览应进索引");
+        assert!(is_image(Path::new("a.psb")));
         assert!(!is_image(Path::new("a.txt")));
         assert!(!is_image(Path::new("a.mp4")));
         assert!(is_raw(Path::new("a.nef")));
         assert!(!is_raw(Path::new("a.jpg")));
+        assert!(is_readonly_media(Path::new("a.gif")));
+        assert!(is_readonly_media(Path::new("a.psd")));
+        assert!(!is_readonly_media(Path::new("a.jpg")));
+        assert!(is_media_ext("psd"));
+    }
+
+    #[test]
+    fn animated_webp_is_readonly_but_static_webp_is_not() {
+        let dir = scratch_dir("webp-anim");
+        let make = |name: &str, flags: u8| -> std::path::PathBuf {
+            let mut h = [0u8; 30];
+            h[0..4].copy_from_slice(b"RIFF");
+            h[8..12].copy_from_slice(b"WEBP");
+            h[12..16].copy_from_slice(b"VP8X");
+            h[20] = flags;
+            let p = dir.join(name);
+            std::fs::write(&p, h).unwrap();
+            p
+        };
+        let anim = make("anim.webp", 0x02);
+        let still = make("still.webp", 0x00);
+        assert!(is_readonly_media(&anim), "动图 WebP 不能被烘培成 JPEG 首帧");
+        assert!(!is_readonly_media(&still), "静态 WebP 仍可正常编辑");
+        assert!(!is_readonly_media(Path::new("missing.webp")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// 快速路径:未变文件不重解码 EXIF(不产生新记录),变更文件会重索引。
@@ -1165,6 +1296,7 @@ mod tests {
 
     /// 自家缓存目录走**路径前缀**而不是目录名:同名用户相册不受误伤,
     /// 前缀也不会罩住名字前缀相同的兄弟目录(`cache` 不罩 `cached_photos`)。
+    #[cfg(windows)]
     #[test]
     fn own_prefix_excludes_whole_subtree_by_path() {
         let e = Exclusions::default().with_own_prefix(r"D:\maliang\cache");
@@ -1192,6 +1324,36 @@ mod tests {
         );
         assert!(e.own_leaf_may_match("cache") && e.own_leaf_may_match("CACHE"));
         assert!(!e.own_leaf_may_match("smallthumbs"));
+    }
+
+    /// own-prefix 子树拦截在 POSIX 路径上的对偶:自家缓存目录由环境推导,
+    /// 前缀边界改用固定的绝对路径 —— 避开「以点开头的目录一律排除」那条名字规则。
+    #[cfg(not(windows))]
+    #[test]
+    fn own_prefix_excludes_whole_subtree_by_path_posix() {
+        let own = crate::db::system_cache_dir();
+        let leaf = own
+            .file_name()
+            .expect("自家缓存目录该有一个叶子名")
+            .to_string_lossy()
+            .into_owned();
+        let e = Exclusions::default().with_own_prefix(&own);
+        assert!(e.under_own_prefix_str(&own.to_string_lossy()), "缓存根本身算子树");
+        assert!(
+            e.under_own_prefix_str(&own.join("albums").join("2026").to_string_lossy()),
+            "自家缓存的任意深度都归 own-prefix 管",
+        );
+        assert!(e.own_leaf_may_match(&leaf) && e.own_leaf_may_match(&leaf.to_uppercase()));
+
+        // 前缀边界:同词头的兄弟目录既不是子树,叶子名也不该被快路径放行。
+        let b = Exclusions::default().with_own_prefix("/var/lib/ml/cache");
+        assert!(b.excludes_dir_path(Path::new("/var/lib/ml/cache/albums")));
+        assert!(b.excludes_path(Path::new("/var/lib/ml/cache/albums/a.jpg")));
+        assert!(
+            !b.excludes_dir_path(Path::new("/var/lib/ml/cache_backup")),
+            "同词头兄弟目录不是子树",
+        );
+        assert!(!b.own_leaf_may_match("cache_backup"));
     }
 
     /// 尾分隔符与不同分隔符写法不能改变判定。
@@ -1420,6 +1582,7 @@ mod tests {
     }
 
     /// MFT 快路:索引子树定位、排除目录、扩展名过滤、大小写与回退。
+    #[cfg(windows)]
     #[test]
     fn mft_candidates_resolves_subtree_and_falls_back() {
         use crate::nameidx::VolumeIndexBuilder;
@@ -1470,8 +1633,7 @@ mod tests {
         assert!(mft_candidates(&[], Path::new(r"C:\Pics"), &excl, None).is_none());
 
         // 卷根直扫:整卷候选(排除 thumbs 子树)。
-        let mc3 =
-            mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\"), &excl, None).unwrap();
+        let mc3 = mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\"), &excl, None).unwrap();
         assert_eq!(mc3.paths.len(), 2, "实际: {:?}", mc3.paths);
         assert_eq!(mc3.excluded_dirs, 1);
 

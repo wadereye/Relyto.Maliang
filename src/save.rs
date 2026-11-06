@@ -74,12 +74,14 @@ fn insert_app1(dst: &mut Vec<u8>, payloads: &[Vec<u8>]) {
     }
 }
 
-fn unique_backup(dir: &Path, stem: &str) -> Result<PathBuf> {
+/// 备份保留原扩展名:别把 GIF / PSD 的原始字节命名成 .jpg,
+/// 否则用户以后连「这是哪种文件」都看不出来。
+fn unique_backup(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
-    let mut cand = dir.join(format!("{stem}.jpg"));
+    let mut cand = dir.join(format!("{stem}{ext}"));
     let mut n = 1;
     while cand.exists() {
-        cand = dir.join(format!("{stem} ({n}).jpg"));
+        cand = dir.join(format!("{stem} ({n}){ext}"));
         n += 1;
     }
     Ok(cand)
@@ -92,6 +94,11 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
         return Err(anyhow!("图片已按 EXIF 方向摆正,无需烘培"));
     }
     let src = Path::new(&path_s);
+    // 只读速看预览的格式绝不进烘培:JPEG 重编码会把动画压成首帧、把多图层
+    // 文档压平,还会用 JPEG 覆盖原路径。备份目录只保原始字节,不做这种事。
+    if crate::scan::is_readonly_media(src) {
+        return Err(anyhow!("该格式只读预览,不参与旋转烘培: {path_s}"));
+    }
     let src_bytes = std::fs::read(src).with_context(|| format!("读取原图失败: {path_s}"))?;
     let mtime = src
         .metadata()?
@@ -101,7 +108,11 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
     let stem = chrono_fmt(mtime as i64);
     let parent = src.parent().context("无父目录")?;
     let bak_dir = parent.join("photooriginals");
-    let bak = unique_backup(&bak_dir, &stem)?;
+    let ext = src
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_else(|| ".jpg".into());
+    let bak = unique_backup(&bak_dir, &stem, &ext)?;
     std::fs::write(&bak, &src_bytes)?;
     let backup_s = bak.to_string_lossy().into_owned();
 

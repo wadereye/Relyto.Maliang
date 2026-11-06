@@ -6,12 +6,14 @@
 mod app;
 mod assets;
 mod assets_format;
+mod anim;
 mod curves;
 mod db;
 mod device;
 mod effects;
 mod exif;
 mod export;
+mod fswatch;
 mod hash;
 mod ipc;
 mod mft;
@@ -20,6 +22,7 @@ mod net;
 mod oneclick;
 mod picasa;
 mod pool;
+mod psd_preview;
 mod rec;
 mod recipes;
 mod save;
@@ -31,6 +34,7 @@ mod share;
 mod theme;
 mod thumbs;
 mod timeline;
+mod update;
 mod video;
 mod watch;
 mod win;
@@ -57,6 +61,11 @@ use std::sync::Arc;
 /// - `--install-service` / `--uninstall-service`:提权子命令,注册 / 撤销服务。
 /// - `--stop-service` / `--start-service`:提权子命令,只停 / 只起(不动注册项)。
 /// - `--mft-scan [卷字母表]` / `--mft-check` / `--mft-diag`:索引人工入口与诊断。
+/// - `--check-update`:按 `update.ini` 检查一次版本清单并打印(验证配置用)。
+/// - `--download-update`:抓清单、后台下载并校验,不安装(现场验证代理/Range 用)。
+/// - `--apply-update <目录> <令牌> <是否起服务>`:提权安装子进程,内部使用;
+///   等服务状态落定 → 停服务 → 换程序文件 → 起服务。
+/// - `--restore-service`:更新被中断后,把索引服务起回来并清掉中断标记。
 fn handle_cli(args: &[String]) -> bool {
     let Some(flag) = args.first().map(|s| s.as_str()) else {
         return false;
@@ -180,6 +189,14 @@ fn handle_cli(args: &[String]) -> bool {
         // 常驻路径是 `--service`;这里只给人工跑一轮,需要提权才有 $MFT 读权限。
         // 用法:`--mft-scan [卷字母表]`(旧的 `--mft-report` 报告协议已废除)。
         "--mft-scan" => {
+            // 旧版定时任务带 `--mft-task` 参数。常驻服务在位时让它空转退出:
+            // 两套索引器会并发写同一份 nameindex.bin,谁后写谁覆盖另一方。
+            if args.iter().any(|a| a == "--mft-task")
+                && crate::win::service_state() == crate::win::ServiceState::Running
+            {
+                println!("常驻索引服务在运行,本次定时扫描跳过");
+                return true;
+            }
             let spec = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned();
             match nameidx::cli_mft_scan(spec.as_deref()) {
                 Ok(()) => {}
@@ -220,6 +237,67 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // USN 原始记录诊断:提权运行,把某卷日志尾部的原始记录写进指定文件。
+        // 用法:`--usn-dump D <输出文件> [回看字节数]`,缺省回看 256 KB。
+        "--usn-dump" => {
+            let letter = args
+                .get(1)
+                .and_then(|a| a.chars().next())
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('C');
+            let Some(out) = args.get(2).cloned() else {
+                eprintln!("用法:--usn-dump <卷字母> <输出文件> [回看字节数]");
+                std::process::exit(1);
+            };
+            let tail: u64 = args
+                .get(3)
+                .and_then(|a| a.parse().ok())
+                .unwrap_or(256 * 1024);
+            match mft::cli_usn_dump(letter, &out, tail) {
+                Ok(()) => println!("USN 记录已写入:{out}"),
+                Err(e) => {
+                    eprintln!("USN 诊断失败:{e:#}");
+                    std::process::exit(1);
+                }
+            }
+            true
+        }
+        // 人工验证更新配置:只查清单、不下载、不改程序文件。
+        "--check-update" => {            if let Err(e) = update::cli_check() {
+                eprintln!("检查更新失败:{e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        // 现场验证整条下载链:清单 → Range 分段 → 校验 → 落地,不安装。
+        "--download-update" => {
+            if let Err(e) = update::cli_download() {
+                eprintln!("下载更新失败:{e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        // 安装更新的提权子进程。退出码供父进程判断成败,详情写在结果文件里
+        // (GUI 子系统下 stdout 未必有人看)。令牌用于区分本次与上次遗留的结果。
+        "--apply-update" => {
+            if let Err(e) = update::cli_apply_update(
+                args.get(1).map(String::as_str),
+                args.get(2).map(String::as_str),
+                args.get(3).map(String::as_str),
+            ) {
+                eprintln!("应用更新失败:{e}");
+                std::process::exit(1);
+            }
+            true
+        }
+        // 更新途中 helper 被杀时的兜底:只把服务起回来,不动任何文件。
+        "--restore-service" => {
+            if let Err(e) = update::cli_restore_service(args.get(1).map(String::as_str)) {
+                eprintln!("恢复索引服务失败:{e}");
+                std::process::exit(1);
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -238,8 +316,18 @@ fn window_icon() -> egui::IconData {
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 更新相关的子命令都不碰数据库,没必要先做分钟级的数据目录迁移。
+    let is_update_helper = matches!(
+        args.first().map(String::as_str),
+        Some("--apply-update")
+            | Some("--restore-service")
+            | Some("--check-update")
+            | Some("--download-update")
+    );
     // 数据目录 pending 迁移必须先于一切打开库/索引的动作(包括命令行子命令)。
-    crate::db::migrate_pending_data();
+    if !is_update_helper {
+        crate::db::migrate_pending_data();
+    }
     // 服务模式由 SCM 在 session 0 拉起:那里没有父终端可挂,日志走数据目录下的
     // index-service.log,所以不能调 attach_parent_console(会白等一个不存在的控制台)。
     let is_service = args.iter().any(|a| a == "--service");
@@ -251,6 +339,10 @@ fn main() -> eframe::Result {
     if handle_cli(&args) {
         return Ok(());
     }
+    // 上次替换留下的旧程序备份,这时已没人占用,顺手清掉。
+    update::cleanup_old_exe();
+    // 上次安装把服务停了却没起回来(helper 被杀 / 断电)时,在这里补一次。
+    update::restore_service_if_interrupted();
 
     // UI 线程提优先级(与原版一致:UI 线程 ABOVE_NORMAL,
     // 扫描/缩略图后台线程 BELOW_NORMAL —— 交互永远优先于后台计算)。

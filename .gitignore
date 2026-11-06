@@ -11,3 +11,6 @@
 Thumbs.db
 .DS_Store
 .wtest
+
+# 用户本地的自动更新配置(可能带内部服务器地址),示例文件 update.ini.example 仍入库
+/update.ini

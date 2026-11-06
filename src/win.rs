@@ -286,6 +286,52 @@ pub fn cpu_count() -> usize {
         .unwrap_or(4)
 }
 
+/// 云盘占位文件判定:网盘(OneDrive / SeaFile / 百度网盘等)的
+/// 「按需下载」占位文件带这些属性位,**打开内容就会触发联网下载**。
+///
+/// 只看属性位,不打开文件 —— `GetFileAttributesW` 是纯元数据查询,安全:
+/// - `OFFLINE`(0x1000):文件物理上不在线上(传统离线存储);
+/// - `RECALL_ON_OPEN`(0x40000):打开(含句柄级读)就会召回;
+/// - `UNPINNED`(0x0010_0000):云文件 API 的「未固定」= 按需占位;
+/// - `RECALL_ON_DATA_ACCESS`(0x0040_0000):读数据才召回(OneDrive 默认)。
+///
+/// 用途:缩略图回填等**自动**内容访问前先问这一句,占位文件跳过,
+/// 别替用户把整库拉下来。用户主动打开/编辑不设限(那是明确意图)。
+pub fn is_cloud_placeholder(p: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::GetFileAttributesW;
+        const FILE_ATTRIBUTE_OFFLINE: u32 = 0x0000_1000;
+        const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0004_0000;
+        const FILE_ATTRIBUTE_UNPINNED: u32 = 0x0010_0000;
+        const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
+        let wide: Vec<u16> = p
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: wide 以 NUL 结尾;INVALID_FILE_ATTRIBUTES(查询失败)当不占位,
+        // 让后续打开按真实错误处理,别把权限问题误伤成跳过。
+        let attrs = unsafe { GetFileAttributesW(PCWSTR(wide.as_ptr())) };
+        if attrs == u32::MAX {
+            return false;
+        }
+        attrs
+            & (FILE_ATTRIBUTE_OFFLINE
+                | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | FILE_ATTRIBUTE_UNPINNED
+                | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS)
+            != 0
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = p;
+        false
+    }
+}
+
 /// 取用户壳目录(我的文档 / 图片 / 桌面),按存在性过滤。
 ///
 /// 对应参考件首启默认扫描范围 —— 安装文案原文:
@@ -554,6 +600,25 @@ pub fn launch_elevated(params: &str) -> Result<(), String> {
     }
 }
 
+/// 提权拉起自身跑 `--apply-update <工作目录> <令牌> <是否起服务>`,并等它退出
+/// (最多 5 分钟:留给用户响应 UAC、服务收尾、大包校验的时间)。
+///
+/// 更新安装必须提权的两个理由:服务在跑时锁着程序文件,停它要 SERVICE_STOP;
+/// 程序装在受保护目录时,往同目录写新 exe 也要管理员。把这两件事合并进一个
+/// 子进程,用户只为一次安装授权一次。`params` 由调用方拼好(含工作目录)。
+pub fn launch_update_helper(params: &str) -> Result<Option<u32>, String> {
+    #[cfg(windows)]
+    {
+        let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+        shell_execute_elevated(&exe.to_string_lossy(), params, Some(300_000))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = params;
+        Err("仅支持 Windows".into())
+    }
+}
+
 // 全盘索引服务的安装/查询/卸载(P0-3:替掉原先「计划任务 + 每次一次性拉起子进程」)。
 //
 // 索引引擎必须常驻:USN 保鲜是挂在内核里阻塞读 journal 的活进程,不是跑完就退的
@@ -642,6 +707,26 @@ pub fn service_state() -> ServiceState {
 pub fn service_installed() -> bool {
     service_state() != ServiceState::NotInstalled
 }
+
+/// 清掉旧版遗留的一次性索引计划任务(名字固定;不存在也算成功)。
+///
+/// 常驻服务上线前,索引靠计划任务定时跑 `--mft-scan` 维护;两套机制同时活着
+/// 会并发写同一份 nameindex.bin。这一步只在提权的安装/装卸子进程里做,
+/// 那里才有删任务的权限;任何失败都忽略,不能拖累服务本身的装配。
+#[cfg(windows)]
+pub fn remove_legacy_indexer_task() {
+    use std::os::windows::process::CommandExt;
+    /// 控制台子进程不该在 GUI 后面闪一个黑框。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const LEGACY_TASK: &str = "RelytoMaliangIndexer";
+    let _ = std::process::Command::new("schtasks.exe")
+        .args(["/Delete", "/TN", LEGACY_TASK, "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+pub fn remove_legacy_indexer_task() {}
 
 /// 提权进程内执行:注册服务(自动启动 + LocalSystem)+ 写描述 + 立刻启动。
 /// 服务已存在时改配置指向当前 exe(升级/搬目录后能自愈),而不是报"已存在"。
@@ -743,12 +828,18 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
         .map_err(|e| format!("写服务描述失败: {e}"))?;
 
         // SAFETY: 不带参数启动(--service 已写在二进制路径里)。
-        match unsafe { StartServiceW(svc.0, None) } {
+        let started = match unsafe { StartServiceW(svc.0, None) } {
             Ok(()) => Ok(()),
             // 已在跑就是成功:重复安装不该报错。
             Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => Ok(()),
             Err(e) => Err(format!("服务已注册但启动失败: {e}")),
+        };
+        if started.is_ok() {
+            // 常驻服务上线后,旧版那条定时扫描若还留着就会和它并发写同一份
+            // nameindex.bin。装服务这一步是提权的,顺手把遗留任务清掉。
+            remove_legacy_indexer_task();
         }
+        started
     }
     #[cfg(not(windows))]
     {
@@ -880,6 +971,9 @@ pub fn service_start() -> Result<(), String> {
 pub fn service_uninstall() -> Result<(), String> {
     #[cfg(windows)]
     {
+        // 这个子进程是提权的:服务撤掉之后,旧版定时扫描不该继续孤零零地
+        // 写索引文件,顺手把遗留任务也清掉(不存在时是空操作)。
+        remove_legacy_indexer_task();
         use windows::core::PCWSTR;
         use windows::Win32::System::Services::{
             DeleteService, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_QUERY_STATUS,

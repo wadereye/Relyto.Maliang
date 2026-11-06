@@ -6,10 +6,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
-/// 视图模式(视图菜单,参照 Picasa:时间线/人物/标签/文件夹)。
+mod editor;
+use editor::{EditorTab, Histogram};
+
+/// 视图模式(视图菜单,参照 Picasa:最近更新/时间线/人物/标签/文件夹)。
 /// Faces/Semantic 仅 ai 构建的菜单会构造;无 ai 时变体存在但无人构造,允许死代码。
 #[derive(PartialEq, Clone, Copy)]
 enum ViewKind {
+    /// 首页虚拟相册「最近更新」:成员有上限、只收已有落盘缩略图的那批。
+    Recent,
     Timeline,
     Folder,
     Duplicates,
@@ -28,6 +33,7 @@ impl ViewKind {
     /// 状态栏/历史提示用的一词名(左栏导航项的文案另有取舍,见导航列表)。
     fn label(self) -> &'static str {
         match self {
+            ViewKind::Recent => "最近更新",
             ViewKind::Timeline => "时间线",
             ViewKind::Folder => "文件夹",
             ViewKind::Duplicates => "重复照片",
@@ -183,6 +189,30 @@ struct ScanResult {
 
 type Dup = (i64, Vec<i64>);
 
+/// 「检查更新」窗口里的时间戳文案。0 = 从没检查过。
+fn update_time_text(secs: i64) -> String {
+    if secs <= 0 {
+        return "从未".into();
+    }
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "从未".into())
+}
+
+/// 「检查更新」窗口里的索引服务状态。安装前必须让用户看见它在不在跑。
+fn update_service_text() -> &'static str {
+    match crate::win::service_state() {
+        crate::win::ServiceState::Running => "运行中(安装时会先停止,完成后恢复)",
+        crate::win::ServiceState::Stopped => "已停止",
+        crate::win::ServiceState::NotInstalled => "未安装",
+        crate::win::ServiceState::Transition(_) => "状态切换中",
+    }
+}
+
 /// 人脸扫描后台线程 → UI 的回报:逐张进度 + 收尾结果。
 #[cfg(feature = "ai")]
 enum FaceScan {
@@ -212,6 +242,17 @@ struct FolderTree {
     roots: Vec<usize>,
 }
 
+/// 单图预览里的动图播放状态。只按帧延迟换纹理,不改文件、不套效果栈。
+struct AnimState {
+    id: i64,
+    clip: crate::anim::Clip,
+    tex: Option<egui::TextureHandle>,
+    playing: bool,
+    elapsed_ms: u64,
+    tick: std::time::Instant,
+    frame: usize,
+}
+
 pub struct App {
     store: Arc<Store>,
     rows: Vec<PhotoRow>,
@@ -219,6 +260,10 @@ pub struct App {
     folders: Vec<String>,
     selected_folder: usize,
     view: ViewKind,
+    /// 首页「最近更新」的成员(下标指向 `rows`):启动时算一次,不逐帧重排全库。
+    recent_idxs: Vec<usize>,
+    /// 相册头那行日期(组内最早拍摄日,中文写法),空串时只报张数。
+    recent_date: String,
     texs: TexCache,
     /// 常驻缩略图后台 worker(P0-1):启动时补存量,扫描后自动补新增。
     thumb_bg: Option<crate::thumbs::ThumbWorker>,
@@ -239,6 +284,12 @@ pub struct App {
     /// 预览中的照片 id(存 id 而非行索引:后台扫描/移除触发 rebuild 后不错位)。
     preview: Option<i64>,
     preview_tex: Option<(i64, egui::TextureHandle)>,
+    /// GIF / 动图 WebP 的逐帧播放状态(没有动图时恒为 None)。
+    anim: Option<AnimState>,
+    /// 动图后台解码结果通道;帧序列可能较大,不能卡在 UI 线程解。
+    anim_rx: Option<mpsc::Receiver<(i64, Option<crate::anim::Clip>)>>,
+    /// 已发起过动图探测的照片,避免每帧重复起线程。
+    anim_req_for: Option<i64>,
     /// P1-10:预览后台 worker(解码 + 落盘缓存,不阻塞 UI)。
     preview_bg: Option<crate::thumbs::PreviewWorker>,
     /// 预览中的照片原文件已不存在:预览窗显示明确提示,不再无限转圈。
@@ -269,6 +320,10 @@ pub struct App {
     /// 「关于」窗口里 Markdown 更新日志的渲染缓存(egui_commonmark)。
     about_cache: egui_commonmark::CommonMarkCache,
     show_shortcuts: bool,
+    /// 自动更新:后台检查/下载线程与「检查更新」窗口的状态快照。
+    updater: crate::update::Updater,
+    /// 安装更新的二次确认窗(UAC + 停服务前必须让用户点一次)。
+    update_confirm: bool,
     confirm_remove: bool,
     // —— 文件夹管理器 / 图库维护——
     show_folder_mgr: bool,
@@ -424,6 +479,8 @@ pub struct App {
     preview_full: Option<(i64, image::RgbaImage)>,
     /// 全图解码在途照片 id。
     zoom_pending: Option<i64>,
+    /// 全图解码已判失败的照片 id(大图 / 解码失败时不再每帧重发请求)。
+    zoom_failed_for: Option<i64>,
     // —— 裁剪工具(编辑视图的 Crop;比例预设取经典图库常用宽高比清单)——
     /// 裁剪框草稿(显示图像的归一化坐标 0..1;[x0, y0, x1, y1],用前归一)。
     crop_rect: Option<[f32; 4]>,
@@ -563,6 +620,8 @@ pub struct App {
     svc_busy: bool,
     /// 首启范围对话框待示(方案 P3-18:两档单选,**无取消** —— 必须答一次)。
     scope_ask: bool,
+    /// 初次设置向导的当前页(0 = 服务说明,1 = 照片范围;两问合一窗分步呈现)。
+    wizard_page: usize,
     /// 对话框里当前选中的那一档。
     scope_choice: InitialScope,
     /// 快速查找输入与结果。
@@ -600,6 +659,34 @@ pub struct App {
     frame_dirs: Vec<String>,
     /// `frame_dirs` 的去重键(大写归一路径)。
     frame_dirs_seen: std::collections::HashSet<String>,
+    // —— 单图编辑视图(参考 Picasa 3 的 View and Edit:左工具 / 中预览 / 右属性)——
+    /// 左栏工具分类页。
+    editor_tab: EditorTab,
+    /// 右栏属性面板显隐(参考件属性面板标题栏的收展按钮)。
+    editor_props: bool,
+    /// 底部胶片带显隐。
+    editor_film: bool,
+    /// RGB 直方图缓存:(照片 id, 效果栈签名, 分桶数据)。
+    editor_hist: Option<(i64, String, Histogram)>,
+    /// 相机信息缓存(按照片 id;换图才重读一次文件)。
+    editor_exif: Option<(i64, Vec<(String, String)>)>,
+    /// 邻片缩略图纹理(顶部小图与胶片带共用)。
+    editor_thumbs: HashMap<i64, egui::TextureHandle>,
+    /// 对比显示:0 = 效果图,1 = 原图,2 = 并排。
+    editor_compare: u8,
+    /// 原图纹理(未套效果栈;对比显示用)。
+    editor_orig_tex: Option<(i64, egui::TextureHandle)>,
+    /// 右栏页签(属性 / 标题 / 标签 / 效果)。
+    editor_props_tab: u8,
+    /// 工具网格里选中的带强度工具(如补光 / 锐化 / 暗角)。
+    editor_tool: Option<&'static str>,
+    /// 该工具的强度(0..100),实时参与预览合成。
+    editor_tool_amount: f32,
+    /// 编辑视图草稿归属的照片 id(换图时清掉未提交的工具草稿)。
+    editor_for: Option<i64>,
+    /// 顶部工具条发来的缩放命令(0 无 / 1 100% / 2 适应 / 3 放大 / 4 缩小),
+    /// 中间图区知道自己的实际尺寸,由它在下一帧消费。
+    editor_zoom_cmd: u8,
 }
 
 /// 索引服务的链路状态(由链路线程按心跳回报)。
@@ -698,6 +785,16 @@ enum LinkCmd {
 const LINK_TICK: std::time::Duration = std::time::Duration::from_secs(3);
 /// 连不上时的退避上限(服务可能正在被安装,别把重连打成忙等)。
 const LINK_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 用户是否允许使用全盘快查(`svc_wanted=0` 时置 false)。
+///
+/// 链路线程独立于 App、拿不到它的锁,只能用原子位传递意向;本程序只有一个
+/// App 实例,模块级单例足够。置 false 后连管道都不再尝试 —— 服务是机器级
+/// 自动启动的,光靠 UI「不弹安装提示」并不能阻止它继续常驻建全盘索引。
+/// 消费方有两处:本文件的 `link_connect`(心跳/重连/装卸/重建)与
+/// `watch.rs` 的 `l1_gone`(删除对账),两边必须同一口径。
+pub(crate) static SVC_LINK_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
 
 /// 启动索引服务链路线程:维持一根管道连接、周期问 `Status`、掉线退避重连,
 /// 并代办装卸服务(要等 UAC)与全量重建。UI 只读回报,自己不碰管道。
@@ -868,6 +965,11 @@ fn link_call(
 
 /// 连上管道并完成握手(协议版本对不上视为连不上)。
 fn link_connect() -> Result<crate::ipc::Client, String> {
+    // 用户明确选了「不用全盘快查」:连握手都不做,不向常驻服务索取全盘数据。
+    // 所有入口(心跳、Retry、重建、落盘)都经过这里,一道门就能收口。
+    if !SVC_LINK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("已按你的选择关闭全盘快查(在 选项 > 常规 可重新启用)".into());
+    }
     let mut c = crate::ipc::Client::connect(500)?;
     match c.call(&crate::ipc::Req::Hello {
         proto: crate::ipc::PROTO_VERSION,
@@ -1348,10 +1450,13 @@ fn build_folder_tree(
 /// (三张缩略图缓存表)。
 fn thumb_tex(
     ctx: &egui::Context,
+    store: &crate::db::Store,
     id: i64,
     tier: crate::thumbs::Tier,
 ) -> Option<egui::TextureHandle> {
-    let img = crate::thumbs::load_cached_tier(tier, id)?;
+    // 自愈装载:缓存文件损坏(解不开)时删坏文件、摘台账,后台回填重生;
+    // 文件不存在则返回 None,走「未生成」的正常路径。
+    let img = crate::thumbs::load_tier_repair(store, tier, id)?;
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];
     let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
@@ -1383,7 +1488,8 @@ const MAX_ADOPT_QUEUE: usize = 24;
 /// 一帧最多上报几个「屏幕上的目录」给后台 worker(显示优先的清单长度上限)。
 const MAX_VISIBLE_DIRS: usize = 32;
 
-/// 把任意长宽比的缩略图裁成正方形(取中间部分),用于网格瓦片。
+/// 把任意长宽比的缩略图裁成正方形(取中间部分)。
+/// 图库的网格不再用它(参考件保留宽高比),但放大态的预览格仍需要方图。
 fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
     let (w, h) = (tw.max(1) as f32, th.max(1) as f32);
     if w > h {
@@ -1395,6 +1501,79 @@ fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
         let y = (1.0 - f) * 0.5;
         egui::Rect::from_min_max(egui::pos2(0.0, y), egui::pos2(1.0, y + f))
     }
+}
+
+/// 首页虚拟相册的成员上限(参考件的 Recently Updated 带数量上限,超出淘汰最旧)。
+const RECENT_LIMIT: usize = 250;
+
+/// 相册头日期:`YYYY-MM-DD` → `YYYY年M月D日`;没有 EXIF 日期时原样返回空串。
+fn cn_date(s: &str) -> String {
+    let p: Vec<&str> = s.split('-').collect();
+    if p.len() == 3 {
+        let m = p[1].parse::<u32>().unwrap_or(0);
+        let d = p[2].parse::<u32>().unwrap_or(0);
+        if m > 0 && d > 0 {
+            return format!("{}年{}月{}日", p[0], m, d);
+        }
+    }
+    s.to_string()
+}
+
+/// 行式缩略图布局的一行:每项 (rows 下标, 该格宽) 与本行统一高。
+/// 参考件不把照片裁成正方形:同行等高,各自按宽高比取宽,行尾贴近右边界。
+struct ThumbRow {
+    cells: Vec<(usize, f32)>,
+    h: f32,
+}
+
+/// 结算一行:按可用宽度等比缩放整行(行高同步缩放,宽高比不变)。
+fn finish_thumb_row(cur: &[(usize, f32)], used: f32, avail: f32, base: f32, gap: f32) -> ThumbRow {
+    let gaps = gap * cur.len().saturating_sub(1) as f32;
+    let f = ((avail - gaps) / (used - gaps).max(1.0)).clamp(0.72, 1.4);
+    ThumbRow {
+        cells: cur.iter().map(|&(i, w)| (i, w * f)).collect(),
+        h: base * f,
+    }
+}
+
+/// 把一批照片排成「等高、行内不等宽」的行。宽高比取 EXIF 像素,
+/// 缺尺寸信息的按正方形;末行不撑满,按基准高度左对齐。
+fn thumb_rows(
+    rows: &[PhotoRow],
+    cells: &[usize],
+    avail: f32,
+    base: f32,
+    gap: f32,
+) -> Vec<ThumbRow> {
+    let mut out: Vec<ThumbRow> = Vec::new();
+    let mut cur: Vec<(usize, f32)> = Vec::new();
+    let mut used = 0.0f32;
+    let max_w = (avail - gap * 2.0).max(base);
+    for &i in cells {
+        let ar = match (rows[i].width, rows[i].height) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => (w as f32 / h as f32).clamp(0.55, 2.4),
+            _ => 1.0,
+        };
+        let w = (base * ar).min(max_w);
+        let need = used + if cur.is_empty() { 0.0 } else { gap } + w;
+        if !cur.is_empty() && need > avail {
+            out.push(finish_thumb_row(&cur, used, avail, base, gap));
+            cur.clear();
+            used = 0.0;
+        }
+        if !cur.is_empty() {
+            used += gap;
+        }
+        used += w;
+        cur.push((i, w));
+    }
+    if !cur.is_empty() {
+        out.push(ThumbRow {
+            cells: std::mem::take(&mut cur),
+            h: base,
+        });
+    }
+    out
 }
 
 /// 缩略图右上角的星标:已收藏常显,未收藏悬停时才出现;点击切换。
@@ -1831,6 +2010,11 @@ impl TexCache {
 }
 
 impl App {
+    /// 初次设置向导配色:推荐档绿底(服务说明页与照片范围页共用)。
+    const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
+    /// 拒绝档深蓝底。
+    const GRANT_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x5F, 0x8A);
+
     pub fn new(cc: &eframe::CreationContext<'_>, store: Arc<Store>) -> Self {
         // 配色:默认 Picasa 灰,可切蓝黑(设置项 ui_theme,入口在 选项 > 常规)。
         let ui_theme = store
@@ -1892,7 +2076,9 @@ impl App {
             months: Vec::new(),
             folders: Vec::new(),
             selected_folder: 0,
-            view: ViewKind::Timeline,
+            view: ViewKind::Recent,
+            recent_idxs: Vec::new(),
+            recent_date: String::new(),
             texs: TexCache::new(TEX_CACHE_CAP),
             thumb_bg: None,
             scan_busy: Arc::new(AtomicBool::new(false)),
@@ -1951,6 +2137,9 @@ impl App {
             id_row: HashMap::new(),
             preview: None,
             preview_tex: None,
+            anim: None,
+            anim_rx: None,
+            anim_req_for: None,
             preview_bg: None,
             preview_missing: None,
             preview_failed: None,
@@ -1970,6 +2159,8 @@ impl App {
             show_about: false,
             about_cache: Default::default(),
             show_shortcuts: false,
+            updater: crate::update::Updater::new(),
+            update_confirm: false,
             confirm_remove: false,
             show_folder_mgr: false,
             exclude_input: String::new(),
@@ -2003,6 +2194,7 @@ impl App {
             preview_full: None,
             zoom_rx: None,
             zoom_pending: None,
+            zoom_failed_for: None,
             crop_rect: None,
             crop_ratio: None,
             crop_drag: None,
@@ -2083,6 +2275,7 @@ impl App {
             svc_never_ask: false,
             svc_busy: false,
             scope_ask: false,
+            wizard_page: 0,
             scope_choice: InitialScope::Complete,
             name_query: String::new(),
             name_results: Vec::new(),
@@ -2103,6 +2296,19 @@ impl App {
             adopt_queue: std::collections::VecDeque::new(),
             frame_dirs: Vec::new(),
             frame_dirs_seen: std::collections::HashSet::new(),
+            editor_tab: EditorTab::default(),
+            editor_props: true,
+            editor_film: true,
+            editor_hist: None,
+            editor_exif: None,
+            editor_thumbs: HashMap::new(),
+            editor_compare: 0,
+            editor_orig_tex: None,
+            editor_props_tab: 0,
+            editor_tool: None,
+            editor_tool_amount: 50.0,
+            editor_for: None,
+            editor_zoom_cmd: 0,
         }
     }
 
@@ -2111,8 +2317,13 @@ impl App {
         let (stx, srx, _) = spawn_search_worker();
         self.search_tx = Some(stx);
         self.search_rx = Some(srx);
+        // 「不用全盘快查」的意向要先于链路线程落地:线程一起来就会探管道。
+        SVC_LINK_ENABLED.store(
+            self.svc_want() != SvcWant::No,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         // 索引服务链路线程(心跳问 Status、掉线重连、代办装卸与重建)。
-        let (ltx, lrx) = spawn_link_worker(ctx);
+        let (ltx, lrx) = spawn_link_worker(ctx.clone());
         self.link_tx = Some(ltx);
         self.link_rx = Some(lrx);
         // 上次拒绝过装服务 → 本次会话不自动发起(入口仍在,手动可再试)。
@@ -2151,6 +2362,40 @@ impl App {
                 format!("续扫 {} 个上次中断的目录", pending.len())
             };
             self.start_scan_roots(roots, &scope);
+        } else if self.store.scope_initialized() {
+            // 启动增量对账(删除侧):程序关着的时候被外部删掉的照片,这里补摘。
+            // 范围 = 全部监听根(含手动加的文件夹);根离线(盘没挂/目录没了)
+            // 整根跳过,不会误清。增量扫描对未变的文件只 stat 不解码,开销可忽略;
+            // 摘行后同线程清掉对应缩略图缓存。首扫 / 续扫已占用扫描线程时不重复发。
+            let roots = self.store.list_watched();
+            if !roots.is_empty() {
+                self.start_scan_roots_ext(roots, "启动对账", true);
+            }
+        }
+        // 缩略图缓存 GC:清「盘上有文件、库里无此行」的孤儿(旧版本遗留、
+        // 历史清行没带走的那批)。硬排除清理这次真摘了行,或从来没跑过 GC
+        // 时才做一次大扫;后台线程跑,不挡启动。
+        {
+            let purged = self
+                .store
+                .hard_purged
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let first = self.store.get_setting("thumb_gc_v1").is_none();
+            if purged > 0 || first {
+                let store = self.store.clone();
+                let gctx = ctx.clone();
+                std::thread::spawn(move || {
+                    crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+                    let root = crate::db::cache_dir();
+                    // 孤儿文件 GC + 台账缺失对账:前者清「文件在、行没了」的
+                    // 垃圾,后者救「台账在、文件没了」的灰格子(缓存目录被
+                    // 外部清空 / 搬移后的自动恢复)。
+                    let _ = crate::thumbs::gc_orphans(&store, &root);
+                    let _ = crate::thumbs::gc_missing_tiers(&store, &root);
+                    let _ = store.set_setting("thumb_gc_v1", "1");
+                    gctx.request_repaint();
+                });
+            }
         }
         // 方案 P3-18:首次启动先问派生作用域(两档单选、无取消,必须答一次)。
         // 答完才落账 `dir_intent` 并发起首扫;`skip_initial_scan` 偏好短路 ——
@@ -2186,7 +2431,15 @@ impl App {
                     self.svc_install();
                 }
             }
-            SvcWant::No => {}
+            SvcWant::No => {
+                // 启动时只核对状态,不主动弹 UAC:卸载是用户刚表达拒绝时
+                // 立刻做的事(见 svc_apply_want),每次开机都提权反而骚扰。
+                // 若服务还在(上次卸载被取消 / 用户后来手动装回),如实提示。
+                if crate::win::service_installed() {
+                    self.status = "已按你的选择关闭全盘快查;检测到索引服务仍在,可在 选项 > 常规 卸载。"
+                        .into();
+                }
+            }
         }
     }
 
@@ -2206,6 +2459,95 @@ impl App {
     ///
     /// `scan=false` 用于 `skip_initial_scan` 偏好短路 —— 作用域照样落账
     /// (不落账派生门是空的,谁都不出缩略图),只是不发起扫描。
+    /// 授权说明窗正文(向导第 1 页):讲清楚要干什么、要什么权限、能不能撤,
+    /// 两档决定写进 `decided`;勾选态留在 `svc_never_ask` 供窗口层落库。
+    #[cfg(windows)]
+    fn svc_grant_body(&mut self, ui: &mut egui::Ui, decided: &mut Option<SvcWant>) {
+        ui.label("「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。");
+        ui.label("读卷日志属于管理员级操作,所以要装一个后台服务来干这件事 —— 这需要你点一次 UAC。");
+        ui.indent("svc_grant_what", |ui| {
+            ui.label("· 服务名 RelytoMaliangIndex,开机自动启动,只在本机跑;");
+            ui.label("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;");
+            ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
+            ui.label("· 界面本身不提权:它通过本地命名管道向服务问结果;");
+            ui.label("· 不联网、不上传,随时可以在 选项 > 常规 卸载。");
+        });
+        ui.add_space(14.0);
+        // 两档:按钮定宽对齐,说明文字跟在右侧,行距拉开。
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("安装并启动服务(推荐)")
+                            .color(egui::Color32::WHITE)
+                            .strong(),
+                    )
+                    .fill(Self::GRANT_GREEN)
+                    .min_size(egui::vec2(200.0, 30.0))
+                    .corner_radius(6),
+                )
+                .clicked()
+            {
+                *decided = Some(SvcWant::Yes);
+            }
+            ui.small("只有这次弹 UAC。装好后开机自启、持续保鲜索引,以后不再问。");
+        });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("不用全盘快查").color(egui::Color32::WHITE),
+                    )
+                    .fill(Self::GRANT_BLUE_DARK)
+                    .min_size(egui::vec2(200.0, 30.0))
+                    .corner_radius(6),
+                )
+                .clicked()
+            {
+                *decided = Some(SvcWant::No);
+            }
+            ui.small("跳过:若已装过服务会一并移除(需一次 UAC);查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 常规 改。");
+        });
+        ui.add_space(14.0);
+        ui.checkbox(&mut self.svc_never_ask, "不再提示");
+        ui.small("嫌每次启动都问就勾上:选「不用全盘快查」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
+    }
+
+    /// 首启范围窗正文(向导第 2 页):两档单选,**无取消** —— 必须答一次;
+    /// 空账本下派生门谁都不放行,网格全是占位,所以这一页没有跳过。
+    fn scope_ask_body(&mut self, ui: &mut egui::Ui, decided: &mut Option<InitialScope>) {
+        ui.label("整台电脑的文件名都会收进索引 —— 那一步不读文件内容,很快。");
+        ui.label("下面这一档只决定**哪些目录要出缩略图、读拍摄信息**,不影响能不能搜到。");
+        ui.add_space(12.0);
+        ui.radio_value(&mut self.scope_choice, InitialScope::Complete, "全盘");
+        ui.indent("scope_complete_why", |ui| {
+            ui.small("所有磁盘上的图都出缩略图。补齐在后台慢慢跑,眼前的目录优先。");
+        });
+        ui.add_space(6.0);
+        ui.radio_value(&mut self.scope_choice, InitialScope::Limited, "只常用目录");
+        ui.indent("scope_limited_why", |ui| {
+            ui.small("只给「我的文档 / 我的图片 / 桌面」出缩略图。别处的图照样在库里、照样搜得到,点进那个目录时再补。");
+        });
+        ui.add_space(14.0);
+        ui.horizontal(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("确定").color(egui::Color32::WHITE).strong(),
+                    )
+                    .fill(Self::GRANT_GREEN)
+                    .min_size(egui::vec2(120.0, 30.0))
+                    .corner_radius(6),
+                )
+                .clicked()
+            {
+                *decided = Some(self.scope_choice);
+            }
+            ui.small("以后可在 选项 > 常规 改。");
+        });
+    }
+
     fn apply_initial_scope(&mut self, choice: InitialScope, scan: bool) {
         let roots = self.store.apply_initial_scope(choice == InitialScope::Complete);
         self.scope_ask = false;
@@ -2295,14 +2637,22 @@ impl App {
         let _ = self.store.set_setting("svc_declined", "0");
         // 明确选了要装 = 撤回「不再提示」,服务丢失时还要恢复询问。
         let _ = self.store.set_setting("svc_never_ask", "0");
+        // 意向一变立刻同步给链路线程,别等到下次启动才生效。
+        SVC_LINK_ENABLED.store(want != SvcWant::No, std::sync::atomic::Ordering::Relaxed);
         match want {
             SvcWant::Yes => self.svc_install(),
             SvcWant::No => {
-                // 已经装着的服务不会因为用户改主意就自动消失:如实告知,
-                // 卸载是破坏性动作(要停服务、删注册项),交给用户自己点。
+                // 「不用全盘快查」是撤回授权,不只是"这次不弹窗":服务是机器级
+                // 自动启动的,留着它就等于继续常驻提权、继续建全盘索引。
+                // 所以已经装上的要一并卸载(一次 UAC),并立刻断开现有连接。
                 if crate::win::service_installed() {
-                    self.status = "已选「不用全盘索引」;服务仍在运行,要彻底移除请点「卸载索引服务」。"
-                        .into();
+                    self.status = "正在移除索引服务…(需要一次 UAC)".into();
+                    self.svc_uninstall();
+                } else {
+                    self.status = "已关闭全盘快查;发现与保鲜走逐目录扫描。".into();
+                }
+                if let Some(tx) = &self.link_tx {
+                    let _ = tx.send(LinkCmd::Retry);
                 }
             }
             SvcWant::Unasked => {}
@@ -2351,6 +2701,10 @@ impl App {
     /// [`Self::svc_try_start`] —— 意向未定时它先弹说明窗,不是直接弹 UAC。
     #[cfg(windows)]
     fn svc_nudge_on_search_entry(&mut self) {
+        // 明确说过不用的人,进快查页也不该被反复劝装。
+        if self.svc_want() == SvcWant::No {
+            return;
+        }
         if self.link.online || self.link_declined || self.svc_busy || self.svc_ask_grant {
             return;
         }
@@ -2426,9 +2780,25 @@ impl App {
                     let state_only = matches!(op, "停止" | "启动");
                     if state_only {
                         self.status = match (&err, op) {
-                            (None, "停止") => "索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动".into(),
+                            (None, "停止") => {
+                                "索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动".into()
+                            }
                             (None, _) => "索引服务已启动,正在重连…".into(),
-                            (Some(e), _) => format!("{op}索引服务未完成:{e}(可在 选项 > 常规 重试)"),
+                            (Some(e), _) => {
+                                format!("{op}索引服务未完成:{e}(可在 选项 > 常规 重试)")
+                            }
+                        };
+                    } else if op == "卸载" {
+                        // 卸载是「不同意」的落地动作。失败只是移除没完成,
+                        // 绝不能照安装失败那样把 svc_wanted 清成「未问过」——
+                        // 那会让下次启动又弹授权窗、甚至把服务装回来。
+                        self.status = match err {
+                            None => {
+                                "已移除索引服务:全盘快查关闭,发现与保鲜走逐目录扫描。".into()
+                            }
+                            Some(e) => format!(
+                                "移除索引服务未完成:{e}(可在 选项 > 常规 点「卸载索引服务」重试)"
+                            ),
                         };
                     } else {
                         match err {
@@ -2572,11 +2942,16 @@ impl App {
         let svc = self.link.svc;
         let why = self.link.why.clone();
         let busy = self.svc_busy;
-        let head = match svc {
-            S::NotInstalled => "全盘快查未启用(索引服务未安装)",
-            S::Stopped => "索引服务已停止",
-            S::Transition(_) => "索引服务正在启动…",
-            S::Running => "索引服务在运行,但连不上它的管道",
+        let want_no = self.svc_want() == SvcWant::No;
+        let head = if want_no {
+            "全盘快查已按你的选择关闭"
+        } else {
+            match svc {
+                S::NotInstalled => "全盘快查未启用(索引服务未安装)",
+                S::Stopped => "索引服务已停止",
+                S::Transition(_) => "索引服务正在启动…",
+                S::Running => "索引服务在运行,但连不上它的管道",
+            }
         };
         ui.horizontal(|ui| {
             // ⚠ 字形默认字体里没有,用橙色加粗文字代替图标(项目里同口径)。
@@ -2590,20 +2965,29 @@ impl App {
         ui.horizontal(|ui| {
             #[cfg(windows)]
             {
-                let label = match svc {
-                    S::NotInstalled => "安装索引服务…",
-                    S::Stopped | S::Transition(_) => "重新安装并启动服务…",
-                    S::Running => "重试连接",
+                let label = if want_no {
+                    "重新启用全盘快查…"
+                } else {
+                    match svc {
+                        S::NotInstalled => "安装索引服务…",
+                        S::Stopped | S::Transition(_) => "重新安装并启动服务…",
+                        S::Running => "重试连接",
+                    }
                 };
                 if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                    self.link_declined = false;
-                    let _ = self.store.set_setting("svc_declined", "0");
-                    if svc == S::Running {
-                        if let Some(tx) = &self.link_tx {
-                            let _ = tx.send(LinkCmd::Retry);
-                        }
+                    if want_no {
+                        // 主动点回来才算重新授权,直接走 Yes 的装配流程。
+                        self.svc_apply_want(SvcWant::Yes);
                     } else {
-                        self.svc_try_start();
+                        self.link_declined = false;
+                        let _ = self.store.set_setting("svc_declined", "0");
+                        if svc == S::Running {
+                            if let Some(tx) = &self.link_tx {
+                                let _ = tx.send(LinkCmd::Retry);
+                            }
+                        } else {
+                            self.svc_try_start();
+                        }
                     }
                 }
                 if busy {
@@ -2728,13 +3112,16 @@ impl App {
                                 let why = match i32::from(r.rich_state) {
                                     crate::db::RICH_OUT => {
                                         "已在图库数据库里,但它所在的目录未纳入派生作用域:\
-                                         不生成缩略图与元数据。点进该目录、在「工具 → \
-                                         文件夹管理器」里添加它,或在网格里点开这张图,\
-                                         就会开始生成。"
+                                         不生成缩略图与元数据。点进该目录、在网格里点开这张图,\
+                                         或在「工具 → 文件夹管理器」里添加它,就会开始生成。\
+                                         目录在排除名单里(应用缓存一类)时点击不管用,\
+                                         得对着网格里的它右键选「纳入此目录(覆盖排除名单)」。"
                                     }
                                     crate::db::RICH_PENDING => "已纳入范围,派生还没跑到这一条。",
                                     crate::db::RICH_DONE => "已纳入范围并完成派生,网格里能看到。",
-                                    crate::db::RICH_BAD => "文件读取失败(损坏或无权限),已隔离,不再重试。",
+                                    crate::db::RICH_BAD => {
+                                        "文件读取失败(损坏或无权限),已隔离,不再重试。"
+                                    }
                                     _ if r.hit.is_dir => "文件夹不进图库。",
                                     _ => "不是图库收录的媒体类型,或还没被扫描入库。",
                                 };
@@ -2819,6 +3206,199 @@ impl App {
             // 装卸索引服务要等 UAC + 提权子进程(最长 120s),这期间算"在忙"。
             || self.svc_busy
             || self.export_rx.is_some()
+            // 检查/下载/安装更新也在后台跑,让工具栏的指示灯带上这一段。
+            || self.updater.phase.working()
+    }
+
+    /// 帮助 > 检查更新 窗口。
+    ///
+    /// 按钮动作先收成局部标记,出了 egui 闭包再动 `self.updater`:闭包里只持有
+    /// 状态快照,不会被窗口关闭后的可变借用绊住。
+    fn update_window(&mut self, ctx: &egui::Context) {
+        if !self.updater.win_open {
+            return;
+        }
+        use crate::update::Phase;
+        let phase = self.updater.phase.clone();
+        let cfg = self.updater.cfg.clone();
+        let last_check = self.updater.last_check;
+        let notice = self.updater.notice.clone();
+        let working = phase.working();
+        let (mut check, mut download, mut install, mut open_cfg, mut clear_notice) =
+            (false, false, false, false, false);
+        let mut skip_ver: Option<String> = None;
+        let mut open = true;
+
+        egui::Window::new("检查更新")
+            .open(&mut open)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("检查更新");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!("当前版本 v{}", crate::update::CURRENT_VERSION));
+                    });
+                });
+                ui.separator();
+                egui::Grid::new("update_info")
+                    .num_columns(2)
+                    .spacing([10.0, 5.0])
+                    .show(ui, |ui| {
+                        ui.label("状态");
+                        ui.horizontal(|ui| {
+                            if working {
+                                ui.spinner();
+                            }
+                            ui.label(phase.label());
+                        });
+                        ui.end_row();
+                        ui.label("更新地址");
+                        ui.label(if cfg.url.is_empty() {
+                            "未配置(自动更新停用)".to_string()
+                        } else {
+                            cfg.url.clone()
+                        });
+                        ui.end_row();
+                        ui.label("配置文件");
+                        ui.monospace(cfg.path.display().to_string());
+                        ui.end_row();
+                        ui.label("上次检查");
+                        ui.label(update_time_text(last_check));
+                        ui.end_row();
+                        ui.label("索引服务");
+                        ui.label(update_service_text());
+                        ui.end_row();
+                    });
+
+                if let Some(n) = &notice {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(n).color(crate::theme::p().accent));
+                        if ui.small_button("知道了").clicked() {
+                            clear_notice = true;
+                        }
+                    });
+                }
+                let notes = match &phase {
+                    Phase::Found(m) => m.notes.clone(),
+                    Phase::Ready(p) => p.notes.clone(),
+                    _ => String::new(),
+                };
+                if !notes.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("更新说明:");
+                    egui::ScrollArea::vertical()
+                        .id_salt("update_notes")
+                        .max_height(110.0)
+                        .show(ui, |ui| ui.label(&notes));
+                }
+
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(!working, egui::Button::new("立即检查"))
+                        .clicked()
+                    {
+                        check = true;
+                    }
+                    // 自动下载开着时已经在跑了,别让用户又排一次相同的下载。
+                    let can_download = matches!(phase, Phase::Found(_)) && !cfg.auto_download;
+                    if ui
+                        .add_enabled(can_download && !working, egui::Button::new("下载更新"))
+                        .clicked()
+                    {
+                        download = true;
+                    }
+                    let can_install = matches!(phase, Phase::Ready(_)) && !working;
+                    if ui
+                        .add_enabled(can_install, egui::Button::new("安装更新…"))
+                        .clicked()
+                    {
+                        install = true;
+                    }
+                    if let Some(v) = match &phase {
+                        Phase::Found(m) => Some(m.version.clone()),
+                        Phase::Ready(p) => Some(p.version.clone()),
+                        _ => None,
+                    } {
+                        if ui.button("跳过此版本").clicked() {
+                            skip_ver = Some(v);
+                        }
+                    }
+                    if ui.button("打开配置文件").clicked() {
+                        open_cfg = true;
+                    }
+                });
+                ui.add_space(6.0);
+                ui.small("启动后在空闲时才检查(没有输入,且扫描 / 导入 / 服务装卸都不在跑)。");
+                ui.small("发现新版本先提示一次;后台分段下载,断线会保留进度,下载完成再提示一次。");
+                ui.small("安装会等索引服务状态落定后停它(它锁着程序文件),替换完按原状态恢复;需要一次管理员授权。");
+                ui.small("若安装进程意外中断,下次启动会自动把索引服务拉回来。");
+                ui.small("当前窗口继续运行,请尽快重新启动程序以使用新版本(服务与界面版本一致更稳)。");
+                if cfg.url.is_empty() {
+                    ui.add_space(4.0);
+                    ui.small("在配置文件里填 UpdateURL=https://你的域名/清单地址 后即可启用。");
+                }
+            });
+
+        self.updater.win_open = open;
+        if clear_notice {
+            self.updater.notice = None;
+        }
+        if check {
+            self.updater.check_now();
+        }
+        if download {
+            if let Phase::Found(m) = &phase {
+                self.updater.download(m);
+            }
+        }
+        if install {
+            self.update_confirm = true;
+        }
+        if let Some(v) = skip_ver {
+            self.updater.skip(&v);
+        }
+        if open_cfg {
+            crate::update::open_config_file();
+        }
+    }
+
+    /// 安装前的二次确认:这一步会弹 UAC 并短暂停止索引服务,必须让用户明说一次。
+    fn update_confirm_window(&mut self, ctx: &egui::Context) {
+        if !self.update_confirm {
+            return;
+        }
+        let mut open = true;
+        let (mut yes, mut no) = (false, false);
+        let ver = match &self.updater.phase {
+            crate::update::Phase::Ready(p) => p.version.clone(),
+            _ => "新版本".into(),
+        };
+        egui::Window::new("确认安装更新")
+            .open(&mut open)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                ui.label(format!("即将安装 v{ver}。"));
+                ui.add_space(4.0);
+                ui.label("· 索引服务正锁着程序文件,安装时会先等它状态稳定再停止,替换完成后自动恢复。");
+                ui.label("· 停止 / 启动服务需要管理员权限,系统会弹出一次授权确认。");
+                ui.label("· 若安装进程被中断,下次启动程序会自动把索引服务起回来。");
+                ui.label("· 本次会话不会中断;请尽快重新启动程序,让界面和服务都跑在新版本上。");
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("开始安装").clicked() {
+                        yes = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        no = true;
+                    }
+                });
+            });
+        self.update_confirm = open && !yes && !no;
+        if yes {
+            self.updater.apply();
+        }
     }
 
     /// 「查看选项」里的壳目录快捷键(参考件 Desktop / My Docs / My Pictures / My Computer):
@@ -2898,15 +3478,19 @@ impl App {
 
     /// 把一个目录纳进派生作用域并立即放行它的行(方案 P3-19)。
     ///
-    /// 返回是否真的纳进去了。**被排除规则挡住的目录一律不写账本**(2026-11-05 拍板):
-    /// 系统目录、应用缓存、回收站不该因为用户滚到过、或点过一张图,就变成
-    /// 「以后这个目录的图都要派生」。
+    /// 返回是否真的纳进去了。**排除名单分两层**(2026-11-05 拍板):
+    /// - 被动来源(`click` / `visible`)什么都不写 —— 系统目录、应用缓存、回收站
+    ///   不该因为用户滚到过、或点过一张图,就变成「以后这个目录的图都要派生」;
+    /// - `import`(用户在文件夹管理器/导入页明确选中)算**表态**,能覆盖软层,
+    ///   于是 `AppData` 里那类「被规则顺手挡掉、但确实是用户的图」有出口。
+    ///   硬层(参考件 4 条 + 回收站 + 自家产出目录)任何来源都覆盖不了。
     ///
     /// 已纳过的目录不重写账本 —— 免得把用户显式设过的来源(首启对话框 /
     /// 手动导入)冲成 click;但 `promote_dir` 照样跑一遍:并发扫描可能刚
     /// 插进一批 `rich_state=0` 的新行。
     fn include_dir(&mut self, dir: &str, state: &str, source: &str) -> bool {
-        if !self.store.adoptable_dir(dir) {
+        let deliberate = source == crate::db::SRC_IMPORT;
+        if !self.store.adoptable_dir(dir, deliberate) {
             return false;
         }
         if !self.store.dir_intent(dir).is_some_and(|d| d.included()) {
@@ -3088,7 +3672,7 @@ impl App {
                 ui.separator();
                 if self.busy() {
                     ui.add(egui::Spinner::new().size(17.0))
-                        .on_hover_text("后台正在扫描 / 生成缩略图 / 建立索引");
+                        .on_hover_text("后台正在扫描 / 生成缩略图 / 建立索引 / 检查或下载更新");
                 } else {
                     // 不忙也占住同样的宽度,免得指示灯出现时整行左右抖。
                     ui.add_space(23.0);
@@ -3272,13 +3856,39 @@ impl App {
             .enumerate()
             .map(|(i, r)| (r.id, i))
             .collect();
+        // 首页相册成员:启动时从库里读「已有落盘缩略图」的那批,不把全库按时间
+        // 铺一遍(参考件的 Recently Updated 是带上限的虚拟相册)。多取几个候选,
+        // 让硬排除名单把历史脏行挡在相册外;余下的按 SQL 给的时间次序收进清单。
+        let watched = self.store.watched_stats();
+        let roots: Vec<String> = watched.iter().map(|(p, _)| p.clone()).collect();
+        let ids = timeline::load_recent(&self.store, &roots, RECENT_LIMIT * 3).unwrap_or_default();
+        let excl = crate::scan::Exclusions::from_store(&self.store);
+        let mut recent = Vec::with_capacity(RECENT_LIMIT);
+        for id in ids {
+            let Some(&i) = self.id_row.get(&id) else { continue };
+            let dir = self.rows[i].parent.as_str();
+            if dir.is_empty()
+                || matches!(
+                    excl.exclude_layer_dir(Path::new(dir)),
+                    Some(crate::scan::ExcludeLayer::Hard)
+                )
+            {
+                continue;
+            }
+            recent.push(i);
+            if recent.len() >= RECENT_LIMIT {
+                break;
+            }
+        }
+        self.recent_date = cn_date(&timeline::group_date(&self.rows, &recent));
+        self.recent_idxs = recent;
         self.dups = if self.dup_near {
             timeline::dup_groups_near(&self.store, NEAR_DUP_DIST).unwrap_or_default()
         } else {
             timeline::dup_groups(&self.store).unwrap_or_default()
         };
         self.tags = timeline::all_tags(&self.store).unwrap_or_default();
-        self.watched = self.store.watched_stats();
+        self.watched = watched;
         if self.selected_folder >= self.folders.len() {
             self.selected_folder = 0;
         }
@@ -3877,6 +4487,11 @@ impl App {
             self.status = "保存进行中,请稍候…".into();
             return;
         }
+        // 只读速看格式:即便 UI 上误触保存,也不启动会覆盖原文件的后台任务。
+        if self.readonly_media(id) {
+            self.status = "只读速看预览格式不参与保存烘培,原文件保持不变".into();
+            return;
+        }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.bake_rx = Some(rx);
@@ -4018,6 +4633,7 @@ impl App {
     /// 当前视图范围内的照片 id(选择/导出的作用范围与视图一致)。
     fn view_ids(&self) -> Vec<i64> {
         match self.view {
+            ViewKind::Recent => self.recent_idxs.iter().map(|&i| self.rows[i].id).collect(),
             ViewKind::Timeline => self.rows.iter().map(|r| r.id).collect(),
             ViewKind::Folder => {
                 // 铺开全部文件夹时,选择/导出/放映的范围就是整个图库
@@ -4284,9 +4900,7 @@ impl App {
             .ok_or_else(|| format!("未找到 uid64 = {uid} 的照片"))?;
         let path: String = self
             .store
-            .read(|conn| {
-                conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
-            })
+            .read(|conn| conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0)))
             .map_err(|e| e.to_string())?;
         Ok(path)
     }
@@ -4334,6 +4948,10 @@ impl App {
     /// "参数 + op 树实时渲染":滑块一动 op 树立刻重建 → 我方等价实现:
     /// 预览纹理签名随草稿变化而重算。
     fn fx_preview_stack(&self, id: i64) -> crate::effects::FilterStack {
+        // 只读速看格式不套效果:动画帧与合成图都不参与编辑链。
+        if self.readonly_media(id) {
+            return crate::effects::FilterStack::new();
+        }
         let mut st = self.fx_stack_for(id);
         if Some(id) == self.preview {
             if !self.fx_draft.is_identity() {
@@ -4342,11 +4960,68 @@ impl App {
             if !self.fx_curve_draft.is_identity() {
                 st.push(crate::effects::Effect::curves(&self.fx_curve_draft));
             }
-            if let Some(name) = &self.fx_oneclick {
-                st.push(crate::effects::Effect::oneclick(name, Default::default()));
+            // 草稿一律带上当前滑杆参数,预览与「应用」写库的形态完全一致。
+            if let Some(eff) = self.fx_oneclick_draft_effect() {
+                st.push(eff);
+            }
+            if let Some(name) = &self.fx_recipe {
+                let mut params = std::collections::BTreeMap::new();
+                params.insert("amount".into(), format!("{:.4}", self.fx_recipe_amount));
+                st.push(crate::effects::Effect::oneclick(name, params));
+            }
+            // 编辑视图工具格子里选中的带滑杆工具:先只进预览栈,
+            // 点「应用」才落库(与调整页草稿同一套语义)。
+            if let Some(name) = self.editor_tool {
+                st.push(crate::effects::Effect::oneclick(
+                    name,
+                    editor::editor_params(name, self.editor_tool_amount),
+                ));
             }
         }
         st
+    }
+
+    /// 一键效果草稿按当前滑杆值构造(预览与落库共用一份参数)。
+    fn fx_oneclick_draft_effect(&self) -> Option<crate::effects::Effect> {
+        let name = self.fx_oneclick.clone()?;
+        Some(crate::effects::Effect::oneclick(
+            &name,
+            self.fx_oneclick_params(&name),
+        ))
+    }
+
+    /// 一键效果的参数表:颗粒与锐化各有独立滑杆,调色类共用一个。
+    fn fx_oneclick_params(&self, name: &str) -> std::collections::BTreeMap<String, String> {
+        let mut p = std::collections::BTreeMap::new();
+        match name {
+            "grain" => {
+                let preset = crate::oneclick::grain_preset(0);
+                p.insert("amount".into(), format!("{:.4}", self.fx_grain_amount));
+                p.insert("seed".into(), preset.seed.to_string());
+                p.insert("channeloptions".into(), preset.channel_options.to_string());
+                p.insert("grayscale".into(), preset.grayscale.to_string());
+            }
+            "sepia" => {
+                let (mix, shadow, highlight) = crate::oneclick::sepia_default();
+                p.insert("mix".into(), format!("{mix:.4}"));
+                p.insert(
+                    "shadow".into(),
+                    format!("{:02x}{:02x}{:02x}", shadow[0], shadow[1], shadow[2]),
+                );
+                p.insert(
+                    "highlight".into(),
+                    format!("{:02x}{:02x}{:02x}", highlight[0], highlight[1], highlight[2]),
+                );
+            }
+            "unsharp" => {
+                p.insert("amount".into(), format!("{:.4}", self.fx_sharpen_amount));
+            }
+            "warm" | "cool" | "vignette" | "faded" | "tilt" | "shadow" => {
+                p.insert("amount".into(), format!("{:.4}", self.fx_tone_amount));
+            }
+            _ => {}
+        }
+        p
     }
 
     /// 把草稿调整写入选中(或当前预览)的照片,并记入撤销栈。
@@ -4355,6 +5030,16 @@ impl App {
     fn fx_apply_draft(&mut self, targets: &[i64]) {
         if targets.is_empty() {
             self.fx_msg = "没有可应用的照片".into();
+            return;
+        }
+        // 批量应用时把只读格式摘掉:效果写进库记录也只会让预览语义含混。
+        let targets: Vec<i64> = targets
+            .iter()
+            .copied()
+            .filter(|id| !self.readonly_media(*id))
+            .collect();
+        if targets.is_empty() {
+            self.fx_msg = "选中的都是只读速看预览格式,未应用".into();
             return;
         }
         let adj = self.fx_draft.clamped();
@@ -4368,7 +5053,7 @@ impl App {
             .iter()
             .map(|id| (*id, crate::effects::read_stack(&self.store, *id)))
             .collect();
-        let n = match crate::effects::commit_adjust(&self.store, targets, &adj) {
+        let n = match crate::effects::commit_adjust(&self.store, &targets, &adj) {
             Ok(n) => n,
             Err(e) => {
                 self.fx_msg = format!("写入失败: {e}");
@@ -4385,6 +5070,8 @@ impl App {
         }
         // 预览纹理需要重算(签名变化即触发)。
         self.fx_applied_sig = None;
+        self.fx_draft_id = None;
+        self.fx_curve_draft_id = None;
         self.fx_msg = format!("已应用到 {n} 张照片");
     }
 
@@ -4397,6 +5084,9 @@ impl App {
         match crate::effects::undo_commit(&self.store, stack, id) {
             Some((label, _)) => {
                 self.fx_applied_sig = None;
+                // 栈被换回旧状态,两条草稿必须按新栈重新载入,否则预览会叠旧值。
+                self.fx_draft_id = None;
+                self.fx_curve_draft_id = None;
                 self.fx_msg = format!("已撤销: {label}");
             }
             None => self.fx_msg = "无可撤销的操作".into(),
@@ -4412,6 +5102,8 @@ impl App {
         match crate::effects::redo_commit(&self.store, stack, id) {
             Some((label, _)) => {
                 self.fx_applied_sig = None;
+                self.fx_draft_id = None;
+                self.fx_curve_draft_id = None;
                 self.fx_msg = format!("已重做: {label}");
             }
             None => self.fx_msg = "无可重做的操作".into(),
@@ -4443,6 +5135,8 @@ impl App {
         match crate::effects::paste_to(&self.store, targets, &st) {
             Ok(n) => {
                 self.fx_applied_sig = None;
+                self.fx_draft_id = None;
+                self.fx_curve_draft_id = None;
                 self.fx_msg = format!("已粘贴效果到 {n} 张照片");
             }
             Err(e) => self.fx_msg = format!("粘贴失败: {e}"),
@@ -4872,43 +5566,7 @@ impl App {
                     self.fx_msg = "先选一个一键效果".into();
                     return;
                 };
-                let mut params = std::collections::BTreeMap::new();
-                if name == "grain" {
-                    // 用内置的颗粒参数预设。
-                    let preset = crate::oneclick::grain_preset(0);
-                    params.insert("amount".into(), format!("{:.4}", self.fx_grain_amount));
-                    params.insert("seed".into(), format!("{}", preset.seed));
-                    params.insert(
-                        "channeloptions".into(),
-                        format!("{}", preset.channel_options),
-                    );
-                    params.insert("grayscale".into(), preset.grayscale.to_string());
-                }
-                if name == "sepia" {
-                    let (mix, shadow, highlight) = crate::oneclick::sepia_default();
-                    params.insert("mix".into(), format!("{mix:.4}"));
-                    params.insert(
-                        "shadow".into(),
-                        format!("{:02x}{:02x}{:02x}", shadow[0], shadow[1], shadow[2]),
-                    );
-                    params.insert(
-                        "highlight".into(),
-                        format!(
-                            "{:02x}{:02x}{:02x}",
-                            highlight[0], highlight[1], highlight[2]
-                        ),
-                    );
-                }
-                if name == "unsharp" {
-                    params.insert("amount".into(), format!("{:.4}", self.fx_sharpen_amount));
-                }
-                // 自主设计调色:只有一个 amount 参数。
-                if matches!(
-                    name.as_str(),
-                    "warm" | "cool" | "vignette" | "faded" | "tilt" | "shadow"
-                ) {
-                    params.insert("amount".into(), format!("{:.4}", self.fx_tone_amount));
-                }
+                let params = self.fx_oneclick_params(&name);
                 self.fx_commit_effect(
                     id,
                     "一键效果",
@@ -5076,6 +5734,10 @@ impl App {
 
     /// 把一个效果项写进目标照片的效果栈并记入撤销栈。
     fn fx_commit_effect(&mut self, id: i64, label: &str, eff: crate::effects::Effect) {
+        if self.readonly_media(id) {
+            self.fx_msg = "只读速看预览格式不支持编辑效果".into();
+            return;
+        }
         let before = self.fx_stack_for(id);
         let mut after = before.clone();
         after.push(eff);
@@ -5116,6 +5778,10 @@ impl App {
     /// 效果栈的同名项会被替换,所以先把既有 `rot` 的 quarter 累加再提交 ——
     /// 连点两次顺时针 = 180°,四次回到原位(quarter 归零时直接移除该项)。
     fn preview_rotate(&mut self, id: i64, quarter_delta: u32) {
+        if self.readonly_media(id) {
+            self.fx_msg = "只读速看预览格式不支持旋转(不写原文件)".into();
+            return;
+        }
         let cur = self
             .fx_preview_stack(id)
             .items
@@ -5926,7 +6592,7 @@ impl App {
                                     self.svc_apply_want(SvcWant::No);
                                 }
                             });
-                            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默。");
+                            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默;选「不用」会断开连接并移除已装的服务。");
                             if self.store.get_setting("svc_never_ask").as_deref() == Some("1") {
                                 ui.small("已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。");
                             }
@@ -6669,6 +7335,7 @@ impl App {
             self.preview = Some(next_id);
             self.preview_tex = None;
             self.preview_failed = None;
+            self.anim_reset();
             self.preview_reset_zoom();
             debug_assert!(row < self.rows.len());
         }
@@ -6684,6 +7351,10 @@ impl App {
         self.zoom_tex = None;
         self.zoom_rx = None;
         self.zoom_pending = None;
+        self.zoom_failed_for = None;
+        // 裁剪框是相对当前照片的草稿,换图 / 关预览时必须一起丢掉。
+        self.crop_rect = None;
+        self.crop_drag = None;
     }
 
     /// 中间栏按文件夹分组的缓存:`(文件夹, 行下标, 组头日期)`。
@@ -6831,7 +7502,7 @@ impl App {
         let tex = match self.tree_texs.get(&id) {
             Some(t) => Some(t.clone()),
             None => {
-                let t = thumb_tex(ctx, id, tier);
+                let t = thumb_tex(ctx, &self.store, id, tier);
                 if let Some(t) = &t {
                     self.tree_texs.insert(id, t.clone());
                 }
@@ -6844,6 +7515,98 @@ impl App {
             }
             // 还没生成缩略图时留同宽的空位,行不会左右跳。
             None => ui.add_space(18.0),
+        }
+    }
+
+    /// 左栏一条导航项(参考件每个条目后带 `(n)` 计数)。
+    fn nav_item(&mut self, ui: &mut egui::Ui, label: &str, v: ViewKind, count: Option<usize>) {
+        let active = self.view == v;
+        let text = match count {
+            Some(n) => format!("{label} ({n})"),
+            None => label.to_string(),
+        };
+        let rt = if active {
+            egui::RichText::new(text)
+                .color(crate::theme::p().accent_strong)
+                .strong()
+        } else {
+            egui::RichText::new(text).color(crate::theme::p().text)
+        };
+        if ui.selectable_label(active, rt).clicked() && !active {
+            self.set_view(v);
+            // 快速查找:服务连不上就顺势引导启用。
+            #[cfg(windows)]
+            if v == ViewKind::Search {
+                self.svc_nudge_on_search_entry();
+            }
+        }
+    }
+
+    /// 首页「最近更新」的相册头:标题 + 日期 + 张数,右侧挂放映 / 邮件 / 重算。
+    /// 参考件把这一组控件固定放在相册缩略图上方(`album_title`、`info_text`、
+    /// 右侧动作槽),文件夹视图的组头与之同构。
+    fn recent_header(&mut self, ui: &mut egui::Ui) {
+        let n = self.recent_idxs.len();
+        let sub = if self.recent_date.is_empty() {
+            format!("{n} 张照片")
+        } else {
+            format!("{} · {n} 张照片", self.recent_date)
+        };
+        let mut act_play = false;
+        let mut act_mail = false;
+        let mut act_refresh = false;
+        ui.horizontal(|ui| {
+            ui.add(album_icon("images", 26.0));
+            ui.add_space(6.0);
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                ui.add(
+                    egui::Label::new(egui::RichText::new("最近更新").size(17.0).strong())
+                        .selectable(false),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(&sub)
+                            .size(12.0)
+                            .color(crate::theme::p().muted),
+                    )
+                    .selectable(false),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("刷新").clicked() {
+                    act_refresh = true;
+                }
+                if ui
+                    .add(tool_button("mail", false))
+                    .on_hover_text("以邮件发送本相册照片")
+                    .clicked()
+                {
+                    act_mail = true;
+                }
+                if ui
+                    .add(tool_button("play", false))
+                    .on_hover_text("放映本相册幻灯片")
+                    .clicked()
+                {
+                    act_play = true;
+                }
+            });
+        });
+        if act_refresh {
+            self.rebuild();
+            self.status = format!("最近更新已刷新:{} 张", self.recent_idxs.len());
+        }
+        if act_play {
+            let ids = self.view_ids();
+            if self.preview.is_some_and(|p| !ids.contains(&p)) {
+                self.preview = None;
+                self.preview_tex = None;
+            }
+            self.start_slideshow();
+        }
+        if act_mail {
+            self.email_win = true;
         }
     }
 
@@ -6939,32 +7702,26 @@ impl App {
         }
     }
 
-    /// 照片网格(按缩略图档位决定列数与格子大小;选中项加蓝框)。
+    /// 照片网格(参考件的行式排布:同行等高、各格按宽高比取宽、行尾铺满)。
     ///
-    /// P1-9:缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)。
-    /// 列数按格子大小反推,保证一行铺满可用宽度。
+    /// P1-9:缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)决定基准行高。
+    /// 行式布局的行高会随铺满系数浮动,所以先把整批的行算出来再按行虚拟化。
     fn photo_grid(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
         // 显示优先:先把屏幕上排队等纳入的目录消化掉几个(写账 + 放行 + 交给后台优先派生),
         // 再画格子。渲染帧不一次写几十个目录的账,所以有上限。
         self.drain_adopts(MAX_ADOPT_PER_FRAME);
-        let tier = self.thumb_tier;
-        let cell = tier.size() as f32;
-        // 列数:按卡片外框(图片 + 4px 内边距×2)与间距反推,保证一行铺满。
+        let base = self.thumb_tier.size() as f32;
         let gap = 14.0;
-        let card_outer = cell + 8.0;
         let avail = ui.available_width();
-        let cols = ((avail + gap) / (card_outer + gap))
-            .floor()
-            .clamp(2.0, 16.0) as usize;
-        // 行级虚拟化:视口外的行不建 widget,只按同一高度占位。
-        // 行高是确定的(卡片外框 + 该行有说明文字时再加 20px)。
+        let layout = thumb_rows(&self.rows, cells, avail, base, gap);
+        // 行级虚拟化:视口外的行不建 widget,只按该行确定的高度占位。
         // 占位记法:每行连它后面的那个间距一起记(行高 + gap),这样后续行
         // 依旧落在原来的位置;若占位段结尾就是整个网格,得多退一次间距,
         // 否则内容总高会比真实值多出一个 gap。
         let clip = ui.clip_rect();
         // 方案 P4-23④:预取带 —— 视口上下各留这么高的一段,里面的行不建 widget,
         // 但会用当帧**剩余**的解码配额把纹理先暖进缓存(滚动时少闪一帧占位块)。
-        let band = (card_outer + gap) * PREFETCH_ROWS as f32;
+        let band = (base + 8.0 + gap) * PREFETCH_ROWS as f32;
         let ctx = ui.ctx().clone();
         ui.push_id(salt, |ui| {
             ui.spacing_mut().item_spacing.y = gap;
@@ -6973,24 +7730,26 @@ impl App {
             // 整片网格都会被判成"在视口上方"而不画(滚着滚着就全空)。
             let mut y = ui.cursor().top();
             let mut hidden = 0.0f32;
-            for chunk in cells.chunks(cols) {
+            for row in &layout {
                 let cap = if self.thumb_captions
-                    && chunk
+                    && row
+                        .cells
                         .iter()
-                        .any(|&i| !self.rows[i].caption.trim().is_empty())
+                        .any(|&(i, _)| !self.rows[i].caption.trim().is_empty())
                 {
                     20.0
                 } else {
                     0.0
                 };
-                let row_h = card_outer + cap;
+                let row_h = row.h + 8.0 + cap;
                 if y + row_h < clip.min.y || y > clip.max.y {
                     // 整行在视口外:记进占位高度,这一帧不建行。
                     let near = y + row_h + band >= clip.min.y && y <= clip.max.y + band;
                     hidden += row_h + gap;
                     y += row_h + gap;
                     if near {
-                        self.prefetch_row(&ctx, chunk);
+                        let ids: Vec<usize> = row.cells.iter().map(|&(i, _)| i).collect();
+                        self.prefetch_row(&ctx, &ids);
                     }
                     continue;
                 }
@@ -7000,8 +7759,8 @@ impl App {
                 }
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = gap;
-                    for &i in chunk {
-                        self.photo_cell(ui, i, cell);
+                    for &(i, w) in &row.cells {
+                        self.photo_cell(ui, i, w, row.h);
                     }
                 });
                 y += row_h + gap;
@@ -7034,7 +7793,7 @@ impl App {
                 continue;
             }
             self.thumb_decode_count += self.thumb_tier.bytes();
-            match thumb_tex(ctx, id, self.thumb_tier) {
+            match thumb_tex(ctx, &self.store, id, self.thumb_tier) {
                 Some(t) => self.texs.put(id, t),
                 // 磁盘上还没有 → 交给后台 worker 生成(与可见格子同一套语义)。
                 None => self.texs.mark_pending(id),
@@ -7149,6 +7908,27 @@ impl App {
             self.confirm_remove = true;
             ui.close();
         }
+        // 软排除目录的显式出口(2026-11-05 拍板:AppData 也要能访问)。
+        //
+        // 「被动滚到过 / 点过一张图」不写账本,但用户亲手右键选这项 = 表态,
+        // 与导入页同一档(`imported` + `import`)。硬层(回收站、自家缓存、
+        // 参考件那 4 条)这里不给按钮 —— 给了也是点不开的死键。
+        let parent = self.rows[idx].parent.clone();
+        if !self.store.adoptable_dir(&parent, false) && self.store.adoptable_dir(&parent, true) {
+            if ui.button("纳入此目录(覆盖排除名单)").clicked() {
+                let ok =
+                    self.include_dir(&parent, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
+                if ok {
+                    self.publish_visible(&parent);
+                }
+                self.status = if ok {
+                    format!("已纳入 {parent}:该目录的照片正在生成缩略图")
+                } else {
+                    format!("{parent} 仍不能纳入(硬排除名单)")
+                };
+                ui.close();
+            }
+        }
         // 坏文件出口(方案 P3-22,对齐经典图库坏图清单的
         // Hide / Don't Hide):立过案的文件不再每轮重试,这里给两个方向的开关。
         let p = self.rows[idx].path.clone();
@@ -7177,7 +7957,7 @@ impl App {
         }
     }
 
-    fn photo_cell(&mut self, ui: &mut egui::Ui, idx: usize, cell: f32) {
+    fn photo_cell(&mut self, ui: &mut egui::Ui, idx: usize, w: f32, h: f32) {
         let id = self.rows[idx].id;
         let star0 = self.rows[idx].star != 0;
         let selected = self.sel.contains(&id);
@@ -7213,7 +7993,7 @@ impl App {
                     } else {
                         self.thumb_decode_count += self.thumb_tier.bytes();
                         // 只从落盘的该档缩略图读(绝不重解码原图)。
-                        match thumb_tex(ui.ctx(), id, self.thumb_tier) {
+                        match thumb_tex(ui.ctx(), &self.store, id, self.thumb_tier) {
                             Some(t) => {
                                 self.texs.put(id, t.clone());
                                 Some(t)
@@ -7237,7 +8017,7 @@ impl App {
             if cap.is_empty() {
                 None
             } else {
-                let max_chars = ((cell / 7.0) as usize).max(6);
+                let max_chars = ((w / 7.0) as usize).max(6);
                 Some(if cap.chars().count() > max_chars {
                     format!("{}…", cap.chars().take(max_chars - 1).collect::<String>())
                 } else {
@@ -7248,10 +8028,11 @@ impl App {
             None
         };
         let pad = 4.0;
-        let card = cell + pad * 2.0;
         let cap_h = if caption.is_some() { 20.0 } else { 0.0 };
-        let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(card, card + cap_h), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(w + pad * 2.0, h + pad * 2.0 + cap_h),
+            egui::Sense::hover(),
+        );
         // 先取悬停态再登记图片控件,否则图片会盖住整卡的命中区域。
         let hovered = ui.rect_contains_pointer(rect);
         let card_fill = if hovered {
@@ -7262,13 +8043,28 @@ impl App {
         ui.painter()
             .rect_filled(rect, crate::theme::CARD_RADIUS, card_fill);
         let img_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(cell, cell));
+            egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(w, h));
+        // 参考件保留照片本身的宽高比:等比缩进到格子里,不居中裁切。
+        // 缺档时 fit_rect 就是整格,占位块仍铺满格子。
+        let fit_rect = match &tex {
+            Some(t) => {
+                let (tw, th) = (t.size()[0].max(1) as f32, t.size()[1].max(1) as f32);
+                let ar = tw / th;
+                let size = if ar > w / h {
+                    egui::vec2(w, w / ar)
+                } else {
+                    egui::vec2(h * ar, h)
+                };
+                let c = img_rect.center();
+                let half = size * 0.5;
+                egui::Rect::from_min_max(c - half, c + half)
+            }
+            None => img_rect,
+        };
         if let Some(ref t) = tex {
-            // 居中裁切成正方形(参考件缩略图网格等宽等高)。
             ui.put(
-                img_rect,
-                egui::Image::new((t.id(), img_rect.size()))
-                    .uv(cover_uv(t.size()))
+                fit_rect,
+                egui::Image::new((t.id(), fit_rect.size()))
                     .corner_radius(crate::theme::IMAGE_RADIUS),
             );
         } else {
@@ -7282,7 +8078,7 @@ impl App {
             // RICH_BAD 才是真的读不出来。小档格子(96px)放不下长句,退成短版,
             // 全称挂在悬停上。
             let ph = match rich {
-                crate::db::RICH_OUT if cell >= 100.0 => "未纳入派生作用域",
+                crate::db::RICH_OUT if w >= 100.0 => "未纳入派生作用域",
                 crate::db::RICH_OUT => "未纳入范围",
                 crate::db::RICH_BAD => "读取失败",
                 _ => "载入中…",
@@ -7295,10 +8091,10 @@ impl App {
                 crate::theme::p().faint,
             );
         }
-        // P2-17:视频条目左上角 ▶ 徽标。
+        // P2-17:视频条目左上角 ▶ 徽标(贴着实际图片边界,不贴卡片留白)。
         if self.rows[idx].kind == crate::video::kind::MOVIE {
             ui.painter().text(
-                img_rect.left_top() + egui::vec2(6.0, 5.0),
+                fit_rect.left_top() + egui::vec2(6.0, 5.0),
                 egui::Align2::LEFT_TOP,
                 "▶",
                 egui::FontId::proportional(15.0),
@@ -7315,13 +8111,15 @@ impl App {
             } else {
                 "这张照片所在的目录未纳入派生作用域:图库收了它的名字与路径,\
                  但不生成缩略图、不抽 EXIF —— 这是门控,不是失败。\
-                 点一下这张图(或点进它所在的目录)就会开始生成;\
-                 排除名单里的目录(系统目录、应用缓存、回收站一类)不会。"
+                 点一下这张图(或点进它所在的目录)就会开始生成。\
+                 在排除名单里的目录(应用缓存、系统目录一类)要点不动,\
+                 得右键选「纳入此目录(覆盖排除名单)」;回收站和图库自己的\
+                 缓存目录任何办法都不收。"
             })
         } else {
             hit
         };
-        thumb_star(ui, id, star0, img_rect, hovered, &mut star_clicked);
+        thumb_star(ui, id, star0, fit_rect, hovered, &mut star_clicked);
         let ring = if selected {
             crate::theme::p().accent
         } else if hovered {
@@ -7359,10 +8157,18 @@ impl App {
             if self.rows[idx].rich_state == crate::db::RICH_OUT {
                 let dir = self.rows[idx].parent.clone();
                 if !self.enter_dir(&dir) {
-                    self.status = format!(
-                        "{dir} 属于排除名单(系统目录、应用缓存、回收站一类),图库不为它生成缩略图;\
-                         要收进来请在「工具 → 文件夹管理器」里调整「扫描时排除的目录」。"
-                    );
+                    let hard = !self.store.adoptable_dir(&dir, true);
+                    self.status = if hard {
+                        format!(
+                            "{dir} 属于硬排除名单(回收站、图库自己的缓存目录一类),\
+                             这里面的图不是照片,不生成缩略图。"
+                        )
+                    } else {
+                        format!(
+                            "{dir} 在排除名单里(系统目录、应用缓存一类),点一张图不足以把它收进图库;\
+                             确实要收,对着这张图右键选「纳入此目录(覆盖排除名单)」。\
+                             也可以在「工具 → 文件夹管理器」里调整「扫描时排除的目录」。")
+                    };
                 }
             }
             if ctrl_click(ui) {
@@ -7401,6 +8207,153 @@ impl App {
         }
     }
 
+    /// 只读速看预览格式(GIF / 动图 WebP / PSD / PSB)的公共判定。
+    /// 编辑、旋转、烘培、效果面板都以此为准,避免各处口径不一致。
+    pub(super) fn readonly_media(&self, id: i64) -> bool {
+        self.photo_path(id)
+            .map(|p| crate::scan::is_readonly_media(Path::new(&p)))
+            .unwrap_or(false)
+    }
+
+    /// 只读格式在界面上给的说明(没有则 None)。
+    pub(super) fn readonly_hint(&self, id: i64) -> Option<&'static str> {
+        let p = self.photo_path(id)?;
+        let ext = Path::new(&p)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)?;
+        match ext.as_str() {
+            "gif" => Some("GIF 只读速看:逐帧播放,不保存、不旋转、不编辑原文件"),
+            "webp" if self.readonly_media(id) => {
+                Some("动图 WebP 只读速看:逐帧播放,不保存、不旋转、不编辑原文件")
+            }
+            "psd" | "psb" => Some(
+                "PSD/PSB 只读速看:显示合并合成图,可能与图层结果不同;不保存、不旋转、不编辑",
+            ),
+            _ => None,
+        }
+    }
+
+    /// 发起动图帧序列的后台解码;非动图路径直接跳过。
+    fn anim_request(&mut self, id: i64) {
+        let Some(path) = self.photo_path(id) else {
+            return;
+        };
+        let p = PathBuf::from(path);
+        if !crate::anim::maybe_animated(&p) || !p.exists() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.anim_rx = Some(rx);
+        std::thread::spawn(move || {
+            let clip = crate::anim::decode_clip(&p);
+            let _ = tx.send((id, clip));
+        });
+    }
+
+    /// 换图 / 关预览时释放帧序列(一张动图可能占几十 MB)。
+    fn anim_reset(&mut self) {
+        self.anim = None;
+        self.anim_rx = None;
+        self.anim_req_for = None;
+    }
+
+    /// 收后台解码结果;换图后的滞后结果直接丢弃。
+    fn anim_pump(&mut self) {
+        let got = match &self.anim_rx {
+            Some(rx) => match rx.try_recv() {
+                Ok(v) => Some(v),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some((0, None)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+            },
+            None => None,
+        };
+        if let Some((rid, clip)) = got {
+            self.anim_rx = None;
+            if Some(rid) == self.preview {
+                if let Some(clip) = clip {
+                    self.anim = Some(AnimState {
+                        id: rid,
+                        clip,
+                        tex: None,
+                        playing: true,
+                        elapsed_ms: 0,
+                        tick: std::time::Instant::now(),
+                        frame: usize::MAX,
+                    });
+                    // 静态预览纹理不再需要,避免同时占两份显存。
+                    self.preview_tex = None;
+                }
+            }
+        }
+    }
+
+    /// 按帧延迟推进时间轴并就地更新同一张 GPU 纹理(不每帧新建句柄)。
+    fn anim_tick(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
+        let now = std::time::Instant::now();
+        let st = self.anim.as_mut()?;
+        if st.playing {
+            st.elapsed_ms = st
+                .elapsed_ms
+                .saturating_add(u64::try_from(st.tick.elapsed().as_millis()).unwrap_or(u64::MAX));
+        }
+        st.tick = now;
+        let last = st.clip.len().saturating_sub(1);
+        let (idx, remain) = match st.clip.frame_index_at(st.elapsed_ms) {
+            Some(v) => v,
+            None => {
+                st.playing = false;
+                (last, 0)
+            }
+        };
+        if idx != st.frame || st.tex.is_none() {
+            st.frame = idx;
+            let f = &st.clip.frames[idx];
+            let size = [f.rgba.width() as usize, f.rgba.height() as usize];
+            let ci = egui::ColorImage::from_rgba_unmultiplied(size, f.rgba.as_raw());
+            match &mut st.tex {
+                Some(t) => t.set(ci, egui::TextureOptions::default()),
+                None => {
+                    st.tex = Some(ctx.load_texture(
+                        format!("anim-{}", st.id),
+                        ci,
+                        egui::TextureOptions::default(),
+                    ));
+                }
+            }
+        }
+        if st.playing {
+            ctx.request_repaint_after(std::time::Duration::from_millis(remain.max(16)));
+        }
+        st.tex.clone()
+    }
+
+    /// 顶栏播放/暂停按钮:只在有帧序列时才有意义。
+    pub(super) fn anim_toggle(&mut self) {
+        if let Some(st) = &mut self.anim {
+            st.playing = !st.playing;
+            st.tick = std::time::Instant::now();
+        }
+    }
+
+    /// 顶栏的帧进度文案(没有动图时 None)。
+    pub(super) fn anim_status(&self, id: i64) -> Option<String> {
+        let st = self.anim.as_ref()?;
+        if st.id != id {
+            return None;
+        }
+        Some(format!(
+            "动图 {}/{} 帧 · {}",
+            st.frame.min(st.clip.len() - 1) + 1,
+            st.clip.len(),
+            if st.playing { "播放中" } else { "已暂停" }
+        ))
+    }
+
+    pub(super) fn anim_playing(&self, id: i64) -> bool {
+        self.anim.as_ref().map(|a| a.id == id && a.playing).unwrap_or(false)
+    }
+
     /// 预览大图纹理(最长边 ≤ 1024;首次打开同步加载一次,按 EXIF 方向摆正)。
     ///
     /// P0-7:相机 RAW 由 `thumbs::load_for_preview` 借 Windows Shell 缩略图扩展解码,
@@ -7423,6 +8376,17 @@ impl App {
         // 不支持格式的文件反复唤醒);换图后由 step/打开处清空重试。
         if self.preview_failed == Some(id) {
             return None;
+        }
+        // 动图:帧序列解出来后按延迟轮播;解码期间先沿用常规静态首帧。
+        self.anim_pump();
+        if self.anim.as_ref().map(|a| a.id) == Some(id) {
+            return self.anim_tick(ctx);
+        }
+        if self.anim_req_for != Some(id) {
+            self.anim = None;
+            self.anim_rx = None;
+            self.anim_req_for = Some(id);
+            self.anim_request(id);
         }
         // P2-16:预览渲染要叠加该照片的效果栈(op 树实时渲染)。
         // 签名 = 照片 id + 效果栈序列化;变了才重算纹理。
@@ -7455,6 +8419,8 @@ impl App {
                 // P2-16:在解码后的像素上套用效果栈(op 树在此位置执行)。
                 let mut rgba = img.to_rgba8();
                 crate::effects::apply_stack(&mut rgba, &stack);
+                // 直方图跟着效果栈走:只在纹理重算时统计一次(编辑视图左栏画)。
+                self.editor_hist = Some((id, sig.clone(), Histogram::of(&rgba)));
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
                 let tex = ctx.load_texture(
@@ -7713,6 +8679,8 @@ mod tests {
 impl eframe::App for App {
     /// 退出时停掉后台缩略图 worker(不留游离线程)。
     fn on_exit(&mut self) {
+        // 自动更新后台线程:让它自己收尾,别留一条游离线程被进程硬砍。
+        self.updater.stop();
         if let Some(w) = self.thumb_bg.take() {
             w.stop();
         }
@@ -7729,6 +8697,10 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // P1-9:每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
         self.thumb_decode_count = 0;
+        // 自动更新:空闲门控与后台事件回流放在帧首 —— 幻灯片/编辑视图会提前
+        // return,放在后面就收不到「发现新版本」的提示了。
+        let app_busy = self.busy();
+        self.updater.tick(ctx, app_busy);
         // 显示优先(2026-11-05 拍板):上一帧真正画在屏幕上的目录整批发给后台 worker
         // 当第一优先 —— 用户看哪儿,缩略图就先补哪儿。在帧首发是为了拿得到「上一帧
         // 的完整清单」:网格分多个 section 画,帧尾没有自然的收口点。
@@ -7787,7 +8759,12 @@ impl eframe::App for App {
                     None => {
                         let mut msg = format!(
                             "{}{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
-                            self.scan_verb, r.scope, r.scanned, r.indexed, r.unchanged, r.excluded_dirs
+                            self.scan_verb,
+                            r.scope,
+                            r.scanned,
+                            r.indexed,
+                            r.unchanged,
+                            r.excluded_dirs
                         );
                         if r.removed > 0 {
                             msg.push_str(&format!(";{} 个已消失文件移出图库", r.removed));
@@ -8131,13 +9108,13 @@ impl eframe::App for App {
             if esc {
                 // P1-8:ESC 优先取消正在进行的扫描
                 // (ESC 取消绑定);
-                // 没有扫描时才关闭预览窗。
+                // 没有扫描时才关闭预览窗(同时丢弃编辑视图里未提交的工具草稿)。
                 if let Some(ctrl) = &self.scan_ctrl {
                     ctrl.cancel();
                     self.status = format!("正在取消{}…", self.scan_verb);
                 } else {
-                    self.preview = None;
-                    self.preview_tex = None;
+                    // 与左栏「返回到图片库」走同一套清理,避免两处状态不一致。
+                    self.editor_back_to_library();
                 }
             }
             if self.preview.is_some() {
@@ -8174,6 +9151,27 @@ impl eframe::App for App {
                     self.dispatch_throttle_event(crate::scroll::SCROLL_EVENTS[1]);
                 }
             }
+        }
+
+        // 预览已关闭:释放帧序列与在途解码(所有关闭路径的统一兜底)。
+        if self.preview.is_none()
+            && (self.anim.is_some() || self.anim_rx.is_some() || self.anim_req_for.is_some())
+        {
+            self.anim_reset();
+        }
+
+        // 单图编辑视图:打开预览后整页接管,返回图库即恢复常规面板。
+        // 版式取自参考件 View and Edit:左工具 / 中预览 / 右属性,
+        // 顶部导航与底部邻片条常驻,工具不必再从菜单里翻出来。
+        if self.preview.is_some() {
+            self.editor_ui(ctx);
+            if self.show_options {
+                self.options_ui(ctx);
+            }
+            // 编辑视图提前返回,通用提示窗仍要画(否则后台消息会一直憋到回图库)。
+            self.update_window(ctx);
+            self.update_confirm_window(ctx);
+            return;
         }
 
         // ===== 菜单栏(结构参照 Picasa 3:文件/编辑/视图/工具/帮助) =====
@@ -8369,6 +9367,13 @@ impl eframe::App for App {
                     });
                     // —— 视图 ——
                     ui.menu_button("视图(V)", |ui| {
+                        if ui
+                            .selectable_label(self.view == ViewKind::Recent, "最近更新")
+                            .clicked()
+                        {
+                            self.set_view(ViewKind::Recent);
+                            ui.close();
+                        }
                         if ui
                             .selectable_label(self.view == ViewKind::Timeline, "时间线")
                             .clicked()
@@ -8654,6 +9659,12 @@ impl eframe::App for App {
                             self.show_shortcuts = true;
                             ui.close();
                         }
+                        if ui.button("检查更新…").clicked() {
+                            // 手动入口:立刻联网,不等空闲窗口,也不看检查间隔。
+                            self.updater.check_now();
+                            self.updater.win_open = true;
+                            ui.close();
+                        }
                         if ui.button("关于 Relyto.Maliang…").clicked() {
                             self.show_about = true;
                             ui.close();
@@ -8740,6 +9751,13 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     ui.label(&self.status);
+                    // 自动更新只在状态栏留一句可点的提示,不常驻弹窗打扰看图。
+                    if let Some(hint) = self.updater.phase.status_hint() {
+                        ui.separator();
+                        if ui.link(format!("{hint} · 点此查看")).clicked() {
+                            self.updater.win_open = true;
+                        }
+                    }
                     // P1-9:当前档位的缓存进度(已生成 / 总数)。
                     // 计数只在切档 / 批次回报 / 重建图库时刷新,不逐帧查库。
                     let cached = self.tier_cached;
@@ -8791,7 +9809,9 @@ impl eframe::App for App {
                 .width_range(260.0..=460.0)
                 .frame(crate::theme::side_frame())
                 .show(ctx, |ui| {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
                         self.fx_panel_ui(ui);
                     });
                 });
@@ -8815,36 +9835,51 @@ impl eframe::App for App {
                     return;
                 }
                 crate::theme::section_title(ui, "库");
-                let mut navs: Vec<(&str, ViewKind)> = vec![
-                    ("最近更新", ViewKind::Timeline),
-                    ("相簿", ViewKind::Albums),
-                    ("文件夹", ViewKind::Folder),
-                ];
+                // 参考件左栏是四个可折叠分组头(相册 / 人物 / 文件夹 / 其他素材),
+                // 每条带 (n) 计数;分组区限高,下面留给随视图切换的明细面板。
+                let recent_n = self.recent_idxs.len();
+                let folders_n = self.folders.len();
+                let tags_n = self.tags.len();
+                let dups_n = self.dups.len();
                 #[cfg(feature = "ai")]
-                navs.push(("人物", ViewKind::Faces));
-                navs.push(("标签", ViewKind::Tags));
-                #[cfg(feature = "ai")]
-                navs.push(("语义搜索", ViewKind::Semantic));
-                navs.push(("重复照片", ViewKind::Duplicates));
-                navs.push(("快速查找", ViewKind::Search));
-                for (label, v) in navs {
-                    let active = self.view == v;
-                    let text = if active {
-                        egui::RichText::new(label)
-                            .color(crate::theme::p().accent_strong)
-                            .strong()
-                    } else {
-                        egui::RichText::new(label).color(crate::theme::p().text)
-                    };
-                    if ui.selectable_label(active, text).clicked() && !active {
-                        self.set_view(v);
-                        // 快速查找:服务连不上就顺势引导启用(意向未定时先弹说明窗)。
-                        #[cfg(windows)]
-                        if v == ViewKind::Search {
-                            self.svc_nudge_on_search_entry();
-                        }
-                    }
-                }
+                let people_n = self.face_people.len();
+                egui::ScrollArea::vertical()
+                    .id_salt("nav-groups")
+                    // egui 0.33 默认 auto_shrink 两轴都开,横向会缩到内容宽,
+                    // 面板右半边留空;这里横向必须撑满。
+                    .auto_shrink([false, true])
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        egui::CollapsingHeader::new(egui::RichText::new("相册").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.nav_item(ui, "最近更新", ViewKind::Recent, Some(recent_n));
+                                self.nav_item(ui, "相簿", ViewKind::Albums, None);
+                            });
+                        egui::CollapsingHeader::new(egui::RichText::new("人物").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                #[cfg(feature = "ai")]
+                                self.nav_item(ui, "人物", ViewKind::Faces, Some(people_n));
+                                #[cfg(not(feature = "ai"))]
+                                ui.label("(未启用人物功能)");
+                            });
+                        egui::CollapsingHeader::new(egui::RichText::new("文件夹").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.nav_item(ui, "文件夹", ViewKind::Folder, Some(folders_n));
+                            });
+                        egui::CollapsingHeader::new(egui::RichText::new("其他素材").strong())
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                self.nav_item(ui, "时间线", ViewKind::Timeline, None);
+                                self.nav_item(ui, "标签", ViewKind::Tags, Some(tags_n));
+                                #[cfg(feature = "ai")]
+                                self.nav_item(ui, "语义搜索", ViewKind::Semantic, None);
+                                self.nav_item(ui, "重复照片", ViewKind::Duplicates, Some(dups_n));
+                                self.nav_item(ui, "快速查找", ViewKind::Search, None);
+                            });
+                    });
                 ui.add_space(6.0);
                 ui.separator();
                 match self.view {
@@ -8869,7 +9904,9 @@ impl eframe::App for App {
                                 },
                             );
                         });
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             if self.folder_tree {
                                 // 真递归目录树:每层缩进,三角展开/收起;
                                 // 只有装了照片的目录才是可选项(点父级 = 展开)。
@@ -8911,7 +9948,9 @@ impl eframe::App for App {
                             }
                         });
                         ui.separator();
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             for (aid, name, n) in albums {
                                 if ui
                                     .selectable_label(
@@ -8952,7 +9991,9 @@ impl eframe::App for App {
                     ViewKind::Tags => {
                         crate::theme::section_title(ui, "标签");
                         ui.label(format!("共 {} 个(右键设颜色)", self.tags.len()));
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             for t in self.tags.clone() {
                                 ui.horizontal(|ui| {
                                     let (rect, _) = ui.allocate_exact_size(
@@ -9038,7 +10079,9 @@ impl eframe::App for App {
                                 });
                             }
                         }
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             for p in self.sorted_people() {
                                 let display = p
                                     .person
@@ -9139,7 +10182,9 @@ impl eframe::App for App {
                         }
                         ui.separator();
                         ui.label(format!("结果 {} 张", self.clip_results.len()));
-                        egui::ScrollArea::vertical().show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                             for (pid, score) in self.clip_results.clone() {
                                 let path = self
                                     .id_row
@@ -9161,7 +10206,10 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    ViewKind::Timeline | ViewKind::Duplicates | ViewKind::Search => {
+                    ViewKind::Recent
+                    | ViewKind::Timeline
+                    | ViewKind::Duplicates
+                    | ViewKind::Search => {
                         crate::theme::section_title(ui, "当前视图");
                         ui.label(format!("{} 张", self.view_ids().len()));
                     }
@@ -9200,6 +10248,32 @@ impl eframe::App for App {
             }
             let out = gallery.show(ui, |ui| {
                 match self.view {
+                    ViewKind::Recent => {
+                        // 首页:相册头(标题 / 日期 / 张数 / 动作) → 已缓存成员的
+                        // 行式缩略图。成员清单在 rebuild 时算好,这里不碰全表。
+                        self.recent_header(ui);
+                        ui.add_space(6.0);
+                        if self.recent_idxs.is_empty() {
+                            ui.label(
+                                "最近更新里还没有照片:等缩略图生成后点上方「刷新」,\
+                                 或到「文件夹」里点开一个目录。",
+                            );
+                        } else {
+                            if self.recent_idxs.len() < 20 && !self.watched.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "首页只显示已纳入管理的文件夹里的照片;\
+                                         要收进更多目录,到「文件夹」视图里添加监听。",
+                                    )
+                                    .size(11.0)
+                                    .color(crate::theme::p().muted),
+                                );
+                                ui.add_space(4.0);
+                            }
+                            let cells = self.recent_idxs.clone();
+                            self.photo_grid(ui, "recent-grid", &cells);
+                        }
+                    }
                     ViewKind::Timeline => {
                         let months = std::mem::take(&mut self.months);
                         for (label, idxs) in &months {
@@ -9519,568 +10593,7 @@ impl eframe::App for App {
             self.last_content_h = out.content_size.y;
         });
 
-        // 预览编辑窗
-        let mut preview_open = self.preview.is_some();
-        if let Some(id) = self.preview {
-            if !self.id_row.contains_key(&id) {
-                self.preview = None; // 照片已不在图库(被移除或删除)
-                self.preview_tex = None;
-                self.preview_base = None;
-                self.preview_missing = None;
-                self.preview_failed = None;
-            } else {
-                let &idx = self.id_row.get(&id).unwrap();
-                egui::Window::new("照片预览")
-                    .open(&mut preview_open)
-                    .resizable(true)
-                    .default_size([780.0, 860.0])
-                    .show(ctx, |ui| {
-                        // 导航行:翻页后本帧直接返回,下一帧按新索引渲染
-                        let mut stepped = false;
-                        ui.horizontal(|ui| {
-                            if ui.button("◀ 上一张").clicked() {
-                                self.step_preview(-1);
-                                stepped = true;
-                            }
-                            if ui.button("下一张 ▶").clicked() {
-                                self.step_preview(1);
-                                stepped = true;
-                            }
-                            ui.separator();
-                            // 90° 直角旋转(参考件编辑视图的两个旋转按钮)。
-                            if ui.button("↺ 逆时针").clicked() {
-                                self.preview_rotate(id, 3);
-                            }
-                            if ui.button("↻ 顺时针").clicked() {
-                                self.preview_rotate(id, 1);
-                            }
-                            // 属性(参考件图片菜单含属性项;预览窗里即当前照片)。
-                            if ui.button("属性").clicked() {
-                                self.show_props = true;
-                            }
-                            #[cfg(feature = "ai")]
-                            {
-                                if ui.checkbox(&mut self.show_face_boxes, "人脸框").changed() {
-                                    self.preview_boxes = None;
-                                }
-                                if ui.checkbox(&mut self.show_ocr_boxes, "识别框").changed() {
-                                    self.preview_boxes = None;
-                                }
-                            }
-                        });
-                        if stepped {
-                            return;
-                        }
-                        // 缩放/平移状态归属检查:换照片自动复位(参考件换图回到适应窗口)。
-                        if self.zoom_active_for != Some(id) {
-                            self.preview_reset_zoom();
-                            self.zoom_active_for = Some(id);
-                        }
-                        // 收取全图解码结果(放大超过预览档分辨率时按需解码)。
-                        if let Some(rx) = &self.zoom_rx {
-                            match rx.try_recv() {
-                                Ok((rid, Some(img))) => {
-                                    if Some(rid) == self.preview {
-                                        self.preview_full = Some((rid, img));
-                                        self.zoom_tex = None; // 触发全图重合成
-                                    }
-                                    self.zoom_rx = None;
-                                    self.zoom_pending = None;
-                                }
-                                Ok((_, None)) => {
-                                    // 解码失败或超过内存上限:停在预览档。
-                                    self.zoom_rx = None;
-                                    self.zoom_pending = None;
-                                    self.fx_msg =
-                                        "原图过大或解码失败,放大显示停留在预览档清晰度".into();
-                                }
-                                Err(mpsc::TryRecvError::Empty) => {}
-                                Err(mpsc::TryRecvError::Disconnected) => {
-                                    self.zoom_rx = None;
-                                    self.zoom_pending = None;
-                                }
-                            }
-                        }
-                        ui.separator();
-                        let tex = self.preview_tex(ctx);
-                        if let Some(t) = tex {
-                            let [tw, th] = t.size();
-                            let mut to_100 = false;
-                            // 缩放工具行(与参考件一致的手势 + 等价按钮)。
-                            ui.horizontal(|ui| {
-                                if ui.button("−").clicked() {
-                                    self.preview_zoom = (self.preview_zoom / 1.25).max(1.0);
-                                }
-                                if ui.button("100%").clicked() {
-                                    to_100 = true;
-                                }
-                                if ui.button("+").clicked() {
-                                    self.preview_zoom = (self.preview_zoom * 1.25).min(8.0);
-                                }
-                                ui.label(format!("{:.0}%", self.preview_zoom * 100.0));
-                                if ui.button("适应窗口").clicked() {
-                                    self.preview_zoom = 1.0;
-                                    self.preview_pan = egui::Vec2::ZERO;
-                                }
-                                ui.separator();
-                                // 裁剪工具开关(参考件 Crop)。
-                                if ui.selectable_label(self.crop_mode, "裁剪").clicked() {
-                                    self.crop_mode = !self.crop_mode;
-                                    self.crop_rect = None;
-                                    self.crop_drag = None;
-                                }
-                            });
-                            // 裁剪工具行:比例预设(经典图库宽高比清单)+ 应用/取消。
-                            if self.crop_mode {
-                                ui.horizontal(|ui| {
-                                    ui.label("比例:");
-                                    let mut presets: Vec<(String, Option<(f32, f32)>)> = vec![
-                                        ("自由".into(), None),
-                                        ("原比例".into(), Some((tw as f32, th as f32))),
-                                        ("4 : 3(屏幕)".into(), Some((4.0, 3.0))),
-                                        ("3 : 2(打印)".into(), Some((3.0, 2.0))),
-                                        ("16 : 9(电影)".into(), Some((16.0, 9.0))),
-                                        ("16 : 10".into(), Some((16.0, 10.0))),
-                                        ("1 : 1(方形)".into(), Some((1.0, 1.0))),
-                                        ("4 : 6".into(), Some((4.0, 6.0))),
-                                        ("5 : 7".into(), Some((5.0, 7.0))),
-                                        ("8 : 10".into(), Some((8.0, 10.0))),
-                                        ("10 : 15".into(), Some((10.0, 15.0))),
-                                        ("9 : 13".into(), Some((9.0, 13.0))),
-                                    ];
-                                    for (n, w, h) in self.custom_ratios.clone() {
-                                        presets.push((format!("{n}({w:.0}×{h:.0})"), Some((w, h))));
-                                    }
-                                    let cur = match self.crop_ratio {
-                                        None => "自由".to_string(),
-                                        Some((w, h)) => format!("{w:.0} : {h:.0}"),
-                                    };
-                                    egui::ComboBox::from_id_salt("crop_ratio")
-                                        .selected_text(cur)
-                                        .show_ui(ui, |ui| {
-                                            for (label, r) in &presets {
-                                                if ui
-                                                    .selectable_label(self.crop_ratio == *r, label)
-                                                    .clicked()
-                                                {
-                                                    self.crop_ratio = *r;
-                                                }
-                                            }
-                                        });
-                                    if let Some((w, h)) = self.crop_ratio {
-                                        if ui.button("⇄ 对调").clicked() {
-                                            self.crop_ratio = Some((h, w));
-                                        }
-                                    }
-                                    if ui.button("应用裁剪").clicked() {
-                                        self.commit_crop(id);
-                                    }
-                                    if ui.button("取消").clicked() {
-                                        self.crop_mode = false;
-                                        self.crop_rect = None;
-                                        self.crop_drag = None;
-                                    }
-                                });
-                                // 自定义比例录入(参考件 Add Custom Aspect Ratio:宽 × 高 + 名称)。
-                                ui.horizontal(|ui| {
-                                    ui.label("自定义比例:");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.crop_cw)
-                                            .desired_width(40.0),
-                                    );
-                                    ui.label("×");
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.crop_ch)
-                                            .desired_width(40.0),
-                                    );
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.crop_cname)
-                                            .hint_text("名称")
-                                            .desired_width(90.0),
-                                    );
-                                    if ui.button("保存为预设").clicked() {
-                                        if let (Ok(w), Ok(h)) = (
-                                            self.crop_cw.trim().parse::<f32>(),
-                                            self.crop_ch.trim().parse::<f32>(),
-                                        ) {
-                                            if w > 0.0 && h > 0.0 {
-                                                let name = if self.crop_cname.trim().is_empty() {
-                                                    format!("{w:.0}:{h:.0}")
-                                                } else {
-                                                    self.crop_cname.trim().to_string()
-                                                };
-                                                self.custom_ratios.push((name, w, h));
-                                                self.save_custom_ratios();
-                                                self.crop_cw.clear();
-                                                self.crop_ch.clear();
-                                                self.crop_cname.clear();
-                                            }
-                                        }
-                                    }
-                                });
-                            }
-                            // 图区:滚动缩放 / 拖拽平移 / 双击切换。全图放大时
-                            // 几何以预览档比例计算(等比,几何与分辨率无关)。
-                            let avail = (ui.available_size() - egui::vec2(0.0, 120.0))
-                                .max(egui::vec2(240.0, 160.0));
-                            let (rect, resp) =
-                                ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
-                            let painter = ui.painter_at(rect);
-                            let fit_scale = (rect.width() / tw.max(1) as f32)
-                                .min(rect.height() / th.max(1) as f32)
-                                .min(1.0);
-                            if to_100 {
-                                // 100% 像素:屏幕 1px = 图像 1px。
-                                self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(8.0);
-                                self.preview_pan = egui::Vec2::ZERO;
-                            }
-                            const ZOOM_MIN: f32 = 1.0;
-                            const ZOOM_MAX: f32 = 8.0;
-                            // 滚轮缩放(以光标为锚点;参考件单图视图滚轮即缩放)。
-                            if resp.hovered() {
-                                let sd = ui.input(|i| i.raw_scroll_delta.y);
-                                if sd != 0.0 {
-                                    let z0 = self.preview_zoom;
-                                    let z1 = (z0 * f32::exp(sd * 0.0022)).clamp(ZOOM_MIN, ZOOM_MAX);
-                                    if (z1 - z0).abs() > f32::EPSILON {
-                                        let c0 = egui::vec2(
-                                            tw as f32 * fit_scale * z0,
-                                            th as f32 * fit_scale * z0,
-                                        );
-                                        let img0 = egui::Rect::from_center_size(
-                                            rect.center() + self.preview_pan,
-                                            c0,
-                                        );
-                                        if let Some(p) = resp.hover_pos() {
-                                            let uv = egui::vec2(
-                                                ((p.x - img0.min.x) / c0.x).clamp(0.0, 1.0),
-                                                ((p.y - img0.min.y) / c0.y).clamp(0.0, 1.0),
-                                            );
-                                            let c1 = egui::vec2(
-                                                tw as f32 * fit_scale * z1,
-                                                th as f32 * fit_scale * z1,
-                                            );
-                                            // 光标下的图像点保持不动。
-                                            self.preview_pan =
-                                                p - uv * c1 + c1 * 0.5 - rect.center();
-                                        }
-                                        self.preview_zoom = z1;
-                                    }
-                                }
-                            }
-                            // 拖拽平移(裁剪模式让位给框选手势;画框在 img_rect 之后处理)。
-                            if !self.crop_mode && resp.dragged_by(egui::PointerButton::Primary) {
-                                self.preview_pan += resp.drag_delta();
-                            }
-                            // 双击:适应窗口 ↔ 100% 像素。
-                            if resp.double_clicked() {
-                                if self.preview_zoom > 1.01 {
-                                    self.preview_zoom = 1.0;
-                                    self.preview_pan = egui::Vec2::ZERO;
-                                } else {
-                                    self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(ZOOM_MAX);
-                                    self.preview_pan = egui::Vec2::ZERO;
-                                }
-                            }
-                            let base = fit_scale * self.preview_zoom;
-                            let content = egui::vec2(tw as f32 * base, th as f32 * base);
-                            // 平移夹在图像边界内(图像小于图区时居中)。
-                            let max_pan = ((content - rect.size()) * 0.5).max(egui::Vec2::ZERO);
-                            self.preview_pan = egui::Vec2::new(
-                                self.preview_pan.x.clamp(-max_pan.x, max_pan.x),
-                                self.preview_pan.y.clamp(-max_pan.y, max_pan.y),
-                            );
-                            let img_rect = egui::Rect::from_center_size(
-                                rect.center() + self.preview_pan,
-                                content,
-                            );
-                            // 裁剪模式:拖拽画裁剪框(比例锁定在像素空间成立)。
-                            if self.crop_mode {
-                                if resp.drag_started() {
-                                    self.crop_drag = resp.interact_pointer_pos();
-                                    self.crop_rect = None;
-                                }
-                                if let Some(start) = self.crop_drag {
-                                    if let Some(p) = resp.interact_pointer_pos() {
-                                        let to_norm = |q: egui::Pos2| {
-                                            let d = q - img_rect.min;
-                                            let s = img_rect.size();
-                                            egui::vec2(
-                                                (d.x / s.x.max(1.0)).clamp(0.0, 1.0),
-                                                (d.y / s.y.max(1.0)).clamp(0.0, 1.0),
-                                            )
-                                        };
-                                        let a = to_norm(start);
-                                        let mut b = to_norm(p);
-                                        if let Some((rw, rh)) = self.crop_ratio {
-                                            // 像素空间 pw/ph = rw/rh
-                                            // → 归一化空间 dw/dh = (rw/rh)·(th/tw)。
-                                            let k = (rw / rh) * (th as f32 / tw as f32);
-                                            let mut dw = (b.y - a.y) * k;
-                                            dw = dw.clamp(-a.x, 1.0 - a.x);
-                                            let dh = (dw / k).clamp(-a.y, 1.0 - a.y);
-                                            dw = dh * k;
-                                            b = egui::vec2(a.x + dw, a.y + dh);
-                                        }
-                                        self.crop_rect = Some([a.x, a.y, b.x, b.y]);
-                                    }
-                                    if !resp.dragged() {
-                                        self.crop_drag = None;
-                                    }
-                                }
-                            }
-                            // 放大超过预览档约 1.35 倍 → 请求全图解码(一次,后台)。
-                            let need_full = self.preview_zoom > 1.35
-                                && self.preview_full.as_ref().map(|(k, _)| *k) != Some(id)
-                                && self.zoom_rx.is_none()
-                                && self.zoom_pending.is_none();
-                            if need_full {
-                                let (tx, rx) = mpsc::channel();
-                                self.zoom_rx = Some(rx);
-                                self.zoom_pending = Some(id);
-                                let path = self.rows[idx].path.clone();
-                                std::thread::spawn(move || {
-                                    // 内存上限:约 40MP(160MB RGBA)。超过则放弃,停在预览档。
-                                    let ok = image::ImageReader::open(&path)
-                                        .ok()
-                                        .and_then(|r| r.with_guessed_format().ok())
-                                        .and_then(|r| r.decode().ok())
-                                        .map(|d| {
-                                            crate::thumbs::apply_exif_rotation(
-                                                d,
-                                                crate::exif::read_orientation(Path::new(&path)),
-                                            )
-                                        })
-                                        .filter(|d| {
-                                            (d.width() as u64) * (d.height() as u64) <= 40_000_000
-                                        })
-                                        .map(|d| d.to_rgba8());
-                                    let _ = tx.send((id, ok));
-                                });
-                                ctx.request_repaint_after(std::time::Duration::from_millis(200));
-                            }
-                            // 放大态且全图已就绪 → 用全图纹理(效果栈合成,带缓存)。
-                            let use_full = self.preview_zoom > 1.35
-                                && self.preview_full.as_ref().map(|(k, _)| *k) == Some(id);
-                            let paint = if use_full {
-                                self.zoom_tex_get(ctx, id).or_else(|| Some(t.clone()))
-                            } else {
-                                Some(t.clone())
-                            };
-                            if let Some(pt) = paint {
-                                painter.image(
-                                    pt.id(),
-                                    img_rect,
-                                    egui::Rect::from_min_max(
-                                        egui::pos2(0.0, 0.0),
-                                        egui::pos2(1.0, 1.0),
-                                    ),
-                                    egui::Color32::WHITE,
-                                );
-                            }
-                            // OCR/人脸框图上标注(坐标相对图像矩形,随缩放平移走)
-                            let boxes = self.preview_boxes_for(id);
-                            if !boxes.is_empty() {
-                                let r = img_rect;
-                                let stroke = egui::Stroke::new(
-                                    1.5_f32,
-                                    egui::Color32::from_rgb(255, 90, 90),
-                                );
-                                for ((a, b, c, d), label) in &boxes {
-                                    let p0 = egui::pos2(
-                                        r.min.x + a * r.width(),
-                                        r.min.y + b * r.height(),
-                                    );
-                                    let p1 = egui::pos2(
-                                        r.min.x + c * r.width(),
-                                        r.min.y + d * r.height(),
-                                    );
-                                    let rect = egui::Rect::from_min_max(p0, p1);
-                                    painter.rect_stroke(
-                                        rect,
-                                        0.0,
-                                        stroke,
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    if !label.is_empty() {
-                                        let galley = painter.layout_no_wrap(
-                                            label.clone(),
-                                            egui::FontId::proportional(11.0),
-                                            egui::Color32::WHITE,
-                                        );
-                                        let bg = egui::Rect::from_min_size(
-                                            rect.min,
-                                            galley.size() + egui::vec2(4.0, 2.0),
-                                        );
-                                        painter.rect_filled(
-                                            bg,
-                                            0.0,
-                                            egui::Color32::from_black_alpha(170),
-                                        );
-                                        painter.galley(
-                                            bg.min + egui::vec2(2.0, 1.0),
-                                            galley,
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-                                }
-                            }
-                            // 裁剪遮罩(参考件 Crop 样式:四周压暗 + 白框 + 三分线)。
-                            if self.crop_mode {
-                                let dim = egui::Color32::from_black_alpha(110);
-                                let inner = self.crop_rect.map(|c| {
-                                    let (x0, x1) = (c[0].min(c[2]), c[0].max(c[2]));
-                                    let (y0, y1) = (c[1].min(c[3]), c[1].max(c[3]));
-                                    egui::Rect::from_min_max(
-                                        img_rect.min
-                                            + egui::vec2(
-                                                x0 * img_rect.width(),
-                                                y0 * img_rect.height(),
-                                            ),
-                                        img_rect.min
-                                            + egui::vec2(
-                                                x1 * img_rect.width(),
-                                                y1 * img_rect.height(),
-                                            ),
-                                    )
-                                });
-                                match inner {
-                                    Some(r) => {
-                                        painter.rect_filled(
-                                            egui::Rect::from_min_max(
-                                                img_rect.min,
-                                                egui::pos2(img_rect.max.x, r.top()),
-                                            ),
-                                            0.0,
-                                            dim,
-                                        );
-                                        painter.rect_filled(
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(img_rect.min.x, r.bottom()),
-                                                img_rect.max,
-                                            ),
-                                            0.0,
-                                            dim,
-                                        );
-                                        painter.rect_filled(
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(img_rect.min.x, r.top()),
-                                                egui::pos2(r.left(), r.bottom()),
-                                            ),
-                                            0.0,
-                                            dim,
-                                        );
-                                        painter.rect_filled(
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(r.right(), r.top()),
-                                                egui::pos2(img_rect.max.x, r.bottom()),
-                                            ),
-                                            0.0,
-                                            dim,
-                                        );
-                                        painter.rect_stroke(
-                                            r,
-                                            0.0,
-                                            egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
-                                            egui::StrokeKind::Inside,
-                                        );
-                                        // 三分构图线。
-                                        let lw = egui::Stroke::new(
-                                            0.75_f32,
-                                            egui::Color32::from_white_alpha(120),
-                                        );
-                                        for i in 1..3 {
-                                            let t = i as f32 / 3.0;
-                                            let x = r.left() + r.width() * t;
-                                            let y = r.top() + r.height() * t;
-                                            painter.line_segment(
-                                                [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
-                                                lw,
-                                            );
-                                            painter.line_segment(
-                                                [egui::pos2(r.left(), y), egui::pos2(r.right(), y)],
-                                                lw,
-                                            );
-                                        }
-                                    }
-                                    None => {
-                                        painter.rect_filled(img_rect, 0.0, dim);
-                                    }
-                                }
-                            }
-                        } else {
-                            // P1-10:预览改为后台生成 —— 缓存未就绪时显示"生成中",
-                            // 而不是"加载失败"(解码在后台线程,失败才会走这里)。
-                            if self.preview_missing == Some(id) {
-                                ui.label("原文件已不存在(可能被移动或删除),正在移出图库…");
-                            } else if self.preview_failed == Some(id) {
-                                ui.label("(预览加载失败:格式不支持或解码出错)");
-                            } else if crate::thumbs::preview_path(id).exists() {
-                                ui.label("(预览加载失败)");
-                            } else {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.label("预览生成中…(后台解码并缓存)");
-                                });
-                                // 后台完成后需要重绘,否则停在"生成中"。
-                                ctx.request_repaint_after(std::time::Duration::from_millis(150));
-                            }
-                        }
-                        let path = self.rows[idx].path.clone();
-                        let star = self.rows[idx].star != 0;
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(if star {
-                                    "★ 取消星标"
-                                } else {
-                                    "☆ 加星"
-                                })
-                                .clicked()
-                            {
-                                self.toggle_star(id);
-                            }
-                            if ui.button("保存(烘培)").clicked() {
-                                self.start_bake(id);
-                            }
-                            if self.bake_rx.is_some() {
-                                ui.spinner();
-                            }
-                            if ui.button("在资源管理器中显示").clicked() {
-                                show_in_explorer(&path);
-                            }
-                        });
-                        // 信息行:尺寸 / 拍摄时间 / 相机 / GPS
-                        let r = &self.rows[idx];
-                        let mut parts: Vec<String> = Vec::new();
-                        if let (Some(w), Some(h)) = (r.width, r.height) {
-                            parts.push(format!("{w}×{h}"));
-                        }
-                        if let Some(t) = &r.taken {
-                            parts.push(t.replace('T', " "));
-                        }
-                        if !r.cam.is_empty() {
-                            parts.push(r.cam.clone());
-                        }
-                        if let (Some(lat), Some(lon)) = (r.lat, r.lon) {
-                            parts.push(format!("GPS {lat:.5}, {lon:.5}"));
-                        }
-                        if !parts.is_empty() {
-                            ui.label(parts.join(" · "));
-                        }
-                        ui.label(format!("文件: {path}"));
-                        self.caption_editor(ui, id);
-                        ui.separator();
-                        self.tags_editor(ui, id);
-                    });
-                if !preview_open {
-                    self.preview = None;
-                    self.preview_tex = None;
-                    // 关闭预览即释放缩放状态与全图缓存(几十 MB 级)。
-                    self.preview_reset_zoom();
-                    self.zoom_active_for = None;
-                }
-            }
-        }
+        // 单图预览与编辑已迁到 editor 模块的整页视图。
 
         // WiFi 导入面板(M4a)
         let mut wifi_open = self.wifi_panel;
@@ -10522,6 +11035,10 @@ impl eframe::App for App {
             self.show_about = open;
         }
 
+        // 帮助 > 检查更新(自动发现新版本时也会把这个窗口推到前台)
+        self.update_window(ctx);
+        self.update_confirm_window(ctx);
+
         // 文件夹管理器:监听文件夹列表 + 添加/全扫/清理 + 每行重新扫描/移除
         if self.show_folder_mgr {
             let mut open = self.show_folder_mgr;
@@ -10716,122 +11233,101 @@ impl eframe::App for App {
             self.face_version_warn = open;
         }
 
-        // 索引服务授权说明窗:动手之前先讲清楚要干什么、要什么权限、能不能撤,
-        // 取得同意再发起(UAC 是系统安全桌面,不会有这些上下文,所以在这里说)。
+        // 初次设置向导:服务授权说明与首启范围两问合在一窗、分步呈现,
+        // 不再两个框叠在屏幕中央。只欠其一问时仍是原来的单窗样式;
+        // 页序固定:先服务说明(可关可拒),后照片范围(必答一次,无取消)。
         #[cfg(windows)]
-        if self.svc_ask_grant {
-            let mut open = self.svc_ask_grant;
-            let mut decided: Option<SvcWant> = None;
+        let svc_page_open = self.svc_ask_grant;
+        #[cfg(not(windows))]
+        let svc_page_open = false;
+        if svc_page_open || self.scope_ask {
+            let mut open = true;
+            #[cfg_attr(not(windows), allow(unused_mut))]
+            let mut decided_svc: Option<SvcWant> = None;
+            let mut decided_scope: Option<InitialScope> = None;
+            let two_pages = svc_page_open && self.scope_ask;
+            let on_scope_page = !svc_page_open || self.wizard_page >= 1;
+            let title = if on_scope_page {
+                "选择照片范围"
+            } else {
+                "启用全盘快速查找"
+            };
             // 系统对话框式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
-            // 推荐档绿底,拒绝档深蓝。
-            const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
-            const GRANT_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x5F, 0x8A);
-            egui::Window::new("启用全盘快速查找")
+            // 推荐档绿底,拒绝档深蓝。标题与页码随当前步变化。
+            egui::Window::new(title)
                 .title_bar(false)
                 .collapsible(false)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .default_width(560.0)
+                .default_width(580.0)
                 .show(ctx, |ui| {
-                    // 绿色标题条 + 自绘关闭钮:关窗职责归这里。
                     let (hdr, _) = ui.allocate_exact_size(
                         egui::vec2(ui.available_width(), 36.0),
                         egui::Sense::hover(),
                     );
-                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), GRANT_GREEN);
+                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), Self::GRANT_GREEN);
                     ui.painter().text(
                         egui::pos2(hdr.center().x, hdr.center().y),
                         egui::Align2::CENTER_CENTER,
-                        "启用全盘快速查找",
+                        title,
                         egui::FontId::proportional(17.0),
                         egui::Color32::WHITE,
                     );
-                    let x_rect = egui::Rect::from_center_size(
-                        egui::pos2(hdr.right() - 20.0, hdr.center().y),
-                        egui::vec2(28.0, 28.0),
-                    );
-                    let x = ui.interact(x_rect, ui.id().with("svc-grant-x"), egui::Sense::click());
-                    // ✕ 字符默认字体缺字形,直接画两笔叉更稳。
-                    let xc = x_rect.center();
-                    let xr = 5.0;
-                    let x_stroke = egui::Stroke::new(
-                        if x.hovered() { 2.2_f32 } else { 1.6_f32 },
-                        egui::Color32::WHITE,
-                    );
-                    ui.painter().line_segment(
-                        [egui::pos2(xc.x - xr, xc.y - xr), egui::pos2(xc.x + xr, xc.y + xr)],
-                        x_stroke,
-                    );
-                    ui.painter().line_segment(
-                        [egui::pos2(xc.x - xr, xc.y + xr), egui::pos2(xc.x + xr, xc.y - xr)],
-                        x_stroke,
-                    );
-                    if x.clicked() {
-                        open = false;
+                    // 关闭钮只在服务说明页画:照片范围页必须答一次,不给跳过。
+                    if !on_scope_page {
+                        let x_rect = egui::Rect::from_center_size(
+                            egui::pos2(hdr.right() - 20.0, hdr.center().y),
+                            egui::vec2(28.0, 28.0),
+                        );
+                        let x = ui.interact(x_rect, ui.id().with("wizard-x"), egui::Sense::click());
+                        // ✕ 字符默认字体缺字形,直接画两笔叉更稳。
+                        let xc = x_rect.center();
+                        let xr = 5.0;
+                        let x_stroke = egui::Stroke::new(
+                            if x.hovered() { 2.2_f32 } else { 1.6_f32 },
+                            egui::Color32::WHITE,
+                        );
+                        ui.painter().line_segment(
+                            [egui::pos2(xc.x - xr, xc.y - xr), egui::pos2(xc.x + xr, xc.y + xr)],
+                            x_stroke,
+                        );
+                        ui.painter().line_segment(
+                            [egui::pos2(xc.x - xr, xc.y + xr), egui::pos2(xc.x + xr, xc.y - xr)],
+                            x_stroke,
+                        );
+                        if x.clicked() {
+                            open = false;
+                        }
                     }
                     ui.add_space(14.0);
-                    ui.label("「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。");
-                    ui.label("读卷日志属于管理员级操作,所以要装一个后台服务来干这件事 —— 这需要你点一次 UAC。");
-                    ui.indent("svc_grant_what", |ui| {
-                        ui.label("· 服务名 RelytoMaliangIndex,开机自动启动,只在本机跑;");
-                        ui.label("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;");
-                        ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
-                        ui.label("· 界面本身不提权:它通过本地命名管道向服务问结果;");
-                        ui.label("· 不联网、不上传,随时可以在 选项 > 常规 卸载。");
-                    });
-                    ui.add_space(14.0);
-                    // 两档:按钮定宽对齐,说明文字跟在右侧,行距拉开。
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("安装并启动服务(推荐)")
-                                        .color(egui::Color32::WHITE)
-                                        .strong(),
-                                )
-                                .fill(GRANT_GREEN)
-                                .min_size(egui::vec2(200.0, 30.0))
-                                .corner_radius(6),
-                            )
-                            .clicked()
-                        {
-                            decided = Some(SvcWant::Yes);
-                        }
-                        ui.small("只有这次弹 UAC。装好后开机自启、持续保鲜索引,以后不再问。");
-                    });
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("不用全盘快查").color(egui::Color32::WHITE),
-                                )
-                                .fill(GRANT_BLUE_DARK)
-                                .min_size(egui::vec2(200.0, 30.0))
-                                .corner_radius(6),
-                            )
-                            .clicked()
-                        {
-                            decided = Some(SvcWant::No);
-                        }
-                        ui.small("跳过:查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 常规 改。");
-                    });
-                    ui.add_space(14.0);
-                    ui.checkbox(&mut self.svc_never_ask, "不再提示");
-                    ui.small("嫌每次启动都问就勾上:选「不用全盘快查」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
+                    if two_pages {
+                        let step = if on_scope_page { 2 } else { 1 };
+                        ui.small(format!("第 {step} 步,共 2 步"));
+                        ui.add_space(4.0);
+                    }
+                    if on_scope_page {
+                        self.scope_ask_body(ui, &mut decided_scope);
+                    } else {
+                        #[cfg(windows)]
+                        self.svc_grant_body(ui, &mut decided_svc);
+                    }
                 });
-            let checked = self.svc_never_ask;
-            if let Some(g) = decided {
+            #[cfg(windows)]
+            let svc_decided = decided_svc;
+            #[cfg(not(windows))]
+            let svc_decided: Option<SvcWant> = None;
+            if let Some(g) = svc_decided {
+                let checked = self.svc_never_ask;
                 match g {
                     // 没勾「不再提示」的拒绝不算决定:不落意向,下次启动继续问。
                     SvcWant::No if !checked => {
-                        self.svc_ask_grant = false;
                         self.link_declined = false;
                         let _ = self.store.set_setting("svc_declined", "0");
                         self.status =
                             "本次跳过全盘快查,下次启动会再问(勾选「不再提示」可免打扰)。".into();
                     }
                     g => {
+                        #[cfg(windows)]
                         self.svc_apply_want(g);
                         if matches!(g, SvcWant::No) && checked {
                             let _ = self.store.set_setting("svc_never_ask", "1");
@@ -10841,76 +11337,29 @@ impl eframe::App for App {
                         }
                     }
                 }
-            } else {
-                // 直接关窗口 = 还没决定:保持「未问过」,下次启动再问一次;
-                // 勾了「不再提示」则尊重,落库后启动不再弹。
-                if !open && checked {
+                // 服务一问本会话已答完;向导还有下一页就翻过去。
+                self.svc_ask_grant = false;
+                if self.scope_ask {
+                    self.wizard_page = 1;
+                }
+            } else if !open {
+                // 直接关窗 = 还没决定:勾了「不再提示」则尊重落库,否则下次启动再问。
+                if self.svc_never_ask {
                     let _ = self.store.set_setting("svc_never_ask", "1");
                     self.status =
                         "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。".into();
                 }
-                self.svc_ask_grant = open;
+                self.svc_ask_grant = false;
+                if self.scope_ask {
+                    self.wizard_page = 1;
+                }
             }
-        }
-
-        // 首启范围对话框(方案 P3-18):两档单选、**无取消**。
-        // 作用域必须答一次 —— 空账本下派生门谁都不放行,网格全是占位。
-        if self.scope_ask {
-            let mut decided: Option<InitialScope> = None;
-            const SCOPE_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
-            egui::Window::new("选择照片范围")
-                .title_bar(false)
-                .collapsible(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                .default_width(580.0)
-                .show(ctx, |ui| {
-                    // 标题条不画关闭钮:这一窗不给跳过,答完就落账。
-                    let (hdr, _) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 36.0),
-                        egui::Sense::hover(),
-                    );
-                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), SCOPE_GREEN);
-                    ui.painter().text(
-                        egui::pos2(hdr.center().x, hdr.center().y),
-                        egui::Align2::CENTER_CENTER,
-                        "选择照片范围",
-                        egui::FontId::proportional(17.0),
-                        egui::Color32::WHITE,
-                    );
-                    ui.add_space(14.0);
-                    ui.label("整台电脑的文件名都会收进索引 —— 那一步不读文件内容,很快。");
-                    ui.label("下面这一档只决定**哪些目录要出缩略图、读拍摄信息**,不影响能不能搜到。");
-                    ui.add_space(12.0);
-                    ui.radio_value(&mut self.scope_choice, InitialScope::Complete, "全盘");
-                    ui.indent("scope_complete_why", |ui| {
-                        ui.small("所有磁盘上的图都出缩略图。补齐在后台慢慢跑,眼前的目录优先。");
-                    });
-                    ui.add_space(6.0);
-                    ui.radio_value(&mut self.scope_choice, InitialScope::Limited, "只常用目录");
-                    ui.indent("scope_limited_why", |ui| {
-                        ui.small("只给「我的文档 / 我的图片 / 桌面」出缩略图。别处的图照样在库里、照样搜得到,点进那个目录时再补。");
-                    });
-                    ui.add_space(14.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("确定").color(egui::Color32::WHITE).strong(),
-                                )
-                                .fill(SCOPE_GREEN)
-                                .min_size(egui::vec2(120.0, 30.0))
-                                .corner_radius(6),
-                            )
-                            .clicked()
-                        {
-                            decided = Some(self.scope_choice);
-                        }
-                        ui.small("以后可在 选项 > 常规 改。");
-                    });
-                });
-            if let Some(c) = decided {
+            if let Some(c) = decided_scope {
                 self.apply_initial_scope(c, true);
+            }
+            if !self.svc_ask_grant && !self.scope_ask {
+                // 向导走完:复位页码,下次(重装 / 新库)首启从头开始。
+                self.wizard_page = 0;
             }
         }
 

@@ -887,6 +887,17 @@ fn parent_slot(p: u32, root: usize) -> Option<usize> {
     }
 }
 
+/// 有序视图的统一比较口径:按折叠池里的名字字节序。
+/// 全量重排(`post_process`)与增量归并(`merge_new_into_order`)共用,
+/// 两边口径一旦分叉,查询二分就会静默漏命中。
+fn folded_cmp(fold: &[u8], off: &[u32], len: &[u32], a: u32, b: u32) -> std::cmp::Ordering {
+    let sa = off[a as usize] as usize;
+    let la = len[a as usize] as usize;
+    let sb = off[b as usize] as usize;
+    let lb = len[b as usize] as usize;
+    fold[sa..sa + la].cmp(&fold[sb..sb + lb])
+}
+
 /// 一条增量操作(与 journal 记录同序,顺序即语义:删除后重建是合法序列)。
 #[derive(Debug, Clone)]
 pub enum DeltaOp {
@@ -999,6 +1010,10 @@ impl VolumeIndex {
         if ops.is_empty() {
             return counts;
         }
+        // 快路径基准:纯新增轮次只有池尾和列尾是新的,收尾可以只做增量
+        // (见 apply_delta 尾部),这两个基准点用来圈出"新"的范围。
+        let pool_before = self.pool.len();
+        let entries_before = self.off.len();
         let mut frn_to_idx: HashMap<u64, u32> = self
             .frn
             .iter()
@@ -1083,8 +1098,50 @@ impl VolumeIndex {
         if !removed.is_empty() || counts.updated > 0 {
             self.compact(&removed);
         }
+        if removed.is_empty() && counts.updated == 0 {
+            // 纯新增轮次走增量收尾:这一轮只有池尾追加了新名字、列尾追加了
+            // 新条目,折叠池只需追加新字节的折叠,有序视图只需把新下标归并
+            // 进去 —— 不必把百万条全部重排。那一步在服务里拿着 state 锁做,
+            // C: 卷每秒都有增量,全量重排一次几百毫秒,期间所有快查/Stat
+            // 都在排队(2026-11-06 观察到查询延迟 2ms↔900ms 双峰,即此因)。
+            self.fold
+                .extend(self.pool[pool_before..].iter().map(|b| b.to_ascii_lowercase()));
+            self.merge_new_into_order(entries_before);
+            self.build_csr();
+            return counts;
+        }
         self.post_process();
         counts
+    }
+
+    /// 把尾部新增的条目(下标 `from..`)按折叠名归并进有序视图。
+    ///
+    /// 单趟归并 O(n + k·log k),替代全量重排的 O(n·log n);保鲜节奏下
+    /// k 通常是个位数。名字唯一的条目归并结果与全量重排逐位一致
+    /// (并列名不保证,与 `sort_unstable` 的并列序一样任取)。
+    fn merge_new_into_order(&mut self, from: usize) {
+        if from >= self.off.len() {
+            return;
+        }
+        let mut adds: Vec<u32> = (from as u32..self.off.len() as u32).collect();
+        let VolumeIndex {
+            fold, off, len, order, ..
+        } = self;
+        adds.sort_unstable_by(|&a, &b| folded_cmp(fold, off, len, a, b));
+        let mut merged = Vec::with_capacity(order.len() + adds.len());
+        let (mut i, mut j) = (0usize, 0usize);
+        while i < order.len() && j < adds.len() {
+            if folded_cmp(fold, off, len, order[i], adds[j]) != std::cmp::Ordering::Greater {
+                merged.push(order[i]);
+                i += 1;
+            } else {
+                merged.push(adds[j]);
+                j += 1;
+            }
+        }
+        merged.extend_from_slice(&order[i..]);
+        merged.extend_from_slice(&adds[j..]);
+        *order = merged;
     }
 
     /// 按当前条目序重建各列与名字池(`removed` 里的下标被摘除;
@@ -1155,13 +1212,7 @@ impl VolumeIndex {
         let VolumeIndex {
             fold, off, len, order, ..
         } = self;
-        order.sort_unstable_by(|&a, &b| {
-            let sa = off[a as usize] as usize;
-            let la = len[a as usize] as usize;
-            let sb = off[b as usize] as usize;
-            let lb = len[b as usize] as usize;
-            fold[sa..sa + la].cmp(&fold[sb..sb + lb])
-        });
+        order.sort_unstable_by(|&a, &b| folded_cmp(fold, off, len, a, b));
         self.build_csr();
     }
 
@@ -1735,10 +1786,12 @@ fn collect_close_op(e: &crate::mft::UsnEntry<'_>, ops: &mut Vec<DeltaOp>) {
 #[derive(Debug)]
 pub enum JournalStep {
     /// 读到一批 CLOSE 终态记录,`next_usn` 是新的 checkpoint。
+    /// `raw` 是本批原始记录摘要(reason, 名字)最多 12 条,诊断用。
     Delta {
         ops: Vec<DeltaOp>,
         next_usn: i64,
         records: u64,
+        raw: Vec<(u32, String)>,
     },
     /// journal 已失效(条目被回收 / 日志被重建)→ 必须全卷重建。
     RebuildNeeded,
@@ -1757,7 +1810,11 @@ pub enum JournalStep {
 /// → 放锁 → L2 落库。读的那段绝不能持锁,否则 UI 的快查会被冻住。
 pub fn poll_journal(letter: char, journal_id: u64, start_usn: i64) -> JournalStep {
     let mut ops: Vec<DeltaOp> = Vec::new();
+    let mut raw: Vec<(u32, String)> = Vec::new();
     match crate::mft::read_journal(letter, journal_id, start_usn, |e| {
+        if raw.len() < 12 {
+            raw.push((e.reason, String::from_utf16_lossy(e.name)));
+        }
         collect_close_op(e, &mut ops);
         true
     }) {
@@ -1765,6 +1822,7 @@ pub fn poll_journal(letter: char, journal_id: u64, start_usn: i64) -> JournalSte
             ops,
             next_usn: st.next_usn,
             records: st.records,
+            raw,
         },
         Err(e) => {
             if e.downcast_ref::<crate::mft::JournalInvalidated>().is_some() {
@@ -1801,6 +1859,7 @@ pub fn refresh_volume(v: &mut VolumeIndex, journal_id: u64, start_usn: i64) -> F
             ops,
             next_usn,
             records,
+            ..
         } => Freshness::Advanced {
             counts: v.apply_delta(ops),
             next_usn,
@@ -1915,16 +1974,42 @@ const L1_INGEST_CHUNK: usize = 20_000;
 ///
 /// 派生门(方案 P3-17)在这里加载**一次**:全量落库动辄百万行,逐行读库判定
 /// 会把落库拖成 IO 密集;读一次账本、之后纯内存判定才符合「判定零 IO」的口径。
-pub fn ingest_l1(store: &crate::db::Store, rows: &[crate::db::L1Row]) -> Result<crate::db::L1Ingest> {
+///
+/// **硬排除目录的行连结构都不落库**(自家产出目录、回收站、系统与程序目录、
+/// temp、点开头目录):那是程序自己写的文件或用户已经判了死刑的文件,收进库
+/// 既不会出图(作用域门挡着),又会因为 mtime 最新霸占「最近更新」首屏,
+/// 还每轮给自己制造 USN 事件(2026-11-05 现场:首屏 200 张里 190 张是自家 thumbs)。
+///
+/// 被摘掉的行还要按 FRN **反删** L2 里的旧行:照片被删进回收站时,L1 给的是一条
+/// 改名 Upsert(路径变成 `$RECYCLE.BIN\...`),只「不落库」会让 L2 留着一条指向
+/// 已不存在路径的陈旧行。walkdir 那条发现路不必重复这一刀 —— 遍历时已经按
+/// 排除规则跳过这些目录了。
+pub fn ingest_l1(
+    store: &crate::db::Store,
+    rows: &[crate::db::L1Row],
+) -> Result<crate::db::L1Ingest> {
     if rows.is_empty() {
         return Ok(crate::db::L1Ingest::default());
     }
     let gate = crate::db::ScopeGate::load(store);
+    let mut kept: Vec<&crate::db::L1Row> = Vec::with_capacity(rows.len());
+    let mut dropped: Vec<i64> = Vec::new();
+    for r in rows {
+        if gate.never_index(&r.parent) {
+            dropped.push(r.frn64);
+        } else {
+            kept.push(r);
+        }
+    }
     let mut out = crate::db::L1Ingest::default();
-    for c in rows.chunks(L1_INGEST_CHUNK) {
-        let r = store.ingest_l1_rows(c, Some(&gate))?;
+    for c in kept.chunks(L1_INGEST_CHUNK) {
+        let batch: Vec<crate::db::L1Row> = c.iter().map(|r| (*r).clone()).collect();
+        let r = store.ingest_l1_rows(&batch, Some(&gate))?;
         out.inserted += r.inserted;
         out.updated += r.updated;
+    }
+    for c in dropped.chunks(L1_INGEST_CHUNK) {
+        store.delete_l1_frn64(c)?;
     }
     Ok(out)
 }
@@ -2009,9 +2094,9 @@ pub fn build_volume(
     ctrl: Option<&crate::scan::ScanControl>,
     mut progress: impl FnMut(usize),
 ) -> Result<VolumeBuild> {
-    let j = p.journal.ok_or_else(|| {
-        anyhow::anyhow!("[{}:] 没有 journal 状态,无法全量建库", p.letter)
-    })?;
+    let j = p
+        .journal
+        .ok_or_else(|| anyhow::anyhow!("[{}:] 没有 journal 状态,无法全量建库", p.letter))?;
     let mut b = VolumeIndexBuilder::new(p.letter);
     let last = std::cell::Cell::new(std::time::Instant::now());
     let mft_res = crate::rec::scan_mft(p.letter, ctrl, |r| {
@@ -3318,6 +3403,87 @@ mod tests {
         assert_eq!(hits[0].path, r"C:\Pics\RAW\NEW.RAW");
     }
 
+    /// 连续多轮增量(新增 / 改名 / 删除交错)之后,查询视图必须始终与名字池同步。
+    ///
+    /// 现场教训(2026-11-06):服务日志一直报「新增 N」,但新建的文件在快查里
+    /// 查不到、落盘索引里也没有它的名字 —— 增量只改了列、没把折叠池与有序
+    /// 视图一起刷新。单轮新增能过的测试抓不到这种"跑久了才失配"的情形,
+    /// 所以这里按轮校验不变量,并在最后同时验证子串查询与路径反查。
+    #[test]
+    fn delta_keeps_query_view_in_sync_across_rounds() {
+        let mut v = tiny_volume();
+        let rounds: Vec<Vec<DeltaOp>> = vec![
+            // 纯新增:走"跳过压实"的快路径。
+            vec![DeltaOp::Upsert(up(0x2002, 0x2000, 0x20, "NEW_SHOT.CR3"))],
+            // 新增 + 原位改名混在一批:会触发压实与全池重写。
+            vec![
+                DeltaOp::Upsert(up(0x2003, 0x2000, 0x20, "ANOTHER.NEF")),
+                DeltaOp::Upsert(up(0x1001, 0x1000, 0x20, "RENAMED.JPG")),
+            ],
+            // 删除:摘条目 + 重映射父引用。
+            vec![DeltaOp::Delete(0x2002)],
+        ];
+        for ops in rounds {
+            let _ = v.apply_delta(ops);
+            assert_eq!(v.fold.len(), v.pool.len(), "折叠池必须覆盖整个名字池");
+            assert_eq!(v.order.len(), v.count(), "有序视图必须覆盖全部条目");
+            // 每轮都真跑一次查询:视图长度对得上但内容错位时也能暴露。
+            let _ = search(std::slice::from_ref(&v), "jpg", 10);
+        }
+        assert_eq!(
+            search(std::slice::from_ref(&v), "another.nef", 10).len(),
+            1,
+            "第二轮新增的名字必须可查"
+        );
+        assert!(
+            search(std::slice::from_ref(&v), "new_shot", 10).is_empty(),
+            "已删除的名字不该再命中"
+        );
+        assert_eq!(
+            search(std::slice::from_ref(&v), "renamed", 10)[0].path,
+            r"C:\Pics\RENAMED.JPG",
+            "改名后的名字与父路径都要更新"
+        );
+        assert!(
+            v.lookup_path(r"C:\Pics\RENAMED.JPG").is_some(),
+            "按完整路径反查也要能看到增量结果"
+        );
+    }
+
+    /// 纯新增轮次走增量收尾(追加折叠 + 单趟归并),各视图必须与全量重建逐位一致。
+    ///
+    /// 增量收尾是性能路径,最容易出的错是"口径分叉":归并用一份比较口径、
+    /// 全量重排用另一份,查询二分就会静默漏命中。这里每轮都拿一个只走全量
+    /// `post_process` 的孪生卷对账(名字唯一,无并列歧义),并把 CSR 一并对。
+    #[test]
+    fn delta_pure_add_incremental_matches_full_rebuild() {
+        let mut v = tiny_volume();
+        let mut twin = tiny_volume();
+        for r in 0..12u32 {
+            let ops: Vec<DeltaOp> = (0..3)
+                .map(|k| {
+                    let frn = 0x9000u64 + ((r * 3 + k) as u64);
+                    DeltaOp::Upsert(up(frn, 0x1000, 0x20, &format!("BATCH{r:02}_IMG{k}.JPG")))
+                })
+                .collect();
+            let c1 = v.apply_delta(ops.clone());
+            let c2 = twin.apply_delta(ops);
+            assert_eq!((c1.added, c2.added), (3, 3));
+            assert_eq!(
+                (c1.updated, c1.removed),
+                (0, 0),
+                "本测试只喂纯新增,喂错了就走不到快路径"
+            );
+            assert_eq!(v.order, twin.order, "第 {r} 轮后有序视图应与全量重建一致");
+            assert_eq!(v.fold, twin.fold, "第 {r} 轮后折叠池应与全量重建一致");
+            assert_eq!(v.csr_start, twin.csr_start, "第 {r} 轮后 CSR 应与全量重建一致");
+            assert_eq!(v.csr_child, twin.csr_child, "第 {r} 轮后 CSR 应与全量重建一致");
+        }
+        let hits = search(std::slice::from_ref(&v), "batch11_img2", 10);
+        assert_eq!(hits.len(), 1, "最后一轮新增的名字必须立即可查");
+        assert!(v.lookup_path(r"C:\Pics\BATCH11_IMG2.JPG").is_some());
+    }
+
     #[test]
     fn delta_order_delete_then_recreate_same_frn() {
         let mut v = tiny_volume();
@@ -3405,7 +3571,12 @@ mod tests {
     fn update_delta_compacts_and_reclaims_dead_bytes() {
         let mut v = tiny_volume();
         let pool_before = v.pool.len();
-        let _ = v.apply_delta(vec![DeltaOp::Upsert(up(0x1001, 0x1000, 0x20, "IMG_0002.JPG"))]);
+        let _ = v.apply_delta(vec![DeltaOp::Upsert(up(
+            0x1001,
+            0x1000,
+            0x20,
+            "IMG_0002.JPG",
+        ))]);
         assert_eq!(v.count(), 5, "改名不换条数");
         assert!(
             v.pool.len() <= pool_before + "IMG_0002.JPG".len(),

@@ -1,0 +1,34 @@
+# 示例:复制成 update.ini,放到 maliang.exe 同目录(便携部署优先),
+# 或放到数据目录(默认 %APPDATA%\Maliang\update.ini)。
+# 程序首启也会在数据目录自动生成一份带完整注释的空模板。
+# 改完在「帮助 > 检查更新」里点「立即检查」即可生效,不必重启程序。
+
+# 指向服务端的「版本清单」地址,纯文本 key=value,格式见 update-manifest.example.ini。
+# 建议一律用 https;明文 http 时清单必须提供 Sha256,否则会被拒绝。
+UpdateURL=https://example.com/maliang/latest.ini
+
+# 两次自动检查之间的最小间隔(小时)。手动检查不受限制。
+CheckIntervalHours=24
+
+# 启动后空闲多少秒才发起第一次自动检查;扫描 / 导入 / 导出 / 服务装卸期间一律推迟。
+IdleDelaySeconds=20
+
+# 0 = 只在「帮助 > 检查更新」里手动联网。
+AutoCheck=1
+
+# 0 = 发现新版本只提示,由用户点「下载更新」。
+AutoDownload=1
+
+# 代理策略:system(默认,跟随系统/环境变量) / none(直连) / http://host:port。
+# 企业网络里环境变量代理指错、或本机代理拦截内网地址时,可改成 none。
+Proxy=system
+
+# 下载分段大小(MB,1~32)。按 Range 分段取,每段单独计时并可重试,
+# 断点会保留在 update/pending/download.part,下次启动继续。
+# 网络特别慢时可改成 1,让每段的时间预算更容易满足。
+ChunkMB=2
+
+# 安装后是否立刻把索引服务起回来。默认是 1(尽量不中断索引);
+# 如果新版本改了服务与界面之间的协议,设 0 可让服务保持停止,等程序重启后再起。
+# 无论哪种情况,停服务前都会留下标记,helper 中途被杀时下次启动会自动恢复服务。
+RestartService=1

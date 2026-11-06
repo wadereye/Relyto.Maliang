@@ -113,6 +113,20 @@ BSD 系许可,兼容本项目的 Apache-2.0 发布协议。各依赖的完整许
 
 ---
 
+## 格式规范与参考
+
+PSD / PSB 只读预览依据 Adobe 公开的《Adobe Photoshop File Formats
+Specification》自行实现,仅解析文件头与文件内已合并好的合成图数据。
+本仓库不复制任何第三方 PSD 实现代码。
+
+可行性调研参考了 PhotoCraft(https://github.com/storytold/photocraft,
+MIT OR Apache-2.0)公开的项目文档与接口说明;其源码、字体、图标与资源均未
+进入本仓库。GIF / WebP 解码分别由 `gif`、`image-webp` crate 提供,两者以及
+`flate2`、`image` 均为 MIT OR Apache-2.0 许可;WebP 解码使用纯 Rust 实现,
+未链接 libwebp,也不分发其代码。
+
+---
+
 ## 商标
 
 **Picasa** 是 Google LLC 的商标。本项目是一个**独立的开源实现**,与 Google LLC
@@ -121,5 +135,4 @@ BSD 系许可,兼容本项目的 Apache-2.0 发布协议。各依赖的完整许
 项目中对 Picasa 的提及仅用于说明功能参照关系与数据互通(如 `picasa.ini`
 这一文件格式名),不表示任何背书或授权。
 
-全盘快查按微软公开的 USN / NTFS 文档口径实现,不集成也不分发任何第三方索引器
-产品的代码或二进制。
+**Adobe** 与 **Photoshop** 是 Adobe Inc. 的商标或注册商标。此处提及 PSD / PSB 仅用于说明文件格式兼容性,不表示任何隶属、授权、赞助或背书关系;本项目也不声称通过 Adobe 的兼容性认证。

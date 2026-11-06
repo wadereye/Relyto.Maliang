@@ -39,6 +39,13 @@ pub struct PhotoRow {
     pub rich_state: i32,
 }
 
+/// `photos.mtime` 的归一表达式。历史数据里这一列有 UNIX 秒与毫秒两种写法,
+/// 直接比大小会让单位大的那批永远排在最前(参考件只登记听目录下的少量
+/// 文件夹,不会撞上这个问题)。阈值按量级区分秒 / 毫秒 / 微秒,小数值原样保留。
+const MTIME_SQL: &str = "CASE WHEN p.mtime >= 100000000000000 THEN p.mtime / 1000000
+                              WHEN p.mtime >= 100000000000 THEN p.mtime / 1000
+                              ELSE p.mtime END";
+
 /// 排序方式(工具栏「查看选项」> 排序;对应原版 View 菜单里的
 /// 四个排序项:按拍摄日期 / 最近 / 按尺寸 / 按名称)。
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
@@ -203,21 +210,26 @@ pub fn load_query(
     }
     // 各模式的"自然方向"(反向开关再翻转):日期/更改新在前、大小大在前、名称升序。
     let order = match sort {
-        SortBy::Date => "p.taken_utc IS NULL, p.taken_utc DESC",
-        SortBy::Recent => "p.mtime DESC",
-        SortBy::Size => "p.size DESC",
-        SortBy::Name => "p.path COLLATE NOCASE ASC",
+        SortBy::Date => "p.taken_utc IS NULL, p.taken_utc DESC".to_string(),
+        SortBy::Recent => format!("{MTIME_SQL} DESC"),
+        SortBy::Size => "p.size DESC".to_string(),
+        SortBy::Name => "p.path COLLATE NOCASE ASC".to_string(),
     };
     let order = if reverse {
         match sort {
-            SortBy::Date => "p.taken_utc IS NULL, p.taken_utc ASC",
-            SortBy::Recent => "p.mtime ASC",
-            SortBy::Size => "p.size ASC",
-            SortBy::Name => "p.path COLLATE NOCASE DESC",
+            SortBy::Date => "p.taken_utc IS NULL, p.taken_utc ASC".to_string(),
+            SortBy::Recent => format!("{MTIME_SQL} ASC"),
+            SortBy::Size => "p.size ASC".to_string(),
+            SortBy::Name => "p.path COLLATE NOCASE DESC".to_string(),
         }
     } else {
         order
     };
+    // 未纳入派生作用域的行(rich_state=0)恒排最后,反向开关也不把它们提前:
+    // 这些行出不了缩略图,而 AppData 之类缓存目录的 mtime 往往最新,
+    // 不压到尾部就会「一开屏全是灰格子」。留而不隐 —— 右键
+    // 「纳入此目录(覆盖排除名单)」这个出口得在网格里够得着。
+    let order = format!("p.rich_state = 0, {order}");
     let sql = format!(
         "SELECT p.id, p.path, p.taken_utc, p.star, p.thumb_ok, p.width, p.height,
                 COALESCE(sp.value, p.cam, ''), p.lat, p.lon, p.kind, p.caption,
@@ -273,6 +285,58 @@ pub fn load_query(
         Ok(rows)
     })?;
     Ok(rows)
+}
+
+/// `parent` 是否落在某个监听根之内(整级匹配,大小写不敏感)。
+/// Windows 与 POSIX 分隔符都归一成反斜杠,避免把 `Pictures2` 当成 `Pictures`。
+fn under_root(parent: &str, root: &str) -> bool {
+    let p = parent.replace('/', "\\");
+    let p = p.to_ascii_uppercase();
+    let r = root
+        .trim_end_matches(['\\', '/'])
+        .replace('/', "\\")
+        .to_ascii_uppercase();
+    p == r || p.starts_with(&format!("{r}\\"))
+}
+
+/// 首页「最近更新」的成员 id:数量有上限的虚拟相册,而不是把全库按时间
+/// 铺一遍(参考件的 `Recently Updated` 与星标、已发邮件同族,成员随扫描
+/// 增量维护,启动直接读已落盘的缩略图库)。
+///
+/// 两条入组门槛:
+/// 1. **该档缩略图已经落盘**(`thumb_ok=1`)且行在派生作用域内 —— 磁盘上
+///    还没图的一律不进相册,首屏因此不会出现「等派生」的灰格子。
+/// 2. **落在已登记的监听根内**(参考件默认只登记我的文档 / 图片 / 桌面
+///    三个壳目录)。全盘索引会把构建产物、开发资源图标、临时夹具一起收进库,
+///    它们的 mtime 永远最新,不圈范围就会把首页铺满非素材。
+///    `roots` 为空表示用户还没登记任何目录,此时退回不限范围。
+///
+/// 排序键与「按最近更改」共用同一份 mtime 归一表达式。
+pub fn load_recent(store: &Store, roots: &[String], limit: usize) -> Result<Vec<i64>> {
+    let sql = format!(
+        "SELECT p.id, p.parent FROM photos p
+         WHERE p.thumb_ok = 1 AND p.rich_state <> 0
+         ORDER BY {MTIME_SQL} DESC, p.id DESC"
+    );
+    store.read(|conn| -> Result<Vec<i64>> {
+        let mut st = conn.prepare(&sql)?;
+        let mut ids = Vec::with_capacity(limit);
+        let mut it = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        while let Some(row) = it.next() {
+            let (id, parent) = row?;
+            let in_scope = roots.is_empty()
+                || roots.iter().any(|r| under_root(&parent, r));
+            if in_scope {
+                ids.push(id);
+                if ids.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(ids)
+    })
 }
 
 /// 按目录分组,组内与组间都保持传入顺序(即排序方式直接决定组头排列)。
@@ -1234,6 +1298,58 @@ mod tests {
         // 名称:NOCASE 升序
         assert_eq!(order(SortBy::Name, false), ["a.jpg", "B.jpg", "c.jpg"]);
         assert_eq!(order(SortBy::Name, true), ["c.jpg", "B.jpg", "a.jpg"]);
+    }
+
+    /// 未纳入派生作用域(rich_state=0)的行恒排最后:反向、换排序都不提前。
+    /// 缓存目录的 mtime 通常最新,不压尾部就会一开屏全是灰格子。
+    #[test]
+    fn load_query_sinks_rows_out_of_scope() {
+        let store = Store::open_mem().unwrap();
+        // 灰格子 mtime 最大、体积最大、名字最靠前 —— 三种排序都想把它顶到第一。
+        insert_photo(&store, "/cache/a.jpg", "/cache", None, 0, 0, 300, 900, None);
+        insert_photo(
+            &store,
+            "/p/z.jpg",
+            "/p",
+            Some("2024-01-01T00:00:00"),
+            0,
+            0,
+            200,
+            100,
+            None,
+        );
+        insert_photo(
+            &store,
+            "/p/y.jpg",
+            "/p",
+            Some("2024-02-01T00:00:00"),
+            0,
+            0,
+            100,
+            200,
+            None,
+        );
+        store
+            .test_conn()
+            .execute("UPDATE photos SET rich_state=1 WHERE parent='/p'", [])
+            .unwrap();
+        let order = |sort: SortBy, reverse: bool| -> Vec<String> {
+            load_query(&store, sort, reverse, &Filters::default())
+                .unwrap()
+                .into_iter()
+                .map(|r| r.path.rsplit('/').next().unwrap().to_string())
+                .collect()
+        };
+        for sort in SortBy::ALL {
+            for reverse in [false, true] {
+                assert_eq!(
+                    order(sort, reverse).last().unwrap(),
+                    "a.jpg",
+                    "{sort:?} reverse={reverse} 该把未纳入的行排在最后"
+                );
+            }
+        }
+        assert_eq!(order(SortBy::Recent, false), ["z.jpg", "y.jpg", "a.jpg"]);
     }
 
     /// 组头分组:组序与组内序都跟随排序方式(参考件平铺视图即按当前排序铺组)。

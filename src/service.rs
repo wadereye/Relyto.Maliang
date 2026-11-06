@@ -685,7 +685,14 @@ fn work_loop(e: Arc<Engine>) {
 
 /// 每卷一个保鲜线程。主体是阻塞的 IOCTL:没有变更就不醒。
 fn fresh_loop(e: Arc<Engine>, letter: char) {
+    e.log.line(&format!("[{letter}:] 保鲜线程启动"));
     let mut backoff = BACKOFF_MIN;
+    // 诊断节奏:10s 一拍,把线程还活着、checkpoint 到哪了写进日志。
+    // (只在空闲轮次打;有增量的轮次本来就有 增量 行。)
+    let mut rounds = 0u64;
+    let mut last_diag = Instant::now();
+    struct RoundDiag { records: u64, ops: usize, next: i64 }
+    let mut last_round = RoundDiag { records: 0, ops: 0, next: 0 };
     while !e.stop.load(Ordering::SeqCst) {
         // 每轮重新问一次 journal:日志可能被重建(id 变了),也可能被关掉。
         let probe = mft::probe().into_iter().find(|p| p.letter == letter);
@@ -710,12 +717,46 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
             let st = e.lock();
             st.journals.get(&letter).map(|s| s.next_usn).unwrap_or(j.next_usn)
         };
+        rounds += 1;
+        if last_diag.elapsed() >= Duration::from_secs(10) {
+            last_diag = Instant::now();
+            e.log.line(&format!(
+                "[{letter}:] 保鲜诊断:checkpoint={start:#x} jid={:x} 近10s轮询 {rounds} 次(末轮 records={lr} ops={lo} next_usn={ln:#x})",
+                j.journal_id, lr = last_round.records, lo = last_round.ops, ln = last_round.next
+            ));
+            rounds = 0;
+        }
         match nameidx::poll_journal(letter, j.journal_id, start) {
             nameidx::JournalStep::Delta {
                 ops,
                 next_usn,
                 records,
+                raw,
             } => {
+                last_round = RoundDiag { records, ops: ops.len(), next: next_usn };
+                // 诊断(临时):把有记录的轮次摊开,验证内核到底回了什么、
+                // collect_close_op 收了什么。收口前整段摘除。
+                if records > 0 {
+                    let det: Vec<String> = ops
+                        .iter()
+                        .take(8)
+                        .map(|op| match op {
+                            nameidx::DeltaOp::Upsert(u) => format!("up:{}", u.name),
+                            nameidx::DeltaOp::Delete(f) => format!("del:{f:x}"),
+                        })
+                        .collect();
+                    let raws: Vec<String> = raw
+                        .iter()
+                        .take(8)
+                        .map(|(r, n)| format!("{r:#x}/{n}"))
+                        .collect();
+                    e.log.line(&format!(
+                        "[{letter}:] 诊断:records={records} ops={} 明细[{}] 原始[{}]",
+                        ops.len(),
+                        det.join(" "),
+                        raws.join(" ")
+                    ));
+                }
                 e.apply_step(letter, j.journal_id, j.first_usn, ops, next_usn, records);
             }
             nameidx::JournalStep::RebuildNeeded => {

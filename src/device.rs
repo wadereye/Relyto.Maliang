@@ -41,9 +41,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
+#[cfg(windows)]
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+#[cfg(windows)]
 use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+#[cfg(windows)]
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+#[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, TranslateMessage,
     WINDOW_EX_STYLE, WNDCLASSW,
@@ -122,6 +126,7 @@ pub fn translate_device_change(wparam: u32, lparam: usize) -> Option<DeviceEvent
 ///
 /// 原版用 `Removable Drive(%s)` 命名这类设备;本实现用 `GetLogicalDrives`
 /// + `GetDriveTypeW` 得到盘符列表,返回形如 `E:\` 的根路径。
+#[cfg(windows)]
 pub fn removable_volumes() -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mask = unsafe { GetLogicalDrives() };
@@ -154,12 +159,14 @@ pub struct DeviceWatcher {
 }
 
 // 隐藏窗口的窗口类名(只用于本进程内的消息窗口)。
+#[cfg(windows)]
 const CLASS_NAME: &[u16] = &[
     b'M' as u16, b'a' as u16, b'l' as u16, b'i' as u16, b'a' as u16, b'n' as u16, b'D' as u16,
     b'e' as u16, b'v' as u16, b'i' as u16, b'c' as u16, b'e' as u16, 0,
 ];
 
 /// 窗口过程:只处理 `WM_DEVICECHANGE`,其余交给 `DefWindowProcW`。
+#[cfg(windows)]
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_DEVICECHANGE {
         // 事件通过全局 channel 传出(窗口过程拿不到自定义数据指针,
@@ -179,11 +186,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 /// 监听器若被重启(停止后再启动)就会把事件发到**已废弃**的旧 channel。
 static EVENT_TX: std::sync::Mutex<Option<mpsc::Sender<DeviceEvent>>> = std::sync::Mutex::new(None);
 
+#[cfg(windows)]
 fn device_event_sender() -> Option<mpsc::Sender<DeviceEvent>> {
     EVENT_TX.lock().ok().and_then(|g| g.clone())
 }
 
 /// 设置当前的事件 Sender(返回是否设置成功)。
+#[cfg(windows)]
 fn set_device_event_sender(tx: mpsc::Sender<DeviceEvent>) -> bool {
     let mut g = match EVENT_TX.lock() {
         Ok(g) => g,
@@ -202,6 +211,7 @@ fn set_device_event_sender(tx: mpsc::Sender<DeviceEvent>) -> bool {
 ///
 /// 失败时(非 Windows / 建窗失败)返回一个 `rx` 立即关闭的监听器,
 /// UI 侧 `try_recv` 得不到任何事件,等于"未启用",不影响其它功能。
+#[cfg(windows)]
 pub fn spawn_device_watcher() -> DeviceWatcher {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -305,6 +315,23 @@ pub fn new_volumes(old: &[PathBuf], new: &[PathBuf]) -> Vec<PathBuf> {
 /// 供 `wnd_proc` 使用的 `c_void` 引用占位(避免未使用导入告警)。
 #[allow(dead_code)]
 fn _unused_cvoid(_: *const c_void) {}
+
+/// 非 Windows:盘符分流是 Win32 口径,本平台返回空列表(等价于“没有可移动卷”)。
+#[cfg(not(windows))]
+pub fn removable_volumes() -> Vec<PathBuf> {
+    Vec::new()
+}
+
+/// 非 Windows:无 WM_DEVICECHANGE 隐藏窗口,返回一个不出事件的监听器(等价于“未启用”)。
+#[cfg(not(windows))]
+pub fn spawn_device_watcher() -> DeviceWatcher {
+    let (_tx, rx) = mpsc::channel();
+    DeviceWatcher {
+        stop: Arc::new(AtomicBool::new(false)),
+        rx,
+        handle: None,
+    }
+}
 
 #[cfg(test)]
 mod tests {

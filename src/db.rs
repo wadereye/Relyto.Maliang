@@ -38,6 +38,8 @@ pub struct Store {
     write_tx: Mutex<Option<mpsc::Sender<WriteJob>>>,
     /// 写线程句柄(Drop 时排干队列再退出,不丢尾部写)。
     write_done: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 本次启动硬排除清理摘掉的行数(0 = 没动);缩略图 GC 的触发信号之一。
+    pub hard_purged: std::sync::atomic::AtomicUsize,
 }
 
 /// 数据目录配置文件名:固定放**默认**目录里,先于任何库打开就能读到
@@ -125,13 +127,14 @@ pub fn service_mode() -> bool {
 
 /// 目录选取口径(纯函数,便于把优先级钉成测试):
 /// 用户标记 > 机器标记 > 按形态的默认目录。
-fn resolve_data_dir(
-    user: Option<PathBuf>,
-    machine: Option<PathBuf>,
-    as_service: bool,
-) -> PathBuf {
-    user.or(machine)
-        .unwrap_or_else(|| if as_service { machine_default_dir() } else { default_data_dir() })
+fn resolve_data_dir(user: Option<PathBuf>, machine: Option<PathBuf>, as_service: bool) -> PathBuf {
+    user.or(machine).unwrap_or_else(|| {
+        if as_service {
+            machine_default_dir()
+        } else {
+            default_data_dir()
+        }
+    })
 }
 
 fn marker_data_dir() -> Option<PathBuf> {
@@ -672,6 +675,13 @@ pub const RICH_BAD: i32 = 3;
 /// 三次都失败才算这个文件真解不开。
 pub const BAD_MEDIA_THRESHOLD: i64 = 3;
 
+/// 硬排除清理的版本号,写进 `hard_excluded_purged` 标记里。
+///
+/// 改一次硬名单(见 `scan::HARD_EXCLUDES_OURS`)就把它往前推一格:老库上次
+/// 清理时用的是旧名单,不推版本的话新加进硬层的那些目录会永远留在库里当灰格子。
+// 名单里新增了构建/测试夹具目录,改版本号让历史库再对账一次。
+const HARD_PURGE_VERSION: &str = "hard-excluded-v2";
+
 /// `dir_intent.state`:首启默认范围(范围对话框 / 壳目录)。
 pub const INTENT_DEFAULT_ROOT: &str = "default_root";
 /// `dir_intent.state`:用户主动导入。
@@ -777,25 +787,37 @@ pub fn volume_of(p: &str) -> Option<String> {
 /// Shell API,两边的大小写不保证一致。
 #[derive(Debug, Default, Clone)]
 pub struct ScopeMap {
-    by_upper: HashMap<String, String>,
+    /// 归一化大写路径 → (state, source)。source 也要带上:软排除层让不让路,
+    /// 只看「这条账本是不是用户亲手导入的」(方案 ④)。
+    by_upper: HashMap<String, (String, String)>,
 }
 
 impl ScopeMap {
     pub fn load(store: &Store) -> Self {
-        let rows: Vec<(String, String)> = store.read(|conn| {
-            let mut st = match conn.prepare("SELECT path,state FROM dir_intent") {
+        let rows: Vec<(String, String, String)> = store.read(|conn| {
+            let mut st = match conn.prepare("SELECT path,state,source FROM dir_intent") {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-                .ok()
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
+            st.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    // source 允许为空(历史行/手工写账),空串按「非亲手导入」处理。
+                    r.get::<_, Option<String>>(2)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default(),
+                ))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
         });
         ScopeMap {
             by_upper: rows
                 .into_iter()
-                .map(|(p, s)| (norm_dir(&p).to_ascii_uppercase(), s))
+                .map(|(p, s, src)| (norm_dir(&p).to_ascii_uppercase(), (s, src)))
                 .collect(),
         }
     }
@@ -806,8 +828,8 @@ impl ScopeMap {
         self.by_upper.is_empty()
     }
 
-    /// 覆盖该目录的最深那条账本的状态;一条都不覆盖时 None(= 未纳入)。
-    pub fn state_of(&self, dir: &str) -> Option<&str> {
+    /// 覆盖该目录的最深那条账本(state + source);一条都不覆盖时 None。
+    fn entry_of(&self, dir: &str) -> Option<&(String, String)> {
         if self.by_upper.is_empty() {
             return None;
         }
@@ -815,13 +837,20 @@ impl ScopeMap {
         let mut end = up.len();
         loop {
             if let Some(st) = self.by_upper.get(&up[..end]) {
-                return Some(st.as_str());
+                return Some(st);
             }
             // 上溯一级:切掉最后一个分隔符之后的部分。
-            let cut = match up[..end].rfind('\\') {
-                // i==0 只可能是 UNC 的 `\\host` 前缀,再上就没有卷根可言。
-                Some(i) if i > 0 => i,
-                _ => return None,
+            let cut = match up[..end].rfind(['\\', '/']) {
+                // 只剩开头那个分隔符:POSIX 的 `/` 也是一级(根),要让它命中账本;
+                // 已经在根上——或 Windows 侧的 UNC 残段——就没有更上的一级了。
+                Some(0) => {
+                    if end == 1 {
+                        return None;
+                    }
+                    return self.by_upper.get("/");
+                }
+                Some(i) => i,
+                None => return None,
             };
             let parent = &up[..cut];
             let pb = parent.as_bytes();
@@ -838,9 +867,23 @@ impl ScopeMap {
         }
     }
 
+    /// 覆盖该目录的最深那条账本的状态;一条都不覆盖时 None(= 未纳入)。
+    pub fn state_of(&self, dir: &str) -> Option<&str> {
+        self.entry_of(dir).map(|(s, _)| s.as_str())
+    }
+
     /// 该目录(或被它覆盖的祖先)是否在派生作用域内。
     pub fn includes(&self, dir: &str) -> bool {
         matches!(self.state_of(dir), Some(s) if intent_included(s))
+    }
+
+    /// 该目录是否由**用户亲手导入**而纳入(账本 source = `import`)。
+    ///
+    /// 只有这一条能压过软排除层:首启对话框落的全盘卷根(`initial_scan_dialog`)、
+    /// 滚动/点击自动记的(`click` / `visible`)都不算 —— 那正是 2026-11-05
+    /// 「滚到过不等于要派生」要挡的场景。
+    pub fn explicit_import(&self, dir: &str) -> bool {
+        matches!(self.entry_of(dir), Some((s, src)) if intent_included(s) && src == SRC_IMPORT)
     }
 }
 
@@ -890,9 +933,30 @@ impl ScopeGate {
         }
     }
 
-    /// 目录是否在派生作用域内(点击懒加载与目录级失效都拿它复核)。
-    pub fn dir_in_scope(&self, dir: &str) -> bool {
-        self.scope.includes(dir)
+    /// 目录级的**派生许可** —— 行判定、点击懒加载、双向对账共用这一份口径。
+    ///
+    /// 三层:硬排除(4 条 + 回收站现代名 + 自家产出)一票否决;软排除
+    /// (AppData / Program Files / temp / node_modules / 点开头目录 / 用户自定义)
+    /// 只在用户亲手导入时让路;都不命中就回账本。
+    pub fn dir_derivable(&self, dir: &str) -> bool {
+        use crate::scan::ExcludeLayer;
+        match self.excl.exclude_layer_dir(Path::new(dir)) {
+            Some(ExcludeLayer::Hard) => false,
+            Some(ExcludeLayer::Soft) => self.scope.explicit_import(dir),
+            None => self.scope.includes(dir),
+        }
+    }
+
+    /// 这一行的目录是否属于**永远不该进库**的那一类(硬层)。
+    ///
+    /// 自家产出目录、回收站、系统与程序目录、点开头目录 —— 里面的文件不是素材,而且 mtime 永远最新,进库就会霸占「最近更新」首屏
+    /// (2026-11-05 现场:首屏 200 张里 190 张是自家 thumbs,全是永远不亮的灰格子)。
+    /// L1→L2 落库前按这条筛掉新行,历史行由 [`Store::purge_hard_excluded_once`] 清。
+    pub fn never_index(&self, parent: &str) -> bool {
+        matches!(
+            self.excl.exclude_layer_dir(Path::new(parent)),
+            Some(crate::scan::ExcludeLayer::Hard)
+        )
     }
 
     /// 空账本 = 谁都不派生(首启对话框还没答过时的状态)。
@@ -916,11 +980,8 @@ impl ScopeGate {
         if self.bad.contains(&path.to_ascii_uppercase()) {
             return false;
         }
-        // ③ 目录级:排除规则 + 意图账本。
-        if self.excl.excludes_dir_path(Path::new(parent)) {
-            return false;
-        }
-        self.scope.includes(parent)
+        // ③ 目录级:排除层 + 意图账本(口径见 [`ScopeGate::dir_derivable`])。
+        self.dir_derivable(parent)
     }
 }
 
@@ -1036,6 +1097,7 @@ impl Store {
             settings: Mutex::new(HashMap::new()),
             write_tx: Mutex::new(None),
             write_done: Mutex::new(None),
+            hard_purged: std::sync::atomic::AtomicUsize::new(0),
         };
         // P1-11:启动时补齐缺失的 uid64。
         // 扫描路径会在 `store_insert` 里写,但**外部导入**(WiFi 接收、拖入)
@@ -1047,6 +1109,13 @@ impl Store {
         let _ = store.backfill_ext();
         // 一次性把历史库的派生状态播种进 rich_state。
         let _ = store.seed_rich_state_once();
+        // 一次性清掉永远不该进库的历史行(自家缓存、回收站、系统目录…)。
+        // 行数留给启动任务:有删除才值得跑一次缩略图缓存 GC。
+        let purged = store.purge_hard_excluded_once().unwrap_or(0);
+        store.hard_purged.store(
+            purged,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         Ok(store)
     }
 
@@ -1337,11 +1406,9 @@ impl Store {
     /// 逐帧画标题时别用它。
     pub fn album_name(&self, album_id: i64) -> Option<String> {
         self.read(move |conn| {
-            conn.query_row(
-                "SELECT name FROM albums WHERE id=?1",
-                [album_id],
-                |r| r.get::<_, String>(0),
-            )
+            conn.query_row("SELECT name FROM albums WHERE id=?1", [album_id], |r| {
+                r.get::<_, String>(0)
+            })
             .ok()
         })
     }
@@ -1583,7 +1650,10 @@ impl Store {
         }
         self.flush();
         let d = dest.to_string_lossy().into_owned();
-        self.write(move |conn| conn.execute("VACUUM INTO ?1", rusqlite::params![d]).map(|_| ()))?;
+        self.write(move |conn| {
+            conn.execute("VACUUM INTO ?1", rusqlite::params![d])
+                .map(|_| ())
+        })?;
         Ok(())
     }
 
@@ -1747,6 +1817,53 @@ impl Store {
         })
     }
 
+    /// 原位改名:把 `from` 的索引行改指 `to`,**id 不变**
+    /// (星标/标签/相册/人脸/缩略图缓存全部保留 —— id 键不变)。
+    ///
+    /// 目标路径已有行(改名覆盖了现有文件)时不覆盖:只删旧行,新位置的内容
+    /// 由扫描刷新,返回 Ok(false) 让调用方知道该目录要重扫。
+    pub fn rename_photo(&self, from: &str, to: &str, parent: &str) -> Result<bool> {
+        let (from, to, parent) = (from.to_string(), to.to_string(), parent.to_string());
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
+            let dupe: bool = tx
+                .query_row("SELECT 1 FROM photos WHERE path=?1", [&to], |_| Ok(true))
+                .unwrap_or(false);
+            let mut moved = false;
+            if dupe {
+                // 覆盖式改名:删旧行;`to` 的行还在(内容已变,扫描会刷新)。
+                let mut st = tx.prepare("SELECT id, path FROM photos WHERE path=?1")?;
+                let rows: Vec<(i64, String)> = st
+                    .query_map([&from], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .map(|it| it.flatten().collect())
+                    .unwrap_or_default();
+                drop(st);
+                Self::delete_photo_rows(&tx, &rows)?;
+            } else {
+                let n = tx.execute(
+                    "UPDATE photos SET path=?2, parent=?3 WHERE path=?1",
+                    rusqlite::params![from, to, parent],
+                )?;
+                if n > 0 {
+                    moved = true;
+                    let id: Option<i64> = tx
+                        .query_row("SELECT id FROM photos WHERE path=?1", [&to], |r| r.get(0))
+                        .ok();
+                    tx.execute(
+                        "INSERT INTO changes(ts,path,action,photo_id) VALUES(?1,?2,?3,?4)",
+                        rusqlite::params![ts, to, "renamed", id],
+                    )?;
+                }
+            }
+            tx.commit()?;
+            Ok(moved)
+        })
+    }
+
     // ===== P1-12 变更日志 =====
 
     /// 记录一条变更(added / modified / removed)。
@@ -1774,12 +1891,10 @@ impl Store {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            st.query_map([limit as i64], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+            st.query_map([limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         })
     }
 
@@ -1820,12 +1935,10 @@ impl Store {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            st.query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
-            .ok()
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         });
         if rows.is_empty() {
             return Ok(0);
@@ -1897,6 +2010,115 @@ impl Store {
         });
         let _ = self.set_setting("rich_state_seeded", "1");
         Ok(n)
+    }
+
+    /// 一次性把**永远不该进库**的历史行清掉(2026-11-05 现场)。
+    ///
+    /// 命中 [`crate::scan::ExcludeLayer::Hard`] 的那些目录 —— 自家产出目录、
+    /// 回收站、系统与程序目录、点开头目录 —— 里面的文件不是素材:它们的
+    /// mtime 永远最新,于是「最近更新」首屏 200 张里 190 张是自家 thumbs
+    /// (全是 `rich_state=0` 的灰格子),用户看到的就是「整屏不亮、等半天
+    /// 也不更新」。
+    ///
+    /// 增量入库那一侧同步拦掉新行(`nameidx::ingest_l1`),这里清历史行。
+    /// 软层(AppData 一类)**不清** —— 那些行留在库里当占位,用户对着它
+    /// 右键「纳入此目录」就能放行(2026-11-05 拍板:AppData 也要能访问)。
+    ///
+    /// 标记值 = 名单版本 + 当前解析出的自有前缀清单,不是一个布尔:缓存位置
+    /// 会被 `MALIANG_CACHE_DIR` / `data.location` 改到别处,硬名单也会随版本
+    /// 调整,任一处变了就得再清一次。
+    pub fn purge_hard_excluded_once(&self) -> Result<usize> {
+        let excl = crate::scan::Exclusions::from_store(self);
+        let mut key = String::from(HARD_PURGE_VERSION);
+        for p in excl.own_prefixes() {
+            key.push('\n');
+            key.push_str(&p.to_string_lossy().to_ascii_lowercase());
+        }
+        if self.get_setting("hard_excluded_purged").as_deref() == Some(key.as_str()) {
+            return Ok(0);
+        }
+        let mut total = 0usize;
+        let mut last_id = 0i64;
+        loop {
+            // 分页扫而不是一次拉完:全盘索引的行数是百万级,
+            // 一次 `SELECT id,parent FROM photos` 会把整表路径堆在内存里。
+            let chunk: Vec<(i64, String)> = self.read(|conn| -> Result<Vec<(i64, String)>> {
+                let mut st = conn.prepare(
+                    "SELECT id, parent FROM photos WHERE id > ?1 ORDER BY id LIMIT 50000",
+                )?;
+                let rows = st.query_map([last_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?;
+                Ok(rows.filter_map(|r| r.ok()).collect())
+            })?;
+            if chunk.is_empty() {
+                break;
+            }
+            last_id = chunk.last().map(|(id, _)| *id).unwrap_or(last_id);
+            let hits: Vec<i64> = chunk
+                .into_iter()
+                .filter(|(_, parent)| {
+                    matches!(
+                        excl.exclude_layer_dir(Path::new(parent)),
+                        Some(crate::scan::ExcludeLayer::Hard)
+                    )
+                })
+                .map(|(id, _)| id)
+                .collect();
+            if !hits.is_empty() {
+                total += self.delete_rows_quiet(hits)?;
+            }
+        }
+        let _ = self.set_setting("hard_excluded_purged", &key);
+        Ok(total)
+    }
+
+    /// 按 id 批量删行,**不写变更日志**:清的是从未属于图库的行,往 `changes`
+    /// 里灌十万条 `removed` 会把真正的用户删除记录冲掉。
+    ///
+    /// 引用表逐条清:SQLite 外键级联默认关闭,只删 `photos` 会留下孤儿行,
+    /// rowid 复用后孤儿会错挂到新照片上(口径同 [`Store::delete_photo_rows`])。
+    fn delete_rows_quiet(&self, ids: Vec<i64>) -> Result<usize> {
+        const CHUNK: usize = 20_000;
+        let mut total = 0usize;
+        for part in ids.chunks(CHUNK) {
+            let chunk = part.to_vec();
+            let chunk2 = chunk.clone();
+            total += self.write(move |conn| {
+                let part = chunk2;
+                let tx = conn.unchecked_transaction()?;
+                tx.execute_batch(
+                    "CREATE TEMP TABLE IF NOT EXISTS purge_ids(id INTEGER PRIMARY KEY);
+                     DELETE FROM purge_ids;",
+                )?;
+                {
+                    let mut st = tx.prepare_cached("INSERT INTO purge_ids(id) VALUES(?1)")?;
+                    for id in &part {
+                        st.execute(rusqlite::params![id])?;
+                    }
+                }
+                tx.execute_batch(
+                    "DELETE FROM photo_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM face_templates WHERE face_id IN
+                         (SELECT id FROM faces WHERE photo_id IN (SELECT id FROM purge_ids));
+                     DELETE FROM faces         WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM clips         WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM clips_cn      WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM thumb_tiers   WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM album_photos  WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM photos        WHERE id IN (SELECT id FROM purge_ids);",
+                )?;
+                let n = part.len();
+                tx.commit()?;
+                Ok::<usize, anyhow::Error>(n)
+            })?;
+            // 行删了,盘上的缩略图/预览缓存也得跟着走:无主文件既占空间,
+            // rowid 复用后还会把旧图显示给新照片。
+            for id in &chunk {
+                crate::thumbs::purge_cached(*id);
+            }
+        }
+        Ok(total)
     }
 
     /// 按 uid64 查照片(供外部工具按持久标识引用)。
@@ -2326,14 +2548,14 @@ impl Store {
         let remap = mem.vacuum(&live_set);
         let orphan_total = all.len().saturating_sub(remap.len());
 
-        // 业务表引用(旧号 → 新号)。先全部改完再换池,避免中途态。
-        let mut updated = 0usize;
-        {
-            let mut up = tx.prepare("UPDATE photos SET cam_id=?2 WHERE cam_id=?1")?;
-            for (old_id, new_id) in remap.iter().filter(|(o, n)| o != n) {
-                updated += up.execute(rusqlite::params![old_id, new_id])?;
+            // 业务表引用(旧号 → 新号)。先全部改完再换池,避免中途态。
+            let mut updated = 0usize;
+            {
+                let mut up = tx.prepare("UPDATE photos SET cam_id=?2 WHERE cam_id=?1")?;
+                for (old_id, new_id) in remap.iter().filter(|(o, n)| o != n) {
+                    updated += up.execute(rusqlite::params![old_id, new_id])?;
+                }
             }
-        }
 
         // 换池:新内容写临时表,再整体切换(边删边插会撞主键)
         tx.execute_batch("DROP TABLE IF EXISTS string_pool_new;")?;
@@ -2344,22 +2566,22 @@ impl Store {
                  value   TEXT    NOT NULL,
                  PRIMARY KEY (pool, value_id)
              );",
-        )?;
-        {
-            let mut ins = tx.prepare(
-                "INSERT INTO string_pool_new(pool, value_id, value) VALUES(?1,?2,?3)",
             )?;
-            for (new_id, val) in mem.values().iter().enumerate() {
-                ins.execute(rusqlite::params![pool, new_id as i64, val])?;
+            {
+                let mut ins = tx.prepare(
+                    "INSERT INTO string_pool_new(pool, value_id, value) VALUES(?1,?2,?3)",
+                )?;
+                for (new_id, val) in mem.values().iter().enumerate() {
+                    ins.execute(rusqlite::params![pool, new_id as i64, val])?;
+                }
             }
-        }
-        // execute 只接受单条语句 —— 这里用 params 删本池
-        tx.execute(
-            "DELETE FROM string_pool WHERE pool=?1",
-            rusqlite::params![pool],
-        )?;
-        tx.execute_batch(
-            "INSERT INTO string_pool(pool, value_id, value)
+            // execute 只接受单条语句 —— 这里用 params 删本池
+            tx.execute(
+                "DELETE FROM string_pool WHERE pool=?1",
+                rusqlite::params![pool],
+            )?;
+            tx.execute_batch(
+                "INSERT INTO string_pool(pool, value_id, value)
              SELECT pool, value_id, value FROM string_pool_new;",
         )?;
         tx.execute_batch("DROP TABLE string_pool_new;")?;
@@ -2398,7 +2620,6 @@ impl Store {
         }
         Ok(out)
     }
-
 
     // ===== P1-9 多档缩略图 =====
 
@@ -2442,6 +2663,57 @@ impl Store {
     /// 反复失败的行不再靠 `thumb_fail` 阈值过滤:达到阈值即由
     /// [`Store::mark_bad_media`] 立案、`rich_state` 置 3 出队(方案 P3-22),
     /// 台账才是权威,`thumb_fail` 退化成计数。
+    /// 摘掉某张照片某一档的缩略图台账,让回填队列重新取它。
+    ///
+    /// 中档(Normal)缓存损坏时只删行还不够:派生状态已落 `rich_state=2`,
+    /// `pending_rich` 不会再取 —— 把它退回「待派生」(仅当仍是 2,坏文件立案
+    /// 的 3 不能动)才会重新生成。其余档删 `thumb_tiers` 行即可。
+    /// 批量摘台账(启动对账用):一次事务里删 `thumb_tiers` 行,并把其中
+    /// 中档(Normal)对应、且仍处「已派生」的照片退回「待派生」。
+    pub fn clear_tier_rows(&self, rows: &[(i64, u8)]) {
+        if rows.is_empty() {
+            return;
+        }
+        let rows = rows.to_vec();
+        let _ = self.write(move |conn| {
+            let _ = conn.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS clear_ids(id INTEGER, tier INTEGER);
+                 DELETE FROM clear_ids;",
+            );
+            let mut st = match conn.prepare("INSERT INTO clear_ids(id, tier) VALUES(?1, ?2)") {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            for (id, tier) in &rows {
+                let _ = st.execute(rusqlite::params![id, *tier as i64]);
+            }
+            drop(st);
+            let _ = conn.execute_batch(
+                "DELETE FROM thumb_tiers
+                 WHERE (photo_id, tier) IN (SELECT id, tier FROM clear_ids);
+                 UPDATE photos SET thumb_ok=0, rich_state=1
+                 WHERE rich_state=2
+                   AND id IN (SELECT id FROM clear_ids WHERE tier=1);",
+            );
+        });
+    }
+
+    pub fn clear_tier_row(&self, photo_id: i64, tier: u8) {
+        let _ = self.write(move |conn| {
+            let _ = conn.execute(
+                "DELETE FROM thumb_tiers WHERE photo_id=?1 AND tier=?2",
+                rusqlite::params![photo_id, tier as i64],
+            );
+            if tier == 1 {
+                let _ = conn.execute(
+                    "UPDATE photos SET thumb_ok=0, rich_state=1
+                     WHERE id=?1 AND rich_state=2",
+                    rusqlite::params![photo_id],
+                );
+            }
+        });
+    }
+
     pub fn missing_tier(&self, tier: u8, visible: &[String], limit: usize) -> Vec<(i64, String)> {
         if limit == 0 {
             return Vec::new();
@@ -2458,10 +2730,9 @@ impl Store {
                     Ok(s) => s,
                     Err(_) => return Vec::new(),
                 };
-                st.query_map(
-                    rusqlite::params![limit as i64, tier as i64],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                st.query_map(rusqlite::params![limit as i64, tier as i64], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .ok()
                 .map(|it| it.filter_map(|r| r.ok()).collect())
                 .unwrap_or_default()
@@ -2758,15 +3029,26 @@ impl Store {
         Ok(total)
     }
 
-    /// 这个目录能不能因为「看到 / 点到」写进派生作用域账本。
+    /// 这个目录能不能写进派生作用域账本。
     ///
-    /// 排除规则一票否决(2026-11-05 拍板):系统目录、应用缓存、回收站不该因为用户
-    /// 滚到过、或点过里面一张图,就变成「以后这个目录的图都要派生」。
+    /// 分两层(2026-11-05 现场修正):
+    /// - **硬层**(参考件 4 条 + 回收站现代名 + 自家产出目录)任何入口都不放行;
+    /// - **软层**(AppData / Program Files / temp / node_modules / 点开头目录 /
+    ///   用户自定义排除)只在 `deliberate=true` —— 用户在文件夹管理器里选中它、
+    ///   或对着占位格右键「纳入此目录」—— 才放行。
+    ///
+    /// 滚到过、屏幕上出现过一律算被动,不写账本(那条口径 11-05 已拍,保留)。
     /// 空路径同样不算可纳入 —— 调用方拿它的返回值决定要不要给回执。
-    pub fn adoptable_dir(&self, dir: &str) -> bool {
-        !dir.is_empty()
-            && !crate::scan::Exclusions::from_store(self)
-                .excludes_dir_path(std::path::Path::new(dir))
+    pub fn adoptable_dir(&self, dir: &str, deliberate: bool) -> bool {
+        use crate::scan::ExcludeLayer;
+        if dir.is_empty() {
+            return false;
+        }
+        match crate::scan::Exclusions::from_store(self).exclude_layer_dir(Path::new(dir)) {
+            Some(ExcludeLayer::Hard) => false,
+            Some(ExcludeLayer::Soft) => deliberate,
+            None => true,
+        }
     }
 
     /// 点击懒加载(方案 P3-19):该目录子树里**未纳入**的行置为待派生。
@@ -2862,40 +3144,66 @@ impl Store {
         })
     }
 
-    /// 拿账本复核一遍已进门的行:落在作用域之外的整目录退回未纳入。
+    /// 拿账本复核一遍库里的行,两个方向都走(方案 ⑤):
     ///
-    /// 这是「保存时把孤儿记录清零不落盘」在 L2 的对应物 —— 那边
-    /// 清的是父级已不存在的 type-4 记录,我们清的是**已不在作用域内却还占着
-    /// rich_state 的行**。文件真被删掉的那一类由 [`Store::delete_l1_frn64`]
-    /// 直接删行,不在这里。返回退回的行数。
+    /// - **降**:已不在作用域内的整目录退回未纳入(0)。这是「保存时把孤儿记录
+    ///   清零不落盘」在 L2 的对应物 —— 那边清的是父级已不存在的 type-4 记录,
+    ///   我们清的是**已不在作用域内却还占着 rich_state 的行**。文件真被删掉的那一类
+    ///   由 [`Store::delete_l1_frn64`] 直接删行,不在这里。
+    /// - **升**:已在作用域内的整目录把 0 抬回 1(台账里的行抬回 3)。
+    ///   少了这一刀,后来才纳入的目录要等文件 mtime 变一次才重算 —— 用户看到的就是
+    ///   「导入完了照片永远是占位块」。
+    ///
+    /// 判定一律走 [`ScopeGate::dir_derivable`](行级同口径),所以「祖先被纳入但本级
+    /// 命中排除」的目录不会被抬进门,而用户亲手导入的软排除目录不会被降回。
+    /// 返回变动的行数。
     pub fn reconcile_rich_state(&self, gate: &ScopeGate) -> Result<usize> {
-        let dirs: Vec<String> = self.read(|conn| {
-            let mut st = match conn
-                .prepare("SELECT DISTINCT parent FROM photos WHERE rich_state<>0")
-            {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
-            st.query_map([], |r| r.get::<_, String>(0))
-                .ok()
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-        });
-        let out: Vec<String> = dirs
-            .into_iter()
-            .filter(|d| !gate.dir_in_scope(d))
-            .collect();
-        if out.is_empty() {
+        let mut demote: Vec<String> = Vec::new();
+        let mut promote: Vec<String> = Vec::new();
+        self.read(|conn| -> Result<()> {
+            let mut st = conn.prepare("SELECT DISTINCT parent FROM photos WHERE rich_state<>0")?;
+            for r in st.query_map([], |r| r.get::<_, String>(0))? {
+                if let Ok(d) = r {
+                    if !gate.dir_derivable(&d) {
+                        demote.push(d);
+                    }
+                }
+            }
+            drop(st);
+            let mut st = conn.prepare("SELECT DISTINCT parent FROM photos WHERE rich_state=0")?;
+            for r in st.query_map([], |r| r.get::<_, String>(0))? {
+                if let Ok(d) = r {
+                    if gate.dir_derivable(&d) {
+                        promote.push(d);
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        if demote.is_empty() && promote.is_empty() {
             return Ok(0);
         }
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let mut n = 0usize;
             {
-                let mut st =
+                let mut down =
                     tx.prepare_cached("UPDATE photos SET rich_state=0 WHERE parent=?1")?;
-                for d in &out {
-                    n += st.execute(rusqlite::params![d])?;
+                for d in &demote {
+                    n += down.execute(rusqlite::params![d])?;
+                }
+                // 升:台账里的行回 3(仍在案,不出队),其余回 1。
+                let mut up_bad = tx.prepare_cached(
+                    "UPDATE photos SET rich_state=3 WHERE rich_state=0 AND parent=?1 \
+                     AND upper(path) IN (SELECT upper(path) FROM bad_media)",
+                )?;
+                let mut up = tx.prepare_cached(
+                    "UPDATE photos SET rich_state=1 WHERE rich_state=0 AND parent=?1 \
+                     AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)",
+                )?;
+                for d in &promote {
+                    n += up_bad.execute(rusqlite::params![d])?;
+                    n += up.execute(rusqlite::params![d])?;
                 }
             }
             tx.commit()?;
@@ -2959,16 +3267,38 @@ impl Store {
 
     /// 销案(「不隐藏」出口):删台账 + 该行 `rich_state` 3→1 重新排队。
     pub fn unmark_bad_media(&self, path: &str) -> Result<()> {
-        let p = path.to_string();
+        self.unmark_bad_media_batch([path])?;
+        Ok(())
+    }
+
+    /// 批量销案:台账行删掉、`rich_state=3` 的行放回待派生、失败计数清零。
+    /// 返回真正被放回队列的行数。
+    ///
+    /// 单事务而不是一条一个事务:整批复盘(比如「误判坏图一次性销案」)动辄
+    /// 几千条,WAL 下每次提交都要落盘,逐条写会把一次后台维护拖成几十秒。
+    pub fn unmark_bad_media_batch(
+        &self,
+        paths: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<usize> {
+        let paths: Vec<String> = paths.into_iter().map(|p| p.as_ref().to_string()).collect();
+        if paths.is_empty() {
+            return Ok(0);
+        }
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            tx.execute("DELETE FROM bad_media WHERE path=?1", rusqlite::params![p])?;
-            tx.execute(
-                "UPDATE photos SET rich_state=?2, thumb_fail=0 WHERE path=?1 AND rich_state=?3",
-                rusqlite::params![p, RICH_PENDING, RICH_BAD],
-            )?;
+            let mut n = 0usize;
+            {
+                let mut del = tx.prepare_cached("DELETE FROM bad_media WHERE path=?1")?;
+                let mut requeue = tx.prepare_cached(
+                    "UPDATE photos SET rich_state=?2, thumb_fail=0 WHERE path=?1 AND rich_state=?3",
+                )?;
+                for p in &paths {
+                    del.execute(rusqlite::params![p])?;
+                    n += requeue.execute(rusqlite::params![p, RICH_PENDING, RICH_BAD])?;
+                }
+            }
             tx.commit()?;
-            Ok(())
+            Ok::<usize, anyhow::Error>(n)
         })
     }
 
@@ -3037,8 +3367,15 @@ fn like_escape(s: &str) -> String {
 /// 卷根要先去掉结尾分隔符,否则会多转义出一个字面反斜杠。
 fn dir_like(dir: &str) -> (String, String) {
     let d = norm_dir(dir);
-    let base = d.trim_end_matches('\\');
-    (like_escape(&d), format!("{}\\\\%", like_escape(base)))
+    let base = d.trim_end_matches(['\\', '/']);
+    // 子树通配的分隔符跟着路径自己的写法走:POSIX 上 `photos.parent` 只有 `/`,
+    // 硬编码反斜杠会让整棵子树一条也匹配不到(2026-11-06 Linux 端 promote 全 0)。
+    let sep = if d.contains('/') && !d.contains('\\') {
+        "/"
+    } else {
+        "\\\\"
+    };
+    (like_escape(&d), format!("{}{}%", like_escape(base), sep))
 }
 
 /// 扫描根目录候选(按盘符枚举)。
@@ -3418,7 +3755,7 @@ mod tests {
             let deep = v.join("Users").join("me").join("Pictures").join("2026");
             let gate = ScopeGate::load(&store);
             assert!(
-                gate.dir_in_scope(&deep.to_string_lossy()),
+                gate.dir_derivable(&deep.to_string_lossy()),
                 "卷内任意深度都应被卷根那条意图覆盖:{deep:?}"
             );
         }
@@ -3427,27 +3764,286 @@ mod tests {
         assert_eq!(watched.len(), default_roots().len());
     }
 
-    /// 「看到 / 点到」能不能把目录写进作用域账本:排除规则一票否决(2026-11-05 拍板)。
+    /// 排除名单分两层(2026-11-05 拍板):软层能被用户表态覆盖(AppData 也要能
+    /// 访问),硬层谁都不能、而且不进库。这条口径是 `adoptable_dir` /
+    /// `dir_derivable` / `purge_hard_excluded_once` 共用的那一份判定,
+    /// 测试打在门口,免得 UI 与入库各抄一遍。
+    #[cfg(windows)]
     #[test]
-    fn adoptable_dir_refuses_excluded_and_empty() {
+    fn adoptable_dir_splits_hard_and_soft_excludes() {
         let store = Store::open_mem().unwrap();
         assert!(
-            store.adoptable_dir("D:\\4.Photos\\coco"),
+            store.adoptable_dir("D:\\4.Photos\\coco", false),
             "普通照片目录该放行"
         );
-        assert!(!store.adoptable_dir(""), "空路径不是一条目录");
+        assert!(!store.adoptable_dir("", true), "空路径不是一条目录");
+
+        // 硬层:表态也打不开。
         for d in [
             "D:\\$RECYCLE.BIN\\S-1-5-21-1",
-            "C:\\Users\\me\\AppData\\Roaming\\someapp",
             "D:\\maliang\\cache\\thumbs",
+            "E:\\photos\\Originals",
+            "C:\\Windows\\Web\\Wallpaper",
+            "C:\\Program Files (x86)\\someapp\\res",
             "E:\\proj\\node_modules\\pkg",
+            "C:\\Users\\me\\.cache\\pkg",
         ] {
-            assert!(!store.adoptable_dir(d), "{d} 属于排除名单,不该因为被看到就进账本");
+            assert!(!store.adoptable_dir(d, false), "{d} 被动该拦住");
+            assert!(!store.adoptable_dir(d, true), "{d} 属于硬层,表态也不放行");
         }
+
+        // 软层:被动拦住、表态放行。`temp` 在这一层 —— 微信把收藏图片放在
+        // `xwechat_files\...\favorite\temp` 里,不能一票否决到没有出口。
         store.set_setting("exclude_dirs", "mytmp").unwrap();
+        for d in [
+            "C:\\Users\\me\\AppData\\Roaming\\kingsoft\\kaccountsdk",
+            "C:\\Users\\me\\AppData\\Local\\npm-cache\\x",
+            "D:\\xwechat_files\\me\\business\\favorite\\temp",
+            "D:\\maliang-archive-20261105\\local-cache",
+            "D:\\mytmp\\sub",
+        ] {
+            assert!(!store.adoptable_dir(d, false), "{d} 不该因为被看到就进账本");
+            assert!(store.adoptable_dir(d, true), "{d} 属于软层,用户表态要放行");
+        }
+    }
+
+    /// 同一套分层在 POSIX 路径上的对偶:分隔符是 `/`、没有盘符,分层只认名字与 own-prefix。
+    #[cfg(not(windows))]
+    #[test]
+    fn adoptable_dir_splits_hard_and_soft_excludes_posix() {
+        let store = Store::open_mem().unwrap();
+        assert!(store.adoptable_dir("/home/me/Photos/coco", false), "普通照片目录该放行");
+        assert!(!store.adoptable_dir("", true), "空路径不是一条目录");
+
+        // 硬排除:点开头目录 / 参考件同名目录 / 我们的系统目录 —— deliberate 也救不回来。
+        for d in [
+            "/home/me/.cache/pkg",
+            "/mnt/win/$RECYCLE.BIN/S-1-5-21-1",
+            "/mnt/win/Windows/Web/Wallpaper",
+            "/mnt/win/Program Files (x86)/someapp/res",
+            "/srv/proj/node_modules/pkg",
+            "/home/me/Pictures/Originals",
+        ] {
+            assert!(!store.adoptable_dir(d, false), "{d} 属于硬排除");
+            assert!(!store.adoptable_dir(d, true), "{d} 是硬排除,明确点名也不放行");
+        }
+        let own = cache_dir_loc().join("thumbs").join("a.jpg");
         assert!(
-            !store.adoptable_dir("D:\\mytmp\\sub"),
-            "用户自己加的排除项同样要拦住"
+            !store.adoptable_dir(&own.to_string_lossy(), true),
+            "自家缓存(由 MALIANG_CACHE_DIR / data.location 推导)整棵子树硬排除",
+        );
+
+        // 软排除:名字规则(含用户自己加的)—— 只有明确点名才放行。
+        store.set_setting("exclude_dirs", "mytmp").unwrap();
+        for d in [
+            "/home/me/Downloads/AppData/Roaming/kingsoft",
+            "/home/me/Downloads/backup/temp",
+            "/srv/npm-cache/x",
+            "/home/me/mytmp/sub",
+        ] {
+            assert!(!store.adoptable_dir(d, false), "{d} 属于软排除,看到不放行");
+            assert!(store.adoptable_dir(d, true), "{d} 软排除,点到该放行");
+        }
+    }
+
+    /// 作用域上溯(修 6)+ 子树 LIKE(修 7)在 POSIX 分隔符下的口径钉子。
+    #[cfg(not(windows))]
+    #[test]
+    fn scope_walk_and_subtree_pattern_work_on_posix_paths() {
+        let store = Store::open_mem().unwrap();
+        store
+            .set_dir_intent(&DirIntent::new(
+                "/home/me/Pictures",
+                INTENT_IMPORTED,
+                SRC_INITIAL_DIALOG,
+            ))
+            .unwrap();
+        let map = ScopeMap::load(&store);
+        assert_eq!(
+            map.state_of("/home/me/Pictures/2026/summer"),
+            Some(INTENT_IMPORTED),
+            "深层目录要靠上溯命中祖先那条意图",
+        );
+        assert_eq!(map.state_of("/other/deep"), None, "账本覆盖不到就仍未纳入");
+        // 根也算一级:落一条根的意图要能覆盖根下任意深度。
+        store
+            .set_dir_intent(&DirIntent::new("/", INTENT_IMPORTED, SRC_INITIAL_DIALOG))
+            .unwrap();
+        let map = ScopeMap::load(&store);
+        assert_eq!(map.state_of("/srv/photos"), Some(INTENT_IMPORTED), "POSIX 根该被命中");
+        let (eq, sub) = dir_like("/home/me/Pictures");
+        assert_eq!(eq, "/home/me/Pictures");
+        assert_eq!(sub, "/home/me/Pictures/%");
+        assert_eq!(dir_like("/").1, "/%", "POSIX 根的子树");
+    }
+
+    /// 自家产出目录里的行不该留在库里(2026-11-05 现场:「最近更新」首屏
+    /// 200 张里 190 张是自家 thumbs,全是永远不亮的灰格子)。
+    /// 清完打标记,二次调用不再动库;引用表跟着清,不留孤儿。
+    #[cfg(windows)]
+    #[test]
+    fn purge_hard_excluded_drops_own_cache_and_recycle_bin_rows() {
+        let store = Store::open_mem().unwrap();
+        let loc = cache_dir_loc();
+        let own = loc.join("thumbs").join("a.jpg");
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
+                 (1,?1,?2,0,0,0),
+                 (2,'D:\\$RECYCLE.BIN\\S-1\\$R9X.jpg','D:\\$RECYCLE.BIN\\S-1',0,0,0),
+                 (3,'D:\\pics\\b.jpg','D:\\pics',0,0,2)",
+                rusqlite::params![own.to_string_lossy(), loc.join("thumbs").to_string_lossy()],
+            )
+            .unwrap();
+            c.execute("INSERT INTO tags(id,name) VALUES(7,'t')", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO photo_tags(photo_id,tag_id) VALUES(1,7),(3,7)",
+                [],
+            )
+            .unwrap();
+        }
+        // 打开库时已经跑过一遍(空库,没清到东西),标记得先失效才能验清理逻辑。
+        store.set_setting("hard_excluded_purged", "stale").unwrap();
+        let n = store.purge_hard_excluded_once().unwrap();
+        assert_eq!(n, 2, "自家 thumbs 与回收站那两行该被清掉");
+        let left: Vec<i64> = store.read(|conn| {
+            let mut st = conn.prepare("SELECT id FROM photos ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(left, vec![3], "普通照片行不受影响");
+        let orphan: i64 = store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM photo_tags WHERE photo_id=1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(orphan, 0, "被清行的标签关联也要跟着清");
+        assert_eq!(
+            store.purge_hard_excluded_once().unwrap(),
+            0,
+            "打过标记不再重跑"
+        );
+
+    /// 同一条清库规则在 POSIX 路径上的对偶:回收站那行的分隔符是 `/`。
+    #[cfg(not(windows))]
+    #[test]
+    fn purge_hard_excluded_drops_own_cache_and_recycle_bin_rows_posix() {
+        let store = Store::open_mem().unwrap();
+        let loc = cache_dir_loc();
+        let own = loc.join("thumbs").join("a.jpg");
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
+                 (1,?1,?2,0,0,0),
+                 (2,'/mnt/win/$RECYCLE.BIN/S-1/$R9X.jpg','/mnt/win/$RECYCLE.BIN/S-1',0,0,0),
+                 (3,'/home/me/pics/b.jpg','/home/me/pics',0,0,2)",
+                rusqlite::params![own.to_string_lossy(), loc.join("thumbs").to_string_lossy()],
+            )
+            .unwrap();
+            c.execute("INSERT INTO tags(id,name) VALUES(7,'t')", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO photo_tags(photo_id,tag_id) VALUES(1,7),(3,7)",
+                [],
+            )
+            .unwrap();
+        }
+        store.set_setting("hard_excluded_purged", "stale").unwrap();
+        let n = store.purge_hard_excluded_once().unwrap();
+        assert_eq!(n, 2, "自家 thumbs 与回收站那两行该被清掉");
+        let left: Vec<i64> = store.read(|conn| {
+            let mut st = conn.prepare("SELECT id FROM photos ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(left, vec![3], "只留没被硬排除的那行");
+        let orphan: i64 = store
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM photo_tags WHERE photo_id=1",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(orphan, 0, "被删照片的标签关联要跟着走");
+        assert_eq!(
+            store.purge_hard_excluded_once().unwrap(),
+            0,
+            "已经打过标记就不再重扫",
+        );
+    }
+    }
+
+    /// 双向对账:撤出作用域的目录要退回占位,新纳入的目录要放出去派生。
+    ///
+    /// 只做单向(旧实现只降不升)的话,账本一改,库里就永远留着一批「本该亮
+    /// 却停在灰格子」的行 —— 用户看到的就是「启动了半天也没有更新」。
+    /// 顺带验软层的两条:用户亲手导入过的 `AppData` 子目录放行,没导入的不放。
+    #[test]
+    fn reconcile_rich_state_moves_rows_both_ways() {
+        let store = Store::open_mem().unwrap();
+        store
+            .set_dir_intent(&DirIntent::new("D:\\in", INTENT_IMPORTED, SRC_IMPORT))
+            .unwrap();
+        store
+            .set_dir_intent(&DirIntent::new(
+                "C:\\Users\\me\\AppData\\Roaming\\kingsoft",
+                INTENT_IMPORTED,
+                SRC_IMPORT,
+            ))
+            .unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
+                 (1,'D:\\in\\a.jpg','D:\\in',0,0,0),
+                 (2,'D:\\in\\bad.jpg','D:\\in',0,0,0),
+                 (3,'D:\\gone\\b.jpg','D:\\gone',0,0,2),
+                 (4,'C:\\Users\\me\\AppData\\Roaming\\kingsoft\\k.jpg',
+                     'C:\\Users\\me\\AppData\\Roaming\\kingsoft',0,0,0),
+                 (5,'C:\\Users\\me\\AppData\\Local\\npm-cache\\n.png',
+                     'C:\\Users\\me\\AppData\\Local\\npm-cache',0,0,0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO bad_media(path,reason,since) VALUES('D:\\in\\bad.jpg','x',0)",
+                [],
+            )
+            .unwrap();
+        }
+        let gate = ScopeGate::load(&store);
+        assert_eq!(store.reconcile_rich_state(&gate).unwrap(), 4, "该动 4 行");
+        let states: Vec<(i64, i64)> = store.read(|conn| {
+            let mut st = conn
+                .prepare("SELECT id, rich_state FROM photos ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(
+            states,
+            vec![
+                (1, 1), // 新纳入 → 待派生
+                (2, 3), // 新纳入但已在坏文件台账 → 回 3,不出队
+                (3, 0), // 账本里没有 → 退回占位
+                (4, 1), // 软排除 + 用户亲手导入 → 放行
+                (5, 0), // 软排除、没表态 → 仍是占位
+            ]
         );
     }
 
@@ -4392,9 +4988,11 @@ mod tests {
         assert_eq!(c, L1Ingest { inserted: 0, updated: 1 });
         let conn = store.test_conn();
         let (n, path, size, mtime): (i64, String, i64, i64) = conn
-            .query_row("SELECT COUNT(*), MAX(path), MAX(size), MAX(mtime) FROM photos", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
+            .query_row(
+                "SELECT COUNT(*), MAX(path), MAX(size), MAX(mtime) FROM photos",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
             .unwrap();
         assert_eq!(n, 1, "改名不该多出一行");
         assert_eq!(path, r"C:\albums\b.jpg");
@@ -4419,7 +5017,9 @@ mod tests {
             .unwrap();
         let (uid_after, star): (i64, i64) = store
             .test_conn()
-            .query_row("SELECT uid64, star FROM photos", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row("SELECT uid64, star FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(uid_after, uid_before, "uid64 的契约是一经分配即不变");
         assert_eq!(star, 5, "用户数据不因改名丢失");
@@ -4492,7 +5092,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        let n = store.delete_l1_frn64(&[frn64_of('C', 0x100), frn64_of('C', 0xdead)]).unwrap();
+        let n = store
+            .delete_l1_frn64(&[frn64_of('C', 0x100), frn64_of('C', 0xdead)])
+            .unwrap();
         assert_eq!(n, 1, "不认识的 FRN 不算删除");
         let left: String = store
             .test_conn()

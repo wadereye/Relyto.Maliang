@@ -1,6 +1,6 @@
 [package]
 name = "maliang"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -14,14 +14,20 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 rusqlite = { version = "0.37", features = ["bundled"] }
 rayon = "1"
 walkdir = "2"
-notify-debouncer-full = "0.7"
 chrono = "0.4"
 kamadak-exif = "0.6"
 memchr = "2"
+flate2 = "1"          # PSD 合成图的 ZIP 解压(只读预览用)
 anyhow = "1"
 dirs = "6"
 rfd = "0.15"
 clap = { version = "4", features = ["derive"] }
+# 自动更新:只取 HTTPS 客户端与 SHA256 校验,两者已由 ort 带入依赖锁,离线可编译。
+# 不启 ureq 默认 features(rustls/gzip),避免引入锁外的新包。
+ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+hmac-sha256 = "1.1.15"
+
+[target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Storage_Imapi", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Registry", "Win32_System_WindowsProgramming", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_Services", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_Com", "Win32_UI_Shell_Common", "Win32_UI_Shell_PropertiesSystem", "Win32_Devices_PortableDevices", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_Security", "Win32_Security_Authorization"] }
 windows-service = "0.8"
 
