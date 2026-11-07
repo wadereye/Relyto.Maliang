@@ -8,7 +8,8 @@ English version: [CHANGELOG.en.md](./CHANGELOG.en.md)。
 
 本版本是 v0.2 之后的一次大幅更新：**全盘快查改为常驻提权服务**、
 **单图编辑视图整页重做**、**动图与 PSD / PSB 只读速看**、**程序内自动更新**、
-**首页「最近更新」**，以及**统一配置与模型自动就位**。
+**首页「最近更新」**、**快查结果双击即开与右键直达**，以及
+**统一配置与模型自动就位**。
 
 ### 新增
 
@@ -95,7 +96,7 @@ English version: [CHANGELOG.en.md](./CHANGELOG.en.md)。
   - 默认推荐 **YuNet 检测 + AdaFace IR-50 识别**（Apache-2.0 / MIT，可商用），
     替换此前不可商用的 insightface antelopev2；
   - **antelopev2**（SCRFD + ArcFace）保留为可选方案，权重不可商用，自备自用。
-- 向量维度仍为 512 维，库结构不变；人脸算法标识升至 v4 并连同方案名一起
+- 向量维度仍为 512 维，库结构不变；人脸算法标识升至 v5 并连同方案名一起
   比对，切换方案或首次启动会提示重扫。程序按检测模型的输出张量数自动
   识别模型类型，文件按方案命名（默认 `face_det.onnx` / `face_rec.onnx`，
   antelopev2 用 `face_det_v2.onnx` / `face_rec_v2.onnx`），获取方式见

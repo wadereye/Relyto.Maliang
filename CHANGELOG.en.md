@@ -9,8 +9,9 @@ All user-visible changes are documented here, newest first.
 A major update since v0.2: **disk-wide quick find now runs as a resident
 elevated service**, plus a **full-page single-photo editor**, **read-only
 previews for animated images and PSD / PSB**, an **in-app self-updater**,
-the **Recently Updated home album**, and **unified configuration with
-automatic model provisioning**.
+the **Recently Updated home album**, **double-click-to-open and context
+menus for quick-find results**, and **unified configuration with automatic
+model provisioning**.
 
 ### Added
 
@@ -132,7 +133,7 @@ automatic model provisioning**.
     its weights are not commercially usable, bring your own at your own
     discretion.
 - Embeddings remain 512-d and the library schema is unchanged; the face
-  algorithm tag moves to v4 and is compared together with the scheme name,
+  algorithm tag moves to v5 and is compared together with the scheme name,
   so switching schemes (or first launch) prompts for a face rescan. The
   detection model type is auto-detected from its output tensor count; files
   are named per scheme (default `face_det.onnx` / `face_rec.onnx`,
