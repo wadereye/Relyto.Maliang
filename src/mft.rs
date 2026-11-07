@@ -14,7 +14,7 @@
 //!
 //! **权限**:打开 `\\.\C:` 需要管理员(未提权时得到 ERROR_ACCESS_DENIED),
 //! 探测结果用 `Support::NeedsAdmin` 表达,由上层决定提权子进程或降级 walkdir。
-//! **能力边界(2026-11-04 校准)**:USN 记录本身仍只有名字/父 FRN/属性 +
+//! **能力边界**:USN 记录本身仍只有名字/父 FRN/属性 +
 //! `Usn`(+0x18)/`TimeStamp`(+0x20),没有 size;但 size/mtime 不必逐文件 stat ——
 //! 直接读 `$MFT` 就能从 `$DATA`(RealSize@+0x30)和 `$STANDARD_INFORMATION`
 //! (+0x08 = write time)拿到,偏移口径已由 rec.rs 的 7 道门禁在 C:/D: 全量验过。
@@ -215,7 +215,7 @@ fn classify_open(code: Option<u32>) -> Support {
     }
 }
 
-/// 查询 journal 失败的分类(缺陷 A7:原先一律吞成 NoJournal)。
+/// 查询 journal 失败的分类(原先一律吞成 NoJournal)。
 fn classify_journal(code: Option<u32>) -> Support {
     match code {
         Some(ERR_ACCESS_DENIED) => Support::NeedsAdmin,
@@ -415,7 +415,7 @@ pub fn scan_volume(
 
 /// 增量读取关心的原因位:只处理影响「存在/名字/位置」的变更,
 /// 内容修改(DATA_OVERWRITE 等)不进名字索引。
-/// (2026-11-06 修正:FILE_CREATE/FILE_DELETE 此前误写成 0x1/0x2 ——
+/// (FILE_CREATE/FILE_DELETE 此前误写成 0x1/0x2 ——
 /// 那两位其实是 DATA_OVERWRITE/DATA_EXTEND,导致新建文件的 CLOSE
 /// 记录被 collect_close_op 错折成 Delete,增量新建永远进不了索引。)
 pub const USN_REASON_DATA_OVERWRITE: u32 = 0x0000_0001;
@@ -904,7 +904,7 @@ mod tests {
         b[4..6].copy_from_slice(&0u16.to_le_bytes()); // MinorVersion
         b[8..16].copy_from_slice(&0x0000_0000_0010_0234u64.to_le_bytes()); // FRN
         b[16..24].copy_from_slice(&0x0000_0000_0000_0005u64.to_le_bytes()); // 父 = 卷根
-        // 134382240000000000 = 2026-11-04T00:00:00Z 的 FILETIME 刻度(真实量级)。
+        // 134382240000000000 = 2026-11-04T00:00:00Z 的 FILETIME 刻度(示例量级)。
         b[24..32].copy_from_slice(&0x01DB_5F48_9A34_0000u64.to_le_bytes()); // Usn
         b[32..40].copy_from_slice(&134_382_240_000_000_000u64.to_le_bytes()); // TimeStamp
         b[40..44].copy_from_slice(&0x8000_2000u32.to_le_bytes()); // CLOSE|RENAME_NEW_NAME

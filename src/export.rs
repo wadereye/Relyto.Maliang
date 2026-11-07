@@ -67,7 +67,7 @@ pub fn copy_all(paths: &[PathBuf], dest: &Path) -> (usize, Vec<String>) {
     (ok, errs)
 }
 
-/// P2-16:导出时套用效果栈(把渲染结果写到目标目录,**不改原图**)。
+/// 导出时套用效果栈(把渲染结果写到目标目录,**不改原图**)。
 ///
 /// 原版的"保存"会把编辑结果写回原文件;我方为安全起见只提供
 /// 「导出为带效果副本」,原图与 `photos.filters` 保持不变。
@@ -155,7 +155,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P2-16:导出带效果副本 —— 目标文件应存在且像素已被调整,
+    /// 导出带效果副本 —— 目标文件应存在且像素已被调整,
     /// 同时**原图不得被修改**。
     #[test]
     fn export_with_effects_leaves_source_untouched() {

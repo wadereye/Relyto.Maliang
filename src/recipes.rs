@@ -13,7 +13,7 @@
 //! 少数配方会**改变画布尺寸**(加边框、投影、旋转),这类配方无法按像素混合,
 //! `amount` 只控制内部装饰的轻重,不改尺寸。
 //!
-//! # 诚实声明(哪些是简化)
+//! # 实现口径(哪些是简化)
 //!
 //! - **光晕合成**([`glow_edge`]):参考产品的内光晕是三通道分离 + 多级半径累积的
 //!   合成器,合成混合模式未公开。此处按「边缘渐变遮罩 + 颜色线性混合」实现,
@@ -294,7 +294,7 @@ pub fn edge_mask(w: u32, h: u32, width: f32) -> Mask {
 /// 参考模糊算子的**阶梯量化**:amount<1 → 0;否则量化到
 /// {2.065, 3.0625, 4.13, 5.13} 四档(半径离散化,非连续 sigma)。
 ///
-/// **诚实声明**:升档阈值未见公开资料,这里取等距 1/2/3/4 假定;
+/// **实现口径**:升档阈值未见公开资料,这里取等距 1/2/3/4 假定;
 /// 档位数值是内置的离散化常数,可由资源包覆盖。
 pub fn blur_ladder(amount: f32) -> f32 {
     if amount < 1.0 {
@@ -557,7 +557,7 @@ pub fn local_contrast(img: &mut RgbaImage, radius: f32, strength: f32) {
 /// ```text
 /// blur = Blur(orig, radius)                    // 先记下 orig 与 blur 两张图
 /// 支一 subtract:(blur − orig)·c  复合回 ⇒ blur + (orig − blur)·c
-/// 支二 add     :(orig − blur)·c  复合回 ⇒ blur + 2c·(orig − blur)
+/// 支二 add :(orig − blur)·c  复合回 ⇒ blur + 2c·(orig − blur)
 /// ```
 ///
 /// 与 [`local_contrast`] 的 USM 形式 `orig + s·(orig − blur)` 属同一族,
@@ -566,7 +566,7 @@ pub fn local_contrast(img: &mut RgbaImage, radius: f32, strength: f32) {
 ///
 /// 参考滑杆量程:`radius` 1.3~40(缺省 15)、`c` 1~3(缺省 1.5)。
 ///
-/// **诚实声明**:嵌套语义按「子级结果以该 BlendMode 复合进父画布」解读,
+/// **实现口径**:嵌套语义按「子级结果以该 BlendMode 复合进父画布」解读,
 /// 各支作用的中间画布顺序取自官方滤镜描述的书写次序;
 /// 若复合方向另有讲究,结果会差一个常数倍,目前无样本可校验。
 pub fn local_contrast_ref(img: &mut RgbaImage, radius: f32, contrast: f32) {
@@ -585,7 +585,7 @@ pub fn local_contrast_ref(img: &mut RgbaImage, radius: f32, contrast: f32) {
 /// mean < v → 亮部:out = v + highlight · (mean − v)  // 向均值回落 = 压高光
 /// ```
 ///
-/// **诚实声明**:参考只公开了三根滑杆的存在与量程,内部实现没有对应资料。上面这条"以局部均值为参照、分别向均值靠拢"的公式属本项目重构,
+/// **实现口径**:参考只公开了三根滑杆的存在与量程,内部实现没有对应资料。上面这条"以局部均值为参照、分别向均值靠拢"的公式属本项目重构,
 /// 其好处是平坦区(局部均值等于自身)天然恒等,不会产生额外的晕圈。
 pub fn shadow_highlight(img: &mut RgbaImage, radius: f32, shadow: f32, highlight: f32) {
     if radius <= 0.0 || (shadow == 0.0 && highlight == 0.0) {
@@ -1001,7 +1001,7 @@ pub fn quantize_palette(img: &mut RgbaImage, steps: u32, depth: u32) {
 
 /// 生成一层噪声(0~255),用于各种颗粒配方。
 ///
-/// **诚实声明**:参考的噪声算子是**加性**的(`v += rand % (max−min+1) + min`,
+/// **实现口径**:参考的噪声算子是**加性**的(`v += rand % (max−min+1) + min`,
 /// min/max 缺省 0/255);我方走「噪声层 + Multiply/Lighten 合成」的配方语义,
 /// 五个调用点(胶片颗粒等)的低幅区间在加性语义下会整体过曝,故保留合成
 /// 路线并在此声明差异。参考通道掩码 bit0/1/2 = R/G/B、bit3 = A;mono 标志
@@ -1077,7 +1077,7 @@ pub fn glow_edge(img: &mut RgbaImage, color: [u8; 3], falloff: f32, strength: f3
 /// `corner_radius > 0` 时把画面四角修圆(`outer` 色填充圆角外的部分)。
 /// `caption_h > 0` 时在底部额外留一条同色底边(拍立得式说明栏)。
 ///
-/// **诚实声明**(与参考的已知差异,知情维持):参考按 **imageWidth** 缩放
+/// **实现口径**(与参考的已知差异):参考按 **imageWidth** 缩放
 /// 且第三个值**不参与缩放**;我方统一按短边缩放、三个值都缩 ——
 /// 竖幅照片的边条会比参考略宽。
 #[allow(clippy::too_many_arguments)]
@@ -1169,7 +1169,7 @@ pub fn round_corners(img: &mut RgbaImage, radius: f32, fill: [u8; 3]) {
 ///
 /// # 剪影从哪来
 ///
-/// **诚实声明**(与参考的已知差异,知情维持):参考是 9 参数(另有
+/// **实现口径**(与参考的已知差异):参考是 9 参数(另有
 /// mode / 强度 / 质量档),我方 6 个;参考的横向/纵向模糊半径分开,
 /// 我方合并为一个 `blur`;参考做两遍填充,我方单遍。
 ///
@@ -1251,7 +1251,7 @@ pub fn drop_shadow(
 
 /// 旋转(度,顺时针为正),`pad = true` 时扩大画布避免裁角。
 ///
-/// **诚实声明**(与参考的已知差异,知情维持):① 不接受弧度入参;
+/// **实现口径**(与参考的已知差异):① 不接受弧度入参;
 /// ② 没有「接近 90° 倍数直接交换宽高」的快速分支 —— 90° 整数旋转因
 /// `cos≈4.4e-8` 的浮点残差会让画布多出 1px;如需像素级精确的 90° 旋转,
 /// 应在调用方走裁切/转置路径。
@@ -1946,8 +1946,8 @@ mod tests {
     /// ```text
     /// blur = Blur(orig, r)
     /// 支一(subtract):(blur − orig)·c   →  以 subtract 复合回:bg = blur + (orig−blur)·c
-    /// 支二(add)      :(orig − blur)·c   →  以 add      复合回:bg + (orig−blur)·c
-    /// 合计           :blur + 2c·(orig − blur)
+    /// 支二(add) :(orig − blur)·c   →  以 add      复合回:bg + (orig−blur)·c
+    /// 合计 :blur + 2c·(orig − blur)
     /// ```
     ///
     /// 于是与常见的 USM 形式 `orig + s·(orig−blur)` 是**同一族**,换算关系

@@ -22,7 +22,7 @@ pub struct PhotoRow {
     /// GPS 坐标(十进制度;无定位为 None)。
     pub lat: Option<f64>,
     pub lon: Option<f64>,
-    /// 媒体类型:0=图片,1=视频(P2-17;`video::kind`)。
+    /// 媒体类型:0=图片,1=视频(;`video::kind`)。
     pub kind: i32,
     /// 磁盘修改时间(ms,扫描器写入):「按最近更改排序」的 SQL 键。
     /// Rust 侧暂只用于属性面板展示,排序本身在 SQL 完成。
@@ -35,7 +35,7 @@ pub struct PhotoRow {
     pub parent: String,
     /// 派生状态([`crate::db::RICH_*`]):网格据此区分「未纳入派生作用域」
     /// ([`crate::db::RICH_OUT`],占位而不当失败)与「读取失败」
-    /// ([`crate::db::RICH_BAD`])—— 方案 P4-29。
+    /// ([`crate::db::RICH_BAD`])—— 。
     pub rich_state: i32,
 }
 
@@ -242,7 +242,7 @@ pub fn load_query(
         },
         order
     );
-    // P1-14:相机型号走字符串池 —— 行里只存 `cam_id`(INTEGER),
+    // 相机型号走字符串池 —— 行里只存 `cam_id`(INTEGER),
     // 字符串本体在 `string_pool` 里去重存一份(对齐原版的池化列)。
     // LEFT JOIN 保证:未池化的历史行(cam 有值、cam_id 为 NULL)仍能显示。
     let pat = format!("%{}%", like_escape(text));

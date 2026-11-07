@@ -101,7 +101,7 @@ pub fn drive_roots() -> Vec<std::path::PathBuf> {
 }
 
 /// 取盘符根目录的卷标(资源管理器里显示的名字)。
-/// P1-13:WPD/盘符统一设备列表用它显示「E:\ — 我的SD卡」。
+/// WPD/盘符统一设备列表用它显示「E:\ — 我的SD卡」。
 /// 取不到或为空返回 `None`。
 pub fn volume_label(root: &Path) -> Option<String> {
     #[cfg(windows)]
@@ -474,7 +474,7 @@ pub fn set_wallpaper(path: &Path) -> bool {
 
 /// 用系统关联程序打开文件。
 ///
-/// P2-17 视频播放的**等效替代**:原版在库内用 DirectShow filter graph
+/// 视频播放的**等效替代**:原版在库内用 DirectShow filter graph
 /// 渲染到一个视频子窗口,我方不内嵌视频管线,改为交给系统默认播放器 ——
 /// 与原版「能看」的目标一致,差异在于不内嵌视频管线,特效与体量从简。
 ///
@@ -619,7 +619,7 @@ pub fn launch_update_helper(params: &str) -> Result<Option<u32>, String> {
     }
 }
 
-// 全盘索引服务的安装/查询/卸载(P0-3:替掉原先「计划任务 + 每次一次性拉起子进程」)。
+// 全盘索引服务的安装/查询/卸载(替掉原先「计划任务 + 每次一次性拉起子进程」)。
 //
 // 索引引擎必须常驻:USN 保鲜是挂在内核里阻塞读 journal 的活进程,不是跑完就退的
 // 批处理。所以进程模型换成拆进程 —— 一个自动启动的提权服务 + 非提权 UI

@@ -735,7 +735,7 @@ pub fn apply(img: &mut image::RgbaImage, adj: &Adjust) {
 ///   **不是** Rec.709 的 `(0.2126, 0.7152, 0.0722)`,否则与 `bw` / `tint` 口径不一致。
 /// - **亮度**:平移量 `brightness/100 × 127.5`(维持既有 UI 量程,未改)。
 ///
-/// **诚实声明**:参考对比度走的是一张 101 项非线性增益表 `T(x)`(`g = 1 + T(x)`,
+/// **实现口径**:参考对比度走的是一张 101 项非线性增益表 `T(x)`(`g = 1 + T(x)`,
 /// `T(0)=0`、`T(50)=1.0`、`T(100)=10.0`),表值暂无对应资料 —— 此处保留**线性** `k`。
 /// 因此正对比度滑块的手感比参考更温和,这是已知的简化,不是漏实现。
 pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
@@ -920,7 +920,7 @@ fn combo_val(e: &Effect, key: &str, raw_default: f32, range: f32, offset: f32) -
 
 /// 高光 / 阴影响应值 → 色阶的白点 / 黑点。
 ///
-/// **诚实声明**:参考只公开了这两根滑杆的存在与量程(0.48),到黑白点的
+/// **实现口径**:参考只公开了这两根滑杆的存在与量程(0.48),到黑白点的
 /// 折算系数暂无对应资料。此处按标准色阶语义线性折算
 /// (高光下调白点、阴影上抬黑点),方向确定、系数属我方重构。
 fn highlights_shadows(e: &Effect) -> (f32, f32) {
@@ -1051,7 +1051,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         // | `finetune2` | 同上,色温轴宽一倍(2.0 / 1.0) | 同上(色温折算不同) |
         // | `colorfix` | 白场吸管 + 色温(1.0 / 0.5) | von Kries 校色 → 色温 |
         //
-        // **诚实声明**:参考只公开了「有哪些滑杆」与其量程/偏移,
+        // **实现口径**:参考只公开了「有哪些滑杆」与其量程/偏移,
         // 高光 / 阴影 两根滑杆到色阶的折算系数暂无对应资料 ——
         // 这里按「负=压、正=提」的方向线性折算到白点 / 黑点,属我方重构。
         "finetune" | "finetune2" => {
@@ -1101,7 +1101,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         // 倾斜校正(Straighten):参考是一根双向滑杆(range 2.0 / offset 1.0),
         // 即 raw 0..1 → −1..1,中位不旋转。
         //
-        // **诚实声明**:滑杆到角度的换算系数暂无对应资料,此处按 ±15° 满量程
+        // **实现口径**:滑杆到角度的换算系数暂无对应资料,此处按 ±15° 满量程
         // 线性折算;调用方也可以用 `angle` 参数直接给度数来绕过折算。
         "tilt" => {
             let deg = match e.params.get("angle").and_then(|v| v.parse::<f32>().ok()) {
@@ -1196,7 +1196,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         }
         // glow / glow2:参考的光晕算子内部参数无对应资料,
         // 我方固定走 gamma 0.5 + 模糊 + 混回的中性光晕,不读 amount、
-        // 阈值写死 128 —— 知情维持,调参留待有资料后再对齐。
+        // 阈值写死 128,后续如有资料再校准。
         "glow" | "glow2" => {
             crate::oneclick::apply_glow(img, 128.0);
         }
@@ -2271,8 +2271,8 @@ mod tests {
         }
     }
 
-    /// 历史教训:先是 `tilt` / `shadow` 有名字无实现,接着 `orton` /
-    /// `vignette_glow` 有分派没登记,再到本轮 `enhance` 有分支却不在效果表里 ——
+    /// 曾出现过三类缺口:`tilt` / `shadow` 有名字无实现,`orton` /
+    /// `vignette_glow` 有分派没登记,以及 `enhance` 有分支却不在效果表里 ——
     /// 三件事是同一个病。分支清单直接从源码解析,杜绝手工清单漂移。
     fn apply_effect_arms() -> Vec<String> {
         // 统一成 LF 再解析:Windows 签出是 CRLF,顶层 `}` 那行会是 `}\r\n`,
@@ -2345,7 +2345,7 @@ mod tests {
     }
 
     /// 「暂不支持」的名字必须真的没有像素实现 ——
-    /// 否则就是上一轮 `tilt` / `shadow` 那种「半吊子」:认得名字却不改像素。
+    /// 否则就会出现「半吊子」效果:认得名字却不改像素。
     #[test]
     fn reference_only_ids_have_no_pixel_implementation() {
         for id in crate::effects::REFERENCE_ONLY {

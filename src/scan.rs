@@ -74,7 +74,7 @@ fn is_animated_webp(p: &Path) -> bool {
 
 /// 事件驱动用:是否为可索引的媒体文件(图片 + RAW + 视频)。
 ///
-/// P2-17:视频照常收录 —— 库中显示视频条目
+/// 视频照常收录 —— 库中显示视频条目
 /// (记录类型 {8,9,10,0xb,0xc,0x17,0x1d})。
 pub fn is_indexable(p: &Path) -> bool {
     is_image(p) || crate::video::is_video(p)
@@ -98,7 +98,7 @@ pub fn is_media_ext(ext: &str) -> bool {
         || crate::video::MOVIE_EXTS.contains(&ext)
 }
 
-/// 初始化时依次入集的 4 条排除,**不可关**(方案 P3-25)。
+/// 初始化时依次入集的 4 条排除,**不可关**。
 ///
 /// 单独成组而不是混进 [`Exclusions::default`]:这 4 条是参考件的硬编码口径,
 /// 用户设置只能往上加、不能减;把它们命名出来,快路(MFT 展开)与慢路
@@ -111,7 +111,7 @@ pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picas
 /// `RECYCLER` 的现代对应物 `$RECYCLE.BIN` 继承同一档硬度:回收站里的东西是
 /// 用户已经判了死刑的,不该因为「显式导入」就变成照片库。系统目录、程序目录、
 /// 依赖目录同理 —— 它们的内容 mtime 永远最新,收进来只会让「最近更新」被
-/// 永远不亮的灰格子占满(2026-11-05 现场:首屏 200 张里 190 张是自家 thumbs)。
+/// 永远不亮的灰格子占满(首屏 200 张里 190 张是自家 thumbs)。
 ///
 /// 硬层的门槛是「**按定义**不可能是用户的照片」。`temp` 不满足这条(微信把
 /// 收藏图片放在 `xwechat_files\...\favorite\temp` 里),所以它在软层。
@@ -133,7 +133,7 @@ pub const HARD_EXCLUDES_OURS: [&str; 11] = [
 /// 我方扩充的**软**排除:默认不派生,但用户亲手指向(导入页选中它、对着占位格
 /// 右键「纳入此目录」)时放行。
 ///
-/// 2026-11-05 拍板:`AppData` 不能一刀切 —— 微信 / QQ / 网盘客户端的接收目录
+/// `AppData` 不能一刀切 —— 微信 / QQ / 网盘客户端的接收目录
 /// 都在那儿,里面确实有用户要的图。软层的意思是「不主动收,但给出口」。
 pub const SOFT_EXCLUDES: [&str; 4] = ["AppData", "temp", "npm-cache", "local-cache"];
 
@@ -167,7 +167,7 @@ pub enum ExcludeLayer {
 ///
 /// 还有一类**不能按名字排**的:[`own_prefixes`](自有数据目录前缀)。缩略图缓存
 /// 落在哪儿取决于用户把数据目录 / 缓存位置设成了什么,把它写死成
-/// `smallthumbs` 这类名字会误伤同名的用户相册(2026-11-05 拍板:自己生成缩略图的
+/// `smallthumbs` 这类名字会误伤同名的用户相册(自己生成缩略图的
 /// 目录必须排除)。所以缓存目录走**整级路径前缀**命中,且跟着 `MALIANG_CACHE_DIR`
 /// / `data.location` 走 —— 用户搬缓存,排除项跟着搬。
 #[derive(Debug, Clone)]
@@ -207,7 +207,7 @@ impl Exclusions {
             }
         }
         // 自家写缩略图的目录:跟着 `MALIANG_CACHE_DIR` / `data.location` 走,
-        // 用户搬缓存,排除项跟着搬(2026-11-05 拍板)。
+        // 用户搬缓存,排除项跟着搬。
         for p in crate::db::own_cache_dirs() {
             e = e.with_own_prefix(p);
         }
@@ -287,7 +287,7 @@ impl Exclusions {
     ///
     /// 只是 [`Exclusions::exclude_layer_dir`] 的布尔视图:生产代码要看**层**
     /// (硬层不可覆盖),测试只问「有没有命中」。判定逻辑只留一份 ——
-    /// 2026-11-05 加软层覆盖时,两处各自走一遍名单正是漏判的来源。
+    /// 两处各自走一遍名单正是漏判的来源。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn excludes_dir_path(&self, dir: &Path) -> bool {
         self.exclude_layer_dir(dir).is_some()
@@ -348,7 +348,7 @@ fn under_key(up: &str, base: &str) -> bool {
     up.len() > base.len() && up.starts_with(base) && matches!(up.as_bytes()[base.len()], b'\\' | b'/')
 }
 
-/// 一条**结构**记录:发现路径只写这些列(方案 P3-25)。
+/// 一条**结构**记录:发现路径只写这些列。
 ///
 /// 宽高 / 拍摄时间 / GPS / 机身属于**派生列**,只在派生时读一次
 /// ([`read_derived`]),由 [`crate::db::Store::mark_derived`] 回写 ——
@@ -365,7 +365,7 @@ pub struct Record {
     pub kind: i32,
 }
 
-/// 派生列:EXIF / 尺寸 / GPS / 机身(方案 P3-25)。
+/// 派生列:EXIF / 尺寸 / GPS / 机身。
 #[derive(Debug, Clone)]
 pub struct Derived {
     pub width: Option<i32>,
@@ -390,7 +390,7 @@ pub struct ScanSummary {
     pub cancelled: bool,
 }
 
-/// 扫描进度与取消控制(P1-8)。
+/// 扫描进度与取消控制。
 ///
 /// 对齐原版两处参考结论:
 /// - 扫描进度:**预计算 `1.0/total` 倒数**,
@@ -518,7 +518,7 @@ fn load_fingerprints(store: &Store) -> HashMap<String, (i64, i64)> {
 ///
 /// - 未变文件(path+size+mtime 与库内一致)直接跳过,不重解码 EXIF、不写库。
 /// - 扫描线程降优先级(BelowNormal),避免与 UI 抢核(与原版一致的做法)。
-/// - `ctrl` 提供进度上报与取消(P1-8)。
+/// - `ctrl` 提供进度上报与取消。
 pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
     let ctrl = Arc::new(ScanControl::new());
     scan_dir_ctrl(store, roots, &ctrl, None)
@@ -771,7 +771,7 @@ pub fn scan_dir_ctrl(
                     ctrl2.advance(1);
                     return None;
                 }
-                // 库里有但内容变了 → 算"修改"(P1-12 变更日志)。
+                // 库里有但内容变了 → 算"修改"(变更日志)。
                 modified2.fetch_add(1, Ordering::Relaxed);
             } else {
                 // 库里没有 → 算"新增"。
@@ -792,7 +792,7 @@ pub fn scan_dir_ctrl(
     let indexed = records.len();
     // 取消也要把已算出的记录入库(不丢已完成的工作)。
     store_insert(store, &records)?;
-    // P1-12:写变更日志(新增/修改各一条聚合记录,避免逐条写库拖慢扫描)。
+    // 写变更日志(新增/修改各一条聚合记录,避免逐条写库拖慢扫描)。
     let n_added = added.load(Ordering::Relaxed);
     let n_mod = modified.load(Ordering::Relaxed);
     if n_added > 0 {
@@ -801,7 +801,7 @@ pub fn scan_dir_ctrl(
     if n_mod > 0 {
         let _ = store.log_change("<扫描>", "modified", None);
     }
-    // P1-11:扫描时顺带补 uid64(不必手动点菜单)。
+    // 扫描时顺带补 uid64(不必手动点菜单)。
     // `store_insert` 里已用 `COALESCE(photos.uid64, :uid)` 写入,
     // 这里只需处理历史遗留的 NULL 行。
     if n_added > 0 {
@@ -816,7 +816,7 @@ pub fn scan_dir_ctrl(
     })
 }
 
-/// 读一条**结构**记录:只碰文件系统元数据,不打开文件内容(方案 P3-25)。
+/// 读一条**结构**记录:只碰文件系统元数据,不打开文件内容。
 fn read_record(p: &Path, size: i64, mtime: i64) -> Record {
     Record {
         path: p.to_string_lossy().into_owned(),
@@ -837,7 +837,7 @@ fn read_record(p: &Path, size: i64, mtime: i64) -> Record {
 /// 读派生列(EXIF 只解析一次;RAW 走 Shell 拿尺寸)。
 ///
 /// 只在派生时调用 —— 缩略图那一趟已经把文件打开了,顺手读一次 EXIF
-/// 比在发现路径上逐行解要省得多(方案 P3-25)。
+/// 比在发现路径上逐行解要省得多。
 pub fn read_derived(p: &Path) -> Derived {
     // 视频不解析 EXIF、也不起 COM 抽帧:容器里没有 Orientation / 机身信息,
     // 逐个拉 Shell 缩略图更是拖垮整趟派生。尺寸留空,
@@ -957,7 +957,7 @@ pub fn index_file_ctrl(
 
     let rec = read_record(path, size, mtime);
     store_insert(store, &[rec])?;
-    // P1-12:事件驱动路径也要写变更日志(否则只有扫描会记,监听发现的变化会丢)。
+    // 事件驱动路径也要写变更日志(否则只有扫描会记,监听发现的变化会丢)。
     let _ = store.log_change(
         &key,
         if existed { "modified" } else { "added" },
@@ -966,15 +966,15 @@ pub fn index_file_ctrl(
     Ok(true)
 }
 
-/// 结构入库:发现路径只写结构列,**派生列一律不动**(方案 P3-25)。
+/// 结构入库:发现路径只写结构列,**派生列一律不动**。
 ///
 /// 派生列归 [`crate::db::Store::mark_derived`] 所有 —— 一条记录被重扫时
 /// 若在这里覆盖,已派生的 EXIF 会在下一趟发现里被抹成 NULL。
 /// 内容变了(mtime 不同)只把该行退回待派生,旧的缩略图与 dhash 留着继续用,
 /// 等后台稳定期过后重做一次覆盖(见 `db::Store::pending_rich`)。
 ///
-/// 顺手按派生门(方案 P3-17)算 `rich_state`:walkdir 与 MFT 两条发现路必须
-/// 共用同一个门,否则非 NTFS 卷会整个绕过作用域(方案 P4-30)。
+/// 顺手按派生门算 `rich_state`:walkdir 与 MFT 两条发现路必须
+/// 共用同一个门,否则非 NTFS 卷会整个绕过作用域。
 fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -1000,7 +1000,7 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
                  ELSE photos.rich_state END",
         )?;
         for r in records {
-            // P1-11:uid64 = fnv1a64(path|size|mtime)。
+            // uid64 = fnv1a64(path|size|mtime)。
             // 用 `COALESCE(photos.uid64, :uid)` —— 已有 uid64 的行**保持不变**
             // (标识是持久的,不应随内容变化而变;重新索引不应改变外部引用)。
             let uid = crate::db::fnv1a64(&format!("{}|{}|{}", r.path, r.size, r.mtime));
@@ -1101,7 +1101,7 @@ mod tests {
 
     #[test]
     fn default_exclusions_skip_system_and_cache_dirs() {
-        // 真实事故:回收站元数据文件($I*.jpg)不是图片,解码永远失败,
+        // 已知问题: 回收站元数据文件($I*.jpg)不是图片,解码永远失败,
         // 缩略图 worker 对失败不记账,每轮取到同一批 → 进度永久卡死。
         // 应用数据/缓存目录同理,不该进照片索引。
         let e = Exclusions::default();
@@ -1391,7 +1391,7 @@ mod tests {
         assert!(e.excludes_dir_path(&loc));
     }
 
-    // ===== P1-8 进度与取消 =====
+    // ===== 进度与取消 =====
 
     /// 进度:预计算倒数 + 乘法(原版扫描进度的核心优化)。
     #[test]
@@ -1497,7 +1497,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 正常扫描不标记取消,且 uid64 被自动分配(P1-11)。
+    /// 正常扫描不标记取消,且 uid64 被自动分配。
     #[test]
     fn scan_assigns_uid64() {
         let dir = scratch_dir("uid");
@@ -1524,7 +1524,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1-12:事件驱动的单文件入库**也**要写变更日志
+    /// 事件驱动的单文件入库**也**要写变更日志
     /// (v5 审计发现:此前只有扫描路径写,监听发现的变化会丢)。
     #[test]
     fn index_file_logs_change() {
@@ -1557,7 +1557,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P1-12:扫描会写变更日志(新增记 added)。
+    /// 扫描会写变更日志(新增记 added)。
     #[test]
     fn scan_logs_changes() {
         let dir = scratch_dir("chg");

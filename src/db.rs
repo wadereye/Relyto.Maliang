@@ -129,7 +129,7 @@ fn parse_location(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
 
 /// 机器级标记:索引服务跑在 LocalSystem 下,它的「用户目录」是
 /// `C:\Windows\System32\config\systemprofile\...`,读不到登录用户写的
-/// `data.location`,于是会悄悄把全盘库建在系统盘里(2026-11-05 排查:
+/// `data.location`,于是会悄悄把全盘库建在系统盘里(
 /// 服务在 systemprofile 下建出 94 MB 索引 + 86 MB 库,而 UI 读的是 D 盘
 /// 那份 —— 两边各一套,图库永远看不到服务入库的元数据)。
 /// 标记放 `ProgramData` 一份,`--install-service`(提权)写、服务读。
@@ -147,7 +147,7 @@ fn machine_marker_text() -> Option<String> {
 /// (取依赖源码坐实,dirs-sys 0.5 走的是 RoamingAppData),登录用户是
 /// `C:\Users\…\AppData\Roaming`,而 LocalSystem 服务是
 /// `C:\Windows\System32\config\systemprofile\AppData\Roaming` —— 用它当
-/// 「机器级」等于什么都没修(2026-11-05 第一次尝试就是这么翻车的)。
+/// 「机器级」等于什么都没修。
 /// `PROGRAMDATA` 是系统级环境变量,服务和任何账号读到的都是同一个
 /// `C:\ProgramData`。
 #[cfg(windows)]
@@ -308,8 +308,8 @@ fn rewrite_marker_text(
 /// 启动早期(Store 打开前)执行 pending 迁移:把 `pending_from` 目录里的
 /// 文件按「目标缺失才复制」搬到当前数据目录(逐文件 tmp+rename,失败不动
 /// 已复制部分,下次启动重试),成功后清掉 pending 行,并**尽力删除旧目录**
-/// —— 旧目录残留会让人分不清哪份是生效数据(2026-11-03 清库事故);
-/// 删不掉的条目(被占用)留着即可,不影响新目录生效(用户拍板:能删尽删)。
+/// —— 旧目录残留会让人分不清哪份是生效数据;
+/// 删不掉的条目(被占用)留着即可,不影响新目录生效(能删尽删)。
 /// 环境变量覆盖(测试/便携)时直接跳过,不碰任何目录。
 pub fn migrate_pending_data() {
     let env_set = std::env::var_os("MALIANG_DATA_DIR")
@@ -409,8 +409,8 @@ fn remove_tree_best_effort(dir: &Path) {
 /// 首启一次性迁移(11-07 配置统一):把旧 `data.location` 与旧 `update.ini`
 /// 并入统一配置 maliang.ini。
 /// **旧文件一律保留不删**:机器上可能还装着按旧文件名读配置的旧版程序
-/// (尤其索引服务),删了它就会退回默认目录另建一套库(2026-11-05 分裂事故
-/// 的剧本);读端对旧名做了兼容,新旧并存互不干扰,等全系统升到新版再清理。
+/// (尤其索引服务),删了它就会退回默认目录另建一套库,造成两边数据分裂;
+/// 读端对旧名做了兼容,新旧并存互不干扰,等全系统升到新版再清理。
 /// data_dir= 并入模板的 [location] 节;update.ini 原文追加到文件尾
 /// (模板最后一节就是 [update],裸键值自动归属,解析端逐行找键不看节)。
 pub fn migrate_legacy_configs() {
@@ -866,7 +866,7 @@ pub struct L1Ingest {
     pub updated: usize,
 }
 
-// ===== 派生作用域账本(方案 P3-14/17/19/21/22) =====
+// ===== 派生作用域账本 =====
 
 /// `photos.rich_state` 只是**后台派生队列的排队状态**,不是「能不能显示」的开关。
 /// 显示一律照常读磁盘缓存;真排除的目录根本不纳入图库,库里有的行就该显示。
@@ -879,7 +879,7 @@ pub const RICH_DONE: i32 = 2;
 /// 3 = 坏文件,已在 `bad_media` 立案,不再每轮重试。
 pub const RICH_BAD: i32 = 3;
 
-/// 派生失败多少次才立案进 `bad_media`(方案 P3-22)。
+/// 派生失败多少次才立案进 `bad_media`。
 ///
 /// 沿用改造前 `thumb_fail<3` 的口径:一次失败可能只是解码器/Shell 临时抽风,
 /// 三次都失败才算这个文件真解不开。
@@ -910,7 +910,7 @@ pub const SRC_CLICK: &str = "click";
 #[allow(dead_code)]
 pub const SRC_VIEW: &str = "visible";
 
-/// `state` 是否属于纳入组(方案 P3-17 的第三个条件)。
+/// `state` 是否属于纳入组(的第三个条件)。
 pub fn intent_included(state: &str) -> bool {
     matches!(state, INTENT_DEFAULT_ROOT | INTENT_IMPORTED | INTENT_CLICKED)
 }
@@ -954,7 +954,7 @@ impl DirIntent {
     }
 }
 
-/// 坏媒体台账的一行(方案 P3-22)。
+/// 坏媒体台账的一行。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadMedia {
     pub path: String,
@@ -989,7 +989,7 @@ pub fn volume_of(p: &str) -> Option<String> {
     }
 }
 
-/// 目录意图的作用域快照:全表读一次,之后逐条判定零 IO(方案 P3-17)。
+/// 目录意图的作用域快照:全表读一次,之后逐条判定零 IO。
 ///
 /// 判定口径 = **最长前缀命中**:一条路径的状态由覆盖它的最深那条账本决定,
 /// 这样 `never`(用户显式退出)才能盖过祖先目录的纳入 —— 否则「别扫这个
@@ -1092,14 +1092,14 @@ impl ScopeMap {
     /// 该目录是否由**用户亲手导入**而纳入(账本 source = `import`)。
     ///
     /// 只有这一条能压过软排除层:首启对话框落的全盘卷根(`initial_scan_dialog`)、
-    /// 滚动/点击自动记的(`click` / `visible`)都不算 —— 那正是 2026-11-05
+    /// 滚动/点击自动记的(`click` / `visible`)都不算 —— 那正是
     /// 「滚到过不等于要派生」要挡的场景。
     pub fn explicit_import(&self, dir: &str) -> bool {
         matches!(self.entry_of(dir), Some((s, src)) if intent_included(s) && src == SRC_IMPORT)
     }
 }
 
-/// 派生门(方案 P3-17):`ext 命中媒体池 && 未被三层跳过 && dir_intent ∈ 纳入组`
+/// 派生门:`ext 命中媒体池 && 未被三层跳过 && dir_intent ∈ 纳入组`
 /// → `rich_state=1`,否则 `0`。
 ///
 /// **不比 size、不比像素** —— 去重口径里没有第三条尺寸比较门;
@@ -1136,7 +1136,7 @@ impl ScopeGate {
     /// 与 [`ScopeGate::rich_state`] 同一条判定,入参换成散列。
     ///
     /// walkdir 那条发现路拿到的是 `scan::Record`(没有 `L1Row`),两边必须共用
-    /// 同一个门,否则非 NTFS 卷会整个绕过作用域(方案 P3-17 / P4-30)。
+    /// 同一个门,否则非 NTFS 卷会整个绕过作用域。
     pub fn rich_state_of(&self, path: &str, parent: &str, ext: Option<&str>) -> i32 {
         if self.in_scope(path, parent, ext) {
             RICH_PENDING
@@ -1162,7 +1162,7 @@ impl ScopeGate {
     /// 这一行的目录是否属于**永远不该进库**的那一类(硬层)。
     ///
     /// 自家产出目录、回收站、系统与程序目录、点开头目录 —— 里面的文件不是素材,而且 mtime 永远最新,进库就会霸占「最近更新」首屏
-    /// (2026-11-05 现场:首屏 200 张里 190 张是自家 thumbs,全是永远不亮的灰格子)。
+    /// (首屏 200 张里 190 张是自家 thumbs,全是永远不亮的灰格子)。
     /// L1→L2 落库前按这条筛掉新行,历史行由 [`Store::purge_hard_excluded_once`] 清。
     pub fn never_index(&self, parent: &str) -> bool {
         matches!(
@@ -1234,15 +1234,15 @@ impl Store {
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lat REAL;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lon REAL;");
-        // P1-11:uid64 持久唯一标识(64 位无符号整数列)。
+        // uid64 持久唯一标识(64 位无符号整数列)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN uid64 INTEGER;");
-        // P2-16:效果栈列(原版记录表里的 `filters` 列)。
+        // 效果栈列(原版记录表里的 `filters` 列)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN filters TEXT;");
-        // P2-17:视频标记列(NOT NULL 带默认值,旧行自动 0=图片)。
+        // 视频标记列(NOT NULL 带默认值,旧行自动 0=图片)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;");
-        // P1-14:相机型号池化列 + 池表。
+        // 相机型号池化列 + 池表。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN cam_id INTEGER;");
-        // 缩略图生成失败计数(防 worker 对坏文件无限重试,真实事故见
+        // 缩略图生成失败计数(防 worker 对坏文件无限重试,已知问题见
         // thumbs.rs::backfill_tier 注释):失败满 3 次不再进回填队列。
         let _ = conn.execute_batch(
             "ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;",
@@ -1311,11 +1311,11 @@ impl Store {
             write_done: Mutex::new(None),
             hard_purged: std::sync::atomic::AtomicUsize::new(0),
         };
-        // P1-11:启动时补齐缺失的 uid64。
+        // 启动时补齐缺失的 uid64。
         // 扫描路径会在 `store_insert` 里写,但**外部导入**(WiFi 接收、拖入)
         // 或历史遗留的行可能没有 → 启动时兜底补一次,保证"库内每行都有标识"。
         let _ = store.backfill_uid64();
-        // P1-14:把旧行残留的 cam TEXT 迁移进字符串池。
+        // 把旧行残留的 cam TEXT 迁移进字符串池。
         let _ = store.backfill_cam_pool();
         // 旧行补齐小写扩展名(ext IS NULL 的行;填完条件自然不再命中)。
         let _ = store.backfill_ext();
@@ -1450,7 +1450,7 @@ impl Store {
         Ok(())
     }
 
-    /// 首启范围是否已落账(方案 P3-18 的对话框只答一次)。
+    /// 首启范围是否已落账(的对话框只答一次)。
     pub fn scope_initialized(&self) -> bool {
         self.get_setting("scan_initialized").is_some()
     }
@@ -1465,7 +1465,7 @@ impl Store {
     /// 没进作用域的行结构列齐全、派生列全空,网格里是占位。
     ///
     /// `watched` 一律只登记壳目录:整卷挂 `ReadDirectoryChangesW` 会被系统临时
-    /// 文件的写事件刷爆,全盘的保鲜归服务的 USN 日志管(方案 P0 决策 2)。
+    /// 文件的写事件刷爆,全盘的保鲜归服务的 USN 日志管。
     pub fn apply_initial_scope(&self, complete: bool) -> Vec<PathBuf> {
         if self.scope_initialized() {
             return Vec::new();
@@ -1737,7 +1737,7 @@ impl Store {
         })
     }
 
-    // ===== P2-15 持久化扫描队列 =====
+    // ===== 持久化扫描队列 =====
 
     /// 登记扫描根(已存在则忽略,scope 保留首次值)。
     ///
@@ -1789,7 +1789,7 @@ impl Store {
         Ok(())
     }
 
-    /// P2-16:读某张照片的效果栈(原版 `filters` 列)。
+    /// 读某张照片的效果栈(原版 `filters` 列)。
     pub fn get_filters(&self, photo_id: i64) -> Option<String> {
         self.read(move |conn| {
             conn.query_row(
@@ -1802,7 +1802,7 @@ impl Store {
         })
     }
 
-    /// P2-16:写某张照片的效果栈(空串 = 无效果)。
+    /// 写某张照片的效果栈(空串 = 无效果)。
     pub fn set_filters(&self, photo_id: i64, filters: &str) -> Result<()> {
         let f = filters.to_string();
         self.write(move |conn| {
@@ -1814,7 +1814,7 @@ impl Store {
         Ok(())
     }
 
-    /// P2-16:批量写效果栈(粘贴所有效果给多张)。
+    /// 批量写效果栈(粘贴所有效果给多张)。
     pub fn set_filters_many(&self, ids: &[i64], filters: &str) -> Result<usize> {
         let ids = ids.to_vec();
         let f = filters.to_string();
@@ -1832,7 +1832,7 @@ impl Store {
         })
     }
 
-    /// P2-16:批量读效果栈(复制所有效果时取源照片)。
+    /// 批量读效果栈(复制所有效果时取源照片)。
     pub fn get_filters_many(&self, ids: &[i64]) -> Vec<(i64, String)> {
         let ids = ids.to_vec();
         self.read(move |conn| {
@@ -1981,7 +1981,7 @@ impl Store {
     ///
     /// 与 [`Store::drop_missing_paths`] 的差别只在「谁做存在性复核」:那个自己
     /// 逐个 `stat`,这个把复核交给调用方 —— 监听线程问得到 L1 索引服务时,
-    /// 一次管道往返就够了,不必再摸一遍磁盘(方案 P3-26)。
+    /// 一次管道往返就够了,不必再摸一遍磁盘。
     ///
     /// 目录被删时事件只报目录本身(子文件不一定逐个上报),
     /// 因此还要按路径边界清掉库里的子项。
@@ -2076,7 +2076,7 @@ impl Store {
         })
     }
 
-    // ===== P1-12 变更日志 =====
+    // ===== 变更日志 =====
 
     /// 记录一条变更(added / modified / removed)。
     pub fn log_change(&self, path: &str, action: &str, photo_id: Option<i64>) -> Result<()> {
@@ -2126,7 +2126,7 @@ impl Store {
         })
     }
 
-    // ===== P1-11 uid64 =====
+    // ===== uid64 =====
 
     /// 为尚未分配 uid64 的照片补一个。
     ///
@@ -2136,7 +2136,7 @@ impl Store {
     /// 导致"改名就换 id",两者都不理想)。
     ///
     /// **uid64 一经分配即保持不变**:写入用 COALESCE,内容变化**不会**换 id
-    /// (参考件的 uid64 生成算法无对应资料,我方方案如上,不臆造)。
+    /// (uid64 生成算法暂无对应资料,本实现采用上述方案)。
     ///
     /// 返回新分配的条数。
     pub fn backfill_uid64(&self) -> Result<usize> {
@@ -2224,7 +2224,7 @@ impl Store {
         Ok(n)
     }
 
-    /// 一次性把**永远不该进库**的历史行清掉(2026-11-05 现场)。
+    /// 一次性把**永远不该进库**的历史行清掉。
     ///
     /// 命中 [`crate::scan::ExcludeLayer::Hard`] 的那些目录 —— 自家产出目录、
     /// 回收站、系统与程序目录、点开头目录 —— 里面的文件不是素材:它们的
@@ -2234,7 +2234,7 @@ impl Store {
     ///
     /// 增量入库那一侧同步拦掉新行(`nameidx::ingest_l1`),这里清历史行。
     /// 软层(AppData 一类)**不清** —— 那些行留在库里当占位,用户对着它
-    /// 右键「纳入此目录」就能放行(2026-11-05 拍板:AppData 也要能访问)。
+    /// 右键「纳入此目录」就能放行(AppData 也要能访问)。
     ///
     /// 标记值 = 名单版本 + 当前解析出的自有前缀清单,不是一个布尔:缓存位置
     /// 会被 `MALIANG_CACHE_DIR` / `data.location` 改到别处,硬名单也会随版本
@@ -2345,7 +2345,7 @@ impl Store {
         })
     }
 
-    // ===== S3 item 12:L1 → L2 增量落库 =====
+    // ===== L1 → L2 增量落库 =====
 
     /// 批量把 L1 结构行写进 photos(单事务,WAL/synchronous=NORMAL)。
     ///
@@ -2356,7 +2356,7 @@ impl Store {
     /// 本身没错),所以 upsert 前先摘掉「同 path、不同 frn64」的陈旧行 ——
     /// 那必然是被删除/被覆盖的旧文件,不摘就会撞约束。
     ///
-    /// `gate` 给定时顺手把派生门(方案 P3-17)的结果写进 `rich_state`;
+    /// `gate` 给定时顺手把派生门的结果写进 `rich_state`;
     /// 给 `None` 表示调用方不参与作用域(测试/兼容扫描),新行按未纳入落。
     /// 冲突分支**只升不降**:门说在作用域内才可能把 0 抬到 1,已派生(2)与
     /// 坏文件(3)由 [`Store::invalidate_dir`] / [`Store::mark_bad_media`] 管;
@@ -2458,7 +2458,7 @@ impl Store {
         self.set_setting(&format!("l1_ingest_usn_{letter}"), &usn.to_string())
     }
 
-    // ===== P1-14 字符串池 =====
+    // ===== 字符串池 =====
 
     /// 把一个字符串驻留进指定池,返回池 id。
     ///
@@ -2578,7 +2578,7 @@ impl Store {
 
     /// 启动时把**旧行**里还留在 `cam` TEXT 列的相机型号补进池。
     ///
-    /// P1-14 之前入库的行没有 `cam_id`;`timeline::load_all` 的
+    /// 之前入库的行没有 `cam_id`;`timeline::load_all` 的
     /// `LEFT JOIN` 会回退显示 `cam`,但那样这些行就享受不到池化。
     /// 返回被迁移的行数。
     pub fn backfill_cam_pool(&self) -> Result<usize> {
@@ -2834,7 +2834,7 @@ impl Store {
         Ok(out)
     }
 
-    // ===== P1-9 多档缩略图 =====
+    // ===== 多档缩略图 =====
 
     /// 标记某张照片的某档缩略图已生成。
     pub fn mark_tier_done(&self, photo_id: i64, tier: u8) -> Result<()> {
@@ -2868,13 +2868,13 @@ impl Store {
     /// 取该档**尚未生成**的照片 id + 路径(供后台 worker 批量补齐)。
     ///
     /// Normal 档(tier 1)的取行条件从「所有 `thumb_ok=0`」改成派生门放行的
-    /// `rich_state=1`(方案 P3-20):不在作用域里的行根本不进队列,而不是
+    /// `rich_state=1`:不在作用域里的行根本不进队列,而不是
     /// 进了队列再失败。排序键是**可见优先 + 全库兜底** —— `visible` 里的目录
     /// 先出,不足 `limit` 再用全库补齐;用户眼前的图先清晰,后台最终把整个
     /// 作用域做完。
     ///
     /// 反复失败的行不再靠 `thumb_fail` 阈值过滤:达到阈值即由
-    /// [`Store::mark_bad_media`] 立案、`rich_state` 置 3 出队(方案 P3-22),
+    /// [`Store::mark_bad_media`] 立案、`rich_state` 置 3 出队,
     /// 台账才是权威,`thumb_fail` 退化成计数。
     /// 摘掉某张照片某一档的缩略图台账,让回填队列重新取它。
     ///
@@ -3076,7 +3076,7 @@ impl Store {
 
     /// 派生失败记账:失败计数 +1,返回累计值。
     ///
-    /// 计数达 [`BAD_MEDIA_THRESHOLD`] 时由调用方立案(方案 P3-22):写
+    /// 计数达 [`BAD_MEDIA_THRESHOLD`] 时由调用方立案:写
     /// `bad_media` 台账并把 `rich_state` 置 3 出队,不再每轮重试同一张坏图。
     /// 文件本身变化(mtime 更新)由落库路径重置 `thumb_ok` 并退回待派生。
     pub fn mark_thumb_fail(&self, id: i64) -> i64 {
@@ -3096,13 +3096,13 @@ impl Store {
 
     /// 中档派生完成回写:派生列 + 缩略图指纹 + 状态,一条 UPDATE 落定。
     ///
-    /// 发现路径不读文件内容(方案 P3-25),`width/height/taken_utc/cam_id/lat/lon/rot`
+    /// 发现路径不读文件内容,`width/height/taken_utc/cam_id/lat/lon/rot`
     /// 这些派生列只由这里写;`thumb_ok` / `dhash` / `rich_state` 必须同一条语句 ——
     /// 分开写会出现 `thumb_ok=1` 而 `rich_state` 还停在待派生的中间态,
-    /// 下一轮又被取回来重做(方案 P3-20)。
+    /// 下一轮又被取回来重做。
     ///
     /// 入参 `(id, dhash, 派生列)`;`d` 为 `None` 表示这行没有派生列可写
-    /// (只推状态)。相机型号先入池再写 id(P1-14),池化必须在事务**外**做完 ——
+    /// (只推状态)。相机型号先入池再写 id,池化必须在事务**外**做完 ——
     /// `intern_batch` 自身要拿连接锁,不能在 tx 内重入。
     pub fn mark_derived(&self, rows: &[(i64, u64, Option<&crate::scan::Derived>)]) -> Result<()> {
         if rows.is_empty() {
@@ -3192,7 +3192,7 @@ impl Store {
         })
     }
 
-    /// 落账一条目录意图(方案 P3-18/19)。
+    /// 落账一条目录意图。
     ///
     /// 已存在则改 `state`/`source`;`volume`/`frn`/`since_usn` 只在给了新值时
     /// 覆盖(`COALESCE`),`needs_refresh` 由 [`Store::set_dir_needs_refresh`]
@@ -3281,7 +3281,7 @@ impl Store {
         })
     }
 
-    /// 给账本上**所有**目录挂失效位(方案 P3-21)。
+    /// 给账本上**所有**目录挂失效位。
     ///
     /// 两个触发点用它:索引 blob 格式版本不匹配(整库重建 → 目录账本全部作废),
     /// 以及用户在选项里勾「强制刷新缩略图」(`force_thumb_update` 偏好)。
@@ -3295,7 +3295,7 @@ impl Store {
         })
     }
 
-    /// 把挂了失效位的目录逐个退回待派生,然后清位(方案 P3-21)。
+    /// 把挂了失效位的目录逐个退回待派生,然后清位。
     ///
     /// `invalidate_dir` 是"全部退回 1",含已派生(2)与坏文件(3)——
     /// 用户要求强制刷新时坏文件也该再试一次(台账本身不动,再失败会重新立案)。
@@ -3315,7 +3315,7 @@ impl Store {
 
     /// 这个目录能不能写进派生作用域账本。
     ///
-    /// 分两层(2026-11-05 现场修正):
+    /// 分两层:
     /// - **硬层**(参考件 4 条 + 回收站现代名 + 自家产出目录)任何入口都不放行;
     /// - **软层**(AppData / Program Files / temp / node_modules / 点开头目录 /
     ///   用户自定义排除)只在 `deliberate=true` —— 用户在文件夹管理器里选中它、
@@ -3335,7 +3335,7 @@ impl Store {
         }
     }
 
-    /// 点击懒加载(方案 P3-19):该目录子树里**未纳入**的行置为待派生。
+    /// 点击懒加载:该目录子树里**未纳入**的行置为待派生。
     ///
     /// 只动 0 —— 已派生(2)不必重做,坏文件(3)由台账拦着,不该因为点开
     /// 一次目录就又开始每轮重试。子树口径与 [`ScopeMap`] 的最长前缀命中一致:
@@ -3384,9 +3384,9 @@ impl Store {
     /// 该目录子树里**已放行**的行(`rich_state<>0`),连同状态一起回读。
     ///
     /// `promote_dir` 改的是库,而网格每帧读的是内存里的 `PhotoRow`,那一列要等
-    /// `rebuild` 才跟库对齐。界面于是必须拿这份回读当唯一真相 —— 上一轮让它
+    /// `rebuild` 才跟库对齐。界面于是必须拿这份回读当唯一真相 —— 若让它
     /// 自己按排除名单再判一遍门,结果库里早就派生完了,屏幕上还锁着
-    /// 「未纳入范围」的占位块(2026-11-05 现场)。取满 5 万行即止,剩下的下一轮重建补。
+    /// 「未纳入范围」的占位块。取满 5 万行即止,剩下的下一轮重建补。
     pub fn promoted_states(&self, dir: &str) -> Vec<(i64, i32)> {
         let (eq, sub) = dir_like(dir);
         self.read(|conn| {
@@ -3407,7 +3407,7 @@ impl Store {
         })
     }
 
-    /// 目录级失效(方案 P3-21):该目录子树的行**全部**退回待派生,
+    /// 目录级失效:该目录子树的行**全部**退回待派生,
     /// 含已派生(2)与坏文件(3)—— 用户要求强制刷新时,坏文件也该再试一次
     /// (台账本身不动,重试再失败会重新立案)。返回置行数。
     pub fn invalidate_dir(&self, dir: &str) -> Result<usize> {
@@ -3554,7 +3554,7 @@ impl Store {
             .collect()
     }
 
-    /// 立案(方案 P3-22):写台账 + 该行 `rich_state` 1→3,不再每轮重试。
+    /// 立案:写台账 + 该行 `rich_state` 1→3,不再每轮重试。
     ///
     /// 台账按 path 记;文件改名后旧条目会失去
     /// 目标,那时它拦不住任何东西,只是一条待清理的死账。
@@ -3682,7 +3682,7 @@ fn dir_like(dir: &str) -> (String, String) {
     let d = norm_dir(dir);
     let base = d.trim_end_matches(['\\', '/']);
     // 子树通配的分隔符跟着路径自己的写法走:POSIX 上 `photos.parent` 只有 `/`,
-    // 硬编码反斜杠会让整棵子树一条也匹配不到(2026-11-06 Linux 端 promote 全 0)。
+    // 硬编码反斜杠会让整棵子树一条也匹配不到(Linux 端 promote 全 0)。
     let sep = if d.contains('/') && !d.contains('\\') {
         "/"
     } else {
@@ -3698,7 +3698,7 @@ fn dir_like(dir: &str) -> (String, String) {
 /// 对应参考件首启口径 —— 安装文案原文
 /// "Only search My Documents, My Pictures, and the Desktop":
 /// 首启只登记这三个壳目录并扫描一次;扩大范围由用户在文件夹管理器手动添加。
-/// **绝不返回盘根** —— 盘根会把系统 / 应用数据目录整卷拖进库(真实事故)。
+/// **绝不返回盘根** —— 盘根会把系统 / 应用数据目录整卷拖进库。
 pub fn default_roots() -> Vec<PathBuf> {
     crate::win::known_dirs()
 }
@@ -3792,7 +3792,7 @@ mod tests {
     }
 
     /// 数据目录优先级:用户标记 > 机器标记 > 按进程形态的默认目录。
-    /// 钉住的是 2026-11-05 那次分裂事故的口径 —— 服务(LocalSystem)读不到
+    /// 钉住的是服务与界面必须用同一份配置的口径 —— 服务(LocalSystem)读不到
     /// 登录用户的标记,必须能从机器级标记拿到同一个目录,而不是各建一套库。
     #[test]
     fn data_dir_prefers_user_marker_then_machine_marker() {
@@ -3921,7 +3921,7 @@ mod tests {
         }
     }
 
-    /// 批量按路径取派生状态(快查投影用,方案 P4-29)。
+    /// 批量按路径取派生状态(快查投影用)。
     ///
     /// 钉两件事:**不在库里的路径不出现在结果里**(调用方靠这个把
     /// 「未纳入作用域」和「压根不是媒体」分开),以及空输入不生成
@@ -3960,7 +3960,7 @@ mod tests {
     #[test]
     fn legacy_db_upgrades_rich_state_and_ext() {
         let conn = Connection::open_in_memory().unwrap();
-        // P1-11 之前的形状:无 uid64/cam_id/kind/thumb_fail/caption/rich_state/ext。
+        // 之前的形状:无 uid64/cam_id/kind/thumb_fail/caption/rich_state/ext。
         conn.execute_batch(
             "CREATE TABLE photos (
                 id INTEGER PRIMARY KEY,
@@ -4045,7 +4045,7 @@ mod tests {
     }
 
     /// 参考件口径:默认扫描范围是壳目录(我的文档/图片/桌面),
-    /// 绝不返回盘根 —— 盘根会把系统/应用数据目录整卷拖进库(真实事故)。
+    /// 绝不返回盘根 —— 盘根会把系统/应用数据目录整卷拖进库。
     #[test]
     fn default_roots_are_shell_dirs_never_drive_roots() {
         for p in default_roots() {
@@ -4108,7 +4108,7 @@ mod tests {
         assert_eq!(watched.len(), default_roots().len());
     }
 
-    /// 排除名单分两层(2026-11-05 拍板):软层能被用户表态覆盖(AppData 也要能
+    /// 排除名单分两层:软层能被用户表态覆盖(AppData 也要能
     /// 访问),硬层谁都不能、而且不进库。这条口径是 `adoptable_dir` /
     /// `dir_derivable` / `purge_hard_excluded_once` 共用的那一份判定,
     /// 测试打在门口,免得 UI 与入库各抄一遍。
@@ -4221,7 +4221,7 @@ mod tests {
         assert_eq!(dir_like("/").1, "/%", "POSIX 根的子树");
     }
 
-    /// 自家产出目录里的行不该留在库里(2026-11-05 现场:「最近更新」首屏
+    /// 自家产出目录里的行不该留在库里(「最近更新」首屏
     /// 200 张里 190 张是自家 thumbs,全是永远不亮的灰格子)。
     /// 清完打标记,二次调用不再动库;引用表跟着清,不留孤儿。
     #[cfg(windows)]
@@ -4494,7 +4494,7 @@ mod tests {
         assert_eq!(visible, vec![1, 2, 3], "可见目录不受稳定期限制");
     }
 
-    /// 放行与回读必须是同一条口径(2026-11-05 现场:`AppData` 里早已派生完的图,
+    /// 放行与回读必须是同一条口径(`AppData` 里早已派生完的图,
     /// 屏幕上仍锁在「未纳入范围」—— 因为界面按排除名单自己又判了一遍门)。
     ///
     /// `promote_dir` 只改库;界面拿 `promoted_states` 回读真相。判定只留库里这一份。
@@ -4555,7 +4555,7 @@ mod tests {
         assert_eq!(store.get_setting("face_algo").as_deref(), Some("3"));
     }
 
-    /// P2-16:效果栈存 `photos.filters` 列(普通 TEXT 列),
+    /// 效果栈存 `photos.filters` 列(普通 TEXT 列),
     /// 支持单张读写、批量写(粘贴所有效果)、批量读(复制所有效果)。
     #[test]
     fn filters_roundtrip_and_batch() {
@@ -4829,7 +4829,7 @@ mod tests {
         assert_eq!(n, 1, "前缀相近的兄弟文件不能误删");
     }
 
-    // ===== P1-14 字符串池 =====
+    // ===== 字符串池 =====
 
     const POOL: &str = "photos_cam";
 
@@ -4891,11 +4891,11 @@ mod tests {
 
     #[test]
     fn missing_tier_takes_scoped_rows_and_ledger_removes_bad_ones() {
-        // 方案 P3-20:回填队列的取行条件是派生门放行的 `rich_state=1`,
+        // 回填队列的取行条件是派生门放行的 `rich_state=1`,
         // 不再是"所有 thumb_ok=0" —— 不在作用域里的行根本不进队列。
-        // 方案 P3-22:反复失败的行由坏媒体台账立案后置 3 出队,
+        // 反复失败的行由坏媒体台账立案后置 3 出队,
         // 出队靠台账而不是 thumb_fail 阈值(否则一批坏文件会让 worker
-        // 永远空转在开头,真实事故:回收站 $I*.jpg 元数据)。
+        // 永远空转在开头,常见来源是回收站 $I*.jpg 元数据)。
         let store = Store::open_mem().unwrap();
         {
             let c = store.test_conn();
@@ -4953,7 +4953,7 @@ mod tests {
 
     #[test]
     fn missing_tier_prefers_visible_dirs_then_falls_back() {
-        // 方案 P3-20 的排序键(用户已拍):可见区域命中优先 + 其余全库兜底。
+        // 的排序键(用户已拍):可见区域命中优先 + 其余全库兜底。
         let store = Store::open_mem().unwrap();
         {
             let c = store.test_conn();
@@ -4986,7 +4986,7 @@ mod tests {
         // 模拟早期版本的 index.db:photos 表已存在但只有老列
         // (没有 cam_id / filters / kind 等后续迁移列)。
         // SCHEMA 不得引用任何迁移列,否则建索引先于 ALTER 失败,
-        // 程序启动即 panic(真实事故:2026-10-29 debug 版启动崩溃)。
+        // 程序启动即 panic,且没有回退余地。
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE photos(
@@ -5036,7 +5036,7 @@ mod tests {
         let store = Store::open_mem().unwrap();
         {
             let c = store.test_conn();
-            // 模拟 P1-14 之前入库的行:cam 有值、cam_id 为 NULL
+            // 模拟 之前入库的行:cam 有值、cam_id 为 NULL
             c.execute(
                 "INSERT INTO photos(id,path,parent,mtime,size,cam) VALUES(1,'/p/a.jpg','/p',0,0,'Nikon D850')",
                 [],
@@ -5188,7 +5188,7 @@ mod tests {
         assert_eq!(stats[0].2, 2, "被 2 行引用");
     }
 
-    // ===== P2-15 持久化扫描队列 =====
+    // ===== 持久化扫描队列 =====
 
     #[test]
     fn scan_queue_enqueue_dedup_and_dequeue() {
@@ -5270,7 +5270,7 @@ mod tests {
         assert!(fcols.contains(&"ignored".to_string()), "faces 列: {fcols:?}");
     }
 
-    // ===== P1-11 uid64 =====
+    // ===== uid64 =====
 
     /// FNV-1a:确定性、跨进程一致、对不同输入不同。
     #[test]
@@ -5319,7 +5319,7 @@ mod tests {
         assert!(store.photo_by_uid64(0xdead_beef_1234_5678).is_none());
     }
 
-    // ===== P1-12 变更日志 =====
+    // ===== 变更日志 =====
 
     /// 变更日志:写入 → 倒序读取 → 清空。
     #[test]
@@ -5346,7 +5346,7 @@ mod tests {
         assert!(store.recent_changes(10).is_empty());
     }
 
-    /// P1-9:thumb_tiers 表记录各档完成状态。
+    /// thumb_tiers 表记录各档完成状态。
     #[test]
     fn thumb_tiers_tracks_per_tier_state() {
         let store = Store::open_mem().unwrap();

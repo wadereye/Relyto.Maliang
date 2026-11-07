@@ -7,15 +7,15 @@
 //!
 //! ```text
 //! if delta == 0            -> vel = 0;  return
-//! v  = delta * (-2.4)                     
-//! neg = v < 0                             
-//! v  = |v|                                
-//! range = (hi - lo)                      
-//! t  = powf(v / range, 0.3)               
-//! v  = t * A                              
-//! if v < 100                              
-//!     v = 100 * powf(v / 100, 4.25)       
-//! if neg: v = -v                          
+//! v  = delta * (-2.4)
+//! neg = v < 0
+//! v  = |v|
+//! range = (hi - lo)
+//! t  = powf(v / range, 0.3)
+//! v  = t * A
+//! if v < 100
+//!     v = 100 * powf(v / 100, 4.25)
+//! if neg: v = -v
 //! vel = v
 //! ```
 //!
@@ -70,7 +70,7 @@ pub const EVENT_SCROLL_THUMB: &str = "scroll/thumb";
 /// 滚动停止时的缩略图解码满额(每帧最多解码多少张)。
 pub const MAX_THUMB_DECODE_PER_FRAME: usize = 64;
 
-/// 滚动停止时每帧允许同步解码的**像素体积**(RGBA8 字节数,方案 P4-23③)。
+/// 滚动停止时每帧允许同步解码的**像素体积**(RGBA8 字节数)。
 ///
 /// 与 [`MAX_THUMB_DECODE_PER_FRAME`] 是同一个满额点的两种口径:
 /// 64 张 × 中档 256×256×4 = 16MB。张数口径在中档没问题,但预览档
@@ -377,7 +377,7 @@ pub fn decode_budget(velocity_px: f64, scale_px: f64) -> usize {
     budget.clamp(0.0, MAX_THUMB_DECODE_PER_FRAME as f64) as usize
 }
 
-/// 按档位体积折算后的每帧解码张数上限(方案 P4-23③)。
+/// 按档位体积折算后的每帧解码张数上限。
 ///
 /// 同时受两道约束,取较小者:滚动限速给出的张数上限 [`decode_budget`],
 /// 以及「每帧字节预算 ÷ 单张体积」。`item_bytes` 见 `thumbs::Tier::bytes`。
@@ -678,7 +678,7 @@ mod tests {
         );
     }
 
-    /// 按档位体积折算(方案 P4-23③):中档与旧口径一致,大档被字节预算压低,
+    /// 按档位体积折算:中档与旧口径一致,大档被字节预算压低,
     /// 小档仍按张数封顶。否则预览档一帧要解 64 × 4MB = 256MB,UI 直接卡死。
     #[test]
     fn decode_budget_for_scales_with_tier_size() {

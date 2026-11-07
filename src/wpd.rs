@@ -26,7 +26,7 @@
 //!   把 pid=9 的 SECURITY_QOS 改 0x80000000 后重试。
 //! - **文件传输走 WIA 通道**:QI `IWiaDataTransfer` + 临时目录。
 //!
-//! # 我方实现范围(诚实声明)
+//! # 我方实现范围(实现口径)
 //!
 //! 1. **设备枚举**(本文件):`IPortableDeviceManager::GetDevices` + 每设备的
 //!    FriendlyName/Description/Manufacturer —— 对齐WPD 管理器/WPD 设备信息。

@@ -1605,7 +1605,7 @@ pub fn cli_check() -> Result<(), String> {
     Ok(())
 }
 
-/// `--download-update`:只抓取清单、下载并校验,不安装。部署时用来现场确认
+/// `--download-update`:只抓取清单、下载并校验,不安装。部署时用来部署时确认
 /// 配置、代理、服务端 Range 支持与校验值是否正确。
 pub fn cli_download() -> Result<(), String> {
     let cfg = load_config();

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-/// 缩略图档位(P1-9)。
+/// 缩略图档位。
 ///
 /// 缩略图档位分派:原版是 **8 档枚举**,每档落到**三张缓存表**之一
 /// (小 / 大 / 预览),缓存与索引分离。
@@ -255,9 +255,9 @@ pub fn load_tier_repair(
     }
 }
 
-// ===================== 解码基底与缩放(方案 P4-23①②) =====================
+// ===================== 解码基底与缩放(②) =====================
 
-/// 内嵌预览够不够格当某一档的基底(方案 P4-23②:按目标尺寸取图)。
+/// 内嵌预览够不够格当某一档的基底(按目标尺寸取图)。
 ///
 /// 边长达到目标的一半就收:上采样只会糊,但比整图解码省一个数量级的时间;
 /// 达不到一半宁可整图解码,也不要糊成马赛克。
@@ -295,7 +295,7 @@ fn downscale(img: image::DynamicImage, size: u32) -> image::DynamicImage {
     img.resize(size, size, FilterType::Triangle)
 }
 
-/// 缩到 `size` 内,**再**按 EXIF 方向摆正(方案 P4-23②)。
+/// 缩到 `size` 内,**再**按 EXIF 方向摆正。
 ///
 /// 顺序是刻意的:先缩后转。90°/270° 旋转是纯像素置换,
 /// 「缩到 S 再转」与「转完再缩到 S」结果逐像素一致(dHash 也不变),
@@ -318,7 +318,7 @@ fn fit_oriented(
 ///
 /// 1. 视频 → Shell 抽帧(`image` crate 解不了容器格式);
 /// 2. JPEG 内嵌 EXIF 缩略图 —— 相机原图几乎都有,免整图解码;
-/// 3. 相机 RAW → **内嵌 JPEG 预览优先**(方案 P4-23①),Shell 只作最后兜底;
+/// 3. 相机 RAW → **内嵌 JPEG 预览优先**,Shell 只作最后兜底;
 /// 4. PSD / PSB → 只读文件里的合成图,解不了再借系统缩略图;
 /// 5. 其余格式走 `image`(按魔数分派),方向随图一起交给调用方。
 ///
@@ -363,7 +363,7 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
         return Err(anyhow::anyhow!("无可用预览(合成图缺失或色彩模式暂不支持): {}", src.display()));
     }
     // 5) 常规格式:按**魔数**分派解码器,不是按扩展名。
-    //    `image::open` 是照扩展名挑解码器的:2026-11-05 现场台账里 3,340 条
+    //    `image::open` 是照扩展名挑解码器的:缓存台账里 3,340 条
     //    "Illegal start bytes:8950" 就是把 PNG(0x89 'P')喂给了 JPEG 解码器 ——
     //    扩展名写着 .jpg、内容其实是 PNG / WebP 的文件到处都是(下载站、客户端
     //    缓存、批量转档都这么干),按扩展名解会把它们全判成坏图立案。
@@ -378,7 +378,7 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
     Ok((img, read_rotation(src)))
 }
 
-/// RAW 的内嵌 JPEG 预览(方案 P4-23①)。
+/// RAW 的内嵌 JPEG 预览。
 ///
 /// 相机在 TIFF 容器里塞了一张全尺寸 JPEG,直接取它比走 Shell 解码器快一个
 /// 量级,也不依赖厂商 RAW 解码扩展装没装。返回(图, 还需施加的方向)。
@@ -540,7 +540,7 @@ pub fn backfill(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
     backfill_tier(store, Tier::Normal, &[], limit)
 }
 
-/// 批量生成指定档位缺失的缩略图(P1-9)。
+/// 批量生成指定档位缺失的缩略图。
 ///
 /// 返回成功生成的 id 列表。Normal 档会顺带回写 `thumb_ok=1`、`dhash` 与
 /// `rich_state=2`;其余档位只记 `thumb_tiers` 表(对应原版的三张缓存表各自
@@ -590,7 +590,7 @@ fn backfill_rows(
             }
             Some(match generate_tier(tier, *id, Path::new(path)) {
                 Ok(h) => {
-                    // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读(方案 P3-25):
+                    // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读:
                     // 发现路径不打开文件内容,这里是唯一读它的地方。
                     // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
                     let d = (tier == Tier::Normal)
@@ -598,7 +598,7 @@ fn backfill_rows(
                     rayon::iter::Either::Left((*id, h, d))
                 }
                 // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
-                // worker 永远空转在开头(真实事故:回收站 $I*.jpg 元数据)。
+                // worker 永远空转在开头(已知问题: 回收站 $I*.jpg 元数据)。
                 Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
             })
         })
@@ -635,7 +635,7 @@ fn backfill_rows(
     Ok(ok.into_iter().map(|(id, _, _)| id).collect())
 }
 
-/// 派生失败记账,累计到阈值就立案进坏媒体台账(方案 P3-22)。
+/// 派生失败记账,累计到阈值就立案进坏媒体台账。
 ///
 /// 立案后 `rich_state` 变 3、行出队,不再每轮重试同一张坏图;
 /// 网格右键给「隐藏此文件 / 不隐藏」两个出口(对齐参考件
@@ -659,7 +659,7 @@ fn short_reason(e: &anyhow::Error) -> String {
 
 /// UI 发布的「当前可见目录」清单:worker 每轮取行前读一次。
 ///
-/// 派生队列的排序键是**可见优先 + 全库兜底**(方案 P3-20,用户已拍):
+/// 派生队列的排序键是**可见优先 + 全库兜底**(用户已拍):
 /// 眼前的图先清晰,但后台最终会把整个作用域做完 —— 这不是「只补看得见的」。
 pub type VisibleDirs = Arc<Mutex<Vec<String>>>;
 
@@ -682,14 +682,14 @@ pub struct ThumbWorker {
     /// 每完成一批就发一次信号,携带本批生成成功的照片 id 列表。
     /// UI 据此把对应格子的占位纹理换成真图。
     pub done: mpsc::Receiver<Vec<i64>>,
-    /// 当前要补齐的档位(P1-9:UI 切档 → worker 改补那一档)。
+    /// 当前要补齐的档位(UI 切档 → worker 改补那一档)。
     pub tier: Arc<AtomicU8>,
-    /// UI 发布的可见目录清单(P3-20:可见优先 + 全库兜底)。
+    /// UI 发布的可见目录清单(可见优先 + 全库兜底)。
     /// 用 [`ThumbWorker::publish_visible`] 写,worker 每轮取行前读一次快照。
     visible: VisibleDirs,
 }
 
-/// 一次性给**误判**的坏图销案(2026-11-05 现场:台账 3,427 条里 3,340 条写着
+/// 一次性给**误判**的坏图销案(台账 3,427 条里 3,340 条写着
 /// "Illegal start bytes:8950" —— 那是 0x89 'P',PNG 的头被喂给了 JPEG 解码器)。
 ///
 /// 判据不看台账里的原因串(那是历史文案,改一次措辞就对不上),而是**现在**拿
@@ -714,7 +714,7 @@ fn reset_misfiled_bad_media_once(store: &crate::db::Store) {
     let _ = store.set_setting(MARK, VERSION);
 }
 
-/// 启动**常驻**缩略图后台线程(P0-1 + P1-9 多档 + P3-20 作用域队列)。
+/// 启动**常驻**缩略图后台线程(+ 多档 + 作用域队列)。
 ///
 /// 行为(对齐原版 Picasa 的"缩略图缓存后台生成"):
 /// - 补齐的是**派生门放行的行**(`rich_state=1`),不再是"所有 `thumb_ok=0`";
@@ -826,7 +826,7 @@ pub fn regen(store: &crate::db::Store, id: i64) -> Result<()> {
     Ok(())
 }
 
-// ===== P1-10 预览缓存 =====
+// ===== 预览缓存 =====
 
 /// 预览图的最长边(像素)。原版预览图是独立的缓存表。
 pub const PREVIEW_SIZE: u32 = 1024;
@@ -1074,7 +1074,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// P0-1:读回落盘缩略图不走原图解码。
+    /// 读回落盘缩略图不走原图解码。
     /// 生成后应能读回,且尺寸为默认档的 256×256(letterbox 画布)。
     #[test]
     fn load_cached_returns_256_canvas() {
@@ -1103,7 +1103,7 @@ mod tests {
     }
 
     /// 生成失败要记账:同一张反复失败达阈值后立案进坏媒体台账并出队。
-    /// 否则一批坏文件(如回收站元数据)会让 worker 永远空转(真实事故)。
+    /// 否则一批坏文件(如回收站元数据)会让 worker 永远空转。
     #[test]
     fn backfill_marks_repeated_failures_then_ledgers_them() {
         let store = std::sync::Arc::new(crate::db::Store::open_mem().unwrap());
@@ -1117,7 +1117,7 @@ mod tests {
             )
             .unwrap();
         }
-        // 每轮:取到这张 → 生成失败 → 记账。三轮后达阈值立案(方案 P3-22)。
+        // 每轮:取到这张 → 生成失败 → 记账。三轮后达阈值立案。
         for round in 1..=3 {
             let ids = backfill_tier(&store, Tier::Normal, &[], 10).unwrap();
             assert!(ids.is_empty(), "第 {round} 轮不应有成功产出");
@@ -1143,7 +1143,7 @@ mod tests {
         );
     }
 
-    /// P0-1 + P3-20:后台 worker 会把**派生门放行**(`rich_state=1`)的照片补上
+    /// + 后台 worker 会把**派生门放行**(`rich_state=1`)的照片补上
     /// 缩略图,回报 id,并把状态推到已派生。
     #[test]
     fn worker_backfills_missing_thumbs() {
@@ -1231,7 +1231,7 @@ mod tests {
         assert_eq!(f, 0, "没进队列就不该记失败");
     }
 
-    // ===== P1-9 多档缩略图 =====
+    // ===== 多档缩略图 =====
 
     /// 损坏缓存自愈:文件在但解不开 → 删文件 + 摘台账;中档还要把
     /// 已派生的行退回「待派生」,回填队列才会重新生成。
@@ -1421,7 +1421,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ===== P1-10 预览缓存 =====
+    // ===== 预览缓存 =====
 
     /// 预览缓存:生成后可读回,尺寸 ≤ 1024。
     #[test]
@@ -1478,7 +1478,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 内嵌预览的**按档尺寸门**(方案 P4-23②)。
+    /// 内嵌预览的**按档尺寸门**。
     ///
     /// 旧实现是硬编码 128px,于是 160px 的 EXIF 缩略图会被拿去喂 512/1024 档,
     /// 大档看着就是一团糊 —— 这条锁住"边长要达到目标的一半"。
@@ -1600,7 +1600,7 @@ mod tests {
         }
     }
 
-    /// 回归:扩展名骗人时按**魔数**认格式(2026-11-05 现场:坏文件台账 3,427 条里
+    /// 回归:扩展名骗人时按**魔数**认格式(坏文件台账 3,427 条里
     /// 3,340 条写着 "Illegal start bytes:8950" —— 0x89 'P' 是 PNG 的头,
     /// 被喂给了 JPEG 解码器;那些文件其实好得很)。
     #[test]

@@ -1,4 +1,4 @@
-//! 名字索引服务的进程间协议(S4 拆进程,决策 5)。
+//! 名字索引服务的进程间协议。
 //!
 //! 形态:一个提权常驻服务握着 L1 内存索引,非提权 UI 通过
 //! 命名管道 `\\.\pipe\maliang-idx` 问它。管道两端都在本机、都是自己人,
@@ -21,7 +21,7 @@ pub const PIPE_NAME: &str = r"\\.\pipe\maliang-idx";
 /// 协议版本。请求方在 `Hello` 里带自己的版本,服务不认就回 `Err`,
 /// 免得新旧构建混跑时把字节流当成对方的结构解。
 ///
-/// v2:`Hit` 多一字节 `rich_state`(方案 P4-29 的结果投影)。
+/// v2:`Hit` 多一字节 `rich_state`(的结果投影)。
 /// 这是**破坏性**改动 —— 旧服务回的 8 字段 Hit 若被新客户端按 9 字段解,
 /// 读到的就是错位字节而不是错误,所以必须靠版本号挡在握手阶段。
 pub const PROTO_VERSION: u8 = 2;
@@ -92,7 +92,7 @@ pub enum Req {
 
 /// 一条命中。比 `nameidx::SearchHit` 多带 size/mtime/cls/rich_state ——
 /// 前三列服务端已经在内存里握着,顺手回给 UI 就省掉一次 `stat`;
-/// `rich_state` 是 L2 的派生门状态,由服务在投影时批量查库补上(方案 P4-29:
+/// `rich_state` 是 L2 的派生门状态,由服务在投影时批量查库补上(
 /// 投影在服务内完成,UI 不该为了一个占位标记自己再跑一趟 SQL)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hit {

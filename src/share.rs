@@ -1,4 +1,4 @@
-//! P2-18 分享链路:邮件(Simple MAPI)与礼品光盘(IMAPI2)。
+//! 分享链路:邮件(Simple MAPI)与礼品光盘(IMAPI2)。
 //!
 //! 参考 Picasa 3 的分享实现:
 //! - **邮件 = Simple MAPI**:`LoadLibraryA("MAPI32.DLL")` + `GetProcAddress("MAPISendMail")`,
@@ -9,7 +9,7 @@
 //!   引擎连接失败的错误提示。盘上卷标 "Picasa CD",JPEG 质量 85,
 //!   并提供盘上清单导出。
 //!
-//! 与原版的差异(诚实声明,不臆造):
+//! 与原版的差异(实现口径):
 //! 1. 原版用 ANSI `MAPISendMail`;我方用同 DLL 的 `MAPISendMailW`(Vista+ 标准导出),
 //!    否则中文路径在 ANSI 代码页会丢字。flags/结构体逐字段对齐。
 //! 2. 原版 Gift CD 会复制幻灯播放器到盘上并写 `autorun.inf`;

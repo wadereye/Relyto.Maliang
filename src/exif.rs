@@ -188,7 +188,7 @@ pub fn read_jpeg_embedded_thumb(p: &std::path::Path) -> Option<Vec<u8>> {
     read_exact_at(t.into_file(), base + off, len as usize)
 }
 
-// ================= TIFF 容器的按需读取(方案 P4-23①) =================
+// ================= TIFF 容器的按需读取 =================
 //
 // 相机 RAW 与高分辨率 JPEG 动辄几十 MB,而派生是 rayon 并行的
 // (批大小可达 128)—— 每个文件 `fs::read` 整读会把峰值内存推到 GB 级。
@@ -509,7 +509,7 @@ pub struct TiffPreview {
     pub orient: u32,
 }
 
-/// 取容器里的内嵌 JPEG 预览候选,按体积降序(方案 P4-23①)。
+/// 取容器里的内嵌 JPEG 预览候选,按体积降序。
 ///
 /// 适用于 JPEG(APP1 Exif)、裸 TIFF 与相机 RAW。遍历 IFD0 → SubIFD → IFD1,
 /// 无损 JPEG 的 raw IFD 在只读 16KB 头部时就被剔掉。
@@ -753,7 +753,7 @@ mod tests {
         t
     }
 
-    /// RAW 的内嵌预览优先(方案 P4-23①):SubIFD 里的 JPEG 切片要被找出来,
+    /// RAW 的内嵌预览优先:SubIFD 里的 JPEG 切片要被找出来,
     /// 并连带 IFD0 的宽高 / Orientation 一起交给调用方判定要不要再转一次。
     #[test]
     fn raw_subifd_preview_is_found_with_ifd0_attrs() {

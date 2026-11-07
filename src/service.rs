@@ -1,9 +1,9 @@
-//! 常驻索引服务(S4 / 方案 P0,决策 5:提权服务与非提权 UI 拆进程)。
+//! 常驻索引服务(提权服务与非提权 UI 拆进程)。
 //!
 //! 为什么要拆:`$MFT` 与 USN 日志只有管理员读得到,而 GUI 不该常驻提权。
 //! 于是提权的一边只留"索引引擎"——建库、保鲜、把结构元数据写进 L2;
 //! 非提权的 UI 通过命名管道([`crate::ipc`])问它要结果。UI 连不上就降级:
-//! 逐目录扫描照旧能用,只是没有全盘快查,界面明示这一点(方案 P0-4)。
+//! 逐目录扫描照旧能用,只是没有全盘快查,界面明示这一点。
 //!
 //! 线程模型(「每卷一个常驻线程」):
 //! - **保鲜线程 × 卷数**:阻塞在 `FSCTL_READ_USN_JOURNAL`(`ReturnOnlyOnClose`)
@@ -39,7 +39,7 @@ const LOG_NAME: &str = "index-service.log";
 const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 索引落盘节奏:脏了才写,最快 5 分钟一次。
-/// 全盘索引落一次是 90 MB(2026-11-05 记录),开发机上 C 盘每分钟都有变更,
+/// 全盘索引落一次是 90 MB,开发机上 C 盘每分钟都有变更,
 /// 60 s 一轮等于每小时往盘里灌 5 GB —— 而这份文件唯一的作用是省下重启时
 /// 那次 $MFT 全量重建,重建只要 4.3 s(C:)+ 2.3 s(D:),不值得。
 const SAVE_INTERVAL: Duration = Duration::from_secs(300);
@@ -54,7 +54,7 @@ const BUILD_LOG_EVERY: Duration = Duration::from_secs(5);
 enum Job {
     /// 全量重建一卷(首建、journal 失效、用户点了"重建")。
     Rebuild(char),
-    /// 只补 L2:索引已在内存里,但结构库落后(服务停过一阵 → 追赶,方案 P2-13)。
+    /// 只补 L2:索引已在内存里,但结构库落后(服务停过一阵 → 追赶)。
     L2Catchup(char),
 }
 
@@ -140,7 +140,7 @@ pub struct Engine {
     last_save: Mutex<Option<Instant>>,
     /// 索引落盘目标。由构造方给,不在 `save_now` 里现取 `index_path()` ——
     /// 单元测试也会走 `shutdown()`→`save_now()`,让它现取就等于拿 3 条样例记录
-    /// 盖掉用户真机上那 90 MB 索引(2026-11-05 真发生过,服务下次启动只能全量重建)。
+    /// 盖掉用户真机上那 90 MB 索引(真发生过,服务下次启动只能全量重建)。
     blob: std::path::PathBuf,
     log: Log,
 }
@@ -170,14 +170,14 @@ impl Engine {
             log: Log::open(echo),
         });
         // 排查的第一行:服务和 UI 是不是同一个数据目录。
-        // (2026-11-05 就是靠这句才发现两边各建了一套库。)
+        // (就是靠这句才发现两边各建了一套库。)
         e.log.line(&format!(
             "数据目录:{:?}(服务形态={})",
             crate::db::data_dir(),
             crate::db::service_mode()
         ));
         let fresh_now = e.bootstrap();
-        // 目录级失效(方案 P3-21):bootstrap 可能刚挂上失效位(索引版本不符),
+        // 目录级失效:bootstrap 可能刚挂上失效位(索引版本不符),
         // 加上上一次进程没跑完留下的,这里一次性退回待派生再清位。
         if let Some(s) = &e.store {
             match s.refresh_pending_dirs() {
@@ -215,7 +215,7 @@ impl Engine {
                 Err(e) => {
                     self.log.line(&format!("索引载入失败,按全量重建:{e:#}"));
                     // 版本不符 = 结构口径变了,旧账本上的目录全部作废重派生
-                    // (方案 P3-21)。文件缺失/损坏不算:那只是还没有索引,
+                    // 。文件缺失/损坏不算:那只是还没有索引,
                     // 重建出来的路径口径没变,已派生的缩略图仍然有效。
                     if let Some(v) = nameidx::blob_version(&path) {
                         if v != nameidx::FORMAT_VERSION {
@@ -284,7 +284,7 @@ impl Engine {
             let vi = vols.len() - 1;
             if vols[vi].count() > 0 && nameidx::can_resume(saved, &j) {
                 fresh_now.push(letter);
-                // L2 落后于 L1 → 只补库,不重建索引(方案 P2-13 的追赶)。
+                // L2 落后于 L1 → 只补库,不重建索引(的追赶)。
                 let behind = self
                     .store
                     .as_ref()
@@ -778,7 +778,7 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
     e.log.line(&format!("[{letter}:] 保鲜线程退出"));
 }
 
-/// 落盘线程:脏了才写(方案 P2-15 的门控,15 分钟节奏下省下 GB 级无谓写入)。
+/// 落盘线程:脏了才写(的门控,15 分钟节奏下省下 GB 级无谓写入)。
 fn save_loop(e: Arc<Engine>) {
     while !e.stop.load(Ordering::SeqCst) {
         std::thread::sleep(SAVE_INTERVAL);
@@ -810,7 +810,7 @@ impl Query for Engine {
     fn search(&self, text: &str, limit: u32, class: u8) -> Resp {
         // 上限收口:UI 只展示 top-N,一个恶意/写错的 limit 不该让服务分配无界。
         let lim = limit.clamp(1, 5000) as usize;
-        // 投影在服务内完成(方案 P4-29):size/mtime/cls 服务端已经在内存里握着,
+        // 投影在服务内完成:size/mtime/cls 服务端已经在内存里握着,
         // 顺手回给 UI 就省一次 stat。降级路径下这几列本来就是 0,含义是
         // "未知"。rich_state 先一律填哨兵,L1 收集完、state 锁放掉之后再统一补。
         let mut out: Vec<Hit> = {
@@ -1433,7 +1433,7 @@ mod tests {
         assert_eq!(e.search("   ", 10, 0), Resp::Hits(Vec::new()));
     }
 
-    /// 结果投影把 L2 的派生状态补上(方案 P4-29)。
+    /// 结果投影把 L2 的派生状态补上。
     ///
     /// 钉三件事:没有库时全部是哨兵;入库的行按 `rich_state` 回真值;
     /// **没入库的行必须留在哨兵上** —— `RICH_UNKNOWN` 与 `RICH_OUT`
@@ -1587,7 +1587,7 @@ mod tests {
         }
     }
 
-    /// 空增量不置脏:机器闲置时不该触发 56 MB 的重写(方案 P2-15)。
+    /// 空增量不置脏:机器闲置时不该触发 56 MB 的重写。
     #[test]
     fn empty_delta_does_not_mark_dirty() {
         let e = engine_with_vols(vec![sample_vol('C')]);
@@ -1606,8 +1606,8 @@ mod tests {
     }
 
     /// 落盘只写构造方注入的目标,**绝不碰 `index_path()`**。
-    /// 这条不变量是补钉:2026-11-05 就是 `shutdown()`→`save_now()` 现取
-    /// `index_path()`,拿 3 条样例记录盖掉了真机上 91 MB 的索引。
+    /// 这条不变量防止 `shutdown()`→`save_now()` 现取 `index_path()`,
+    /// 把样例记录写到真机索引路径上。
     #[test]
     fn save_now_writes_only_the_injected_blob() {
         let e = engine_with_vols(vec![sample_vol('C')]);

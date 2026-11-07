@@ -265,11 +265,11 @@ pub struct App {
     /// 相册头那行日期(组内最早拍摄日,中文写法),空串时只报张数。
     recent_date: String,
     texs: TexCache,
-    /// 常驻缩略图后台 worker(P0-1):启动时补存量,扫描后自动补新增。
+    /// 常驻缩略图后台 worker:启动时补存量,扫描后自动补新增。
     thumb_bg: Option<crate::thumbs::ThumbWorker>,
     scan_busy: Arc<AtomicBool>,
     scan_rx: Option<mpsc::Receiver<ScanResult>>,
-    /// 扫描进度/取消控制(P1-8:进度回调 + 退出检查)。
+    /// 扫描进度/取消控制(进度回调 + 退出检查)。
     scan_ctrl: Option<Arc<crate::scan::ScanControl>>,
     /// 扫描进度显示的文案(如"正在扫描整个图库…")。
     scan_scope: String,
@@ -290,7 +290,7 @@ pub struct App {
     anim_rx: Option<mpsc::Receiver<(i64, Option<crate::anim::Clip>)>>,
     /// 已发起过动图探测的照片,避免每帧重复起线程。
     anim_req_for: Option<i64>,
-    /// P1-10:预览后台 worker(解码 + 落盘缓存,不阻塞 UI)。
+    /// 预览后台 worker(解码 + 落盘缓存,不阻塞 UI)。
     preview_bg: Option<crate::thumbs::PreviewWorker>,
     /// 预览中的照片原文件已不存在:预览窗显示明确提示,不再无限转圈。
     preview_missing: Option<i64>,
@@ -315,7 +315,7 @@ pub struct App {
     sort_rev: bool,
     /// 工具栏过滤开关(星标/人物/视频/地理标记;全 false = 显示全部)。
     filters: timeline::Filters,
-    /// 当前缩略图档位(P1-9:小 96 / 普通 256 / 大 512 / 预览 1024)。
+    /// 当前缩略图档位(小 96 / 普通 256 / 大 512 / 预览 1024)。
     thumb_tier: crate::thumbs::Tier,
     tags: Vec<timeline::TagInfo>,
     sel_tag: Option<String>,
@@ -333,20 +333,20 @@ pub struct App {
     confirm_remove: bool,
     // —— 文件夹管理器 / 图库维护——
     show_folder_mgr: bool,
-    /// P1-7:排除目录输入框(自定义排除规则的待添加目录名)。
+    /// 排除目录输入框(自定义排除规则的待添加目录名)。
     exclude_input: String,
     watched: Vec<(String, usize)>,
     confirm_folder_remove: Option<String>,
     maint_rx: Option<mpsc::Receiver<Result<String, String>>>,
-    /// P1-12:变更历史窗口开关。
+    /// 变更历史窗口开关。
     show_changes: bool,
-    /// P1-12:变更历史条目 (时间戳ms, 路径, 动作)。
+    /// 变更历史条目 (时间戳ms, 路径, 动作)。
     change_log: Vec<(i64, String, String)>,
-    /// 坏文件台账窗口开关(方案 P3-22)。
+    /// 坏文件台账窗口开关。
     show_bad_media: bool,
     /// 台账快照(开窗与点「刷新」时重读)。
     bad_media_rows: Vec<crate::db::BadMedia>,
-    /// P1-11:uid64 查找窗口。
+    /// uid64 查找窗口。
     show_uid_lookup: bool,
     /// uid64 查找输入框。
     uid_input: String,
@@ -357,13 +357,13 @@ pub struct App {
     /// 监听模式(事件驱动 / 降级轮询)—— 供 UI 展示。
     watch_mode: Option<Arc<std::sync::atomic::AtomicU8>>,
     watch_on: Arc<AtomicBool>,
-    /// P1-9:滚动限速器(与 Picasa 3 一致的位移阻尼)。
+    /// 滚动限速器(与 Picasa 3 一致的位移阻尼)。
     /// 滚动时按整形后的速度调节"本帧允许解码的缩略图数量",
     /// 滚动越快解码越少 → 大图库滚动不卡顿(限速节点的等价作用)。
     scroll_throttle: crate::scroll::ScrollSmoother,
     /// 本帧允许同步解码的缩略图**像素体积**(RGBA8 字节数)。
     ///
-    /// 方案 P4-23③:原来是「每帧 64 张」的张数上限,在中档(256px,256KB/张)
+    /// 原来是「每帧 64 张」的张数上限,在中档(256px,256KB/张)
     /// 下约 16MB —— 没问题;但预览档(1024px,4MB/张)同样 64 张就是 256MB 的
     /// 解码 + 纹理上传,一帧几百毫秒,「UI 永不阻塞」在大档上等于没做。
     /// 改成字节口径后各档的每帧耗时才拉平(见 [`crate::scroll::decode_budget_for`])。
@@ -387,13 +387,13 @@ pub struct App {
     last_viewport_h: f32,
     /// 上一帧主图库内容总高(作为阻尼的内容包围盒)。
     last_content_h: f32,
-    /// P1-9:键盘翻页/跳转的目标滚动偏移(滚动事件派发后生效)。
+    /// 键盘翻页/跳转的目标滚动偏移(滚动事件派发后生效)。
     gallery_scroll_target: Option<f32>,
-    /// P1-13:设备热插拔监听(WM_DEVICECHANGE 链路)。
+    /// 设备热插拔监听(WM_DEVICECHANGE 链路)。
     device_watch: Option<crate::device::DeviceWatcher>,
     /// 上一次见到的可移动卷列表(用于识别新接入的设备)。
     last_volumes: Vec<PathBuf>,
-    // —— P2-16 效果系统(效果栈 + 撤销栈)——
+    // —— 效果系统(效果栈 + 撤销栈)——
     /// 效果面板是否展开。
     fx_panel: bool,
     /// 右侧属性面板是否展开(可伸缩,平时收起;设置项 drawer_open)。
@@ -414,13 +414,13 @@ pub struct App {
     fx_msg: String,
     /// 导出时是否套用已保存的效果(默认否,保持"导出=原图副本"的既有语义)。
     export_with_effects: bool,
-    /// P2-18:邮件发送窗口开关 + 尺寸档。
+    /// 邮件发送窗口开关 + 尺寸档。
     email_win: bool,
     email_size: crate::share::ShareSize,
-    /// P2-18:礼品光盘窗口开关 + 尺寸档。
+    /// 礼品光盘窗口开关 + 尺寸档。
     cd_win: bool,
     cd_size: crate::share::ShareSize,
-    /// P2-18:邮件/光盘后台任务结果通道。
+    /// 邮件/光盘后台任务结果通道。
     share_rx: Option<mpsc::Receiver<Result<String, String>>>,
     /// 预览已解出的原图(未加效果)—— 滑块变化时重新合成,避免重复解码。
     preview_base: Option<(i64, image::DynamicImage)>,
@@ -450,9 +450,9 @@ pub struct App {
     fx_trim_total: f64,
     /// 视频裁剪草稿所属照片 id(换照片时才重载)。
     fx_trim_id: Option<i64>,
-    /// P1-14:字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
+    /// 字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
     pool_probe_id: i64,
-    /// P1-13:从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
+    /// 从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
     show_import_devices: bool,
     import_devices: Vec<crate::wpd::DeviceEntry>,
     import_devices_err: String,
@@ -637,7 +637,7 @@ pub struct App {
     svc_never_ask: bool,
     /// 服务安装/卸载在途(提权子进程最长等 120s,期间不能重复发起)。
     svc_busy: bool,
-    /// 首启范围对话框待示(方案 P3-18:两档单选,**无取消** —— 必须答一次)。
+    /// 首启范围对话框待示(两档单选,**无取消** —— 必须答一次)。
     scope_ask: bool,
     /// 初次设置向导的当前页(0 = 服务说明,1 = 照片范围;两问合一窗分步呈现)。
     wizard_page: usize,
@@ -722,7 +722,7 @@ struct LinkInfo {
     vols: u32,
     /// 正在全量建库的卷数(>0 时结果面板该说"正在建库"而不是"没有命中")。
     building: usize,
-    /// 走不了 USN/MFT 的卷 → 原因(方案 P4-30:这些卷走兼容扫描,无实时快查)。
+    /// 走不了 USN/MFT 的卷 → 原因(这些卷走兼容扫描,无实时快查)。
     compat: Vec<(char, String)>,
     /// 索引里有未落盘的变更。
     dirty: bool,
@@ -1003,7 +1003,7 @@ fn link_connect() -> Result<crate::ipc::Client, String> {
 ///
 /// 服务回的命中自带 size/mtime(这几列服务端本来就在内存里握着),
 /// 所以 UI 侧不再逐条 `stat` —— 省掉一趟 500 次文件 IO,冷目录上差别很明显。
-/// 投影在服务内完成(方案 P4-29):派生状态也由服务批量查库后随命中一起回。
+/// 投影在服务内完成:派生状态也由服务批量查库后随命中一起回。
 #[derive(Debug, Clone)]
 struct NameRow {
     hit: crate::nameidx::SearchHit,
@@ -1247,11 +1247,11 @@ impl SvcWant {
     }
 }
 
-/// 首启范围对话框的两档(方案 P3-18:全盘完整扫描 / 仅常见目录)。
+/// 首启范围对话框的两档(全盘完整扫描 / 仅常见目录)。
 ///
 /// 这一档决定的是**派生**作用域,不是库的作用域:两档都全盘发现、全盘入库,
 /// 区别只在"哪些目录的图要出缩略图 / 读 EXIF"。没进作用域的行结构列齐全、
-/// 派生列全空,网格里显示成占位,点进去才补(方案 P3-19)。
+/// 派生列全空,网格里显示成占位,点进去才补。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitialScope {
     /// 全盘:每个可扫卷根各落一条意图。
@@ -1267,7 +1267,7 @@ const NEAR_DUP_DIST: u32 = 10;
 /// 网络盘/移动盘瞬时不可用时,一次 `exists()` 失败不足以判定删除。
 const MISSING_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// 缩略图纹理缓存上限(P0-1)。每张 256×256 RGBA 纹理约 256KB,
+/// 缩略图纹理缓存上限。每张 256×256 RGBA 纹理约 256KB,
 /// 768 张 ≈ 192MB 显存,取一个既能覆盖常见滚动范围又不会撑爆的量。
 const TEX_CACHE_CAP: usize = 768;
 
@@ -1306,7 +1306,7 @@ fn path_under_dir(path: &str, dir: &str) -> bool {
     if d.is_empty() {
         return true;
     }
-    // 一律按字节切片比对(2026-11-07 修):`&path[..d.len()]` 会在
+    // 一律按字节切片比对:`&path[..d.len()]` 会在
     // 截断字节恰好落进路径后半段某个多字节字符中间时 panic
     // (目录名字节长度撞上别的路径里的汉字,点文件夹必闪退)。
     let (p, b) = (path.as_bytes(), d.as_bytes());
@@ -1481,10 +1481,10 @@ fn build_folder_tree(
 
 /// 从**已落盘的缩略图**加载纹理(不碰原图)。
 ///
-/// P0-1 关键:原实现 `image::open(path)` 直接解原图,网格每帧每个可见格子
+/// 关键:原实现 `image::open(path)` 直接解原图,网格每帧每个可见格子
 /// 都重解码一次 JPEG,是帧率杀手。现在只读缓存里的小图。
 ///
-/// P1-9:按档位读(`tier`)。不同档位落在不同目录
+/// 按档位读(`tier`)。不同档位落在不同目录
 /// (三张缩略图缓存表)。
 fn thumb_tex(
     ctx: &egui::Context,
@@ -1507,7 +1507,7 @@ fn thumb_tex(
     ))
 }
 
-/// 网格预取的行数(视口上下各这么多行,方案 P4-23④)。
+/// 网格预取的行数(视口上下各这么多行)。
 ///
 /// 预取线程口径:滚到哪就把前后几行的缩略图先备好。
 /// 只吃当帧剩余的解码配额,不与真正可见的格子抢时间。
@@ -1943,7 +1943,7 @@ fn show_in_explorer(path: &str) {
 
 /// 缩略图纹理缓存(带 LRU 上限 + 占位追踪)。
 ///
-/// P0-1:用块文件 + 纹理缓存,不会随浏览量无限增长。
+/// 用块文件 + 纹理缓存,不会随浏览量无限增长。
 /// 我方原先用裸 `HashMap<i64, TextureHandle>`,每张看过的照片常驻一张 256×256
 /// 纹理(约 256KB),几千张就把显存撑爆;这里加 LRU 上限,超出时淘汰最久未用的。
 struct TexCache {
@@ -2024,7 +2024,7 @@ impl TexCache {
         self.pending.retain(|k| alive.contains(k));
     }
 
-    /// 清空全部纹理(P1-9 切换档位时调用)。
+    /// 清空全部纹理(切换档位时调用)。
     ///
     /// 必须全清 —— 旧档的纹理内容尺寸不同,复用会导致显示错档;
     /// `drop` 掉 `TextureHandle` 会让 egui 真正释放显存。
@@ -2034,7 +2034,7 @@ impl TexCache {
         self.pending.clear();
     }
 
-    /// 调整 LRU 上限(P1-9 切大档时按显存预算下调)。
+    /// 调整 LRU 上限(切大档时按显存预算下调)。
     fn set_cap(&mut self, cap: usize) {
         self.cap = cap;
         // 立刻收缩:多出来的纹理现在就该释放显存。
@@ -2388,7 +2388,7 @@ impl App {
             self.store.clone(),
             crate::thumbs::visible_dirs(),
         ));
-        // P1-10:预览后台 worker(解码 + 落盘 previews/ 缓存,不阻塞 UI)
+        // 预览后台 worker(解码 + 落盘 previews/ 缓存,不阻塞 UI)
         self.preview_bg = Some(crate::thumbs::spawn_preview_worker(self.store.clone()));
         // 启动时静默导入新照片的 XMP sidecar(外部工具写的星标/标签,DB 权威不覆盖)
         self.start_xmp_import(false);
@@ -2396,7 +2396,7 @@ impl App {
         let w = crate::watch::spawn(self.store.clone(), self.watch_on.clone());
         self.watch_rx = Some(w.events);
         self.watch_mode = Some(w.mode);
-        // P1-13:设备热插拔监听(WM_DEVICECHANGE 链路)。
+        // 设备热插拔监听(WM_DEVICECHANGE 链路)。
         // 新接入的相机/手机/可移动盘 → 自动扫描该卷。
         self.device_watch = Some(crate::device::spawn_device_watcher());
         self.last_volumes = crate::device::removable_volumes();
@@ -2404,7 +2404,7 @@ impl App {
         // 人脸模型就位检查:缺件时提示可下载(不替用户花流量,点了才联网)。
         #[cfg(feature = "ai")]
         self.check_face_models();
-        // P2-15:上次中断的扫描(持久化队列残留)自动续扫。
+        // 上次中断的扫描(持久化队列残留)自动续扫。
         // 正常完成/取消都会出队;本项目改用持久化队列,
         // 进程中途退出后仍可在下次启动时继续。
         let pending = self.store.pending_scans();
@@ -2451,7 +2451,7 @@ impl App {
                 });
             }
         }
-        // 方案 P3-18:首次启动先问派生作用域(两档单选、无取消,必须答一次)。
+        // 首次启动先问派生作用域(两档单选、无取消,必须答一次)。
         // 答完才落账 `dir_intent` 并发起首扫;`skip_initial_scan` 偏好短路 ——
         // 明确说过不要首扫的用户按保守档静默落账,不弹窗。
         if !self.store.scope_initialized() {
@@ -2461,7 +2461,7 @@ impl App {
                 self.scope_ask = true;
             }
         }
-        // 方案 P3-21:上次点了「重建全部缩略图」但进程中途退出 → 续做完。
+        // 上次点了「重建全部缩略图」但进程中途退出 → 续做完。
         self.resume_force_thumb_update();
         // 全盘快查的数据源是**索引服务**(常驻提权进程):
         // 服务在位就由 SCM 自动拉起,UI 侧全程静默,链路线程自己会连上。
@@ -2509,7 +2509,7 @@ impl App {
         self.svc_never_ask = false;
     }
 
-    /// 首启范围落账(方案 P3-18):写 `dir_intent` + 打标记,按需发起首扫。
+    /// 首启范围落账:写 `dir_intent` + 打标记,按需发起首扫。
     ///
     /// `scan=false` 用于 `skip_initial_scan` 偏好短路 —— 作用域照样落账
     /// (不落账派生门是空的,谁都不出缩略图),只是不发起扫描。
@@ -2799,7 +2799,7 @@ impl App {
                         self.name_search_cache.clear();
                         // 这句只在「刚接上」那一刻写一次,所以不能带条数:
                         // 条数会随建库一直涨,写死在这儿就成了过期读数
-                        // (2026-11-05 的「2 卷 0 条」就是这么来的)。
+                        // (「2 卷 0 条」就是这么来的)。
                         self.status =
                             format!("全盘快查已接上索引服务:{} 卷(条数见快查页)", self.link.vols);
                         if !self.name_query.trim().is_empty() {
@@ -2988,9 +2988,9 @@ impl App {
 
     /// 降级横幅:索引服务连不上时说清楚「少了什么、为什么、怎么办」。
     ///
-    /// 方案 P0-4 要求连接失败必须明示降级 —— 静默退化成"搜不到东西"最坑人:
+    /// 连接失败必须明示降级 —— 静默退化成"搜不到东西"最坑人:
     /// 用户会以为盘上真没有这个文件。图库侧的发现/保鲜另有 walkdir + watch
-    /// 兜底(方案 P4-30),这里丢的只是"全盘按名字快查"这一项能力。
+    /// 兜底,这里丢的只是"全盘按名字快查"这一项能力。
     fn svc_degraded_ui(&mut self, ui: &mut egui::Ui) {
         use crate::win::ServiceState as S;
         let svc = self.link.svc;
@@ -3062,12 +3062,12 @@ impl App {
         // 索引服务链路事件已在 update 顶层统一泵(见 pump_link_events),这里只画。
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("快速查找");
-            // A9:三层数据必须标来源(仅源码注释,不进 UI)。名字/路径/大小/日期这一路走
+            // 三层数据必须标来源(仅源码注释,不进 UI)。名字/路径/大小/日期这一路走
             // L1(服务内存里的文件名索引,不经 SQLite);图库条件查询走 L2;派生列只可能
             // 来自 L3。只有「图库」这一列是 L2 的投影,由服务批量查库后随命中一起回。
             ui.separator();
 
-            // 服务连不上 = 全盘快查没有数据源:明示降级(方案 P0-4),本页只剩说明。
+            // 服务连不上 = 全盘快查没有数据源:明示降级,本页只剩说明。
             // 图库内照片仍可从顶栏的图库搜索查(那条路走 SQL,与这里无关)。
             if !self.link.online {
                 self.svc_degraded_ui(ui);
@@ -3541,7 +3541,7 @@ impl App {
 
     /// 「查看选项」里的壳目录快捷键(参考件 Desktop / My Docs / My Pictures / My Computer):
     /// 目录已在图库里 → 跳到该文件夹页;没导入 → 只给提示,不擅自扩扫描范围。
-    /// 进入一个目录(方案 P3-19 点击懒加载 + P3-20 可见优先)。
+    /// 进入一个目录(点击懒加载 + 可见优先)。
     ///
     /// 库里早已收录、但没落在派生作用域里的目录,点进来才补一条 `clicked`
     /// 账,并把该目录 `rich_state=0` 的行置 1 —— 眼前的图先清晰。
@@ -4045,7 +4045,7 @@ impl App {
 
     /// 启动扫描后台线程;scope 仅用于状态文案。
     ///
-    /// P2-15:扫描根先登记进持久化队列,线程完成后移除 ——
+    /// 扫描根先登记进持久化队列,线程完成后移除 ——
     /// 应用中途退出时残留条目在下次启动自动续扫(`start_initial_tasks`)。
     fn start_scan_roots(&mut self, roots: Vec<PathBuf>, scope: &str) {
         self.start_scan_roots_ext(roots, scope, false)
@@ -4066,15 +4066,15 @@ impl App {
         let scope_owned = scope.to_string();
         let (tx, rx) = mpsc::channel();
         self.scan_rx = Some(rx);
-        // P1-8:进度与取消控制(进度回调 + 退出检查)。
+        // 进度与取消控制(进度回调 + 退出检查)。
         let ctrl = Arc::new(crate::scan::ScanControl::new());
         self.scan_ctrl = Some(ctrl.clone());
         self.scan_scope = scope_owned.clone();
         self.scan_verb = "扫描";
         self.status = format!("正在{}{scope}…", self.scan_verb);
         std::thread::spawn(move || {
-            // L1 索引住在服务进程里(方案 P0 决策 5),UI 侧不再持有 `IndexFile`,
-            // 所以监听根的发现走 walkdir —— 这正是方案 P4-30 的口径:全盘发现与
+            // L1 索引住在服务进程里,UI 侧不再持有 `IndexFile`,
+            // 所以监听根的发现走 walkdir —— 这正是的口径:全盘发现与
             // 结构入库由服务负责,监听根只是用户挑的那几个目录,walkdir 足够。
             let res = crate::scan::scan_dir_ctrl(&store, &roots, &ctrl, None);
             let mut removed = 0usize;
@@ -4090,7 +4090,7 @@ impl App {
                 }
             }
             busy.store(false, Ordering::SeqCst);
-            // P2-15:无论成功/失败/取消都出队(取消是用户意志,不续扫);
+            // 无论成功/失败/取消都出队(取消是用户意志,不续扫);
             // 只有线程根本没跑完(进程退出)才会残留 → 下次启动续扫。
             for r in &roots {
                 let _ = store.dequeue_scan(&r.to_string_lossy());
@@ -4463,7 +4463,7 @@ impl App {
             self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
         }
         let scope = dir.display().to_string();
-        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账(方案 P3-19)。
+        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账。
         // 必须在起扫之前落 —— 扫描线程入库时读这份账本算 `rich_state`。
         self.include_dir(&scope, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
         self.start_scan_roots(vec![dir], &scope);
@@ -4485,7 +4485,7 @@ impl App {
             return;
         };
         let _ = self.store.upsert_watched(&dir);
-        // 用户挑中的这几张 = 它所在的目录该出缩略图(方案 P3-19)。
+        // 用户挑中的这几张 = 它所在的目录该出缩略图。
         self.include_dir(
             &dir.display().to_string(),
             crate::db::INTENT_IMPORTED,
@@ -4547,7 +4547,7 @@ impl App {
             self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
         }
         let scope = dir.display().to_string();
-        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账(方案 P3-19)。
+        // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账。
         // 必须在起扫之前落 —— 扫描线程入库时读这份账本算 `rich_state`。
         self.include_dir(&scope, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
         self.start_scan_roots(vec![dir], &scope);
@@ -5010,7 +5010,7 @@ impl App {
             .collect()
     }
 
-    /// P2-18:分享条目 = 当前视图 + 可选效果(与导出同一作用域语义)。
+    /// 分享条目 = 当前视图 + 可选效果(与导出同一作用域语义)。
     fn share_items(&self) -> Vec<(PathBuf, crate::effects::FilterStack)> {
         let paths = self.view_paths();
         if self.export_with_effects {
@@ -5034,7 +5034,7 @@ impl App {
         }
     }
 
-    /// P2-18:后台线程暂存邮件附件并调 Simple MAPI(附件暂存目录链路)。
+    /// 后台线程暂存邮件附件并调 Simple MAPI(附件暂存目录链路)。
     fn start_email(&mut self) {
         if self.share_rx.is_some() {
             self.status = "已有分享任务进行中…".into();
@@ -5060,7 +5060,7 @@ impl App {
         });
     }
 
-    /// P2-18:后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
+    /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
     fn start_gift_cd(&mut self) {
         if self.share_rx.is_some() {
             self.status = "已有分享任务进行中…".into();
@@ -5103,7 +5103,7 @@ impl App {
         else {
             return;
         };
-        // P2-16:导出可选择"套用已保存的效果"(不修改原图)。
+        // 导出可选择"套用已保存的效果"(不修改原图)。
         let with_fx = self.export_with_effects;
         let items: Vec<(PathBuf, crate::effects::FilterStack)> = if with_fx {
             self.rows
@@ -5162,7 +5162,7 @@ impl App {
 
     /// 文件 > 导入 > 从设备(相机/手机):打开统一设备列表窗口。
     ///
-    /// P1-13:WPD 设备 + 可移动卷合成一个统一列表。
+    /// WPD 设备 + 可移动卷合成一个统一列表。
     /// 枚举在**打开时**做一次(懒),之后靠热插拔事件失效缓存。
     fn open_import_devices(&mut self) {
         self.refresh_import_devices();
@@ -5182,12 +5182,12 @@ impl App {
         self.show_folder_mgr = true;
     }
 
-    /// P1-12:重新读取变更历史(最近 500 条)。
+    /// 重新读取变更历史(最近 500 条)。
     fn reload_changes(&mut self) {
         self.change_log = self.store.recent_changes(500);
     }
 
-    /// P1-11:按输入的 uid64 查照片路径。
+    /// 按输入的 uid64 查照片路径。
     fn lookup_uid(&mut self) -> Result<String, String> {
         let t = self.uid_input.trim();
         if t.is_empty() {
@@ -5220,7 +5220,7 @@ impl App {
         self.tier_cached = self.store.tier_count(self.thumb_tier as u8);
     }
 
-    /// P1-9:切换缩略图档位。    ///
+    /// 切换缩略图档位。    ///
     /// 三件事:
     /// 1. 清空纹理缓存(旧档的纹理不能复用 —— egui 的 TextureId 按 alloc 分配);
     /// 2. 通知后台 worker 改补新档(切档时按需生成对应缓存表);
@@ -5240,7 +5240,7 @@ impl App {
         self.status = format!("已切换到{}", tier.label());
     }
 
-    // ===== P2-16 效果系统 =====
+    // ===== 效果系统 =====
 
     /// 读某张照片已保存的效果栈(`photos.filters` 列)。
     fn fx_stack_for(&self, id: i64) -> crate::effects::FilterStack {
@@ -5607,7 +5607,7 @@ impl App {
         self.pool_maintenance_ui(ui);
     }
 
-    /// P1-14 字符串池维护区。
+    /// 字符串池维护区。
     ///
     /// 字符串池:按列隔离、
     /// append-only、**无引用计数**,回收靠「写时重建」。
@@ -6495,7 +6495,7 @@ impl App {
                 let cur = self.drawer_tab;
                 ui.horizontal(|ui| {
                     for t in DrawerTab::ALL {
-                        // A9:抽屉里这几页的字段只可能来自 L3(派生层)—— EXIF、
+                        // 抽屉里这几页的字段只可能来自 L3(派生层)—— EXIF、
                         // 缩略图、标签、人物、地理都是逐条打开文件抽出来的,L1/L2 里
                         // 没有。标注挂在页签的悬停上,不新增可见控件。
                         if ui
@@ -7247,7 +7247,7 @@ impl App {
         );
     }
 
-    /// P1-9:派发滚动事件(键盘翻页 / 跳到顶底)。
+    /// 派发滚动事件(键盘翻页 / 跳到顶底)。
     ///
     /// 按事件名派发给对应的滚动处理;未匹配的事件直接忽略。
     /// 这里把事件语义映射到本项目的画廊滚动。
@@ -7266,7 +7266,7 @@ impl App {
         self.status = format!("已派发 {event}");
     }
 
-    /// P1-9:用位移阻尼曲线整形本帧滚动速度,
+    /// 用位移阻尼曲线整形本帧滚动速度,
     /// 并据此决定"本帧允许同步解码多少张缩略图"。
     ///
     /// 设计要点:
@@ -7285,7 +7285,7 @@ impl App {
         // 这条路径对应缩略图滚动事件
         // (唯一走缩略图质心位移算法质心算法的事件,滚动事件处理)。
         let vel = self.scroll_throttle.feed_offset(offset_y, content_h);
-        // 张数口径 → 字节口径:大档一张就是 4MB,只按张数限流会让 UI 卡死(方案 P4-23③)。
+        // 张数口径 → 字节口径:大档一张就是 4MB,只按张数限流会让 UI 卡死。
         self.thumb_decode_budget = crate::scroll::decode_budget_for(
             vel,
             self.last_viewport_h.max(1.0) as f64,
@@ -7298,7 +7298,7 @@ impl App {
         }
     }
 
-    /// P1-7:添加一个自定义排除目录名(写回 `settings.exclude_dirs`)。
+    /// 添加一个自定义排除目录名(写回 `settings.exclude_dirs`)。
     ///
     /// 包含 / 排除文件夹设置
     /// 的用户自定义部分;内置默认值不可删。
@@ -7323,7 +7323,7 @@ impl App {
         }
     }
 
-    /// P1-7:移除一个自定义排除目录名。
+    /// 移除一个自定义排除目录名。
     fn remove_exclude_dir(&mut self, name: &str) {
         let cur = self.store.get_setting("exclude_dirs").unwrap_or_default();
         let kept: Vec<&str> = cur
@@ -7353,7 +7353,7 @@ impl App {
         }
     }
 
-    /// 强制刷新缩略图(方案 P3-21 的 `force_thumb_update` 偏好)。
+    /// 强制刷新缩略图(的 `force_thumb_update` 偏好)。
     ///
     /// 先落偏好再动手:动作中途进程被杀,下次启动还能补做完。
     /// 账本里每个目录挂失效位 → 子树全部退回待派生(含已派生与坏文件 ——
@@ -7978,7 +7978,7 @@ impl App {
             });
             // 参考件把动作按钮钉在组头右侧(槽位序照原版排版,从右往左)。
             // 单文件夹视图再钉一组本视图专属的控制:文件名过滤框 + 详细/缩略图切换,
-            // 视觉上排在「放映本组幻灯片」前面(用户 2026-11-06 拍板,不再单占一行)。
+            // 视觉上排在「放映本组幻灯片」前面(不再单占一行)。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("mail", false))
@@ -8340,7 +8340,7 @@ impl App {
 
     /// 照片网格(参考件的行式排布:同行等高、各格按宽高比取宽、行尾铺满)。
     ///
-    /// P1-9:缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)决定基准行高。
+    /// 缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)决定基准行高。
     /// 行式布局的行高会随铺满系数浮动,所以先把整批的行算出来再按行虚拟化。
     fn photo_grid(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
         // 显示优先:先把屏幕上排队等纳入的目录消化掉几个(写账 + 放行 + 交给后台优先派生),
@@ -8355,7 +8355,7 @@ impl App {
         // 依旧落在原来的位置;若占位段结尾就是整个网格,得多退一次间距,
         // 否则内容总高会比真实值多出一个 gap。
         let clip = ui.clip_rect();
-        // 方案 P4-23④:预取带 —— 视口上下各留这么高的一段,里面的行不建 widget,
+        // 预取带 —— 视口上下各留这么高的一段,里面的行不建 widget,
         // 但会用当帧**剩余**的解码配额把纹理先暖进缓存(滚动时少闪一帧占位块)。
         let band = (base + 8.0 + gap) * PREFETCH_ROWS as f32;
         let ctx = ui.ctx().clone();
@@ -8407,7 +8407,7 @@ impl App {
         });
     }
 
-    /// 预取一行的缩略图纹理(方案 P4-23④)。
+    /// 预取一行的缩略图纹理。
     ///
     /// 用的是当帧**剩余**的解码配额:真正可见的格子先吃配额,预取只捡剩下的,
     /// 所以它永远不会把可见格子挤成占位块。快速滚动时配额被限速器压到 0
@@ -8547,7 +8547,7 @@ impl App {
             self.confirm_remove = true;
             ui.close();
         }
-        // 软排除目录的显式出口(2026-11-05 拍板:AppData 也要能访问)。
+        // 软排除目录的显式出口(AppData 也要能访问)。
         //
         // 「被动滚到过 / 点过一张图」不写账本,但用户亲手右键选这项 = 表态,
         // 与导入页同一档(`imported` + `import`)。硬层(回收站、自家缓存、
@@ -8568,7 +8568,7 @@ impl App {
                 ui.close();
             }
         }
-        // 坏文件出口(方案 P3-22,对齐经典图库坏图清单的
+        // 坏文件出口(对齐经典图库坏图清单的
         // Hide / Don't Hide):立过案的文件不再每轮重试,这里给两个方向的开关。
         let p = self.rows[idx].path.clone();
         if self.store.is_bad_media(&p) {
@@ -8615,7 +8615,7 @@ impl App {
                 Some(t) => Some(t),
                 None if self.texs.is_pending(id) => None, // 后台正在生成,先占位
                 None => {
-                    // P1-9:滚动限速 —— 本帧解码配额已用尽时,跳过同步解码,
+                    // 滚动限速 —— 本帧解码配额已用尽时,跳过同步解码,
                     // 只画灰色占位块(下一帧再补)。滚动越快配额越小 → 滚动不掉帧。
                     // 注意:此处**不能** mark_pending(那是"磁盘上还没有、交给后台生成"
                     // 的语义),否则已落盘的缩略图会被误判为待生成而不再加载。
@@ -8722,7 +8722,7 @@ impl App {
                 crate::theme::p().faint,
             );
         }
-        // P2-17:视频条目左上角 ▶ 徽标(贴着实际图片边界,不贴卡片留白)。
+        // 视频条目左上角 ▶ 徽标(贴着实际图片边界,不贴卡片留白)。
         if self.rows[idx].kind == crate::video::kind::MOVIE {
             ui.painter().text(
                 fit_rect.left_top() + egui::vec2(6.0, 5.0),
@@ -8954,7 +8954,7 @@ impl App {
 
     /// 预览大图纹理(最长边 ≤ 1024;首次打开同步加载一次,按 EXIF 方向摆正)。
     ///
-    /// P0-7:相机 RAW 由 `thumbs::load_for_preview` 借 Windows Shell 缩略图扩展解码,
+    /// 相机 RAW 由 `thumbs::load_for_preview` 借 Windows Shell 缩略图扩展解码,
     /// 不再因为 image crate 不认识格式而显示"加载失败"。
     fn preview_tex(&mut self, ctx: &egui::Context) -> Option<egui::TextureHandle> {
         let id = self.preview?;
@@ -8986,14 +8986,14 @@ impl App {
             self.anim_req_for = Some(id);
             self.anim_request(id);
         }
-        // P2-16:预览渲染要叠加该照片的效果栈(op 树实时渲染)。
+        // 预览渲染要叠加该照片的效果栈(op 树实时渲染)。
         // 签名 = 照片 id + 效果栈序列化;变了才重算纹理。
         let stack = self.fx_preview_stack(id);
         let sig = format!("{id}|{}", stack.serialize());
         if self.preview_tex.as_ref().map(|(k, _)| *k) != Some(id)
             || self.fx_applied_sig.as_deref() != Some(sig.as_str())
         {
-            // P1-10:预览**不阻塞 UI**。
+            // 预览**不阻塞 UI**。
             // 1) 先查落盘缓存;
             // 2) 没有 → 发请求给后台 worker(后台解码 + 落盘),本帧先不显示;
             // 3) worker 完成后回报,UI 再加载纹理。
@@ -9014,7 +9014,7 @@ impl App {
                 }
             }
             if let Some((_, img)) = self.preview_base.as_ref() {
-                // P2-16:在解码后的像素上套用效果栈(op 树在此位置执行)。
+                // 在解码后的像素上套用效果栈(op 树在此位置执行)。
                 let mut rgba = img.to_rgba8();
                 crate::effects::apply_stack(&mut rgba, &stack);
                 // 直方图跟着效果栈走:只在纹理重算时统计一次(编辑视图左栏画)。
@@ -9204,7 +9204,7 @@ mod tests {
         assert!(!path_under_dir(r"D:\other\a.jpg", r"D:\pics"));
         // 盘根本身也是合法子树根(D:\ 下的全部)。
         assert!(path_under_dir(r"D:\anything.jpg", r"D:\"));
-        // 修字节边界闪退:目录名长度撞上别的路径里的汉字(2026-11-07)。
+        // 修字节边界闪退:目录名长度撞上别的路径里的汉字。
         // 「D:\我的资料库」15 字节,历史照片路径里某汉字被第 15 字节切开。
         assert!(path_under_dir(r"D:\我的资料库\a.jpg", r"D:\我的资料库"));
         assert!(!path_under_dir(r"D:\我的资料库2\a.jpg", r"D:\我的资料库"));
@@ -9304,18 +9304,18 @@ impl eframe::App for App {
         if let Some(w) = self.thumb_bg.take() {
             w.stop();
         }
-        // P1-10:预览 worker 也要停(否则后台线程会随进程一起被砍,留下半张图)。
+        // 预览 worker 也要停(否则后台线程会随进程一起被砍,留下半张图)。
         if let Some(w) = self.preview_bg.take() {
             w.stop();
         }
-        // P1-13:设备监听线程(隐藏窗口 + 消息循环)也要停。
+        // 设备监听线程(隐藏窗口 + 消息循环)也要停。
         if let Some(w) = self.device_watch.take() {
             w.stop();
         }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // P1-9:每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
+        // 每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
         self.thumb_decode_count = 0;
         // 自动更新:空闲门控与后台事件回流放在帧首 —— 幻灯片/编辑视图会提前
         // return,放在后面就收不到「发现新版本」的提示了。
@@ -9334,7 +9334,7 @@ impl eframe::App for App {
             }
             self.model_prompt_window(ctx);
         }
-        // 显示优先(2026-11-05 拍板):上一帧真正画在屏幕上的目录整批发给后台 worker
+        // 显示优先:上一帧真正画在屏幕上的目录整批发给后台 worker
         // 当第一优先 —— 用户看哪儿,缩略图就先补哪儿。在帧首发是为了拿得到「上一帧
         // 的完整清单」:网格分多个 section 画,帧尾没有自然的收口点。
         if !self.frame_dirs.is_empty() {
@@ -9408,7 +9408,7 @@ impl eframe::App for App {
                 self.rebuild();
             }
         }
-        // P1-13:设备热插拔事件("置刷新标志 + 触发刷新")。
+        // 设备热插拔事件("置刷新标志 + 触发刷新")。
         // 设备节点树变化时重建设备列表;本项目对应动作是
         // "重新枚举可移动卷 → 新出现的卷自动扫描"。
         if let Some(dw) = &self.device_watch {
@@ -9432,7 +9432,7 @@ impl eframe::App for App {
                             .collect::<Vec<_>>()
                             .join("、")
                     );
-                    // P1-13:设备列表缓存失效(原版 WM_DEVICECHANGE 链路同样
+                    // 设备列表缓存失效(原版 WM_DEVICECHANGE 链路同样
                     // 会重建设备列表);若导入窗口开着,下次重绘即看到新设备。
                     self.refresh_import_devices();
                     self.start_scan_roots(roots, "新接入的设备");
@@ -9461,7 +9461,7 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
         }
-        // P1-10:预览后台完成信号 → 清掉预览纹理缓存,让下一帧重新加载。
+        // 预览后台完成信号 → 清掉预览纹理缓存,让下一帧重新加载。
         if let Some(w) = &self.preview_bg {
             let mut got: Vec<i64> = Vec::new();
             let mut failed = 0usize;
@@ -9539,7 +9539,7 @@ impl eframe::App for App {
         if self.export_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        // P2-18:邮件/光盘后台任务结果
+        // 邮件/光盘后台任务结果
         if let Some(rx) = &self.share_rx {
             if let Ok(res) = rx.try_recv() {
                 self.share_rx = None;
@@ -9744,7 +9744,7 @@ impl eframe::App for App {
                 }
             }
             if esc {
-                // P1-8:ESC 优先取消正在进行的扫描
+                // ESC 优先取消正在进行的扫描
                 // (ESC 取消绑定);
                 // 没有扫描时才关闭预览窗(同时丢弃编辑视图里未提交的工具草稿)。
                 if let Some(ctrl) = &self.scan_ctrl {
@@ -9771,7 +9771,7 @@ impl eframe::App for App {
                     }
                 }
             }
-            // P1-9:7 个滚动事件在这里派发
+            // 7 个滚动事件在这里派发
             // (按事件名匹配 + 派发;
             //  缩略图滚动事件走缩略图质心位移算法)。
             // 本项目把前 6 个接成键盘翻页/跳转,语义与原版一一对应。
@@ -9877,7 +9877,7 @@ impl eframe::App for App {
                                 self.add_folder_to_library();
                                 ui.close();
                             }
-                            // P1-13:从设备导入(设备选择窗口)。
+                            // 从设备导入(设备选择窗口)。
                             if ui.button("从设备(相机/手机)…").clicked() {
                                 self.open_import_devices();
                                 ui.close();
@@ -9903,10 +9903,10 @@ impl eframe::App for App {
                                 self.start_export();
                                 ui.close();
                             }
-                            // P2-16:导出时套用已保存的效果(不修改原图)。
+                            // 导出时套用已保存的效果(不修改原图)。
                             ui.checkbox(&mut self.export_with_effects, "套用已保存的效果");
                         });
-                        // P2-18:分享(邮件 / 礼品光盘;上传目标服务已关停,不实现)。
+                        // 分享(邮件 / 礼品光盘;上传目标服务已关停,不实现)。
                         ui.menu_button("分享(S)", |ui| {
                             let busy = self.share_rx.is_some();
                             if ui
@@ -9990,7 +9990,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        // P2-16:效果面板。
+                        // 效果面板。
                         if ui.selectable_label(self.fx_panel, "效果面板").clicked() {
                             self.fx_panel = !self.fx_panel;
                             ui.close();
@@ -10111,7 +10111,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.menu_button("缩略图", |ui| {
-                            // P1-9:多档缩略图(与 Picasa 3 一致的四个视图尺寸菜单项)。
+                            // 多档缩略图(与 Picasa 3 一致的四个视图尺寸菜单项)。
                             for tier in crate::thumbs::ALL_TIERS {
                                 if ui
                                     .selectable_label(self.thumb_tier == tier, tier.label())
@@ -10240,12 +10240,12 @@ impl eframe::App for App {
                                 self.clean_missing();
                                 ui.close();
                             }
-                            // 方案 P3-21:目录级失效的用户出口。
+                            // 目录级失效的用户出口。
                             if ui.button("重建全部缩略图").clicked() {
                                 self.force_thumb_update();
                                 ui.close();
                             }
-                            // 方案 P3-22:坏文件台账(整批销案在这里)。
+                            // 坏文件台账(整批销案在这里)。
                             if ui.button("坏文件台账…").clicked() {
                                 self.bad_media_rows = self.store.bad_media();
                                 self.show_bad_media = true;
@@ -10261,13 +10261,13 @@ impl eframe::App for App {
                                 self.start_xmp_import(true);
                                 ui.close();
                             }
-                            // P1-12:变更历史(可回溯的变更日志)。
+                            // 变更历史(可回溯的变更日志)。
                             if ui.button("变更历史…").clicked() {
                                 self.show_changes = true;
                                 self.reload_changes();
                                 ui.close();
                             }
-                            // P1-11:给还没有 uid64 的照片补一个持久唯一标识。
+                            // 给还没有 uid64 的照片补一个持久唯一标识。
                             if ui.button("分配唯一标识(uid64)…").clicked() {
                                 match self.store.backfill_uid64() {
                                     Ok(n) => {
@@ -10368,7 +10368,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(format!("共 {} 张", self.rows.len()))
-                        // A9:图库视图是 L2(SQLite)的结果,与顶部整条快速查找(L1
+                        // 图库视图是 L2(SQLite)的结果,与顶部整条快速查找(L1
                         // 内存文件名索引)不是同一条路 —— 标出来,免得两处张数对不上时
                         // 用户以为是丢图。
                         .on_hover_text(
@@ -10396,7 +10396,7 @@ impl eframe::App for App {
                             self.updater.win_open = true;
                         }
                     }
-                    // P1-9:当前档位的缓存进度(已生成 / 总数)。
+                    // 当前档位的缓存进度(已生成 / 总数)。
                     // 计数只在切档 / 批次回报 / 重建图库时刷新,不逐帧查库。
                     let cached = self.tier_cached;
                     let total = self.rows.len();
@@ -10404,7 +10404,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
                     }
-                    // P1-8:进度条 + 取消按钮(百分比照原版说法,明细挂悬停;
+                    // 进度条 + 取消按钮(百分比照原版说法,明细挂悬停;
                     // 扫描与导入共用通道,动词跟着任务走)。
                     if let Some(ctrl) = &self.scan_ctrl {
                         let (done, total) = ctrl.counts();
@@ -10893,7 +10893,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // P1-9:滚动限速(位移阻尼限速)。
+            // 滚动限速(位移阻尼限速)。
             // 上一帧记下的滚动偏移 + 视口高 + 内容高 → 逐帧质心位移 × 2.7
             // → 原版阻尼曲线 → 平滑速度 → 换算成本帧的缩略图解码预算。
             // 滚动越快 → 预算越低 → 大图库滚动不掉帧(原版限速节点的等价作用)。
@@ -10902,7 +10902,7 @@ impl eframe::App for App {
                 self.last_viewport_h,
                 self.last_content_h,
             );
-            // P1-9:原版滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
+            // 原版滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
             // (egui 会用 `state.offset` 记忆滚动位置,这里只在有目标时覆盖一次)。
             let mut gallery = egui::ScrollArea::vertical().id_salt("gallery");
             if let Some(t) = self.gallery_scroll_target.take() {
@@ -11200,7 +11200,7 @@ impl eframe::App for App {
                         // 从全部行里按目录筛一遍是 O(行数) 次路径运算,
                         // 只在图库版本变了或换了目录时重算(缓存借出后归还)。
                         // 递归语义:点上级 = 本目录+全部子孙目录的照片都算,
-                        // 一路点进下级逐级收窄(用户 2026-11-06 拍板)。
+                        // 一路点进下级逐级收窄。
                         let mut idxs = std::mem::take(&mut self.folder_cells.2);
                         let mut date = std::mem::take(&mut self.folder_cells.3);
                         if self.folder_cells.0 != self.rows_gen || self.folder_cells.1 != folder {
@@ -11294,7 +11294,7 @@ impl eframe::App for App {
                     }
                 }
             });
-            // P1-9:把本帧的实际滚动偏移 / 视口高 / 内容高记下来,
+            // 把本帧的实际滚动偏移 / 视口高 / 内容高记下来,
             // 下一帧用来算逐帧质心位移(原版缩略图质心位移算法的算法)。
             self.last_scroll_y = out.state.offset.y;
             self.last_viewport_h = out.inner_rect.height();
@@ -11393,7 +11393,7 @@ impl eframe::App for App {
             self.album_new_win = open && !close;
         }
 
-        // P1-13:从设备导入窗口(统一设备列表)。
+        // 从设备导入窗口(统一设备列表)。
         if self.show_import_devices {
             let mut open = self.show_import_devices;
             egui::Window::new("从设备导入")
@@ -11456,7 +11456,7 @@ impl eframe::App for App {
             self.show_import_devices = open;
         }
 
-        // P2-18:邮件发送窗口(尺寸档与原版 1600/1024/800 一致)。
+        // 邮件发送窗口(尺寸档与原版 1600/1024/800 一致)。
         if self.email_win {
             let mut open = self.email_win;
             egui::Window::new("以邮件发送")
@@ -11489,7 +11489,7 @@ impl eframe::App for App {
             self.email_win = open;
         }
 
-        // P2-18:礼品光盘窗口(原版「Create a Gift CD…」,IMAPI2 刻录)。
+        // 礼品光盘窗口(原版「Create a Gift CD…」,IMAPI2 刻录)。
         if self.cd_win {
             let mut open = self.cd_win;
             egui::Window::new("制作礼品光盘")
@@ -11520,7 +11520,7 @@ impl eframe::App for App {
             self.cd_win = open;
         }
 
-        // P1-12:变更历史窗口(可回溯的变更日志)。
+        // 变更历史窗口(可回溯的变更日志)。
         if self.show_changes {
             let mut open = self.show_changes;
             egui::Window::new("变更历史")
@@ -11566,7 +11566,7 @@ impl eframe::App for App {
             self.show_changes = open;
         }
 
-        // 坏文件台账(方案 P3-22):派生反复失败被立案的文件,不再每轮重试。
+        // 坏文件台账:派生反复失败被立案的文件,不再每轮重试。
         // 这里给整批销案的出口 —— 网格右键只能一张一张来。
         if self.show_bad_media {
             let mut open = self.show_bad_media;
@@ -11617,7 +11617,7 @@ impl eframe::App for App {
             self.options_ui(ctx);
         }
 
-        // P1-11:按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。
+        // 按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。
         if self.show_uid_lookup {
             let mut open = self.show_uid_lookup;
             egui::Window::new("按唯一标识(uid64)查找")

@@ -48,7 +48,7 @@
 //!   可用的预设(见 `grain_preset`)。
 //! - **`sepia` 灰度→棕色的精确映射**:用**双色调插值**近似,并在此明确标注。
 //! - **`sat` 的曲线表索引方向**:存在下标读法歧义,按正向实现(见
-//!   [`apply_saturation`] 的诚实声明)。
+//!   [`apply_saturation`] 的实现口径)。
 //! - **`glow` 的合成混合模式**:按线性不透明度混合实现(见 [`apply_glow`])。
 //! - **`rainbow` 的渐变段数/各段颜色**:段数据未逐段展开,
 //!   暂按 `tint` 骨架落地。
@@ -125,8 +125,8 @@ pub fn apply_bw(img: &mut image::RgbaImage) {
 ///
 /// 默认 `highlight` = `0xddc9ae` = RGB(221,201,174)(双色调查表)。
 ///
-/// **诚实声明**:原版把灰度映射到棕色的精确函数(灰度到棕色的映射)
-/// ,原版精确映射未公开;我方用「Picasa 权重灰度 → 双色调插值」近似,
+/// **实现口径**:原版把灰度映射到棕色的精确函数(灰度到棕色的映射)
+/// 原版精确映射未公开;我方用「Picasa 权重灰度 → 双色调插值」近似,
 /// **参数(色值、mix 语义、256 项 LUT 结构)与原版一致,映射函数是近似**。
 pub fn apply_sepia(img: &mut image::RgbaImage, mix: f32, shadow: [u8; 3], highlight: [u8; 3]) {
     let m = (mix.clamp(0.0, 100.0)) / 100.0;
@@ -279,7 +279,7 @@ impl Mt19937 {
 ///
 /// 权重 `0xa0 − |0x80 − src|` 使**中间调颗粒最重、极暗/极亮处颗粒最轻**。
 ///
-/// **诚实声明**:原版噪点算子的参数名是 `low`/`high`/`randomSeed`/
+/// **实现口径**:原版噪点算子的参数名是 `low`/`high`/`randomSeed`/
 /// `channelOptions`/`grayscale`,其 `low`/`high`/`randomSeed` 的**默认值未公开**
 /// (见模块文档)。我方的 `amount` 是对第一段强度参数的等价参数名;
 /// 两段公式、随机数结构、混合公式**均已确认**。
@@ -892,7 +892,7 @@ pub fn apply_ansel(img: &mut image::RgbaImage, weights: [f32; 3], amount: f32) {
 /// 因此负色度自然落到 `idx == 0` 的不变支路。
 ///
 /// 因为 `k ≥ 0`,该支路**只会把通道推离亮度**(增饱和),不会去饱和;
-/// 滑块的去饱和方向走另一条支路。**诚实声明**:曲线表的索引方向在
+/// 滑块的去饱和方向走另一条支路。**实现口径**:曲线表的索引方向在
 /// 该处下标读法有两种可能,未能确认;此处按正向实现。
 pub fn apply_saturation(img: &mut image::RgbaImage, s: f32) {
     let s = if s.is_nan() { 1.0 } else { s };
@@ -941,7 +941,7 @@ pub fn apply_saturation(img: &mut image::RgbaImage, s: f32) {
 /// 最后按不透明度 (256 − r)/256 混回原图
 /// ```
 ///
-/// **诚实声明**:`gamma = 0.5` 对应 `pow(x, 1/0.5) = pow(x, 2)`,是**压暗**而非提亮;
+/// **实现口径**:`gamma = 0.5` 对应 `pow(x, 1/0.5) = pow(x, 2)`,是**压暗**而非提亮;
 /// 发光观感来自"压暗+模糊的副本再混回原图"这一步。合成阶段的混合模式
 /// 暂无对应资料,此处按线性不透明度混合实现。
 pub fn apply_glow(img: &mut image::RgbaImage, r: f32) {
@@ -1042,7 +1042,7 @@ pub fn apply_dir_tint(img: &mut image::RgbaImage, angle: f32, strength: f32, col
     }
     // 软化宽度:`strength` 是滑杆原值(0..100),按百分比折算成长边的像素数。
     //
-    // **诚实声明**:参考把 `strength` 传给 B 样条软化环节,
+    // **实现口径**:参考把 `strength` 传给 B 样条软化环节,
     // 但「百分比 → 像素」这一步的基准边长暂无对应资料 ——
     // 这里按**长边**取基准(方向向量是单位向量,投影以像素为单位)。
     let cx = w as f64 / 2.0;

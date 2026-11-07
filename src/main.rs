@@ -66,7 +66,7 @@ use std::sync::Arc;
 /// - `--stop-service` / `--start-service`:提权子命令,只停 / 只起(不动注册项)。
 /// - `--mft-scan [卷字母表]` / `--mft-check` / `--mft-diag`:索引人工入口与诊断。
 /// - `--check-update`:按统一配置 maliang.ini 检查一次版本清单并打印(验证配置用)。
-/// - `--download-update`:抓清单、后台下载并校验,不安装(现场验证代理/Range 用)。
+/// - `--download-update`:抓清单、后台下载并校验,不安装(部署时验证代理/Range 用)。
 /// - `--version`:打印版本号后退出;不带它时未知参数会落到 GUI 分支,脚本无从取版本。
 /// - `--apply-update <目录> <令牌> <是否起服务>`:提权安装子进程,内部使用;
 ///   等服务状态落定 → 停服务 → 换程序文件 → 起服务。
@@ -274,7 +274,7 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
-        // 现场验证整条下载链:清单 → Range 分段 → 校验 → 落地,不安装。
+        // 部署时验证整条下载链:清单 → Range 分段 → 校验 → 落地,不安装。
         "--download-update" => {
             if let Err(e) = update::cli_download() {
                 eprintln!("下载更新失败:{e}");

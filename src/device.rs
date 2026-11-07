@@ -20,7 +20,7 @@
 //! - 设备枚举用 **WPD**(`IPortableDevice` + `PROPVARIANT`)。
 //! - 本项目**不**引入独立检测进程,后台线程即可。
 //!
-//! # 本模块的实现范围(诚实声明)
+//! # 本模块的实现范围(实现口径)
 //!
 //! - **消息层**:`WM_DEVICECHANGE` + 3 个 wParam +
 //!   `dbcc_devicetype == 2` 的粗过滤。
