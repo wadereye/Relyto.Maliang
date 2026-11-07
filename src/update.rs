@@ -2,7 +2,7 @@
 //!
 //! 三段式,刻意让「查」和「装」分开,不打断正在看图的人:
 //!
-//! 1. `update.ini` 里的 `UpdateURL` 指向服务端的版本清单(key=value 文本)。
+//! 1. 统一配置 maliang.ini 里的 `UpdateURL` 指向服务端的版本清单(key=value 文本)。
 //!    配置文件优先取 exe 同目录(便携部署),否则取数据目录;环境变量
 //!    `MALIANG_UPDATE_URL` 可临时覆盖。没配 URL 就整个功能静默停用。
 //! 2. [`Updater`] 拉一条后台线程。启动后等一个**空闲窗口**(一段时间没有输入,
@@ -41,7 +41,8 @@ const MAX_AUTO_WAIT: Duration = Duration::from_secs(300);
 /// 清单与更新包的体积上限(防坏服务器把磁盘吃满)。
 const MAX_MANIFEST: u64 = 64 * 1024;
 const MAX_PACKAGE: u64 = 512 * 1024 * 1024;
-const CONFIG_NAME: &str = "update.ini";
+/// 统一配置文件名(数据目录 + 升级 + 模型都在这一份,见 db::SETTINGS_TEMPLATE)。
+const CONFIG_NAME: &str = crate::db::SETTINGS_FILE;
 const STATE_NAME: &str = "state.ini";
 const RESULT_NAME: &str = "apply-result.ini";
 const PARTIAL_NAME: &str = "download.part";
@@ -56,38 +57,6 @@ const MANIFEST_GLOBAL_SECS: u64 = 30;
 const MAX_SEGMENT_ATTEMPTS: u32 = 4;
 /// 单实例锁的陈旧判定:进程被强杀时锁文件留得下来,不能永久挡住后续启动。
 const LOCK_STALE_SECS: i64 = 30 * 60;
-
-/// 首启生成的配置模板。全部键都列出并给默认值,改一行就能用。
-const CONFIG_TEMPLATE: &str = "\
-# Relyto.Maliang 自动更新配置
-# UpdateURL 指向一份版本清单(纯文本 key=value),例如:
-#   UpdateURL=https://example.com/maliang/latest.ini
-# 留空 = 关闭自动更新。修改后重启程序,或在「帮助 > 检查更新」里点「打开配置文件」。
-UpdateURL=
-
-# 两次自动检查之间的最小间隔(小时)。手动检查不受此限制。
-CheckIntervalHours=24
-
-# 启动后空闲多少秒才发起第一次自动检查(扫描/导入/服务装卸中一律推迟)。
-IdleDelaySeconds=20
-
-# 启动后是否自动检查;0 = 只在手动点「检查更新」时联网。
-AutoCheck=1
-
-# 发现新版本后是否自动在后台下载;0 = 只提示,由用户点「下载」。
-AutoDownload=1
-
-# 代理:system(默认,读系统/环境变量代理) / none(直连) / http://host:port。
-# 企业网络里环境变量代理指向不对时,可填 none 或显式地址。
-Proxy=system
-
-# 安装后是否立刻把索引服务起回来。1(默认)= 尽量不中断索引;
-# 0 = 保持停止,等程序重启或开机自启。跨大版本、服务与界面协议不兼容时设 0 更稳。
-RestartService=1
-
-# 下载分段大小(MB)。慢网可调小到 1,让每段的时间预算更容易满足。
-ChunkMB=2
-";
 
 // ---------------------------------------------------------------- 路径与工具
 
@@ -262,7 +231,9 @@ pub fn cli_restore_service(dir: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// 配置文件路径:exe 同目录优先,其次数据目录。
+/// 统一配置文件路径:exe 同目录(便携部署)优先,否则固定配置目录 ——
+/// 用 db 的默认目录而非 data_dir(),避免「配置决定数据目录、数据目录又
+/// 决定配置在哪」的自指。
 pub fn config_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
@@ -272,7 +243,7 @@ pub fn config_path() -> PathBuf {
             }
         }
     }
-    crate::db::data_dir().join(CONFIG_NAME)
+    crate::db::default_settings_path()
 }
 
 fn now_secs() -> i64 {
@@ -395,6 +366,8 @@ pub struct Config {
     pub restart_service: bool,
     /// 每个 Range 分段的 MiB 数,慢网可调小。
     pub chunk_bytes: u64,
+    /// 服务端模型目录(结尾带 /)。空 = 界面只给手动放置指引,不提供下载。
+    pub model_url: String,
     /// 实际读到的配置文件,窗口里显示出来好让用户知道该改哪一个。
     pub path: PathBuf,
 }
@@ -410,6 +383,7 @@ impl Default for Config {
             proxy: "system".into(),
             restart_service: true,
             chunk_bytes: CHUNK_BYTES,
+            model_url: String::new(),
             path: PathBuf::new(),
         }
     }
@@ -435,6 +409,7 @@ impl Config {
         c.auto_download = bool_of(kv.get("autodownload"), true);
         c.restart_service = bool_of(kv.get("restartservice"), true);
         c.proxy = kv.get("proxy").cloned().unwrap_or(c.proxy);
+        c.model_url = kv.get("modelurl").cloned().unwrap_or_default();
         c.chunk_bytes = kv
             .get("chunkmb")
             .and_then(|v| v.parse::<u64>().ok())
@@ -445,12 +420,10 @@ impl Config {
     }
 }
 
-/// 读配置。文件不存在就写一份模板(留空 URL = 停用),不因配置文件出错影响主程序。
+/// 读配置。文件不存在时直接用内存默认值,不落盘 —— 落模板交给迁移函数与
+/// 「打开配置文件」:若在这里写,迁移失败留下的空模板会把下次迁移挡住。
 pub fn load_config() -> Config {
     let path = config_path();
-    if !path.exists() {
-        let _ = atomic_write(&path, CONFIG_TEMPLATE.as_bytes());
-    }
     let text = std::fs::read_to_string(&path).unwrap_or_default();
     let mut cfg = Config::from_kv(&parse_kv(&text), path);
     if let Ok(v) = std::env::var("MALIANG_UPDATE_URL") {
@@ -465,7 +438,7 @@ pub fn load_config() -> Config {
 pub fn open_config_file() {
     let p = config_path();
     if !p.exists() {
-        let _ = atomic_write(&p, CONFIG_TEMPLATE.as_bytes());
+        let _ = atomic_write(&p, crate::db::SETTINGS_TEMPLATE.as_bytes());
     }
     #[cfg(windows)]
     {
@@ -964,7 +937,8 @@ pub fn pending() -> Option<Pending> {
 
 // ---------------------------------------------------------------- 网络
 
-fn http_agent(cfg: &Config, global_secs: u64, body_secs: Option<u64>) -> ureq::Agent {
+/// 按配置里的代理策略建 HTTP 客户端。模型下载(`crate::models`)也走这一份。
+pub(crate) fn http_agent(cfg: &Config, global_secs: u64, body_secs: Option<u64>) -> ureq::Agent {
     let mut b = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(global_secs)))
         .timeout_connect(Some(Duration::from_secs(CONNECT_SECS)))
@@ -1671,7 +1645,7 @@ pub fn cli_download() -> Result<(), String> {
 }
 
 /// 「已经写入磁盘但还没重启」的版本也算已装上,否则安装完再点检查会重复下一次。
-fn effective_version(st: &State) -> String {
+pub fn effective_version(st: &State) -> String {
     if !st.applied_version.is_empty() && is_newer(&st.applied_version, CURRENT_VERSION) {
         st.applied_version.clone()
     } else {
@@ -1683,7 +1657,7 @@ fn effective_version(st: &State) -> String {
 
 #[derive(Debug)]
 enum Cmd {
-    /// 命令自带配置快照:用户刚改过 update.ini 时,不必重启也能用上新地址/代理。
+    /// 命令自带配置快照:用户刚改过 maliang.ini 时,不必重启也能用上新地址/代理。
     Check { manual: bool, cfg: Box<Config> },
     Download(Box<Manifest>, Box<Config>),
     Apply(Box<Config>),
@@ -1852,7 +1826,7 @@ impl Updater {
         }
     }
 
-    /// 用户改完 update.ini 点「立即检查」时,不必重启程序也能用上新配置。
+    /// 用户改完 maliang.ini 点「立即检查」时,不必重启程序也能用上新配置。
     fn cfg_snapshot(&mut self) -> Box<Config> {
         self.cfg = load_config();
         Box::new(self.cfg.clone())
@@ -2241,7 +2215,7 @@ mod tests {
             url: url.clone(),
             proxy: "none".into(),
             chunk_bytes: chunk,
-            path: root.join("update.ini"),
+            path: root.join("maliang.ini"),
             ..Config::default()
         };
         (cfg, url)
@@ -2455,8 +2429,10 @@ mod tests {
         assert_eq!(c.chunk_bytes, CHUNK_BYTES);
         assert!(c.restart_service);
         assert_eq!(c.proxy, "system");
+        // 模型下载默认关:没填 ModelURL 时界面只给手动放置指引。
+        assert!(c.model_url.is_empty());
         let c = Config::from_kv(
-            &parse_kv("UpdateURL=https://a/b\nAutoCheck=0\nAutoDownload=no\nIdleDelaySeconds=3\nCheckIntervalHours=0\nProxy=none\nRestartService=0\nChunkMB=4"),
+            &parse_kv("UpdateURL=https://a/b\nAutoCheck=0\nAutoDownload=no\nIdleDelaySeconds=3\nCheckIntervalHours=0\nProxy=none\nRestartService=0\nChunkMB=4\nModelURL=https://a/models/"),
             PathBuf::from("x.ini"),
         );
         assert_eq!(c.url, "https://a/b");
@@ -2467,6 +2443,7 @@ mod tests {
         assert_eq!(c.proxy, "none");
         assert!(!c.restart_service);
         assert_eq!(c.chunk_bytes, 4 * 1024 * 1024);
+        assert_eq!(c.model_url, "https://a/models/");
     }
 
     #[test]

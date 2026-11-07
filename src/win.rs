@@ -1295,6 +1295,108 @@ fn from_wide(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..end])
 }
 
+// ---- 单实例(同一登录会话只允许一个马良 GUI 进程) ----
+
+/// 单实例命名互斥体。`Local\` 前缀 = 作用域限定在当前登录会话:
+/// 同一会话的双开被拦下,不同用户/不同 RDP 会话互不干扰。
+/// 内核对象由进程退出自动清理,不落盘、无残留问题。
+#[cfg(windows)]
+const SINGLE_INSTANCE_MUTEX: &str = r"Local\Relyto.Maliang.Gui";
+
+/// 主窗口标题:激活已有实例时 FindWindow 按它找(与 main.rs 的 ViewportBuilder 一致)。
+#[cfg(windows)]
+pub const MAIN_WINDOW_TITLE: &str = "Relyto.Maliang";
+
+/// 单实例守卫:存活期间本进程握有单实例权。
+/// 提前 drop 等于让出单实例权,调用方须一路持有到 main 结束。
+pub struct InstanceGuard {
+    #[cfg(windows)]
+    _handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(not(windows))]
+pub struct InstanceGuard;
+
+/// 尝试成为本会话唯一的马良 GUI。
+/// 返回 `Some(守卫)` = 拿到单实例权,继续启动;
+/// 返回 `None` = 已有实例在跑,调用方应激活既有窗口后退出。
+pub fn acquire_single_instance() -> Option<InstanceGuard> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, CloseHandle, GetLastError};
+        use windows::Win32::System::Threading::CreateMutexW;
+        use windows::core::PCWSTR;
+
+        let name = to_wide(SINGLE_INSTANCE_MUTEX);
+        // SAFETY: 名字是 NUL 结尾的 UTF-16 串;句柄属性为空 = 默认安全描述符。
+        match unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) } {
+            Ok(h) => {
+                // CreateMutexW 语义:互斥体已存在时照样返回有效句柄,
+                // 靠 GetLastError == ERROR_ALREADY_EXISTS 区分「新建」和「已有人」。
+                if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+                    unsafe { let _ = CloseHandle(h); }
+                    None
+                } else {
+                    Some(InstanceGuard { _handle: h })
+                }
+            }
+            // 打不开命名互斥体(极端受限环境)就放行,别把程序挡死在门外。
+            Err(_) => Some(InstanceGuard { _handle: windows::Win32::Foundation::HANDLE::default() }),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        Some(InstanceGuard)
+    }
+}
+
+/// 把已在运行的实例主窗口拉到前台(最小化则先还原)。
+/// 找不到窗口(可能刚退到托盘/标题改了)就安静返回,不报错。
+pub fn activate_running_instance() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
+        };
+        use windows::core::PCWSTR;
+
+        let title = to_wide(MAIN_WINDOW_TITLE);
+        // SAFETY: 类名为空指针、窗口名是 NUL 结尾 UTF-16,二者只读。
+        if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR::null(), PCWSTR(title.as_ptr())) } {
+            if hwnd != HWND::default() {
+                // 第二个实例通常就是前台进程,SetForegroundWindow 在此条件下被放行。
+                unsafe {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                    let _ = SetForegroundWindow(hwnd);
+                }
+            }
+        }
+    }
+}
+
+/// 弹「已在运行」提示框。放在激活已有窗口之后,用户先看到切换、再看到说明。
+pub fn alert_already_running() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
+        };
+        use windows::core::PCWSTR;
+        let text = to_wide("马良已经在运行了,同一会话只允许一个进程。\n已为你切换到已打开的窗口。");
+        let title = to_wide("马良");
+        // SAFETY: 文本/标题均为 NUL 结尾 UTF-16;无父窗口。
+        unsafe {
+            let _ = MessageBoxW(
+                None,
+                PCWSTR(text.as_ptr()),
+                PCWSTR(title.as_ptr()),
+                MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

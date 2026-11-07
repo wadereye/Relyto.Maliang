@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/target-rel033/
 **/*.rs.bk
 
 # IDE

@@ -47,6 +47,10 @@ mod ai;
 #[cfg(feature = "ai")]
 mod faces;
 
+/// 人脸模型就位检查与后台下载(依赖 `ai` 的模型目录与加载校验)。
+#[cfg(feature = "ai")]
+mod models;
+
 #[cfg(feature = "ai")]
 mod clip;
 
@@ -61,8 +65,9 @@ use std::sync::Arc;
 /// - `--install-service` / `--uninstall-service`:提权子命令,注册 / 撤销服务。
 /// - `--stop-service` / `--start-service`:提权子命令,只停 / 只起(不动注册项)。
 /// - `--mft-scan [卷字母表]` / `--mft-check` / `--mft-diag`:索引人工入口与诊断。
-/// - `--check-update`:按 `update.ini` 检查一次版本清单并打印(验证配置用)。
+/// - `--check-update`:按统一配置 maliang.ini 检查一次版本清单并打印(验证配置用)。
 /// - `--download-update`:抓清单、后台下载并校验,不安装(现场验证代理/Range 用)。
+/// - `--version`:打印版本号后退出;不带它时未知参数会落到 GUI 分支,脚本无从取版本。
 /// - `--apply-update <目录> <令牌> <是否起服务>`:提权安装子进程,内部使用;
 ///   等服务状态落定 → 停服务 → 换程序文件 → 起服务。
 /// - `--restore-service`:更新被中断后,把索引服务起回来并清掉中断标记。
@@ -298,6 +303,11 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // 打印版本号后退出。
+        "--version" => {
+            println!("马良 (Relyto.Maliang) v{}", update::CURRENT_VERSION);
+            true
+        }
         _ => false,
     }
 }
@@ -323,7 +333,12 @@ fn main() -> eframe::Result {
             | Some("--restore-service")
             | Some("--check-update")
             | Some("--download-update")
+            | Some("--version")
     );
+    // 统一配置迁移(旧 data.location / update.ini → maliang.ini)必须最先行:
+    // 后续一切配置与数据目录解析都只认新文件。update-helper 子命令也要跑,
+    // 否则 --check-update 会在迁移前读到空配置。
+    crate::db::migrate_legacy_configs();
     // 数据目录 pending 迁移必须先于一切打开库/索引的动作(包括命令行子命令)。
     if !is_update_helper {
         crate::db::migrate_pending_data();
@@ -343,6 +358,18 @@ fn main() -> eframe::Result {
     update::cleanup_old_exe();
     // 上次安装把服务停了却没起回来(helper 被杀 / 断电)时,在这里补一次。
     update::restore_service_if_interrupted();
+
+    // 单实例:同一登录会话只允许一个马良 GUI 进程。已有实例在跑时,
+    // 激活它的主窗口并弹提示,本进程随即退出(命令行子命令/服务模式不在此列)。
+    // 守卫必须活到 main 结束 —— 提前 drop 等于交出单实例权。
+    let _instance_guard = match win::acquire_single_instance() {
+        Some(guard) => guard,
+        None => {
+            win::activate_running_instance();
+            win::alert_already_running();
+            return Ok(());
+        }
+    };
 
     // UI 线程提优先级(与原版一致:UI 线程 ABOVE_NORMAL,
     // 扫描/缩略图后台线程 BELOW_NORMAL —— 交互永远优先于后台计算)。

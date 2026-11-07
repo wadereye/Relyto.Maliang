@@ -225,11 +225,8 @@ pub fn load_query(
     } else {
         order
     };
-    // 未纳入派生作用域的行(rich_state=0)恒排最后,反向开关也不把它们提前:
-    // 这些行出不了缩略图,而 AppData 之类缓存目录的 mtime 往往最新,
-    // 不压到尾部就会「一开屏全是灰格子」。留而不隐 —— 右键
-    // 「纳入此目录(覆盖排除名单)」这个出口得在网格里够得着。
-    let order = format!("p.rich_state = 0, {order}");
+    // 派生状态只是后台排队进度,不参与排序:状态 0 的照片一样能读缓存、
+    // 一样要按当前排序出现在它该在的位置。只有硬排除目录不进库,那才是真排除。
     let sql = format!(
         "SELECT p.id, p.path, p.taken_utc, p.star, p.thumb_ok, p.width, p.height,
                 COALESCE(sp.value, p.cam, ''), p.lat, p.lon, p.kind, p.caption,
@@ -304,8 +301,9 @@ fn under_root(parent: &str, root: &str) -> bool {
 /// 增量维护,启动直接读已落盘的缩略图库)。
 ///
 /// 两条入组门槛:
-/// 1. **该档缩略图已经落盘**(`thumb_ok=1`)且行在派生作用域内 —— 磁盘上
-///    还没图的一律不进相册,首屏因此不会出现「等派生」的灰格子。
+/// 1. **该档缩略图已经落盘**(`thumb_ok=1`) —— 磁盘上还没图的一律不进
+///    相册,首屏因此不会出现「等派生」的灰格子。派生状态不设门槛:
+///    有缓存就该显示,跟它在不在批量派生计划里无关。
 /// 2. **落在已登记的监听根内**(参考件默认只登记我的文档 / 图片 / 桌面
 ///    三个壳目录)。全盘索引会把构建产物、开发资源图标、临时夹具一起收进库,
 ///    它们的 mtime 永远最新,不圈范围就会把首页铺满非素材。
@@ -315,7 +313,7 @@ fn under_root(parent: &str, root: &str) -> bool {
 pub fn load_recent(store: &Store, roots: &[String], limit: usize) -> Result<Vec<i64>> {
     let sql = format!(
         "SELECT p.id, p.parent FROM photos p
-         WHERE p.thumb_ok = 1 AND p.rich_state <> 0
+         WHERE p.thumb_ok = 1
          ORDER BY {MTIME_SQL} DESC, p.id DESC"
     );
     store.read(|conn| -> Result<Vec<i64>> {
@@ -1300,10 +1298,10 @@ mod tests {
         assert_eq!(order(SortBy::Name, true), ["c.jpg", "B.jpg", "a.jpg"]);
     }
 
-    /// 未纳入派生作用域(rich_state=0)的行恒排最后:反向、换排序都不提前。
-    /// 缓存目录的 mtime 通常最新,不压尾部就会一开屏全是灰格子。
+    /// 派生状态不参与排序:rich_state=0 只表示「还没轮到后台批量派生」,
+    /// 照样按当前排序出现在它该在的位置,不再被恒压到末尾。
     #[test]
-    fn load_query_sinks_rows_out_of_scope() {
+    fn load_query_does_not_sink_rows_by_derived_state() {
         let store = Store::open_mem().unwrap();
         // 灰格子 mtime 最大、体积最大、名字最靠前 —— 三种排序都想把它顶到第一。
         insert_photo(&store, "/cache/a.jpg", "/cache", None, 0, 0, 300, 900, None);
@@ -1340,16 +1338,12 @@ mod tests {
                 .map(|r| r.path.rsplit('/').next().unwrap().to_string())
                 .collect()
         };
-        for sort in SortBy::ALL {
-            for reverse in [false, true] {
-                assert_eq!(
-                    order(sort, reverse).last().unwrap(),
-                    "a.jpg",
-                    "{sort:?} reverse={reverse} 该把未纳入的行排在最后"
-                );
-            }
-        }
-        assert_eq!(order(SortBy::Recent, false), ["z.jpg", "y.jpg", "a.jpg"]);
+        // mtime 最大(300)、体积最大(900)的那张恰好是 rich_state=0;
+        // 按更改 / 大小排序时它就应该排第一,不该被派生状态压到尾部。
+        assert_eq!(order(SortBy::Recent, false).first().unwrap(), "a.jpg");
+        assert_eq!(order(SortBy::Size, false).first().unwrap(), "a.jpg");
+        assert_eq!(order(SortBy::Recent, false), ["a.jpg", "z.jpg", "y.jpg"]);
+        assert_eq!(order(SortBy::Recent, true), ["y.jpg", "z.jpg", "a.jpg"]);
     }
 
     /// 组头分组:组序与组内序都跟随排序方式(参考件平铺视图即按当前排序铺组)。

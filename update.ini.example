@@ -1,3 +1,5 @@
+# 注意:统一配置已改到 maliang.ini(旧 data.location + update.ini 合并,分 [location] /
+# [update] 两段),本文件只作旧文件名时代的字段说明参考,新版程序读的是 maliang.ini。
 # 示例:复制成 update.ini,放到 maliang.exe 同目录(便携部署优先),
 # 或放到数据目录(默认 %APPDATA%\Maliang\update.ini)。
 # 程序首启也会在数据目录自动生成一份带完整注释的空模板。
@@ -5,7 +7,7 @@
 
 # 指向服务端的「版本清单」地址,纯文本 key=value,格式见 update-manifest.example.ini。
 # 建议一律用 https;明文 http 时清单必须提供 Sha256,否则会被拒绝。
-UpdateURL=https://example.com/maliang/latest.ini
+UpdateURL=https://example.com/maliang/update/latest.ini
 
 # 两次自动检查之间的最小间隔(小时)。手动检查不受限制。
 CheckIntervalHours=24
@@ -32,3 +34,12 @@ ChunkMB=2
 # 如果新版本改了服务与界面之间的协议,设 0 可让服务保持停止,等程序重启后再起。
 # 无论哪种情况,停服务前都会留下标记,helper 中途被杀时下次启动会自动恢复服务。
 RestartService=1
+
+# 模型下载目录:服务端放模型文件的目录,结尾带「/」。程序按固定文件名
+# (face_det.onnx / face_rec.onnx)在这个目录下取文件,存进数据目录的 models\。
+# 留空 = 不提供下载,界面只给手动放置指引。
+# 只有默认方案(YuNet + AdaFace,Apache-2.0 / MIT)可由程序代下载;
+# insightface antelopev2 的权重许可不可再分发,界面不会给下载按钮。
+# 建议用 https;服务端放什么模型由部署方自行选择与授权,
+# 程序落盘前会用 onnxruntime 真加载一次,加载不了的內容直接丢弃。
+ModelURL=

@@ -27,7 +27,9 @@ pub const RAW_EXTS: [&str; 14] = [
     "nef", "cr2", "cr3", "arw", "raf", "orf", "rw2", "dng", "pef", "srw", "3fr", "erf", "iiq", "kdc",
 ];
 
-fn is_image(p: &Path) -> bool {
+/// 是否本系统支持预览的图片(常规格式 + RAW + PSD 家族)。
+/// 快速查找页双击路由用:命中就走图库预览,否则交给系统关联程序。
+pub fn is_image(p: &Path) -> bool {
     p.extension()
         .and_then(|e| e.to_str())
         .map(|e| {
@@ -968,7 +970,8 @@ pub fn index_file_ctrl(
 ///
 /// 派生列归 [`crate::db::Store::mark_derived`] 所有 —— 一条记录被重扫时
 /// 若在这里覆盖,已派生的 EXIF 会在下一趟发现里被抹成 NULL。
-/// 内容变了(mtime 不同)只清 `thumb_ok` / `dhash` 并退回待派生,让队列重跑。
+/// 内容变了(mtime 不同)只把该行退回待派生,旧的缩略图与 dhash 留着继续用,
+/// 等后台稳定期过后重做一次覆盖(见 `db::Store::pending_rich`)。
 ///
 /// 顺手按派生门(方案 P3-17)算 `rich_state`:walkdir 与 MFT 两条发现路必须
 /// 共用同一个门,否则非 NTFS 卷会整个绕过作用域(方案 P4-30)。
@@ -989,11 +992,10 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
              ON CONFLICT(path) DO UPDATE SET
                mtime=:mtime, size=:size, kind=:kind,
                uid64=COALESCE(photos.uid64, :uid),
-               thumb_ok=CASE WHEN photos.mtime<>:mtime THEN 0 ELSE photos.thumb_ok END,
-               dhash=CASE WHEN photos.mtime<>:mtime THEN NULL ELSE photos.dhash END,
                rich_state=CASE
+                 WHEN photos.mtime<>:mtime AND photos.thumb_ok=1
+                      AND photos.rich_state<>3 THEN 1
                  WHEN :rich<>1 THEN photos.rich_state
-                 WHEN photos.mtime<>:mtime THEN 1
                  WHEN photos.rich_state=0 THEN 1
                  ELSE photos.rich_state END",
         )?;

@@ -1,6 +1,6 @@
 [package]
 name = "maliang"
-version = "0.3.0"
+version = "0.3.4"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -24,7 +24,9 @@ rfd = "0.15"
 clap = { version = "4", features = ["derive"] }
 # 自动更新:只取 HTTPS 客户端与 SHA256 校验,两者已由 ort 带入依赖锁,离线可编译。
 # 不启 ureq 默认 features(rustls/gzip),避免引入锁外的新包。
-ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+# 3.4.2 必须显式选 TLS provider:默认 Rustls 但不编该 feature 时 https 直接 panic;
+# native-tls 在 Windows 走 Schannel,对本项目 nginx(1.20.1)握手会被 RST,故用 rustls。
+ureq = { version = "3.4.2", default-features = false, features = ["rustls"] }
 hmac-sha256 = "1.1.15"
 
 [target.'cfg(windows)'.dependencies]

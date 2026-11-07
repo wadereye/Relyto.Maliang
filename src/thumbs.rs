@@ -555,6 +555,24 @@ pub fn backfill_tier(
     limit: usize,
 ) -> Result<Vec<i64>> {
     let rows = store.missing_tier(tier as u8, visible, limit);
+    backfill_rows(store, tier, rows)
+}
+
+/// 闲时低速补齐:优先队列排空后,把其余目录的缩略图提前做好。
+///
+/// 参考件的文件夹切换快,是因为打开时缓存早已落盘、只按索引取字节;
+/// 若一律等用户切过去才补,每次进新文件夹都要现等生成。这里在空闲时
+/// 一小批一小批铺过去,任何可见目录 / 新导入一出现就立刻让位。
+pub fn backfill_idle(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
+    let rows = store.missing_idle(limit);
+    backfill_rows(store, Tier::Normal, rows)
+}
+
+fn backfill_rows(
+    store: &crate::db::Store,
+    tier: Tier,
+    rows: Vec<(i64, String)>,
+) -> Result<Vec<i64>> {
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -650,6 +668,11 @@ pub fn visible_dirs() -> VisibleDirs {
     Arc::new(Mutex::new(Vec::new()))
 }
 
+/// 闲时补齐每批的张数:小批短间隔,既不霸占磁盘也不至于 2 秒才动一批。
+const IDLE_BATCH: usize = 8;
+/// 闲时补齐两批之间的让出时间(毫秒)。
+const IDLE_GAP_MS: u64 = 120;
+
 /// 常驻后台缩略图 worker 的对外句柄。
 ///
 /// 持有 `JoinHandle`(退出时 join)与"完成信号"接收端。
@@ -732,7 +755,18 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
                 // 立刻继续下一批,直到这一轮补完。
                 continue;
             }
-            // 没有待生成的:睡一会再查(扫描新增照片后自动补齐)。
+            // 常用目录 / 可见目录 / 新导入都排空了 —— 才轮到其余目录。
+            // 每批只补一小把,中间让出 CPU;下一轮开头会重新检查优先队列,
+            // 用户一滚动或导入就立刻让位,不会跟眼前的图抢时间。
+            if t == Tier::Normal {
+                let idle = backfill_idle(&store, IDLE_BATCH).unwrap_or_default();
+                if !idle.is_empty() {
+                    let _ = tx.send(idle);
+                    std::thread::sleep(Duration::from_millis(IDLE_GAP_MS));
+                    continue;
+                }
+            }
+            // 全库都补齐了:睡一会再查(扫描新增照片后自动补齐)。
             std::thread::sleep(Duration::from_millis(2000));
         }
     });

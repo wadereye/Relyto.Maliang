@@ -308,6 +308,9 @@ pub struct App {
     wifi_panel: bool,
     // —— 菜单相关状态 ——
     sel: BTreeSet<i64>,
+    /// 最近一次单击/Ctrl+单击命中的照片 id(Shift+单击连选的基准;
+    /// 参考件点选习惯:单击只选一张,Ctrl 加减选,Shift 从基准连选)。
+    sel_anchor: Option<i64>,
     sort_by: timeline::SortBy,
     sort_rev: bool,
     /// 工具栏过滤开关(星标/人物/视频/地理标记;全 false = 显示全部)。
@@ -324,6 +327,9 @@ pub struct App {
     updater: crate::update::Updater,
     /// 安装更新的二次确认窗(UAC + 停服务前必须让用户点一次)。
     update_confirm: bool,
+    /// 人脸模型:启动检查、后台下载线程与进度快照(下载源 = maliang.ini 的 ModelURL)。
+    #[cfg(feature = "ai")]
+    models: crate::models::ModelDownloader,
     confirm_remove: bool,
     // —— 文件夹管理器 / 图库维护——
     show_folder_mgr: bool,
@@ -528,6 +534,19 @@ pub struct App {
     /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
     /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
     folder_show_all: bool,
+    /// 单个文件夹视图的呈现形态:false = 缩略图网格(缺省),true = 详细列表
+    /// (文件名 / 拍摄日期 / 大小,点列头排序;设置项 folder_details)。
+    folder_details: bool,
+    /// 单个文件夹视图的文件名过滤词(会话内有效,不落库;
+    /// 只过滤**当前文件夹**的显示,与顶部全盘搜索无关)。
+    folder_filter: String,
+    /// 过滤词生效时所在的目录;换目录即清空过滤(资源管理器直觉:
+    /// 过滤跟着文件夹走,不跟着用户走)。
+    folder_filter_owner: String,
+    /// 左栏树里被选中的**子树根**(中间层目录,自身可能没有直挂照片)。
+    /// 递归语义:选中父级 = 中间栏聚合显示本目录+全部子孙目录的照片,
+    /// 一路点下去逐级收窄;Some 时优先于 selected_folder 槽位。
+    subtree_sel: Option<String>,
     /// 左栏每行画该目录的缩略图(参考件 View > Show Thumbnails in Library;
     /// 设置项 tree_thumbs)。
     tree_thumbs: bool,
@@ -651,10 +670,10 @@ pub struct App {
     thumb_inflight: std::collections::HashSet<String>,
     /// 快速查找列表当前选中行(视觉反馈;右键菜单直接作用于所在行)。
     name_sel: Option<String>,
-    /// 「屏幕上出现过、已经纳过」的目录(大写归一路径)。每个目录本进程只纳一次。
-    adopt_seen: std::collections::HashSet<String>,
-    /// 待纳入目录队列(原样路径):渲染帧只入队,`photo_grid` 每帧消化少量。
-    adopt_queue: std::collections::VecDeque<String>,
+    /// 「屏幕上出现过、已经排过队」的照片 id:同一张只推一次。
+    adopt_seen: std::collections::HashSet<i64>,
+    /// 待按张放行的照片 id:渲染帧只入队,`photo_grid` 每帧批量消化。
+    adopt_queue: std::collections::VecDeque<i64>,
     /// 本帧真正画在屏幕上的目录(原样路径,按出现顺序、去重)。帧首整批发给后台 worker。
     frame_dirs: Vec<String>,
     /// `frame_dirs` 的去重键(大写归一路径)。
@@ -993,7 +1012,7 @@ struct NameRow {
     /// 修改时间,UNIX 秒;0 = 这卷走 USN 降级路径,索引里没有权威时间。
     mtime: u64,
     /// 派生状态([`crate::db::RICH_*`]);[`crate::ipc::RICH_UNKNOWN`] = 这条
-    /// 不在图库数据库里(非媒体文件、或还没落库),与「未纳入派生作用域」不是一回事。
+    /// 不在图库数据库里(非媒体文件、或还没落库),与「缩略图还没轮到生成」不是一回事。
     rich_state: u8,
 }
 
@@ -1015,18 +1034,18 @@ impl NameRow {
 
     /// 结果表「图库」列的短标签。
     ///
-    /// 快查是 L1(内存文件名索引)的东西,它看得见全盘;图库只收媒体且派生还受
-    /// 作用域门控。这一列就是把两者的差集讲清楚,免得用户以为「搜到了但打不开缩略图」
-    /// 是坏了。
+    /// 快查是 L1(内存文件名索引)的东西,它看得见全盘;图库只收媒体,
+    /// 硬排除目录根本不纳入图库。这一列把两者的差集讲清楚,免得用户以为
+    /// 「搜到了但打不开缩略图」是坏了。
     fn rich_label(&self) -> &'static str {
         if self.hit.is_dir {
             return "—";
         }
         // 常量不能带 `as` 当模式用,所以把被匹配的值转成 i32(db 侧的原类型)。
         match i32::from(self.rich_state) {
-            crate::db::RICH_OUT => "未纳入范围",
-            crate::db::RICH_PENDING => "待派生",
-            crate::db::RICH_DONE => "已入库",
+            crate::db::RICH_OUT => "待生成缩略图",
+            crate::db::RICH_PENDING => "排队中",
+            crate::db::RICH_DONE => "已就绪",
             crate::db::RICH_BAD => "读取失败",
             _ => "非图库文件",
         }
@@ -1279,6 +1298,25 @@ fn folder_of(path: &str) -> String {
         .unwrap_or_default()
 }
 
+/// path 是否落在 dir 的子树里(含 dir 本身)。与 folder_of 同口径:
+/// 两边都是扫描器写库的规范化路径,按字节前缀 + 分隔符比对即可。
+/// 用于「点上级目录 = 显示子树全部照片」的递归聚合。
+fn path_under_dir(path: &str, dir: &str) -> bool {
+    let d = dir.trim_end_matches(['\\', '/']);
+    if d.is_empty() {
+        return true;
+    }
+    // 一律按字节切片比对(2026-11-07 修):`&path[..d.len()]` 会在
+    // 截断字节恰好落进路径后半段某个多字节字符中间时 panic
+    // (目录名字节长度撞上别的路径里的汉字,点文件夹必闪退)。
+    let (p, b) = (path.as_bytes(), d.as_bytes());
+    if p.len() < b.len() {
+        return false;
+    }
+    let (head, tail) = p.split_at(b.len());
+    head == b && (tail.is_empty() || tail[0] == b'\\' || tail[0] == b'/')
+}
+
 /// 导入页源列表的一行:图标 + 名称,选中态高亮。返回是否被点中。
 fn source_row(
     ui: &mut egui::Ui,
@@ -1475,15 +1513,12 @@ fn thumb_tex(
 /// 只吃当帧剩余的解码配额,不与真正可见的格子抢时间。
 const PREFETCH_ROWS: usize = 2;
 
-/// 一帧最多消化几个「屏幕上看到但还没纳入」的目录。
-///
-/// 首屏一次铺开上百个目录是常态(「最近更新」按天分组),不能让渲染帧去写上百次账;
-/// 队列下一帧继续消化,人眼看不出先后。
-const MAX_ADOPT_PER_FRAME: usize = 4;
+/// 一帧最多放行几张「缺缓存」的图:一批一次事务,几十张也只是几十行 UPDATE。
+const MAX_ADOPT_PER_FRAME: usize = 64;
 
-/// 「看到但还没纳入」队列的长度上限:快速滚动一屏可能铺出上百个目录,
-/// 排到 5 帧以后就没人等了 —— 后面的请求直接丢弃,那一格仍显示「未纳入范围」。
-const MAX_ADOPT_QUEUE: usize = 24;
+/// 按张放行队列的长度上限:快速滚动一屏可能铺出上百格,排太长的
+/// 下一帧继续消化;超出的不登记去重,那一格下一帧还会再来敲门。
+const MAX_ADOPT_QUEUE: usize = 256;
 
 /// 一帧最多上报几个「屏幕上的目录」给后台 worker(显示优先的清单长度上限)。
 const MAX_VISIBLE_DIRS: usize = 32;
@@ -1676,6 +1711,8 @@ const ICON_LIGHT: &[(&str, &[u8])] = &[
         "list-tree",
         include_bytes!("../assets/icons/light/list-tree.svg"),
     ),
+    ("list", include_bytes!("../assets/icons/light/list.svg")),
+    ("funnel", include_bytes!("../assets/icons/light/funnel.svg")),
     (
         "sliders-horizontal",
         include_bytes!("../assets/icons/light/sliders-horizontal.svg"),
@@ -1744,6 +1781,8 @@ const ICON_DARK: &[(&str, &[u8])] = &[
         "list-tree",
         include_bytes!("../assets/icons/dark/list-tree.svg"),
     ),
+    ("list", include_bytes!("../assets/icons/dark/list.svg")),
+    ("funnel", include_bytes!("../assets/icons/dark/funnel.svg")),
     (
         "sliders-horizontal",
         include_bytes!("../assets/icons/dark/sliders-horizontal.svg"),
@@ -2042,6 +2081,11 @@ impl App {
             .get_setting("tree_thumbs")
             .map(|v| v != "0")
             .unwrap_or(true);
+        // 单个文件夹视图的呈现形态(缺省缩略图网格,记住上次的详细/网格选择)。
+        let folder_details = store
+            .get_setting("folder_details")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let people_sort = store
             .get_setting("people_sort")
             .and_then(|v| PeopleSort::from_key(&v))
@@ -2150,6 +2194,7 @@ impl App {
             wifi: None,
             wifi_panel: false,
             sel: BTreeSet::new(),
+            sel_anchor: None,
             sort_by,
             sort_rev,
             filters,
@@ -2161,6 +2206,8 @@ impl App {
             show_shortcuts: false,
             updater: crate::update::Updater::new(),
             update_confirm: false,
+            #[cfg(feature = "ai")]
+            models: crate::models::ModelDownloader::new(),
             confirm_remove: false,
             show_folder_mgr: false,
             exclude_input: String::new(),
@@ -2217,6 +2264,10 @@ impl App {
             cache_usage: None,
             folder_tree,
             folder_show_all: true,
+            folder_details,
+            folder_filter: String::new(),
+            folder_filter_owner: String::new(),
+            subtree_sel: None,
             tree_thumbs,
             folder_tree_cache: FolderTree::default(),
             tree_open: HashSet::new(),
@@ -2350,6 +2401,9 @@ impl App {
         self.device_watch = Some(crate::device::spawn_device_watcher());
         self.last_volumes = crate::device::removable_volumes();
         self.rebuild();
+        // 人脸模型就位检查:缺件时提示可下载(不替用户花流量,点了才联网)。
+        #[cfg(feature = "ai")]
+        self.check_face_models();
         // P2-15:上次中断的扫描(持久化队列残留)自动续扫。
         // 正常完成/取消都会出队;本项目改用持久化队列,
         // 进程中途退出后仍可在下次启动时继续。
@@ -3008,14 +3062,9 @@ impl App {
         // 索引服务链路事件已在 update 顶层统一泵(见 pump_link_events),这里只画。
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("快速查找");
-            // A9:三层数据必须标来源。名字/路径/大小/日期这一路走 L1(服务内存里的
-            // 文件名索引,不经 SQLite);图库条件查询走 L2;派生列只可能来自 L3。
-            // 只有「图库」这一列是 L2 的投影,由服务批量查库后随命中一起回。
-            ui.small(
-                "结果来自 L1 内存文件名索引(NTFS USN/MFT;由常驻索引服务维护,安装一次后开机自动更新)\
-                 —— 名字、路径、大小、修改日期都在这里查,不经图库数据库;「图库」一列取自 L2。\
-                 要按拍摄时间、相机、评分等条件查,请用图库搜索(走 L2 SQL)。",
-            );
+            // A9:三层数据必须标来源(仅源码注释,不进 UI)。名字/路径/大小/日期这一路走
+            // L1(服务内存里的文件名索引,不经 SQLite);图库条件查询走 L2;派生列只可能
+            // 来自 L3。只有「图库」这一列是 L2 的投影,由服务批量查库后随命中一起回。
             ui.separator();
 
             // 服务连不上 = 全盘快查没有数据源:明示降级(方案 P0-4),本页只剩说明。
@@ -3061,6 +3110,8 @@ impl App {
 
             let results = std::mem::take(&mut self.name_results);
             let mut opened: Option<String> = None;
+            let mut preview_req: Option<String> = None;
+            let mut revealed: Option<String> = None;
             let mut menu_for: Option<String> = None;
             egui_extras::TableBuilder::new(ui)
                 .striped(true)
@@ -3106,19 +3157,18 @@ impl App {
                                 ui.label(fmt_mtime(r.mtime));
                             });
                             row.col(|ui| {
-                                // 快查看得见全盘,图库只收作用域内的媒体 —— 这一列把
-                                // 「搜到了为什么网格里没有」讲明白(方案 P4-29)。
+                                // 快查看得见全盘,硬排除目录不进图库 —— 这一列把
+                                // 「搜到了为什么网格里没有」讲明白。
                                 let label = r.rich_label();
                                 let why = match i32::from(r.rich_state) {
                                     crate::db::RICH_OUT => {
-                                        "已在图库数据库里,但它所在的目录未纳入派生作用域:\
-                                         不生成缩略图与元数据。点进该目录、在网格里点开这张图,\
-                                         或在「工具 → 文件夹管理器」里添加它,就会开始生成。\
-                                         目录在排除名单里(应用缓存一类)时点击不管用,\
-                                         得对着网格里的它右键选「纳入此目录(覆盖排除名单)」。"
+                                        "图库里有这张照片,缩略图还没轮到生成。\
+                                         打开它所在的文件夹就会开始补,不影响查看原图。\
+                                         想让这个文件夹以后优先生成,可以在\
+                                         「工具 → 文件夹管理器」里导入它。"
                                     }
-                                    crate::db::RICH_PENDING => "已纳入范围,派生还没跑到这一条。",
-                                    crate::db::RICH_DONE => "已纳入范围并完成派生,网格里能看到。",
+                                    crate::db::RICH_PENDING => "缩略图正在排队生成。",
+                                    crate::db::RICH_DONE => "缩略图已就绪,网格里能看到。",
                                     crate::db::RICH_BAD => {
                                         "文件读取失败(损坏或无权限),已隔离,不再重试。"
                                     }
@@ -3144,19 +3194,86 @@ impl App {
                             if resp.clicked() {
                                 self.name_sel = Some(h.path.clone());
                             }
-                            if resp.double_clicked() {
-                                opened = Some(h.path.clone());
-                            }
-                            if resp.secondary_clicked() {
-                                menu_for = Some(h.path.clone());
+                            // 右键出应用内菜单:常用动作直达,系统原生的那一份
+                            // (Shell IContextMenu)也收在末项里,不丢功能。
+                            let mut open_clicked = false;
+                            resp.context_menu(|ui| {
+                                if ui.button("打开").clicked() {
+                                    open_clicked = true;
+                                    ui.close();
+                                }
+                                if ui
+                                    .button(if h.is_dir {
+                                        "打开文件夹"
+                                    } else {
+                                        "打开所在文件夹"
+                                    })
+                                    .clicked()
+                                {
+                                    revealed = Some(h.path.clone());
+                                    ui.close();
+                                }
+                                if ui.button("复制完整路径").clicked() {
+                                    ui.ctx().copy_text(h.path.clone());
+                                    ui.close();
+                                }
+                                ui.separator();
+                                if ui.button("系统右键菜单…").clicked() {
+                                    menu_for = Some(h.path.clone());
+                                    ui.close();
+                                }
+                            });
+                            // 双击与菜单「打开」同一路由:目录直接进资源管理器;
+                            // 图片请求本系统预览(库里有没有这行,表外再查);
+                            // 视频与其余类型交给系统关联程序。
+                            if resp.double_clicked() || open_clicked {
+                                let p = Path::new(&h.path);
+                                if h.is_dir || !crate::scan::is_image(p) {
+                                    opened = Some(h.path.clone());
+                                } else {
+                                    preview_req = Some(h.path.clone());
+                                }
                             }
                         });
                     }
                 });
             self.name_results = results;
-            // 打开/菜单在表外执行:右键菜单是模态的,不在遍历中途弹。
+            // 动作在表外执行:打开类即时生效;系统右键菜单是模态的,不在
+            // 遍历中途弹。文件夹条目「打开所在文件夹」= 直接进该目录。
             if let Some(p) = opened {
                 crate::win::shell_open(std::path::Path::new(&p));
+            }
+            if let Some(p) = preview_req {
+                // 图片双击:库里有这行就进编辑视图(与网格双击同一套状态复位);
+                // 还没入库的退回系统关联打开,并讲明白为什么没进预览。
+                let path = Path::new(&p).to_string_lossy().into_owned();
+                match self.store.photo_id_at(&path) {
+                    Some(id) => {
+                        self.preview = Some(id);
+                        self.preview_tex = None;
+                        self.preview_failed = None;
+                        self.anim_reset();
+                        self.preview_reset_zoom();
+                    }
+                    None => {
+                        if !crate::win::shell_open(Path::new(&path)) {
+                            self.status = format!("无法打开:{path}(无关联程序)");
+                        } else {
+                            self.status = format!(
+                                "{p} 还没入库,已用系统关联程序打开;\
+                                 要在本系统里预览编辑,请先把所在目录纳入图库。"
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(p) = revealed {
+                let p = Path::new(&p);
+                if p.is_dir() {
+                    crate::win::shell_open(p);
+                } else {
+                    show_in_explorer(&p.to_string_lossy());
+                }
             }
             if let Some(p) = menu_for {
                 // 与资源管理器同一份系统右键菜单(Shell IContextMenu)。
@@ -3208,6 +3325,18 @@ impl App {
             || self.export_rx.is_some()
             // 检查/下载/安装更新也在后台跑,让工具栏的指示灯带上这一段。
             || self.updater.phase.working()
+            || self.models_busy()
+    }
+
+    /// 人脸模型下载同样算一段后台活(精简构建里没有这个模块,恒为不忙)。
+    #[cfg(feature = "ai")]
+    fn models_busy(&self) -> bool {
+        self.models.phase.working()
+    }
+
+    #[cfg(not(feature = "ai"))]
+    fn models_busy(&self) -> bool {
+        false
     }
 
     /// 帮助 > 检查更新 窗口。
@@ -3224,6 +3353,11 @@ impl App {
         let last_check = self.updater.last_check;
         let notice = self.updater.notice.clone();
         let working = phase.working();
+        // 显示「生效版本」:安装后未重启时 applied_version 比运行中的映像新,
+        // 口径与 --check-update 一致,免得用户以为升级没成功。
+        let st = crate::update::load_state();
+        let cur_ver = crate::update::effective_version(&st);
+        let pending_restart = cur_ver != crate::update::CURRENT_VERSION.to_string();
         let (mut check, mut download, mut install, mut open_cfg, mut clear_notice) =
             (false, false, false, false, false);
         let mut skip_ver: Option<String> = None;
@@ -3236,7 +3370,11 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.heading("检查更新");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(format!("当前版本 v{}", crate::update::CURRENT_VERSION));
+                        ui.label(if pending_restart {
+                            format!("当前版本 v{cur_ver}(重启后生效)")
+                        } else {
+                            format!("当前版本 v{cur_ver}")
+                        });
                     });
                 });
                 ui.separator();
@@ -3443,53 +3581,46 @@ impl App {
         }
     }
 
-    /// 屏幕上出现一张未纳入的图 → 把它的目录排进「纳入」队列(每个目录只排一次)。
+    /// 磁盘上确实没有这张图的缓存 → 把它的 id 排进「按张放行」队列。
     ///
-    /// 不在渲染帧里直接写库:首屏一次可能铺开几十上百个目录,那就变成几十次
-    /// `UPDATE` + 回读,帧会被自己拖死。排队,由 `photo_grid` 每帧消化少量。
-    /// 去重键用大写归一路径(`adopt_seen`),队列里保留界面上那串原样大小写。
-    /// 队列排满时**不**登记去重(返回 false),这个目录下一帧还会再来敲门 ——
-    /// 登记了却不出队,就等于本进程永远不再纳它。
-    fn note_visible_out(&mut self, dir: &str) -> bool {
-        if dir.is_empty() || self.adopt_queue.len() >= MAX_ADOPT_QUEUE {
+    /// 只看「有没有缓存文件」,不看派生状态、也不看目录在不在批量计划里:
+    /// 库里有的图就该显示,缺的那一张就补那一张,不牵动整个目录。
+    /// 渲染帧不直接写库,由 `photo_grid` 每帧批量消化;同一 id 只推一次。
+    /// 队列排满时**不**登记去重,下一帧还会再来敲门。
+    fn note_missing_photo(&mut self, id: i64) -> bool {
+        if self.adopt_queue.len() >= MAX_ADOPT_QUEUE {
             return false;
         }
-        let key = crate::db::norm_dir(dir).to_ascii_uppercase();
-        if self.adopt_seen.contains(&key) {
+        if !self.adopt_seen.insert(id) {
             return false;
         }
-        self.adopt_seen.insert(key);
-        self.adopt_queue.push_back(dir.to_string());
+        self.adopt_queue.push_back(id);
         true
     }
 
-    /// 消化「看到但还没纳入」的队列:每帧最多 `max` 个目录。
-    ///
-    /// 口径与点进目录一致(写 `clicked` 账 + 放行该目录),只是账本来源记 `visible`,
-    /// 好跟用户亲手点进去的分开。可见清单不用在这里发:帧首按整帧上屏目录一次发完。
+    /// 消化按张放行队列:一批 id 一次批量抬进后台派生队列,不写目录账本。
     fn drain_adopts(&mut self, max: usize) {
-        for _ in 0..max {
-            let Some(dir) = self.adopt_queue.pop_front() else {
-                break;
-            };
-            self.include_dir(&dir, crate::db::INTENT_CLICKED, crate::db::SRC_VIEW);
+        let ids: Vec<i64> = self.adopt_queue.drain(..max.min(self.adopt_queue.len())).collect();
+        if ids.is_empty() {
+            return;
         }
+        let _ = self.store.promote_photos(&ids);
+        // 不回读库:网格下一帧照常读缓存,缓存生成完由 worker 的完成信号
+        // 刷新纹理。剩余队列靠 note_missing_photo 那边的重绘请求继续消化。
     }
 
-    /// 把一个目录纳进派生作用域并立即放行它的行(方案 P3-19)。
+    /// 用户明确点进 / 导入一个文件夹 → 整个目录排进派生队列。
     ///
-    /// 返回是否真的纳进去了。**排除名单分两层**(2026-11-05 拍板):
-    /// - 被动来源(`click` / `visible`)什么都不写 —— 系统目录、应用缓存、回收站
-    ///   不该因为用户滚到过、或点过一张图,就变成「以后这个目录的图都要派生」;
-    /// - `import`(用户在文件夹管理器/导入页明确选中)算**表态**,能覆盖软层,
-    ///   于是 `AppData` 里那类「被规则顺手挡掉、但确实是用户的图」有出口。
-    ///   硬层(参考件 4 条 + 回收站 + 自家产出目录)任何来源都覆盖不了。
+    /// 「明确表态」包括导入和点进文件夹树两种:用户已经指到这个目录了,
+    /// 软排除名单(应用缓存、临时目录一类)该让路,否则点了也看不到图。
+    /// 只有硬排除名单(回收站、系统目录、自家缓存)任何来源都不收 ——
+    /// 那些目录根本不纳入图库,是唯一真正的排除。
     ///
     /// 已纳过的目录不重写账本 —— 免得把用户显式设过的来源(首启对话框 /
     /// 手动导入)冲成 click;但 `promote_dir` 照样跑一遍:并发扫描可能刚
     /// 插进一批 `rich_state=0` 的新行。
     fn include_dir(&mut self, dir: &str, state: &str, source: &str) -> bool {
-        let deliberate = source == crate::db::SRC_IMPORT;
+        let deliberate = source == crate::db::SRC_IMPORT || source == crate::db::SRC_CLICK;
         if !self.store.adoptable_dir(dir, deliberate) {
             return false;
         }
@@ -3507,10 +3638,9 @@ impl App {
     /// `promote_dir` 落库后,把库里的真相搬进内存视图。
     ///
     /// 网格每帧只读 `self.rows`,而这里的 `rich_state` 要等 `rebuild` 才跟库对齐 ——
-    /// 不搬这一趟,点进目录后整屏仍是「未纳入范围」的占位块,用户看到的就是
-    /// 「懒加载根本没动」。**真相一律回读库**(`Store::promoted_states`),界面不按
-    /// 排除名单自己再判一遍门:上一轮那么做,把库里早已派生完的 `AppData` 目录
-    /// 永远锁在占位块上(2026-11-05 现场)。
+    /// 不搬这一趟,刚点进目录时内存行还停在旧状态。**真相一律回读库**
+    /// (`Store::promoted_states`),界面不按排除名单自己再判一遍门:那么做
+    /// 会让库里早已派生完的目录在界面上停在旧状态。
     fn sync_dir_promoted(&mut self, dir: &str) {
         let done = self.store.promoted_states(dir);
         for (id, state) in done {
@@ -3544,6 +3674,7 @@ impl App {
         match hit {
             Some((i, _)) => {
                 self.selected_folder = i;
+                self.subtree_sel = None;
                 self.folder_show_all = false;
                 self.set_view(ViewKind::Folder);
                 let p = self.folders[i].clone();
@@ -4075,6 +4206,7 @@ impl App {
         self.page = s.page;
         self.view = s.view;
         self.folder_show_all = s.show_all;
+        self.subtree_sel = None;
         self.selected_folder = if self.folders.is_empty() {
             0
         } else {
@@ -4521,6 +4653,175 @@ impl App {
         });
     }
 
+    /// 启动检查:人脸模型缺不缺件。缺件且配了服务端下载源 → 弹一次提示窗,
+    /// 由用户点「开始下载」才联网(识别模型上百 MB,不替用户花流量);
+    /// 没配 ModelURL 时只留一行状态,界面仍是原来的手动放置指引。
+    #[cfg(feature = "ai")]
+    fn check_face_models(&mut self) {
+        let algo = crate::faces::current_algo(&self.store);
+        if !self.models.check_on_startup(algo) {
+            return;
+        }
+        // 「不再提示」只压掉开机弹窗,下载入口仍留在 选项 > 常规 与人脸视图。
+        if self.model_never_ask() {
+            self.models.prompt_open = false;
+            return;
+        }
+        if self.models.model_base().is_empty() {
+            self.status = "人脸模型未就位:放置方法见 选项 > 常规".into();
+        }
+    }
+
+    /// 开机是否不再提示下载人脸模型。
+    #[cfg(feature = "ai")]
+    fn model_never_ask(&self) -> bool {
+        self.store.get_setting("model_never_ask").as_deref() == Some("1")
+    }
+
+    /// 后台开始下载指定方案的模型(提示窗与手动按钮都走这里)。
+    #[cfg(feature = "ai")]
+    fn start_model_download(&mut self, algo: crate::ai::face::FaceAlgo) {
+        self.models.start(algo);
+        if self.models.phase.working() {
+            self.status = "正在后台下载人脸模型…".into();
+        } else if let crate::models::Phase::Failed(e) = &self.models.phase {
+            self.status = format!("人脸模型下载失败:{e}");
+        }
+    }
+
+    /// 人脸模型的下载入口与状态(只在缺模型时画):状态一行 + 按钮一行。
+    /// 选项 > 常规、人脸视图共用;下载源是 maliang.ini 的 ModelURL。
+    #[cfg(feature = "ai")]
+    fn face_model_ui(&mut self, ui: &mut egui::Ui, algo: crate::ai::face::FaceAlgo) {
+        use crate::models::Phase;
+        let dir = crate::ai::models_dir();
+        let phase = self.models.phase.clone();
+        match &phase {
+            Phase::Downloading { file, .. } => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(phase.label());
+                });
+                if let Some(d) = &dir {
+                    ui.small(format!(
+                        "断点留在 {}/{}.part,再点一次「下载模型」接着下",
+                        d.display(),
+                        file
+                    ));
+                }
+            }
+            Phase::Failed(e) => {
+                ui.label(egui::RichText::new(format!("下载失败:{e}")).color(crate::theme::p().accent));
+            }
+            _ => {
+                let (det_f, rec_f) = algo.files();
+                if !crate::models::downloadable(algo) {
+                    ui.small(format!("缺少 {det_f} / {rec_f}:该方案的权重许可不可再分发,只能自备"));
+                } else if self.models.model_base().is_empty() {
+                    ui.small(format!(
+                        "缺少 {det_f} / {rec_f}:自行放入模型目录,或在 maliang.ini 填 ModelURL 后由程序下载"
+                    ));
+                } else {
+                    ui.small(format!("可从服务端下载:{}", self.models.model_base()));
+                }
+            }
+        }
+        let downloadable = crate::models::downloadable(algo) && !self.models.model_base().is_empty();
+        let working = phase.working();
+        // 提示窗勾过「不再提示」后,这里给回勾的入口:开机弹不弹只看这一项。
+        if downloadable {
+            let mut ask = !self.model_never_ask();
+            if ui.checkbox(&mut ask, "开机提醒下载模型").changed() {
+                let _ = self
+                    .store
+                    .set_setting("model_never_ask", if ask { "0" } else { "1" });
+                self.status = if ask {
+                    "已恢复开机提醒:缺人脸模型时会弹窗问一次".into()
+                } else {
+                    "已设为不再提示:开机不再弹人脸模型窗,下载入口留在这里".into()
+                };
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            if downloadable
+                && ui
+                    .add_enabled(!working, egui::Button::new("下载模型"))
+                    .clicked()
+            {
+                self.start_model_download(algo);
+            }
+            if ui.button("打开模型目录").clicked() {
+                if let Some(d) = &dir {
+                    show_in_explorer(&d.display().to_string());
+                }
+            }
+            if ui.button("打开配置文件").clicked() {
+                crate::update::open_config_file();
+            }
+        });
+    }
+
+    /// 首启提示窗:缺人脸模型时问一次「现在下载吗」。
+    /// 关掉后不再生扰,下载入口仍留在 选项 > 常规 与人脸视图里。
+    #[cfg(feature = "ai")]
+    fn model_prompt_window(&mut self, ctx: &egui::Context) {
+        if !self.models.prompt_open {
+            return;
+        }
+        let mut open = self.models.prompt_open;
+        let mut dismissed = false;
+        let mut start = false;
+        let mut never = false;
+        let dir_text = crate::ai::models_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        egui::Window::new("缺少人脸模型")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label("「人物」视图要靠人脸模型工作,本机模型目录里还没有模型文件。");
+                ui.small(format!("模型目录:{dir_text}"));
+                ui.small(format!(
+                    "下载地址:{}(改这一行就换源,见 maliang.ini 的 ModelURL)",
+                    self.models.model_base()
+                ));
+                ui.label("识别模型体积较大,确认后会在后台分段下载,可随时关掉本窗口继续用其它功能。");
+                ui.add_space(6.0);
+                ui.checkbox(&mut never, "不再提示(以后开机不再弹这个窗)");
+                ui.add_space(4.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("开始下载").clicked() {
+                        start = true;
+                        dismissed = true;
+                    }
+                    if ui.button("以后再说").clicked() {
+                        dismissed = true;
+                    }
+                });
+            });
+        if dismissed {
+            self.models.prompt_open = false;
+            if start {
+                // 愿意下 = 撤回「不再提示」:没下成下次开机还得再问。
+                if !never {
+                    let _ = self.store.set_setting("model_never_ask", "0");
+                }
+                let algo = crate::faces::current_algo(&self.store);
+                self.start_model_download(algo);
+            }
+        } else if !open {
+            self.models.prompt_open = false;
+        }
+        // 拒绝、关窗、点下载时勾了都要落库,否则下次开机照旧弹窗。
+        if never {
+            let _ = self.store.set_setting("model_never_ask", "1");
+            self.status = "已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > 常规".into();
+        }
+    }
+
     /// 后台人脸识别扫描(M2c):加载模型分析一批未分析照片并入库存簇。
     #[cfg(feature = "ai")]
     fn start_face_scan(&mut self) {
@@ -4528,16 +4829,20 @@ impl App {
             self.status = "人脸扫描进行中…".into();
             return;
         }
-        // 模型缺失时直说怎么放,不进后台线程撞裸错误。
+        // 模型缺失时先问要不要下载(没配下载源就直说怎么手动放),不进后台线程撞裸错误。
         let algo = crate::faces::current_algo(&self.store);
         if !crate::ai::face::Faces::models_present(algo) {
-            let dir = crate::ai::models_dir()
-                .map(|d| d.display().to_string())
-                .unwrap_or_default();
             let (det_f, rec_f) = algo.files();
-            self.status = format!(
-                "缺少人脸模型:请将 {det_f} 与 {rec_f} 放入模型目录 {dir},获取方式见 README"
-            );
+            if crate::models::downloadable(algo) && !self.models.model_base().is_empty() {
+                self.status = format!("缺少人脸模型 {det_f} / {rec_f}:确认后可在后台下载");
+                self.models.prompt_open = true;
+            } else {
+                let dir = crate::ai::models_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default();
+                self.status =
+                    format!("缺少人脸模型:请将 {det_f} 与 {rec_f} 放入模型目录 {dir},获取方式见 README");
+            }
             return;
         }
         let store = self.store.clone();
@@ -4641,14 +4946,16 @@ impl App {
                 if self.folder_show_all {
                     return self.rows.iter().map(|r| r.id).collect();
                 }
+                // 与文件夹视图同一套选中口径:子树根优先(递归聚合),
+                // 否则回退槽位选中。范围口径必须与中间栏完全一致。
                 let folder = self
-                    .folders
-                    .get(self.selected_folder)
-                    .cloned()
+                    .subtree_sel
+                    .clone()
+                    .or_else(|| self.folders.get(self.selected_folder).cloned())
                     .unwrap_or_default();
                 self.rows
                     .iter()
-                    .filter(|r| folder_of(&r.path) == folder)
+                    .filter(|r| path_under_dir(&r.path, &folder))
                     .map(|r| r.id)
                     .collect()
             }
@@ -6195,10 +6502,9 @@ impl App {
                             .selectable_label(cur == t, t.label())
                             .on_hover_text(
                                 "来源 L3:派生数据(EXIF / 缩略图 / 标签 / 人物 / 地理),\
-                                 由图库按作用域门控逐条抽取。\
-                                 未纳入派生作用域的目录这里没有内容 ——\
-                                 点进该目录、在「工具 → 文件夹管理器」里添加它,\
-                                 或在网格里点开这张图即可纳入。",
+                                 由图库逐条抽取,后台按常用目录、最近变更、\
+                                 当前可见的顺序依次补齐。\
+                                 还没轮到的照片这里暂时没有内容,打开文件夹即开始生成。",
                             )
                             .clicked()
                         {
@@ -6521,12 +6827,14 @@ impl App {
                                     }
                                 });
                                 let (det_f, rec_f) = algo.files();
-                                let ready = if crate::ai::face::Faces::models_present(algo) {
-                                    "模型已就位".to_string()
+                                if crate::ai::face::Faces::models_present(algo) {
+                                    ui.small(format!("　模型已就位:{det_f} / {rec_f}"));
                                 } else {
-                                    format!("缺少 {det_f} / {rec_f}(获取方式见 README)")
-                                };
-                                ui.small(format!("　{ready}"));
+                                    ui.small(format!("　缺少 {det_f} / {rec_f}"));
+                                    ui.indent(("face_models_", algo.key()), |ui| {
+                                        self.face_model_ui(ui, algo);
+                                    });
+                                }
                             }
                             ui.separator();
                         }
@@ -7434,9 +7742,12 @@ impl App {
         let folder_index = n.folder_index;
         let thumb = n.photo_id;
         let open = self.tree_open.contains(&path);
-        let active = folder_index.is_some()
-            && !self.folder_show_all
-            && self.selected_folder == folder_index.unwrap_or(usize::MAX);
+        // 选中态:叶子 = 槽位命中且没有子树根覆盖;中间层 = 自己就是当前子树根。
+        let active = !self.folder_show_all
+            && match folder_index {
+                Some(fi) => self.subtree_sel.is_none() && self.selected_folder == fi,
+                None => self.subtree_sel.as_deref() == Some(path.as_str()),
+            };
         ui.horizontal(|ui| {
             ui.add_space((depth as f32) * 10.0);
             if !kids.is_empty() {
@@ -7459,25 +7770,32 @@ impl App {
                     self.tree_thumb_ui(ui, ctx, pid);
                 }
             }
-            let text = egui::RichText::new(name.as_str()).color(if folder_index.is_some() {
-                crate::theme::p().text
-            } else {
-                crate::theme::p().muted
-            });
+            // 树里每个节点都装着照片(至少子树里有),名字一律可选色;
+            // 中间层与叶子的差别只在点击后的聚合范围。
+            let text = egui::RichText::new(name.as_str()).color(crate::theme::p().text);
             if ui.selectable_label(active, text).clicked() {
                 match folder_index {
                     Some(fi) => {
                         self.selected_folder = fi;
+                        self.subtree_sel = None;
                         self.folder_show_all = false;
                         self.enter_dir(&path);
                         self.tree_reveal(&path);
                     }
-                    // 中间层目录本身没有照片:点名字即展开/收起,不当作选中。
+                    // 中间层目录:点名字 = 选中该子树,中间栏聚合显示
+                    // 本目录 + 全部子孙目录的照片;已选中时再点 = 展开/收起。
                     None => {
-                        if open {
-                            self.tree_open.remove(&path);
+                        if self.subtree_sel.as_deref() == Some(path.as_str()) {
+                            if open {
+                                self.tree_open.remove(&path);
+                            } else {
+                                self.tree_open.insert(path.clone());
+                            }
                         } else {
-                            self.tree_open.insert(path.clone());
+                            self.subtree_sel = Some(path.clone());
+                            self.folder_show_all = false;
+                            self.enter_dir(&path);
+                            self.tree_reveal(&path);
                         }
                     }
                 }
@@ -7618,7 +7936,15 @@ impl App {
     ///
     /// 放映与邮件复用视图级入口:先把视图范围收窄到本组,再调现成的
     /// `start_slideshow` / 邮件窗口 —— 不必为幻灯片另开一条 id 队列。
-    fn album_label(&mut self, ui: &mut egui::Ui, folder: &str, date: &str, count: usize) {
+    #[allow(clippy::too_many_arguments)]
+    fn album_label(
+        &mut self,
+        ui: &mut egui::Ui,
+        folder: &str,
+        date: &str,
+        count: usize,
+        controls: bool,
+    ) {
         let mut name = Path::new(folder.trim_end_matches(['\\', '/']))
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -7651,6 +7977,8 @@ impl App {
                 );
             });
             // 参考件把动作按钮钉在组头右侧(槽位序照原版排版,从右往左)。
+            // 单文件夹视图再钉一组本视图专属的控制:文件名过滤框 + 详细/缩略图切换,
+            // 视觉上排在「放映本组幻灯片」前面(用户 2026-11-06 拍板,不再单占一行)。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("mail", false))
@@ -7673,6 +8001,38 @@ impl App {
                 {
                     act_play = true;
                 }
+                if controls {
+                    if ui
+                        .add(tool_button("list", self.folder_details))
+                        .on_hover_text("详细列表视图(点列头排序)")
+                        .clicked()
+                    {
+                        self.set_folder_details(true);
+                    }
+                    if ui
+                        .add(tool_button("layout-grid", !self.folder_details))
+                        .on_hover_text("缩略图视图")
+                        .clicked()
+                    {
+                        self.set_folder_details(false);
+                    }
+                    ui.separator();
+                    ui.add(toolbar_icon("funnel"))
+                        .on_hover_text("只显示文件名含关键词的照片(仅当前文件夹)");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.folder_filter)
+                            .desired_width(180.0)
+                            .hint_text("在此文件夹内过滤文件名…"),
+                    );
+                    if !self.folder_filter.is_empty()
+                        && ui
+                            .add(tool_button("x", false))
+                            .on_hover_text("清除过滤")
+                            .clicked()
+                    {
+                        self.folder_filter.clear();
+                    }
+                }
             });
         });
         if act_open && !crate::win::shell_open(Path::new(folder)) {
@@ -7682,6 +8042,7 @@ impl App {
             // 只在点击时反查一次左栏槽位(逐帧扫 folders 列表没必要)。
             if let Some(slot) = self.folders.iter().position(|f| f == folder) {
                 self.selected_folder = slot;
+                self.subtree_sel = None;
                 self.enter_dir(folder);
                 self.tree_reveal(folder);
             }
@@ -7700,6 +8061,281 @@ impl App {
                 self.email_win = true;
             }
         }
+    }
+
+    /// 切换单文件夹视图的详细/网格形态(设置项 folder_details,记住上次选择)。
+    fn set_folder_details(&mut self, details: bool) {
+        if self.folder_details == details {
+            return;
+        }
+        self.folder_details = details;
+        let _ = self
+            .store
+            .set_setting("folder_details", if details { "1" } else { "0" });
+    }
+
+    /// 点选语义(网格格子与详细列表行共用;对齐参考件的点选习惯):
+    /// 单击 = 只选这一张(替换选区);Ctrl+单击 = 加入/移出;
+    /// Shift+单击 = 从上次单击处到当前张连选(在**当前视图范围内**取,
+    /// 基准不在本视图里就退化为只选当前张;基准本身不移动)。
+    fn select_by_click(&mut self, id: i64, ctrl: bool, shift: bool) {
+        if ctrl {
+            if !self.sel.remove(&id) {
+                self.sel.insert(id);
+            }
+            self.sel_anchor = Some(id);
+            return;
+        }
+        if shift {
+            let view = self.view_ids();
+            if view.is_empty() {
+                return;
+            }
+            let pos = |x: i64| view.iter().position(|&p| p == x);
+            let clicked = pos(id).unwrap_or(0);
+            let anchor = self
+                .sel_anchor
+                .and_then(pos)
+                .unwrap_or(clicked);
+            let (lo, hi) = if anchor <= clicked {
+                (anchor, clicked)
+            } else {
+                (clicked, anchor)
+            };
+            self.sel = view[lo..=hi].iter().copied().collect();
+            return;
+        }
+        self.sel.clear();
+        self.sel.insert(id);
+        self.sel_anchor = Some(id);
+    }
+
+    /// 双击打开(参考件双击 = 进 View and Edit 单图视图;视频不进库内渲染,
+    /// 交给系统关联播放器)。与快速查找页双击同一套状态复位。
+    fn open_photo_editor(&mut self, id: i64, movie: bool) {
+        if movie {
+            if let Some(p) = self.photo_path(id) {
+                if !crate::win::shell_open(Path::new(&p)) {
+                    self.status = format!("无法打开视频(无关联播放器):{p}");
+                }
+            }
+        } else {
+            self.preview = Some(id);
+            self.preview_tex = None;
+            self.preview_failed = None;
+            self.anim_reset();
+            self.preview_reset_zoom();
+        }
+    }
+
+    /// 详细列表视图(单文件夹视图的「详细」形态):
+    /// 文件名 / 拍摄日期 / 大小 三列 + 星标,点列头排序(再点同一列反向);
+    /// 交互与网格一致:单击选中(双击进单图视图)、Ctrl+单击加减选、右键同一套上下文菜单。
+    fn photo_details(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
+        // 与网格同一套「显示优先」:屏幕上出现的目录照常消化纳入队列。
+        self.drain_adopts(MAX_ADOPT_PER_FRAME);
+        // 逐行先取数据再谈交互(行内要用 &mut self,不能同时攥着 &self.rows)。
+        struct Row {
+            idx: usize,
+            id: i64,
+            star: bool,
+            movie: bool,
+            name: String,
+            dir: String,
+            taken: String,
+            size: String,
+        }
+        let items: Vec<Row> = cells
+            .iter()
+            .map(|&i| {
+                let r = &self.rows[i];
+                Row {
+                    idx: i,
+                    id: r.id,
+                    star: r.star != 0,
+                    movie: r.kind == crate::video::kind::MOVIE,
+                    name: r.path
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or(&r.path)
+                        .to_string(),
+                    dir: r.parent.clone(),
+                    taken: r.taken.clone().map(|t| t.replace('T', " ")).unwrap_or_default(),
+                    size: fmt_size(r.size.max(0) as u64),
+                }
+            })
+            .collect();
+        let date_w = 150.0;
+        let size_w = 80.0;
+        let star_w = 26.0;
+        let name_w = (ui.available_width() - date_w - size_w - star_w - 24.0).max(120.0);
+        let row_h = 22.0;
+        let accent = crate::theme::p().accent;
+        let muted = crate::theme::p().muted;
+        let text = crate::theme::p().text;
+        let faint = crate::theme::p().faint;
+        ui.push_id(salt, |ui| {
+            // —— 列头(扁平文字,与数据行同轴对齐,高度统一;
+            // 点列名即按该列排序,再点同一列反向。名称/日期左对齐,大小右对齐)——
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let cols = [
+                    ("名称", name_w, timeline::SortBy::Name, false),
+                    ("拍摄日期", date_w, timeline::SortBy::Date, false),
+                    ("大小", size_w, timeline::SortBy::Size, true),
+                ];
+                for (col_label, w, col, right) in cols {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
+                    let hit =
+                        ui.interact(rect, egui::Id::new(("col-head", col.key())), egui::Sense::click());
+                    let active = self.sort_by == col;
+                    let mut disp = col_label.to_string();
+                    if active {
+                        let arrow_up = if col == timeline::SortBy::Name {
+                            !self.sort_rev
+                        } else {
+                            self.sort_rev
+                        };
+                        disp.push_str(if arrow_up { " ▲" } else { " ▼" });
+                    }
+                    if ui.rect_contains_pointer(rect) {
+                        ui.painter().rect_filled(rect, 3.0, crate::theme::p().card);
+                    }
+                    let (pos, align) = if right {
+                        (
+                            egui::pos2(rect.right(), rect.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                        )
+                    } else {
+                        (
+                            egui::pos2(rect.left() + 8.0, rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                        )
+                    };
+                    ui.painter().text(
+                        pos,
+                        align,
+                        &disp,
+                        egui::FontId::proportional(12.0),
+                        if active { accent } else { muted },
+                    );
+                    if hit.clicked() {
+                        if active {
+                            self.sort_rev = !self.sort_rev;
+                        } else {
+                            self.sort_by = col;
+                            self.sort_rev = false;
+                        }
+                        self.apply_view_state();
+                    }
+                    hit.on_hover_text(format!("按{col_label}排序(再点一次反向)"));
+                }
+            });
+            ui.separator();
+            // —— 行(文本为主,不建缩略图;选中高亮 + 悬停变色)——
+            for it in &items {
+                let selected = self.sel.contains(&it.id);
+                let total_w = name_w + date_w + size_w + star_w + 16.0;
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(total_w, row_h), egui::Sense::hover());
+                self.note_frame_dir(&it.dir);
+                let hovered = ui.rect_contains_pointer(rect);
+                let fill = if selected || hovered {
+                    crate::theme::p().card_hover
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                if fill != egui::Color32::TRANSPARENT {
+                    ui.painter().rect_filled(rect, 4.0, fill);
+                }
+                if selected {
+                    ui.painter().rect_stroke(
+                        rect,
+                        4.0,
+                        egui::Stroke::new(1.5_f32, accent),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                let name_text = if it.movie {
+                    format!("▶ {}", it.name)
+                } else {
+                    it.name.clone()
+                };
+                let name_rect =
+                    egui::Rect::from_min_size(rect.left_top(), egui::vec2(name_w, row_h))
+                        .translate(egui::vec2(8.0, 0.0));
+                ui.put(
+                    name_rect,
+                    egui::Label::new(egui::RichText::new(&name_text).size(12.5).color(text))
+                        .wrap_mode(egui::TextWrapMode::Truncate),
+                )
+                .on_hover_text(&it.dir);
+                let date_c = egui::pos2(
+                    rect.left() + 8.0 + name_w + 8.0,
+                    rect.center().y,
+                );
+                ui.painter().text(
+                    date_c,
+                    egui::Align2::LEFT_CENTER,
+                    if it.taken.is_empty() { "—" } else { &it.taken },
+                    egui::FontId::proportional(12.0),
+                    if it.taken.is_empty() { faint } else { muted },
+                );
+                let size_r = egui::pos2(
+                    rect.left() + 8.0 + name_w + 8.0 + date_w + size_w,
+                    rect.center().y,
+                );
+                ui.painter().text(
+                    size_r,
+                    egui::Align2::RIGHT_CENTER,
+                    &it.size,
+                    egui::FontId::proportional(12.0),
+                    muted,
+                );
+                if it.star {
+                    ui.painter().text(
+                        egui::pos2(rect.right() - star_w / 2.0, rect.center().y),
+                        egui::Align2::CENTER_CENTER,
+                        "★",
+                        egui::FontId::proportional(13.0),
+                        accent,
+                    );
+                }
+                // —— 交互(与 photo_cell 同一套语义)——
+                let hit = ui.interact(rect, egui::Id::new(("detail-hit", it.id)), egui::Sense::click());
+                let mut star_clicked = false;
+                let mut preview_clicked = false;
+                hit.context_menu(|ui| {
+                    self.photo_ctx_menu(
+                        ui,
+                        it.idx,
+                        it.star,
+                        selected,
+                        &mut star_clicked,
+                        &mut preview_clicked,
+                    )
+                });
+                if hit.clicked() {
+                    // 单击只是选中,与网格一致;缺缓存的行由渲染帧按张排队,
+                    // 不再因为派生状态去做「纳入目录」这一步。
+                    // 点选语义与网格一致(参考件习惯):单击只选、Ctrl 加减选、Shift 连选。
+                    let (ctrl, shift) = ui
+                        .input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+                    self.select_by_click(it.id, ctrl, shift);
+                }
+                if hit.double_clicked() {
+                    self.open_photo_editor(it.id, it.movie);
+                }
+                if star_clicked {
+                    self.toggle_star(it.id);
+                }
+                if preview_clicked {
+                    self.open_photo_editor(it.id, it.movie);
+                }
+            }
+        });
     }
 
     /// 照片网格(参考件的行式排布:同行等高、各格按宽高比取宽、行尾铺满)。
@@ -7782,10 +8418,8 @@ impl App {
             if self.thumb_decode_count >= self.thumb_decode_budget {
                 return;
             }
-            // 未纳入/已立案的行不吃这一帧的配额,也不 `mark_pending`(那是
-            // 「磁盘还没有,交给后台生成」的语义);排队纳入后它们自己会回到正常路径。
-            let rich = self.rows[i].rich_state;
-            if rich == crate::db::RICH_OUT || rich == crate::db::RICH_BAD {
+            // 已立案的坏文件不吃配额;其余行一律照常读缓存。
+            if self.rows[i].rich_state == crate::db::RICH_BAD {
                 continue;
             }
             let id = self.rows[i].id;
@@ -7795,8 +8429,13 @@ impl App {
             self.thumb_decode_count += self.thumb_tier.bytes();
             match thumb_tex(ctx, &self.store, id, self.thumb_tier) {
                 Some(t) => self.texs.put(id, t),
-                // 磁盘上还没有 → 交给后台 worker 生成(与可见格子同一套语义)。
-                None => self.texs.mark_pending(id),
+                // 磁盘上还没有 → 也按张放行,交给后台生成(与可见格子同一套语义)。
+                None => {
+                    if self.note_missing_photo(id) {
+                        ctx.request_repaint();
+                    }
+                    self.texs.mark_pending(id);
+                }
             }
         }
     }
@@ -7961,23 +8600,15 @@ impl App {
         let id = self.rows[idx].id;
         let star0 = self.rows[idx].star != 0;
         let selected = self.sel.contains(&id);
-        // 方案 P4-29:派生状态决定占位文案,也决定要不要去要缩略图。
-        // RICH_OUT(未纳入作用域)/ RICH_BAD(已立案失败)这两类在本帧磁盘上还没有
-        // 缩略图,不能进「交给后台生成」那条路 —— 那是白跑一趟解码再失败一次,
-        // 还会把滚动配额吃掉。(RICH_OUT 只是**这一帧**的状态:下面的排队纳入会让
-        // 它在下一帧变成待派生,显示优先。)
+        // 显示与派生解耦:派生状态只是后台排队进度,不是「能不能看图」的开关。
+        // 真排除的目录根本不纳入图库,库里有的行一律照常读缓存;只有已立案的坏文件
+        // 不读(它确实解不开)。缓存不在磁盘上时才把这一张推去后台生成。
         let rich = self.rows[idx].rich_state;
-        let no_derive = rich == crate::db::RICH_OUT || rich == crate::db::RICH_BAD;
-        // 显示优先(2026-11-05 拍板):屏幕上出现过的目录决定后台派生的先后;
-        // 屏幕上出现一张还没纳入的图,它的目录当场排队纳入 —— 用户看到的是图,
-        // 不是作用域账本。排队后要自己把下一帧叫回来:站着不滚动时 egui 不重绘,
-        // 队列就会空等。
+        let bad = rich == crate::db::RICH_BAD;
+        // 屏幕上出现过的目录整批发给后台当第一优先,用户看哪儿先补哪儿。
         let dir = self.rows[idx].parent.clone();
         self.note_frame_dir(&dir);
-        if rich == crate::db::RICH_OUT && self.note_visible_out(&dir) {
-            ui.ctx().request_repaint();
-        }
-        let tex = if no_derive {
+        let tex = if bad {
             None
         } else {
             match self.texs.get(id) {
@@ -7999,7 +8630,11 @@ impl App {
                                 Some(t)
                             }
                             None => {
-                                // 磁盘上还没有 → 交给后台 worker 生成,本帧先显示占位块。
+                                // 磁盘上确实没有这一档缓存 → 只放行这一张,
+                                // 由后台生成;本帧先显示占位块。
+                                if self.note_missing_photo(id) {
+                                    ui.ctx().request_repaint();
+                                }
                                 self.texs.mark_pending(id);
                                 None
                             }
@@ -8010,7 +8645,6 @@ impl App {
         };
         let mut star_clicked = false;
         let mut preview_clicked = false;
-        let ctrl_click = |ui: &egui::Ui| ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
         // 缩略图说明(参考件 Thumbnail captions 视图开关)。
         let caption: Option<String> = if self.thumb_captions {
             let cap = self.rows[idx].caption.trim();
@@ -8073,15 +8707,12 @@ impl App {
                 crate::theme::IMAGE_RADIUS,
                 crate::theme::p().placeholder,
             );
-            // 占位文案按派生状态分三种(方案 P4-29):
-            // RICH_OUT 是「作用域门挡住了」,**不是失败**,必须写成占位而不是错误;
-            // RICH_BAD 才是真的读不出来。小档格子(96px)放不下长句,退成短版,
-            // 全称挂在悬停上。
-            let ph = match rich {
-                crate::db::RICH_OUT if w >= 100.0 => "未纳入派生作用域",
-                crate::db::RICH_OUT => "未纳入范围",
-                crate::db::RICH_BAD => "读取失败",
-                _ => "载入中…",
+            // 占位只有两种:真的读不出来,以及还在准备。派生进度是内部实现,
+            // 不印在格子上给用户看。
+            let ph = if rich == crate::db::RICH_BAD {
+                "读取失败"
+            } else {
+                "载入中…"
             };
             ui.painter().text(
                 img_rect.center(),
@@ -8103,19 +8734,12 @@ impl App {
         }
         // 星标悬浮在缩略图右上角(常驻显示已加星,悬停才露出空心星)。
         let hit = ui.interact(rect, egui::Id::new(("thumb-hit", id)), egui::Sense::click());
-        // 占位格的悬停给全称与出路;正常格不挂(避免翻格子时到处弹提示)。
-        let hit = if no_derive {
-            hit.on_hover_text(if rich == crate::db::RICH_BAD {
+        // 坏文件格给诊断与销案出口;其余占位只是「还在准备」,不必解释内部状态。
+        let hit = if bad {
+            hit.on_hover_text(
                 "这张照片读取失败(文件损坏或无权限),已记入坏文件台账并隔离,不再重试。\
-                 在「工具 → 图库维护 → 坏文件台账…」里可以看明细或整批销案。"
-            } else {
-                "这张照片所在的目录未纳入派生作用域:图库收了它的名字与路径,\
-                 但不生成缩略图、不抽 EXIF —— 这是门控,不是失败。\
-                 点一下这张图(或点进它所在的目录)就会开始生成。\
-                 在排除名单里的目录(应用缓存、系统目录一类)要点不动,\
-                 得右键选「纳入此目录(覆盖排除名单)」;回收站和图库自己的\
-                 缓存目录任何办法都不收。"
-            })
+                 在「工具 → 图库维护 → 坏文件台账…」里可以看明细或整批销案。",
+            )
         } else {
             hit
         };
@@ -8150,34 +8774,17 @@ impl App {
             );
         }
         if hit.clicked() {
-            // 点到这张图 = 用户已经明确表态「我要看它」:作用域外的目录当场纳入。
-            // 但**排除名单里的目录不写账本**(系统目录 / 应用缓存 / 回收站),这种情况
-            // 给一句准话,而不是让人对着永远不亮的格子反复点。
-            // RICH_BAD 不走这条路 —— 那是已立案的读取失败,再点一次也不会好。
-            if self.rows[idx].rich_state == crate::db::RICH_OUT {
-                let dir = self.rows[idx].parent.clone();
-                if !self.enter_dir(&dir) {
-                    let hard = !self.store.adoptable_dir(&dir, true);
-                    self.status = if hard {
-                        format!(
-                            "{dir} 属于硬排除名单(回收站、图库自己的缓存目录一类),\
-                             这里面的图不是照片,不生成缩略图。"
-                        )
-                    } else {
-                        format!(
-                            "{dir} 在排除名单里(系统目录、应用缓存一类),点一张图不足以把它收进图库;\
-                             确实要收,对着这张图右键选「纳入此目录(覆盖排除名单)」。\
-                             也可以在「工具 → 文件夹管理器」里调整「扫描时排除的目录」。")
-                    };
-                }
-            }
-            if ctrl_click(ui) {
-                if !self.sel.remove(&id) {
-                    self.sel.insert(id);
-                }
-            } else {
-                preview_clicked = true;
-            }
+            // 单击只是选中。缺缓存的那一格渲染时已按张排进后台队列,
+            // 不需要再靠点击去「纳入目录」,也没有点不动的情况。
+            // 点选语义对齐参考件:单击只选一张,Ctrl 加减选,Shift 连选;
+            // 双击才进单图视图(见下方 double_clicked)。
+            let (ctrl, shift) =
+                ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+            self.select_by_click(id, ctrl, shift);
+        }
+        if hit.double_clicked() {
+            let movie = self.rows[idx].kind == crate::video::kind::MOVIE;
+            self.open_photo_editor(id, movie);
         }
         hit.context_menu(|ui| {
             self.photo_ctx_menu(
@@ -8193,17 +8800,8 @@ impl App {
             self.toggle_star(id);
         }
         if preview_clicked {
-            if self.rows[idx].kind == crate::video::kind::MOVIE {
-                // P2-17 视频:交给系统关联播放器(库内渲染管线体量过大,不在本轮实现)。
-                let p = std::path::PathBuf::from(&self.rows[idx].path);
-                if !crate::win::shell_open(&p) {
-                    self.status = format!("无法打开视频(无关联播放器):{}", p.display());
-                }
-            } else {
-                self.preview = Some(id);
-                self.preview_tex = None;
-                self.preview_failed = None;
-            }
+            let movie = self.rows[idx].kind == crate::video::kind::MOVIE;
+            self.open_photo_editor(id, movie);
         }
     }
 
@@ -8593,6 +9191,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 「点上级 = 显示子树全部照片」的路径前缀判定。
+    #[test]
+    fn path_under_dir_matches_subtree_only() {
+        assert!(path_under_dir(r"D:\pics", r"D:\pics"));
+        assert!(path_under_dir(r"D:\pics\a.jpg", r"D:\pics"));
+        assert!(path_under_dir(r"D:\pics\2024\jan\x.jpg", r"D:\pics"));
+        assert!(path_under_dir(r"D:\pics\", r"D:\pics"));
+        // 前缀撞车不算子树:photos2 不是 photos 的孩子。
+        assert!(!path_under_dir(r"D:\photos2\a.jpg", r"D:\photos"));
+        assert!(!path_under_dir(r"D:\pic\a.jpg", r"D:\pics"));
+        assert!(!path_under_dir(r"D:\other\a.jpg", r"D:\pics"));
+        // 盘根本身也是合法子树根(D:\ 下的全部)。
+        assert!(path_under_dir(r"D:\anything.jpg", r"D:\"));
+        // 修字节边界闪退:目录名长度撞上别的路径里的汉字(2026-11-07)。
+        // 「D:\我的资料库」15 字节,历史照片路径里某汉字被第 15 字节切开。
+        assert!(path_under_dir(r"D:\我的资料库\a.jpg", r"D:\我的资料库"));
+        assert!(!path_under_dir(r"D:\我的资料库2\a.jpg", r"D:\我的资料库"));
+        assert!(!path_under_dir(r"D:\照片库\a.jpg", r"D:\我的资料库"));
+        assert!(!path_under_dir(r"D:\我的资料\库\a.jpg", r"D:\我的资料库"));
+        assert!(!path_under_dir(r"D:\我", r"D:\我的资料库"));
+    }
+
     /// 目录树两件事必须成立,左栏的真递归树全靠它们:
     /// 1) 中间层目录(本身没有照片)也成节点,并且借到子树里的一张代表图;
     /// 2) 只有装了照片的目录带 `folder_index`,即树上只有它可选。
@@ -8701,6 +9321,19 @@ impl eframe::App for App {
         // return,放在后面就收不到「发现新版本」的提示了。
         let app_busy = self.busy();
         self.updater.tick(ctx, app_busy);
+        // 人脸模型:后台下载的事件回流 + 缺件提示窗。同放帧首,免得幻灯片/编辑
+        // 视图提前 return 时收不到进度。
+        #[cfg(feature = "ai")]
+        {
+            let was_working = self.models.phase.working();
+            self.models.tick(ctx);
+            if was_working && !self.models.phase.working() {
+                if let Some(h) = self.models.phase.status_hint() {
+                    self.status = h;
+                }
+            }
+            self.model_prompt_window(ctx);
+        }
         // 显示优先(2026-11-05 拍板):上一帧真正画在屏幕上的目录整批发给后台 worker
         // 当第一优先 —— 用户看哪儿,缩略图就先补哪儿。在帧首发是为了拿得到「上一帧
         // 的完整清单」:网格分多个 section 画,帧尾没有自然的收口点。
@@ -8817,6 +9450,11 @@ impl eframe::App for App {
             }
             if !got.is_empty() {
                 self.texs.clear_pending(&got);
+                // 这批 id 已经生成过一次。把按张去重的记录也清掉:日后
+                // 缓存文件被外部清掉时,那一格还能再排一次队补回来。
+                for id in &got {
+                    self.adopt_seen.remove(id);
+                }
                 // 库里刚多了一批已生成记录,顺手刷新;不写 status ——
                 // 逐批覆盖会让状态栏文字一直跳,进度看「N缓存 x/y」就够了。
                 self.refresh_tier_count();
@@ -9792,6 +10430,28 @@ impl eframe::App for App {
                             .on_hover_text(format!("本批 {d}/{t} 张"));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                     }
+                    // 人脸模型下载进度:在下哪个文件、下了多少,状态栏一眼看到。
+                    #[cfg(feature = "ai")]
+                    if let crate::models::Phase::Downloading {
+                        file,
+                        idx,
+                        count,
+                        pct,
+                        done,
+                        total,
+                    } = &self.models.phase
+                    {
+                        let mb = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
+                        let frac = if *total > 0 { *pct as f32 / 100.0 } else { 0.0 };
+                        ui.separator();
+                        ui.label(format!("正在下载人脸模型 {file}… {pct}%"))
+                            .on_hover_text(format!(
+                                "第 {idx}/{count} 个:{} / {}",
+                                mb(*done),
+                                mb(*total)
+                            ));
+                        ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
+                    }
                 });
             });
 
@@ -9900,6 +10560,7 @@ impl eframe::App for App {
                                         .clicked()
                                     {
                                         self.folder_show_all = true;
+                                        self.subtree_sel = None;
                                     }
                                 },
                             );
@@ -9917,6 +10578,7 @@ impl eframe::App for App {
                                     let on = !self.folder_show_all && self.selected_folder == i;
                                     if ui.selectable_label(on, f).clicked() {
                                         self.selected_folder = i;
+                                        self.subtree_sel = None;
                                         self.folder_show_all = false;
                                         // 平铺列表同样是「进目录」:树形那条点完会补派生账,
                                         // 这里漏掉就让两种文件夹视图行为不一致。
@@ -10343,20 +11005,18 @@ impl eframe::App for App {
                         match self.sel_cluster {
                             None => {
                                 ui.heading("人脸");
-                                if !crate::ai::face::Faces::models_present(
-                                    crate::faces::current_algo(&self.store),
-                                ) {
-                                    let (det_f, rec_f) =
-                                        crate::faces::current_algo(&self.store).files();
+                                let algo = crate::faces::current_algo(&self.store);
+                                if !crate::ai::face::Faces::models_present(algo) {
+                                    let (det_f, rec_f) = algo.files();
                                     ui.label(format!(
-                                        "还没有人脸模型,无法识别:请将 {det_f} 与 {rec_f} \
-                                         放入模型目录(获取方式见 README):"
+                                        "还没有人脸模型,无法识别(需要 {det_f} 与 {rec_f}):"
                                     ));
                                     ui.small(
                                         crate::ai::models_dir()
                                             .map(|d| d.display().to_string())
                                             .unwrap_or_default(),
                                     );
+                                    self.face_model_ui(ui, algo);
                                 } else {
                                     ui.label(
                                         "左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。",
@@ -10519,7 +11179,7 @@ impl eframe::App for App {
                             // 每个文件夹一个相册组头 + 一组逐行缩略图。
                             let groups = self.take_folder_groups();
                             for (folder, idxs, date) in &groups {
-                                self.album_label(ui, folder, date, idxs.len());
+                                self.album_label(ui, folder, date, idxs.len(), false);
                                 ui.add_space(4.0);
                                 self.photo_grid(ui, &format!("fb-{folder}"), idxs);
                                 ui.add_space(16.0);
@@ -10530,13 +11190,17 @@ impl eframe::App for App {
                             self.folder_groups.1 = groups;
                             return;
                         }
+                        // 选中目录:左栏树点中的子树根(可为本目录+全部子孙的递归聚合)
+                        // 优先;否则回退到平铺列表/槽位选中的目录。
                         let folder = self
-                            .folders
-                            .get(self.selected_folder)
-                            .cloned()
+                            .subtree_sel
+                            .clone()
+                            .or_else(|| self.folders.get(self.selected_folder).cloned())
                             .unwrap_or_default();
                         // 从全部行里按目录筛一遍是 O(行数) 次路径运算,
                         // 只在图库版本变了或换了目录时重算(缓存借出后归还)。
+                        // 递归语义:点上级 = 本目录+全部子孙目录的照片都算,
+                        // 一路点进下级逐级收窄(用户 2026-11-06 拍板)。
                         let mut idxs = std::mem::take(&mut self.folder_cells.2);
                         let mut date = std::mem::take(&mut self.folder_cells.3);
                         if self.folder_cells.0 != self.rows_gen || self.folder_cells.1 != folder {
@@ -10544,16 +11208,60 @@ impl eframe::App for App {
                                 .rows
                                 .iter()
                                 .enumerate()
-                                .filter(|(_, r)| folder_of(&r.path) == folder)
+                                .filter(|(_, r)| path_under_dir(&r.path, &folder))
                                 .map(|(i, _)| i)
                                 .collect();
                             date = timeline::group_date(&self.rows, &idxs);
                             self.folder_cells.0 = self.rows_gen;
                             self.folder_cells.1 = folder.clone();
                         }
-                        self.album_label(ui, &folder, &date, idxs.len());
+                        // 过滤词跟着目录走:换了目录就清空(资源管理器直觉,
+                        // 免得在别的文件夹里对着"莫名少了一半"的网格发愣)。
+                        if self.folder_filter_owner != folder {
+                            self.folder_filter.clear();
+                            self.folder_filter_owner = folder.clone();
+                        }
+                        // 文件名过滤(大小写不敏感,只匹配文件名本身,不动缓存)。
+                        let needle = self.folder_filter.trim().to_lowercase();
+                        let filtered = !needle.is_empty();
+                        let shown: Vec<usize> = if filtered {
+                            idxs.iter()
+                                .copied()
+                                .filter(|&i| {
+                                    self.rows[i]
+                                        .path
+                                        .rsplit(['\\', '/'])
+                                        .next()
+                                        .is_some_and(|n| n.to_lowercase().contains(&needle))
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
+                        let cells: &[usize] = if filtered { &shown } else { &idxs };
+                        self.album_label(ui, &folder, &date, cells.len(), true);
+                        if filtered {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "文件名过滤:匹配 {} / 共 {} 张",
+                                    cells.len(),
+                                    idxs.len()
+                                ))
+                                .size(11.5)
+                                .color(crate::theme::p().muted),
+                            );
+                        }
                         ui.add_space(4.0);
-                        self.photo_grid(ui, "folder-grid", &idxs);
+                        if cells.is_empty() && filtered {
+                            ui.label(format!(
+                                "此文件夹里没有文件名含「{}」的照片。",
+                                self.folder_filter.trim()
+                            ));
+                        } else if self.folder_details {
+                            self.photo_details(ui, "folder-details", cells);
+                        } else {
+                            self.photo_grid(ui, "folder-grid", cells);
+                        }
                         self.folder_cells.2 = idxs;
                         self.folder_cells.3 = date;
                     }
@@ -11015,7 +11723,8 @@ impl eframe::App for App {
                                 "版本 {} · Rust + egui 编写的本地照片管理应用",
                                 env!("CARGO_PKG_VERSION")
                             ));
-                            ui.label("全本地、无联网;文件夹优先,绝不复制或移动原图。");
+                            ui.strong("神笔马良,本地照片 AI 管家");
+                            ui.label("秒查速览、智能标签、对话搜图、一键搞定");
                         });
                     });
                     ui.separator();

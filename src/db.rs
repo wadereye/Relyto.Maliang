@@ -42,9 +42,64 @@ pub struct Store {
     pub hard_purged: std::sync::atomic::AtomicUsize,
 }
 
-/// 数据目录配置文件名:固定放**默认**目录里,先于任何库打开就能读到
+/// 统一配置文件名:数据目录定位([location] 节)与自动更新/模型下载
+/// ([update] 节)都在这一份里,固定放**默认**目录,先于任何库打开就能读到
 /// (避免「配置本身存在哪」的自指问题)。环境变量 MALIANG_DATA_DIR 仍最高优先。
-const LOCATION_FILE: &str = "data.location";
+pub(crate) const SETTINGS_FILE: &str = "maliang.ini";
+/// 11-07 统一配置前的旧 marker 名,只读兼容(迁移函数会把旧文件并入删除)。
+const LEGACY_LOCATION_FILE: &str = "data.location";
+/// 11-07 统一配置前的旧升级配置名(曾放 exe 同目录或数据目录)。
+const LEGACY_UPDATE_FILE: &str = "update.ini";
+
+/// 统一配置文件模板(首启无配置时写入;[location] 归本模块,[update] 节
+/// 供升级/模型下载用,解析端只认键不认节,节头仅作视觉分组)。
+pub const SETTINGS_TEMPLATE: &str = "\
+# Relyto.Maliang 统一配置文件:数据目录 + 自动更新 + 模型下载。
+# 本文件固定存放于此目录(便携版可放 exe 同目录),不随数据目录迁移。
+# 改完重启程序生效;「帮助 > 检查更新 > 打开配置文件」可直达。
+
+[location]
+# 数据目录:索引库、缩略图缓存、人脸模型都放这里。
+# 留空 = 默认(Windows: %APPDATA%\\Relyto\\Maliang)。
+# 改动后重启,旧目录内容会自动搬到新目录,搬完旧目录会被删除。
+data_dir=
+
+[update]
+# UpdateURL 指向一份版本清单(纯文本 key=value),例如:
+#   UpdateURL=https://example.com/maliang/latest.ini
+# 留空 = 关闭自动更新。
+UpdateURL=
+
+# 两次自动检查之间的最小间隔(小时)。手动检查不受此限制。
+CheckIntervalHours=24
+
+# 启动后空闲多少秒才发起第一次自动检查(扫描/导入/服务装卸中一律推迟)。
+IdleDelaySeconds=20
+
+# 启动后是否自动检查;0 = 只在手动点「检查更新」时联网。
+AutoCheck=1
+
+# 发现新版本后是否自动在后台下载;0 = 只提示,由用户点「下载」。
+AutoDownload=1
+
+# 代理:system(默认,读系统/环境变量代理) / none(直连) / http://host:port。
+# 企业网络里环境变量代理指向不对时,可填 none 或显式地址。
+Proxy=system
+
+# 安装后是否立刻把索引服务起回来。1(默认)= 尽量不中断索引;
+# 0 = 保持停止,等程序重启或开机自启。跨大版本、服务与界面协议不兼容时设 0 更稳。
+RestartService=1
+
+# 下载分段大小(MB)。慢网可调小到 1,让每段的时间预算更容易满足。
+ChunkMB=2
+
+# 模型下载目录:服务端放模型文件的目录,结尾带「/」,例如:
+#   ModelURL=https://example.com/maliang/models/
+# 程序按固定文件名(face_det.onnx / face_rec.onnx)在这个目录下取文件,
+# 存进数据目录的 models\\。留空 = 不提供下载,界面只给手动放置指引。
+# 建议用 https;模型由服务端自行选择与授权,程序只校验它能否被加载。
+ModelURL=
+";
 
 /// 默认数据目录(marker 文件所在;env/marker 都不生效时它就是数据目录)。
 fn default_data_dir() -> PathBuf {
@@ -79,7 +134,12 @@ fn parse_location(text: &str) -> (Option<PathBuf>, Option<PathBuf>) {
 /// 那份 —— 两边各一套,图库永远看不到服务入库的元数据)。
 /// 标记放 `ProgramData` 一份,`--install-service`(提权)写、服务读。
 fn machine_marker_path() -> PathBuf {
-    machine_default_dir().join(LOCATION_FILE)
+    machine_default_dir().join(SETTINGS_FILE)
+}
+
+/// 机器级标记文本:统一名优先,旧 data.location 兜底。
+fn machine_marker_text() -> Option<String> {
+    read_marker_text(&machine_default_dir())
 }
 
 /// 机器级默认数据目录。**必须与账号无关**:
@@ -107,8 +167,7 @@ fn machine_default_dir() -> PathBuf {
 }
 
 fn machine_marker_dir() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(machine_marker_path()).ok()?;
-    parse_location(&text).0
+    machine_marker_text().and_then(|t| parse_location(&t).0)
 }
 
 /// 本进程是否以服务形态运行(只有 `--service` 入口会置起)。
@@ -138,13 +197,24 @@ fn resolve_data_dir(user: Option<PathBuf>, machine: Option<PathBuf>, as_service:
 }
 
 fn marker_data_dir() -> Option<PathBuf> {
-    let text = std::fs::read_to_string(default_data_dir().join(LOCATION_FILE)).ok()?;
-    parse_location(&text).0
+    read_marker_text(&default_data_dir()).and_then(|t| parse_location(&t).0)
+}
+
+/// 统一配置文件的固定位置(用户级)。升级/模型配置也放这一份(update.rs 用)。
+pub fn default_settings_path() -> PathBuf {
+    default_data_dir().join(SETTINGS_FILE)
+}
+
+/// 读目录下的配置文本:统一名优先,旧 marker 名兜底(迁移前的存量安装)。
+fn read_marker_text(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(dir.join(SETTINGS_FILE))
+        .ok()
+        .or_else(|| std::fs::read_to_string(dir.join(LEGACY_LOCATION_FILE)).ok())
 }
 
 /// 数据目录(索引库 + 模型)。优先级:MALIANG_DATA_DIR 环境变量 >
-/// 用户默认目录下的 `data.location` 标记(选项页写入)>
-/// 机器级 `data.location`(装服务时写入)> 默认目录
+/// 用户默认目录下 maliang.ini 的 [location](选项页写入)>
+/// 机器级 maliang.ini(装服务时写入)> 默认目录
 /// (服务形态 = ProgramData,普通进程 = 用户 AppData)。
 pub fn data_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("MALIANG_DATA_DIR") {
@@ -168,34 +238,71 @@ pub fn data_dir() -> PathBuf {
 pub fn sync_machine_marker() -> std::io::Result<PathBuf> {
     let marker = machine_marker_path();
     std::fs::create_dir_all(marker.parent().unwrap())?;
-    std::fs::write(&marker, format!("data_dir={}\n", data_dir().display()))?;
+    // 机器级文件只由本函数写(不含 [update] 节),整份重写安全。
+    // 旧 data.location 留着不删:服务可能还是按旧文件名读的旧版。
+    std::fs::write(&marker, format!("[location]\ndata_dir={}\n", data_dir().display()))?;
     Ok(marker)
 }
 
-/// 选项页:设定数据目录(写 marker;`None` = 恢复默认)。
+/// 选项页:设定数据目录(写统一配置的 [location] 节;`None` = 恢复默认)。
 /// 记下 `pending_from = 当前数据目录`,下次启动把旧文件复制过去;
 /// 本会话继续用原目录,保证写库不中断。
+/// 同一文件里的 [update] 节与注释原样保留,只增删 location 两行。
 pub fn set_data_dir(dir: Option<&Path>) -> std::io::Result<()> {
-    let marker = default_data_dir().join(LOCATION_FILE);
+    let marker = default_data_dir().join(SETTINGS_FILE);
     let _ = std::fs::create_dir_all(default_data_dir());
-    match dir {
+    let (data_line, pending_line) = match dir {
         Some(d) => {
             let cur = data_dir();
-            let mut text = format!("data_dir={}\n", d.display());
-            if cur != d {
-                text.push_str(&format!("pending_from={}\n", cur.display()));
-            }
-            std::fs::write(&marker, text)
+            let pending = (cur != d).then(|| format!("pending_from={}", cur.display()));
+            (Some(format!("data_dir={}", d.display())), pending)
         }
+        None => (None, None),
+    };
+    // 旧 marker 还在(未迁移)时以它为底本,顺手完成到新文件名的搬迁。
+    // 旧文件留着不删:可能还有按旧名读配置的旧版程序在跑。
+    let existing = read_marker_text(&default_data_dir()).unwrap_or_default();
+    std::fs::write(&marker, rewrite_marker_text(&existing, data_line, pending_line))?;
+    Ok(())
+}
+
+/// 把 data_dir=/pending_from= 两行写进配置文本,其余行(注释、[update] 节)
+/// 原样保留。`None` = 抹掉该行。行插在 [location] 节头之后;旧 marker 没有
+/// 节结构,插在最前 —— 读取端逐行找前缀,位置无关。
+fn rewrite_marker_text(
+    existing: &str,
+    data_line: Option<String>,
+    pending_line: Option<String>,
+) -> String {
+    let kept: Vec<String> = existing
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !(t.starts_with("data_dir=") || t.starts_with("pending_from="))
+        })
+        .map(String::from)
+        .collect();
+    let mut kept = kept;
+    let insert_at = match kept.iter().position(|l| l.trim() == "[location]") {
+        Some(i) => i + 1,
         None => {
-            match std::fs::remove_file(&marker) {
-                Ok(()) => Ok(()),
-                // 没有标记 = 已经是默认,视为成功。
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
+            if kept.iter().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')) {
+                kept.insert(0, "[location]".into());
+                1
+            } else {
+                0
             }
         }
+    };
+    if let Some(p) = pending_line {
+        kept.insert(insert_at, p);
     }
+    if let Some(d) = data_line {
+        kept.insert(insert_at, d);
+    }
+    let mut out = kept.join("\n");
+    out.push('\n');
+    out
 }
 
 /// 启动早期(Store 打开前)执行 pending 迁移:把 `pending_from` 目录里的
@@ -211,8 +318,8 @@ pub fn migrate_pending_data() {
     if env_set {
         return;
     }
-    let marker_path = default_data_dir().join(LOCATION_FILE);
-    let Ok(text) = std::fs::read_to_string(&marker_path) else {
+    let marker_path = default_data_dir().join(SETTINGS_FILE);
+    let Some(text) = read_marker_text(&default_data_dir()) else {
         return;
     };
     let (target, pending) = parse_location(&text);
@@ -224,26 +331,20 @@ pub fn migrate_pending_data() {
         let _ = std::fs::create_dir_all(&target);
         if copy_missing_recursive(&from, &target) {
             remove_tree_best_effort(&from);
-            let kept: Vec<&str> = text
-                .lines()
-                .filter(|l| !l.starts_with("pending_from="))
-                .collect();
-            let _ = std::fs::write(&marker_path, kept.join("\n") + "\n");
+            let kept = rewrite_marker_text(&text, Some(format!("data_dir={}", target.display())), None);
+            let _ = std::fs::write(&marker_path, kept);
         }
     } else {
         // 指回自身:清掉 pending 即可。
-        let kept: Vec<&str> = text
-            .lines()
-            .filter(|l| !l.starts_with("pending_from="))
-            .collect();
-        let _ = std::fs::write(&marker_path, kept.join("\n") + "\n");
+        let kept = rewrite_marker_text(&text, Some(format!("data_dir={}", target.display())), None);
+        let _ = std::fs::write(&marker_path, kept);
     }
 }
 
 /// 递归复制 `src` → `dst`,只复制目标缺失的文件(已有文件一律不覆盖,
 /// 避免「旧默认目录的陈旧副本回写覆盖新目录里更新的数据」)。
 /// 逐文件先写 `.tmp` 再改名;返回是否全部成功。
-/// 跳过:marker 本身、`*.tmp`、mft_report.txt(瞬态文件)。
+/// 跳过:配置文件本身、`*.tmp`、mft_report.txt(瞬态文件)。
 fn copy_missing_recursive(src: &Path, dst: &Path) -> bool {
     let mut ok = true;
     let Ok(entries) = std::fs::read_dir(src) else {
@@ -252,7 +353,11 @@ fn copy_missing_recursive(src: &Path, dst: &Path) -> bool {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == LOCATION_FILE || name_s == "mft_report.txt" || name_s.ends_with(".tmp") {
+        if name_s == SETTINGS_FILE
+            || name_s == LEGACY_LOCATION_FILE
+            || name_s == "mft_report.txt"
+            || name_s.ends_with(".tmp")
+        {
             continue;
         }
         let s = entry.path();
@@ -299,6 +404,105 @@ fn remove_tree_best_effort(dir: &Path) {
         }
     }
     let _ = std::fs::remove_dir(dir);
+}
+
+/// 首启一次性迁移(11-07 配置统一):把旧 `data.location` 与旧 `update.ini`
+/// 并入统一配置 maliang.ini。
+/// **旧文件一律保留不删**:机器上可能还装着按旧文件名读配置的旧版程序
+/// (尤其索引服务),删了它就会退回默认目录另建一套库(2026-11-05 分裂事故
+/// 的剧本);读端对旧名做了兼容,新旧并存互不干扰,等全系统升到新版再清理。
+/// data_dir= 并入模板的 [location] 节;update.ini 原文追加到文件尾
+/// (模板最后一节就是 [update],裸键值自动归属,解析端逐行找键不看节)。
+pub fn migrate_legacy_configs() {
+    // 便携部署(exe 同目录放统一配置)以它为准,不生成第二份。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            if d.join(SETTINGS_FILE).exists() {
+                return;
+            }
+        }
+    }
+    let dir = default_data_dir();
+    // 统一配置已在(迁移过或用户已在用)就绝不再写:旧文件按「只增不删」
+    // 政策一直都在,没有这道闸,每次启动都会用模板把用户改过的配置冲掉。
+    if !default_settings_path().exists() {
+        let loc = std::fs::read_to_string(dir.join(LEGACY_LOCATION_FILE)).ok();
+        let upd = legacy_update_ini_text();
+        if loc.is_some() || upd.is_some() {
+            // 默认目录可能尚不存在(全新机器上不会走到这;存量老安装由
+            // marker 迁移首次落笔),fs::write 不自建目录,必须先建。
+            let _ = std::fs::create_dir_all(&dir);
+            let mut lines: Vec<String> = SETTINGS_TEMPLATE.lines().map(String::from).collect();
+            if let Some(t) = &loc {
+                let tpl = lines
+                    .iter()
+                    .position(|l| l.trim() == "data_dir=")
+                    .unwrap_or(0);
+                let loc_lines: Vec<String> = t.lines().map(String::from).collect();
+                let has_data = loc_lines
+                    .iter()
+                    .any(|l| l.trim_start().starts_with("data_dir="));
+                let at = if has_data { tpl } else { tpl + 1 };
+                if has_data {
+                    lines.remove(tpl);
+                }
+                for (k, ll) in loc_lines.iter().enumerate() {
+                    lines.insert(at + k, ll.clone());
+                }
+            }
+            let mut text = lines.join("\n");
+            text.push('\n');
+            if let Some(t) = &upd {
+                // 只搬键值行:模板已含全部用法说明,旧文件里的注释是历史
+                // 叙事,不该带进给用户的配置。
+                let kv: Vec<&str> = t
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| {
+                        !l.is_empty()
+                            && !l.starts_with('#')
+                            && !l.starts_with(';')
+                            && !l.starts_with('[')
+                    })
+                    .collect();
+                if !kv.is_empty() {
+                    text.push_str("\n# —— 以下键值由旧 update.ini 自动并入 ——\n");
+                    for l in kv {
+                        text.push_str(l);
+                        text.push('\n');
+                    }
+                }
+            }
+            let _ = std::fs::write(default_settings_path(), text);
+        }
+    }
+    // 机器级 marker 换名(服务读);同样只增不删。普通进程写不动 ProgramData
+    // 就留给装服务动作补。
+    let mdir = machine_default_dir();
+    if !mdir.join(SETTINGS_FILE).exists() {
+        if let Ok(t) = std::fs::read_to_string(mdir.join(LEGACY_LOCATION_FILE)) {
+            let _ = std::fs::create_dir_all(&mdir);
+            let _ = std::fs::write(mdir.join(SETTINGS_FILE), format!("[location]\n{t}"));
+        }
+    }
+}
+
+/// 旧 update.ini 的内容:exe 同目录优先,其次数据目录(与旧定位规则一致)。
+fn legacy_update_ini_text() -> Option<String> {
+    legacy_update_ini_path().and_then(|p| std::fs::read_to_string(p).ok())
+}
+
+fn legacy_update_ini_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(d) = exe.parent() {
+            let p = d.join(LEGACY_UPDATE_FILE);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+    let p = data_dir().join(LEGACY_UPDATE_FILE);
+    p.exists().then_some(p)
 }
 
 /// 数据目录被迁走时,缓存挂在它下面的子目录名(与 `models` / `Incoming` 同级)。
@@ -432,7 +636,7 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 }
 
 /// 递归搬运(只搬目标缺失的文件),累计搬动数/失败数。
-/// 跳过 marker 本身、`*.tmp` 与瞬态报告文件。
+/// 跳过配置文件本身、`*.tmp` 与瞬态报告文件。
 fn copy_cache_missing(src: &Path, dst: &Path, moved: &mut usize, failed: &mut bool) {
     let Ok(entries) = std::fs::read_dir(src) else {
         *failed = true;
@@ -441,7 +645,11 @@ fn copy_cache_missing(src: &Path, dst: &Path, moved: &mut usize, failed: &mut bo
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == LOCATION_FILE || name_s == "mft_report.txt" || name_s.ends_with(".tmp") {
+        if name_s == SETTINGS_FILE
+            || name_s == LEGACY_LOCATION_FILE
+            || name_s == "mft_report.txt"
+            || name_s.ends_with(".tmp")
+        {
             continue;
         }
         let s = entry.path();
@@ -660,13 +868,15 @@ pub struct L1Ingest {
 
 // ===== 派生作用域账本(方案 P3-14/17/19/21/22) =====
 
-/// `photos.rich_state`:未纳入作用域 —— 结构列齐全,派生列全空,网格里是占位。
+/// `photos.rich_state` 只是**后台派生队列的排队状态**,不是「能不能显示」的开关。
+/// 显示一律照常读磁盘缓存;真排除的目录根本不纳入图库,库里有的行就该显示。
+/// 0 = 还没排进队列(由可见时按张放行 / 闲时低速补齐处理)。
 pub const RICH_OUT: i32 = 0;
-/// `photos.rich_state`:待派生 —— 已进门,排队等缩略图/EXIF。
+/// 1 = 已排队,等缩略图/EXIF。
 pub const RICH_PENDING: i32 = 1;
-/// `photos.rich_state`:已派生。
+/// 2 = 已派生(缓存与 dhash 都在)。
 pub const RICH_DONE: i32 = 2;
-/// `photos.rich_state`:坏文件 —— 已在 `bad_media` 立案,不再每轮重试。
+/// 3 = 坏文件,已在 `bad_media` 立案,不再每轮重试。
 pub const RICH_BAD: i32 = 3;
 
 /// 派生失败多少次才立案进 `bad_media`(方案 P3-22)。
@@ -695,7 +905,9 @@ pub const SRC_INITIAL_DIALOG: &str = "initial_scan_dialog";
 pub const SRC_IMPORT: &str = "import";
 /// `dir_intent.source`:点击展开。
 pub const SRC_CLICK: &str = "click";
-/// 来源:滚动时出现在屏幕上(显示优先),用户没有亲手点进该目录。
+/// 历史账本里出现过的来源值:滚动时上屏过。现在滚动只按张放行、不再写
+/// 目录账本,但旧库里还留着这个字符串,读账本时要认得它。
+#[allow(dead_code)]
 pub const SRC_VIEW: &str = "visible";
 
 /// `state` 是否属于纳入组(方案 P3-17 的第三个条件)。
@@ -2166,11 +2378,12 @@ impl Store {
                  ON CONFLICT(frn64) DO UPDATE SET
                    path=:path, parent=:parent, mtime=:mtime, size=:size,
                    kind=:kind, ext=:ext,
-                   thumb_ok=CASE WHEN photos.mtime<>:mtime THEN 0 ELSE photos.thumb_ok END,
-                   dhash=CASE WHEN photos.mtime<>:mtime THEN NULL ELSE photos.dhash END,
+                   -- 内容变了不清旧缩略图与 dhash:磁盘缓存还在,旧图继续显示、
+                   -- 重复检测分组也不散。只重新排队,等稳定期过后做一次覆盖。
                    rich_state=CASE
+                     WHEN photos.mtime<>:mtime AND photos.thumb_ok=1
+                          AND photos.rich_state<>3 THEN 1
                      WHEN :rich<>1 THEN photos.rich_state
-                     WHEN photos.mtime<>:mtime THEN 1
                      WHEN photos.rich_state=0 THEN 1
                      ELSE photos.rich_state
                    END",
@@ -2738,24 +2951,89 @@ impl Store {
                 .unwrap_or_default()
             });
         }
-        let mut out = self.pending_rich(visible, limit, &[]);
-        if out.len() < limit {
-            let skip: Vec<i64> = out.iter().map(|r| r.0).collect();
-            out.extend(self.pending_rich(&[], limit - out.len(), &skip));
-        }
+        // 第一趟只服务用户眼前那几个目录:立刻做,不设稳定期。
+        // 其余批次都走稳定期:反复改写的文件(下载中、接收目录、编辑器保存)
+        // 等它安静一会儿再重做一次,避免同一张图被反复解码。
+        let out = if visible.is_empty() {
+            self.pending_rich(&[], limit, &[], true)
+        } else {
+            let mut o = self.pending_rich(visible, limit, &[], false);
+            if o.len() < limit {
+                let skip: Vec<i64> = o.iter().map(|r| r.0).collect();
+                o.extend(self.pending_rich(&[], limit - o.len(), &skip, true));
+            }
+            o
+        };
         out
     }
 
-    /// `rich_state=1 AND thumb_ok=0` 的行(方案 P3-20 的取行条件)。
+    /// 闲时低速补齐:既不在常用/导入目录、又不在排除名单里的普通照片。
     ///
-    /// `dirs` 非空时只取这些目录**直属**的行(可见优先那一趟);`skip` 里的
-    /// id 不再返回(兜底那一趟要避开已经拿到的)。SQL 与参数表一起动态拼,
-    /// 但值一律走绑定,不做字符串内插。
-    fn pending_rich(&self, dirs: &[String], limit: usize, skip: &[i64]) -> Vec<(i64, String)> {
+    /// 只在派生队列排空之后由后台调用,每轮固定一小批,不跟用户眼前的图
+    /// 或常用目录抢时间。按最近变更优先取,让全盘的重复检测、首页与时间线
+    /// 数据最终补齐;排除名单在 Rust 侧过滤(名单来自设置,SQL 里查不到)。
+    pub fn missing_idle(&self, limit: usize) -> Vec<(i64, String)> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut sql = String::from("SELECT id, path FROM photos WHERE rich_state=1 AND thumb_ok=0");
+        let cand: Vec<(i64, String, String)> = self.read(|conn| {
+            let mut st = match conn.prepare(
+                "SELECT id, path, parent FROM photos
+                 WHERE rich_state=0 AND thumb_ok=0
+                   AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)
+                 ORDER BY CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
+                               WHEN mtime >= 100000000000 THEN mtime / 1000
+                               ELSE mtime END DESC, id
+                 LIMIT ?1",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([limit as i64 * 4], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .ok()
+            .map(|it| it.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        });
+        let excl = crate::scan::Exclusions::from_store(self);
+        cand
+            .into_iter()
+            .filter(|(_, _, parent)| excl.exclude_layer_dir(Path::new(parent)).is_none())
+            .take(limit)
+            .map(|(id, path, _)| (id, path))
+            .collect()
+    }
+
+    /// 待派生队列里的行(`rich_state=1`)。
+    ///
+    /// 条件不再要求 `thumb_ok=0`:文件改过之后旧缩略图仍留在磁盘上供界面
+    /// 显示,行照样回到队列里刷新一次,`mark_derived` 会整条覆盖回写。
+    /// `dirs` 非空时只取这些目录**直属**的行(可见优先那一趟);`skip` 里的
+    /// id 不再返回(兜底那一趟要避开已经拿到的)。SQL 与参数表一起动态拼,
+    /// 但值一律走绑定,不做字符串内插。
+    fn pending_rich(
+        &self,
+        dirs: &[String],
+        limit: usize,
+        skip: &[i64],
+        settle: bool,
+    ) -> Vec<(i64, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut sql = String::from("SELECT id, path FROM photos WHERE rich_state=1");
+        if settle {
+            // thumb_ok=0 是第一次派生(新照片),不压;thumb_ok=1 是内容改过要
+            // 重做的旧照片,给它一段安静期。归一后的 mtime 是 UNIX 秒。
+            sql.push_str(
+                " AND (thumb_ok=0 OR
+                   CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
+                        WHEN mtime >= 100000000000 THEN mtime / 1000
+                        ELSE mtime END
+                   <= CAST(strftime('%s','now') AS INTEGER) - 20)",
+            );
+        }
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         let dirs: Vec<&String> = dirs
             .iter()
@@ -2774,7 +3052,13 @@ impl Store {
             params.push(Box::new(*id));
             sql.push_str(&format!(" AND id<>?{}", params.len()));
         }
-        sql.push_str(" ORDER BY id");
+        // 最近变更优先:同一批里先做用户刚动过的照片。mtime 在历史库里有
+        // 秒 / 毫秒 / 100ns 三种写法,沿用时间线的归一表达式再排。
+        sql.push_str(
+            " ORDER BY CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
+                            WHEN mtime >= 100000000000 THEN mtime / 1000
+                            ELSE mtime END DESC, id",
+        );
         params.push(Box::new(limit as i64));
         sql.push_str(&format!(" LIMIT ?{}", params.len()));
         self.read(move |conn| {
@@ -3072,6 +3356,31 @@ impl Store {
         })
     }
 
+    /// 按张放行:只把屏幕上这几张缺缓存的照片抬进派生队列。
+    ///
+    /// 调用方已经判过磁盘:这一档缓存确实不在。所以台账说「已生成」也算数 ——
+    /// 缓存文件可能被外部清掉,这时 `thumb_ok` 要一并退回 0,否则队列不会
+    /// 重新生成,格子会一直停在「载入中」。dhash 保留:旧哈希让重复分组不散,
+    /// 重派生完成时由 `mark_derived` 覆盖。坏文件不动,重复调用是幂等的。
+    pub fn promote_photos(&self, ids: &[i64]) -> Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let ids = ids.to_vec();
+        self.write(move |conn| {
+            let mut st = conn.prepare(
+                "UPDATE photos SET rich_state=?1, thumb_ok=0
+                 WHERE id=?2 AND rich_state<>3
+                   AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)",
+            )?;
+            let mut n = 0usize;
+            for id in &ids {
+                n += st.execute(rusqlite::params![RICH_PENDING, id])?;
+            }
+            Ok(n)
+        })
+    }
+
     /// 该目录子树里**已放行**的行(`rich_state<>0`),连同状态一起回读。
     ///
     /// `promote_dir` 改的是库,而网格每帧读的是内存里的 `PhotoRow`,那一列要等
@@ -3144,32 +3453,33 @@ impl Store {
         })
     }
 
-    /// 拿账本复核一遍库里的行,两个方向都走(方案 ⑤):
+    /// 按路径精确取图库行 id(快速查找页双击进预览用)。
     ///
-    /// - **降**:已不在作用域内的整目录退回未纳入(0)。这是「保存时把孤儿记录
-    ///   清零不落盘」在 L2 的对应物 —— 那边清的是父级已不存在的 type-4 记录,
-    ///   我们清的是**已不在作用域内却还占着 rich_state 的行**。文件真被删掉的那一类
-    ///   由 [`Store::delete_l1_frn64`] 直接删行,不在这里。
-    /// - **升**:已在作用域内的整目录把 0 抬回 1(台账里的行抬回 3)。
-    ///   少了这一刀,后来才纳入的目录要等文件 mtime 变一次才重算 —— 用户看到的就是
-    ///   「导入完了照片永远是占位块」。
+    /// 路径口径与 [`Store::rich_states_by_paths`] 一致:快速查找回的路径本就
+    /// 直接拿来做 IN 匹配,这里同样原样等值查询,不做分隔符归一。
+    /// `photos.path` 唯一索引,单条等值查询即索引点查。
+    pub fn photo_id_at(&self, path: &str) -> Option<i64> {
+        self.read(|conn| {
+            conn.query_row("SELECT id FROM photos WHERE path=?1", [path], |r| r.get(0))
+                .ok()
+        })
+    }
+
+    /// 拿账本复核一遍库里的行:把常用目录 / 用户导入目录里还没排队的抬进队列。
     ///
-    /// 判定一律走 [`ScopeGate::dir_derivable`](行级同口径),所以「祖先被纳入但本级
-    /// 命中排除」的目录不会被抬进门,而用户亲手导入的软排除目录不会被降回。
-    /// 返回变动的行数。
+    /// 只做「升」,不再做「降」。派生状态只是排队进度,不是显示开关:
+    /// 目录移出批量计划,不代表它的缓存要作废、更不代表正在排队的几张要被踢出去
+    /// (按张放行随时会往队列里放行几张,降分支会和它抢,把刚放行的又打回 0)。
+    /// 真正的排除由硬排除名单在入库层完成 —— 那些目录根本不进 `photos` 表;
+    /// 文件被删掉由 [`Store::delete_l1_frn64`] 直接删行。
+    ///
+    /// 少了「升」这一刀,后来才纳入的目录要等文件 mtime 变一次才重算,
+    /// 用户看到的就是「导入完了照片永远是占位块」。
+    /// 判定走 [`ScopeGate::dir_derivable`],所以「祖先被纳入但本级命中排除」
+    /// 的目录不会被抬进门。返回变动的行数。
     pub fn reconcile_rich_state(&self, gate: &ScopeGate) -> Result<usize> {
-        let mut demote: Vec<String> = Vec::new();
         let mut promote: Vec<String> = Vec::new();
         self.read(|conn| -> Result<()> {
-            let mut st = conn.prepare("SELECT DISTINCT parent FROM photos WHERE rich_state<>0")?;
-            for r in st.query_map([], |r| r.get::<_, String>(0))? {
-                if let Ok(d) = r {
-                    if !gate.dir_derivable(&d) {
-                        demote.push(d);
-                    }
-                }
-            }
-            drop(st);
             let mut st = conn.prepare("SELECT DISTINCT parent FROM photos WHERE rich_state=0")?;
             for r in st.query_map([], |r| r.get::<_, String>(0))? {
                 if let Ok(d) = r {
@@ -3180,29 +3490,32 @@ impl Store {
             }
             Ok(())
         })?;
-        if demote.is_empty() && promote.is_empty() {
+        if promote.is_empty() {
             return Ok(0);
         }
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let mut n = 0usize;
             {
-                let mut down =
-                    tx.prepare_cached("UPDATE photos SET rich_state=0 WHERE parent=?1")?;
-                for d in &demote {
-                    n += down.execute(rusqlite::params![d])?;
-                }
-                // 升:台账里的行回 3(仍在案,不出队),其余回 1。
+                // 升:台账里的行回 3(仍在案,不出队);已有缓存的历史行直接
+                // 记成已完成,不再排一次队重做;其余回 1。
                 let mut up_bad = tx.prepare_cached(
                     "UPDATE photos SET rich_state=3 WHERE rich_state=0 AND parent=?1 \
                      AND upper(path) IN (SELECT upper(path) FROM bad_media)",
                 )?;
+                let mut up_done = tx.prepare_cached(
+                    "UPDATE photos SET rich_state=2 WHERE rich_state=0 AND parent=?1 \
+                     AND thumb_ok=1 \
+                     AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)",
+                )?;
                 let mut up = tx.prepare_cached(
                     "UPDATE photos SET rich_state=1 WHERE rich_state=0 AND parent=?1 \
+                     AND thumb_ok=0 \
                      AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)",
                 )?;
                 for d in &promote {
                     n += up_bad.execute(rusqlite::params![d])?;
+                    n += up_done.execute(rusqlite::params![d])?;
                     n += up.execute(rusqlite::params![d])?;
                 }
             }
@@ -3395,6 +3708,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rewrite_marker_preserves_update_section() {
+        // 统一格式:替换 data_dir 两行,注释与 [update] 节原样保留。
+        let src = "# 头注释\n[location]\ndata_dir=C:\\old\n\n[update]\nUpdateURL=http://a/latest.ini\nModelURL=http://a/models/\n";
+        let out = rewrite_marker_text(
+            src,
+            Some("data_dir=D:\\new".into()),
+            Some("pending_from=C:\\old".into()),
+        );
+        assert!(out.contains("data_dir=D:\\new"));
+        assert!(out.contains("pending_from=C:\\old"));
+        assert!(out.contains("[update]"));
+        assert!(out.contains("UpdateURL=http://a/latest.ini"));
+        assert!(out.contains("ModelURL=http://a/models/"));
+        assert!(!out.contains("data_dir=C:\\old"));
+        // 旧 marker(无节结构、纯键值):旧行滤净后重建 [location] 节。
+        let out = rewrite_marker_text(
+            "data_dir=D:\\maliang\npending_from=D:\\orig\n",
+            Some("data_dir=E:\\elsewhere".into()),
+            None,
+        );
+        assert!(out.contains("data_dir=E:\\elsewhere"));
+        assert!(!out.contains("pending_from="));
+        assert_eq!(out.matches("data_dir=").count(), 1);
+        // 空底本(首启):生成最小 [location] 节。
+        let out = rewrite_marker_text("", Some("data_dir=D:\\x".into()), None);
+        assert_eq!(out, "[location]\ndata_dir=D:\\x\n");
+    }
+
+    #[test]
     fn parse_location_reads_both_lines_and_ignores_junk() {
         let (d, p) = parse_location("data_dir=D:\\mliang\npending_from=C:\\Users\\x\\AppData\n");
         assert_eq!(d, Some(PathBuf::from("D:\\mliang")));
@@ -3419,6 +3761,7 @@ mod tests {
         std::fs::create_dir_all(&dst).unwrap();
         std::fs::write(src.join("index.db"), b"AAA").unwrap();
         std::fs::write(src.join("sub").join("nameindex.bin"), b"BBB").unwrap();
+        std::fs::write(src.join("maliang.ini"), b"[location]\ndata_dir=X").unwrap();
         std::fs::write(src.join("data.location"), b"data_dir=X").unwrap();
         std::fs::write(src.join("mft_report.txt"), b"r").unwrap();
         std::fs::write(src.join("junk.tmp"), b"t").unwrap();
@@ -3427,7 +3770,8 @@ mod tests {
         assert!(copy_missing_recursive(&src, &dst));
         assert_eq!(std::fs::read(dst.join("index.db")).unwrap(), b"OLD");
         assert_eq!(std::fs::read(dst.join("sub").join("nameindex.bin")).unwrap(), b"BBB");
-        assert!(!dst.join("data.location").exists(), "marker 不随迁");
+        assert!(!dst.join("maliang.ini").exists(), "统一配置不随迁");
+        assert!(!dst.join("data.location").exists(), "旧 marker 不随迁");
         assert!(!dst.join("mft_report.txt").exists());
         assert!(!dst.join("junk.tmp").exists());
         let _ = std::fs::remove_dir_all(&base);
@@ -4025,7 +4369,7 @@ mod tests {
             .unwrap();
         }
         let gate = ScopeGate::load(&store);
-        assert_eq!(store.reconcile_rich_state(&gate).unwrap(), 4, "该动 4 行");
+        assert_eq!(store.reconcile_rich_state(&gate).unwrap(), 3, "该动 3 行");
         let states: Vec<(i64, i64)> = store.read(|conn| {
             let mut st = conn
                 .prepare("SELECT id, rich_state FROM photos ORDER BY id")
@@ -4040,11 +4384,114 @@ mod tests {
             vec![
                 (1, 1), // 新纳入 → 待派生
                 (2, 3), // 新纳入但已在坏文件台账 → 回 3,不出队
-                (3, 0), // 账本里没有 → 退回占位
+                (3, 2), // 已派生、目录不在账本 → 保持,缓存不作废
                 (4, 1), // 软排除 + 用户亲手导入 → 放行
-                (5, 0), // 软排除、没表态 → 仍是占位
+                (5, 0), // 软排除、没表态 → 留给闲时补齐 / 按张放行
             ]
         );
+    }
+
+    /// 对账只升不降:已派生行、正在排队的行、坏文件都保持原状。
+    ///
+    /// 旧口径整目录 `SET rich_state=0`,造出一批「dhash 在、缩略图在、状态却是 0」
+    /// 的矛盾行:重复检测按哈希把它们列成组,界面却拿状态当没图。它还会把
+    /// 刚按张放行、还没轮到生成的行踢回队列外,和显示层抢状态。
+    #[test]
+    fn reconcile_keeps_derived_rows_when_dir_leaves_scope() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state,thumb_ok,dhash) VALUES
+                 (1,'D:\\gone\\done.jpg','D:\\gone',0,0,2,1,777),
+                 (2,'D:\\gone\\waiting.jpg','D:\\gone',0,0,1,0,NULL),
+                 (3,'D:\\gone\\broken.jpg','D:\\gone',0,0,3,0,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let gate = ScopeGate::load(&store);
+        assert!(!gate.dir_derivable("D:\\gone"), "这个目录不在账本里");
+        store.reconcile_rich_state(&gate).unwrap();
+        let states: Vec<(i64, i32, i64, Option<i64>)> = store.read(|conn| {
+            let mut st = conn
+                .prepare("SELECT id, rich_state, thumb_ok, dhash FROM photos ORDER BY id")
+                .unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(
+            states,
+            vec![
+                (1, RICH_DONE, 1, Some(777)),
+                (2, RICH_PENDING, 0, None),
+                (3, RICH_BAD, 0, None),
+            ]
+        );
+    }
+
+    /// 按张放行:只抬点名的那几张,不牵动同目录其它行,坏文件不复活。
+    #[test]
+    fn promote_photos_only_touches_named_rows() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state,thumb_ok) VALUES
+                 (1,'/p/a.jpg','/p',0,0,0,0),
+                 (2,'/p/b.jpg','/p',0,0,0,0),
+                 (3,'/p/c.jpg','/p',0,0,2,1),
+                 (4,'/p/bad.jpg','/p',0,0,3,0)",
+                [],
+            )
+            .unwrap();
+            c.execute("INSERT INTO bad_media(path,reason,since) VALUES('/p/bad.jpg','x',0)", [])
+                .unwrap();
+        }
+        assert_eq!(store.promote_photos(&[1, 4]).unwrap(), 1, "坏文件不复活");
+        // 台账说已生成、但磁盘缓存没了的行,按张放行要一并退回待派生。
+        assert_eq!(store.promote_photos(&[3]).unwrap(), 1);
+        let missing: Vec<i64> = store
+            .missing_tier(1, &[], 10)
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        assert_eq!(missing, vec![1, 3], "只放行点名的两张,同目录其它行不动");
+    }
+
+    /// 首次派生不等稳定期;「已做过又变了」的重做行在后台兜底批次里等安静,
+    /// 但用户当前可见的目录立刻出队 —— 眼前的图优先。
+    #[test]
+    fn redoing_rows_wait_for_quiet_period_but_visible_dirs_do_not() {
+        let store = Store::open_mem().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,rich_state,thumb_ok) VALUES
+                 (1,'/p/fresh.jpg','/p',?1,0,1,0),
+                 (2,'/p/changed.jpg','/p',?1,0,1,1),
+                 (3,'/p/settled.jpg','/p',?2,0,1,1)",
+                rusqlite::params![now, now - 600],
+            )
+            .unwrap();
+        }
+        let mut idle: Vec<i64> = store
+            .missing_tier(1, &[], 10)
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        idle.sort();
+        assert_eq!(idle, vec![1, 3], "首次派生与已安静的重做行照常出队");
+        let mut visible: Vec<i64> = store
+            .missing_tier(1, &["/p".to_string()], 10)
+            .into_iter()
+            .map(|r| r.0)
+            .collect();
+        visible.sort();
+        assert_eq!(visible, vec![1, 2, 3], "可见目录不受稳定期限制");
     }
 
     /// 放行与回读必须是同一条口径(2026-11-05 现场:`AppData` 里早已派生完的图,
@@ -4924,19 +5371,25 @@ mod tests {
         store.mark_tier_done(pid, TIER_BIG).unwrap();
         assert_eq!(store.tier_count(TIER_BIG), 1);
 
-        // Normal 档走 photos.thumb_ok,不走 thumb_tiers;取行还要过派生门
-        // (方案 P3-20):rich_state=0 的行压根不排队。
+        // Normal 档走 photos.thumb_ok,不走 thumb_tiers;取行看的是派生队列
+        // 状态:rich_state=0 的行不进队列(由按张放行 / 闲时补齐处理)。
         assert!(
             store.missing_tier(TIER_NORMAL, &[], 10).is_empty(),
-            "未纳入作用域的行不进回填队列"
+            "没排进派生队列的行不进回填队列"
         );
         store
             .test_conn()
             .execute("UPDATE photos SET rich_state=1 WHERE id=?1", [pid])
             .unwrap();
         assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
+        // 派生完成是 thumb_ok 与 rich_state 一起落定(mark_derived 一条语句):
+        // 只改 thumb_ok 却还停在排队态,属于要重做的行,仍会出队。
         store.test_conn()
             .execute("UPDATE photos SET thumb_ok=1 WHERE id=?1", [pid])
+            .unwrap();
+        assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
+        store.test_conn()
+            .execute("UPDATE photos SET rich_state=2 WHERE id=?1", [pid])
             .unwrap();
         assert!(store.missing_tier(TIER_NORMAL, &[], 10).is_empty());
         assert_eq!(store.tier_count(TIER_NORMAL), 1);
@@ -5026,36 +5479,41 @@ mod tests {
     }
 
     #[test]
-    fn l1_ingest_mtime_change_resets_derived_state() {
+    fn l1_ingest_mtime_change_keeps_old_thumb_and_requeues() {
         let store = Store::open_mem().unwrap();
         store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
         store
             .test_conn()
-            .execute("UPDATE photos SET thumb_ok=1, dhash=123", [])
+            .execute("UPDATE photos SET thumb_ok=1, dhash=123, rich_state=2", [])
             .unwrap();
-        // 内容变了(mtime 前进)→ 缩略图与感知哈希必须作废重派生。
+        // 内容变了(mtime 前进)→ 只重新排队。旧缩略图继续显示、旧 dhash
+        // 让重复分组不散,等后台重派生完成时一次性覆盖。
         store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 2000, 5000)], None).unwrap();
-        let (thumb, dhash): (i64, Option<i64>) = store
+        let (thumb, dhash, rich): (i64, Option<i64>, i32) = store
             .test_conn()
-            .query_row("SELECT thumb_ok, dhash FROM photos", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT thumb_ok, dhash, rich_state FROM photos",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!(thumb, 0);
-        assert_eq!(dhash, None);
-        // mtime 没动 → 派生态保留。
+        assert_eq!((thumb, dhash), (1, Some(123)));
+        assert_eq!(rich, RICH_PENDING, "内容变了要重新排队");
+        // mtime 没动 → 派生态与状态都保留。
         store
             .test_conn()
-            .execute("UPDATE photos SET thumb_ok=1, dhash=999", [])
+            .execute("UPDATE photos SET thumb_ok=1, dhash=999, rich_state=2", [])
             .unwrap();
         store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a2.jpg", 2000, 5000)], None).unwrap();
-        let (thumb, dhash): (i64, Option<i64>) = store
+        let (thumb, dhash, rich): (i64, Option<i64>, i32) = store
             .test_conn()
-            .query_row("SELECT thumb_ok, dhash FROM photos", [], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT thumb_ok, dhash, rich_state FROM photos",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
-        assert_eq!((thumb, dhash), (1, Some(999)));
+        assert_eq!((thumb, dhash, rich), (1, Some(999), RICH_DONE));
     }
 
     #[test]

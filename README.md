@@ -152,6 +152,8 @@ In a slim build, the "People" and "Semantic Search" views will indicate that the
 
 Model files and weights are not distributed with the program (size and licensing reasons). At runtime they live in the `models\` subfolder of the **data directory** (default `%APPDATA%\Relyto\Maliang\models\`; the data directory can be relocated under Options > General). When a model is missing, the corresponding feature shows placement guidance instead of failing; other features are unaffected.
 
+Set `ModelURL=https://your.host/maliang/models/` (the server-side models folder, with a trailing `/`) in the `[update]` section of the unified `maliang.ini` — the copy next to `maliang.exe` wins if present (portable layout), otherwise `%APPDATA%\Relyto\Maliang\maliang.ini`; the "打开配置文件" (Open config file) button, present both under Help > Check for updates and in the face-scheme block of Options > General, opens it directly — and the program can fetch the two face models of the default scheme for you: at startup it checks the models folder and, if something is missing, asks — the download only starts once you confirm in that dialog or press 「下载模型」 (Download models) under Options > General (the recognition model is large, so traffic is never spent on the user's behalf by default). Downloading runs in the background in Range segments with progress in the status bar and the settings page; an interrupted transfer keeps its breakpoint and the next press resumes it. Before a file is put in place it is actually loaded through ONNX Runtime, and anything that fails to load is discarded. The `antelopev2` scheme's weights may not be redistributed, so it stays manual-only. With `ModelURL` left empty the behaviour is exactly as before.
+
 | File | Purpose | Source & license |
 |---|---|---|
 | `face_det.onnx` | Face detection (YuNet, 2023mar release) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/), Apache-2.0 |
@@ -160,11 +162,21 @@ Model files and weights are not distributed with the program (size and licensing
 | `ch_PP-OCRv4_det_infer.onnx` / `ch_PP-OCRv4_rec_infer.onnx` / `ppocr_keys_v1.txt` | Chinese OCR | PP-OCRv4 (PaddleOCR, Apache-2.0) |
 | `clip_vision.onnx` / `clip_text.onnx` / `clip_merges.txt` | Semantic search | OpenAI CLIP (MIT), exported to ONNX |
 
+The program fetches by fixed file names only (`<ModelURL>face_det.onnx`, `<ModelURL>face_rec.onnx`), so **the default source is your own server**. The official URLs below are for lining things up when you stage the files, and for manual placement: prefer the official links, and fall back to an accelerator mirror in China only when the official address is unreachable.
+
+#### Where each face model can actually be downloaded from (measured one by one, 2026-11-07)
+
+| File name in the program | Official URL | Accelerator mirror reachable in China | Measured result |
+|---|---|---|---|
+| `face_det.onnx` | <https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> | OpenCV's official HuggingFace repo <https://huggingface.co/opencv/face_detection_yunet>, mirrored at <https://hf-mirror.com/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx> | Official URL: 200 / 232,589 bytes; `hf-mirror.com` gives the same 200 / 232,589 (`huggingface.co` itself depends on your network — it was unreachable during this measurement). ⚠️ The same path on `raw.githubusercontent.com` returns only a 131-byte Git-LFS pointer — you must go through `media.githubusercontent.com`. opencv_zoo's GitHub Releases carry no model assets. The GitCode mirror of opencv_zoo **cannot serve as a direct source**: `.../raw/main/...onnx` answers 200 with a 6 KB HTML shell, `file.gitcode.com` answers 401, and the `raw.gitcode.com` path is 404. |
+| `face_rec.onnx` | AdaFace publishes PyTorch weights only, hosted on Google Drive (IR-50 / MS1MV2: <https://drive.google.com/file/d/1eUaSHG4pGlIZK7hBkqjyp2fc2epKoBvI>) | No official mirror | The official repo has no ONNX asset at all (GitHub Releases are empty), and the author's later CVLFace repo on HuggingFace ships only `model.safetensors`. So this file is either converted with the script below or staged on your server once converted; AdaFace ONNX files circulating elsewhere are not official releases. |
+| `face_det_v2.onnx`, `face_rec_v2.onnx` | <https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip> (a release asset under tag `v0.7`; `buffalo_l.zip` sits on the same page) | ModelScope's `deepghs/insightface` is an automated community mirror, not official | Official package is 360,662,982 bytes (≈344 MiB; size measured through the GitHub API). After unpacking, rename the detector (SCRFD 10G, `scrfd_10g_bnkps.onnx` inside the package) to `face_det_v2.onnx` and the recognizer (ArcFace R100, `glintr100.onnx`, which is where the 512-d side comes from) to `face_rec_v2.onnx` — take the names actually present in the package as authoritative. The `det_10g.onnx` / `w600k_r50.onnx` files inside `buffalo_l.zip` belong to a different scheme and are not what these names mean. **Redistribution is not permitted by the weight license, so the program never downloads this scheme.** |
+
 Both face schemes are supported; pick one under **Options > General > Face recognition scheme**. The default is YuNet + AdaFace (commercially friendly licenses). Vectors from the two schemes are incompatible — switching prompts a rescan. The detection model type is auto-detected from its output tensor count, so just name the files per the chosen scheme.
 
 Face model setup:
 
-- **Detection (YuNet)**: download the `face_detection_yunet_2023mar.onnx` linked above, rename it to `face_det.onnx`, and drop it into the models folder.
+- **Detection (YuNet)**: download the `face_detection_yunet_2023mar.onnx` linked above, rename it to `face_det.onnx`, and drop it into the models folder. Fetch it through `media.githubusercontent.com` or HuggingFace — the same path on `raw.githubusercontent.com` gives you a 131-byte Git-LFS pointer instead of the model, which the load check rejects.
 - **Recognition (AdaFace)**: the official repository ships PyTorch weights, which must be converted to ONNX first. Download the IR-50 weights per its README (e.g. `adaface_ir50_ms1mv2.ckpt`) and run the following from the AdaFace repository root:
 
   ```python
@@ -184,6 +196,7 @@ Face model setup:
   ```
 
   Put the resulting `face_rec.onnx` into the models folder (512-d output, matching the vector dimension stored in the library).
+- **Optional scheme (antelopev2)**: unpack the official `antelopev2.zip` and rename `scrfd_10g_bnkps.onnx` to `face_det_v2.onnx`, `glintr100.onnx` to `face_rec_v2.onnx` (the 512-d side is the latter) before placing them. `det_10g.onnx` / `w600k_r50.onnx` come from the buffalo_l scheme and are not the files this scheme expects — do not rename those instead. The weight license forbids redistribution, so this scheme stays manual: the program never downloads it.
 
 Model files remain the property of their respective owners; see [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for attribution and license texts.
 
