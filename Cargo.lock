@@ -2037,7 +2037,7 @@ checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
 
 [[package]]
 name = "maliang"
-version = "0.3.4"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",

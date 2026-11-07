@@ -4,13 +4,31 @@ All user-visible changes are documented here, newest first.
 中文版见 [CHANGELOG.md](./CHANGELOG.md)；the full feature list is in
 [README.md](./README.md).
 
-## 0.3.0 (2026-11-06)
+## 0.3.0 (2026-11-07)
 
-This release focuses on four things: a **full-page single-photo editor**,
-**animated-image and PSD previews**, an **in-app self-updater**, and the
-**Recently Updated home album**.
+A major update since v0.2: **disk-wide quick find now runs as a resident
+elevated service**, plus a **full-page single-photo editor**, **read-only
+previews for animated images and PSD / PSB**, an **in-app self-updater**,
+the **Recently Updated home album**, and **unified configuration with
+automatic model provisioning**.
 
 ### Added
+
+**Disk-wide quick find as a resident elevated service**
+
+- The index engine and the UI are now separate processes: volume metadata
+  is only readable by an administrator, so an elevated resident service
+  holds the in-memory index while the non-elevated UI queries it over a
+  local named pipe; a single search returns up to 500 hits with full paths.
+- If the UI cannot reach the service it falls back to per-folder scanning:
+  all other features keep working, only disk-wide quick find is unavailable,
+  and the UI says so explicitly.
+- Subcommands for service install / uninstall / start / stop are provided,
+  along with manual index rebuild and diagnostic entry points.
+- The index now uses a columnar in-memory layout (a name pool plus
+  fixed-width columns) and rebuilds paths by walking parent links instead of
+  storing full path strings; refreshing merges new entries incrementally
+  rather than re-sorting the whole index.
 
 **Full-page single-photo editor**
 
@@ -32,14 +50,15 @@ This release focuses on four things: a **full-page single-photo editor**,
   and friends) preview live; "Apply" commits, "Cancel" discards, and
   every step is undoable.
 
-**Animated images and PSD previews**
+**Read-only previews for animated images and PSD / PSB**
 
 - GIF and animated WebP now play back frame by frame with proper delays
   in the single-photo preview (read-only; files are never modified and
   baking/export are unaffected); indexing and thumbnails still use the
-  first frame.
-- PSD files now render their embedded composite image for thumbnails and
-  previews instead of a placeholder icon.
+  first frame, with caps on frame count and memory use.
+- PSD / PSB files render their embedded composite image for thumbnails and
+  previews; when no composite is present, layers are approximated instead.
+  Read-only files never enter the editing or export pipelines.
 
 **In-app self-updater**
 
@@ -50,11 +69,14 @@ This release focuses on four things: a **full-page single-photo editor**,
   performs the install (one UAC prompt stops the service, swaps the
   executable and restarts it); the new version takes effect on next
   launch, and failures roll back to the previous executable.
-- Update server URL, check interval, proxy and chunk size are all
-  configurable via `update.ini` (a commented template is generated on
-  first launch; the server manifest format ships as an example file).
+- Server URL, check interval, proxy, chunk size and the model directory are
+  all configured in one `maliang.ini` (older data-location settings and
+  `update.ini` are migrated automatically on first launch; the server
+  manifest format ships as an example file).
 - When auto-download is off, a new version is only announced and the
   user decides when to update.
+- `--version` prints the version for scripts; "check only" and
+  "download but do not install" entry points are available for diagnosis.
 
 **Recently Updated home album**
 
@@ -62,6 +84,25 @@ This release focuses on four things: a **full-page single-photo editor**,
   on-disk thumbnails, ordered by update time with a member cap that
   evicts the oldest; the album header offers slideshow and manual
   refresh.
+
+**Single instance and unified configuration**
+
+- Only one UI process per login session; launching a second one activates
+  the existing window and shows a hint, instead of two windows competing
+  for the index service.
+- Data directory, updater settings and model source now live in a single
+  `maliang.ini`; the two older configuration files are migrated at startup.
+
+**Model readiness and background download**
+
+- The People and Semantic Search pages, plus the options page, show the
+  models folder and placement guidance when models are missing.
+- Once a server-side model directory is configured, "Download models"
+  fetches them in a background thread with ranged resume; each file is
+  really loaded once through the runtime before it is accepted, and files
+  that fail to load are discarded.
+- Without that setting the app stays fully manual and ships no third-party
+  download links.
 
 ### Changed
 
@@ -83,9 +124,20 @@ This release focuses on four things: a **full-page single-photo editor**,
 - The People and Semantic Search pages now show the models folder location
   and placement guidance when models are missing, and the options page shows
   per-scheme readiness, instead of failing only when a scan/index is started.
+- Directory watching is now an in-house implementation: the previous
+  third-party backend could terminate the whole process when a file inside
+  a watched folder was deleted on Windows. Rename events are now paired at
+  this layer so stars, labels and other user metadata survive.
+- Updater TLS now uses rustls: the Windows system TLS stack had its
+  handshake reset by the target server, so an independent implementation
+  is used for stable downloads.
 
 ### Improved
 
+- Corrected the volume change-journal reason flags, fixing newly created
+  and genuinely deleted files being missed by the service's incremental
+  updates; incremental finalization is now incremental too, removing
+  quick-find queue jitter.
 - The first-run "quick find service" and "photo scope" prompts are now a
   single two-step wizard window instead of two stacked dialogs.
 - A deletion reconciliation pass runs at startup: photos deleted externally
@@ -101,7 +153,7 @@ This release focuses on four things: a **full-page single-photo editor**,
   dominate the Recently Updated wall, or generate self-inflicted watch
   events.
 - Index refreshing now merges new entries incrementally into the ordered
-  view instead of re-sorting everything.
+  view instead of re-sorting the whole index.
 - When a photo moves to the recycle bin, stale index rows are removed by
   file identifier so search no longer lists deleted files.
 - Folder index states are now explicit: deliberate import / ask no more /
@@ -120,6 +172,12 @@ This release focuses on four things: a **full-page single-photo editor**,
   zoom decode.
 - Fix stale edits lingering in the preview after undo / redo / clear
   effects.
+- Fix the process exiting when a file is deleted inside a watched folder,
+  and user metadata being lost on rename.
+- Fix incremental updates missing creations and deletions, and cloud
+  placeholder files triggering online recalls during backfill.
+- Fix reading an empty configuration before migration completes, which
+  left the updater without its server URL.
 
 ## 0.2.0 (2026-11-03)
 
