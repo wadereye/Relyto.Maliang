@@ -109,6 +109,18 @@ automatic model provisioning**.
   the built-in address is the official distribution directory, and no
   third-party download links are shipped.
 
+**Acting on quick-find results**
+
+- Double-click a result row to open it: folders open in Explorer; images
+  open the in-app preview/editor, with a fallback to the system's
+  associated app (and an explanation) for files not yet in the library;
+  videos and everything else open with the associated app.
+- The result-row context menu matches the gallery menu; files outside the
+  library support open / open containing folder / copy full path /
+  system context menu.
+- The sidebar "Folders" group gains common places: Documents / Desktop /
+  Pictures / Videos.
+
 ### Changed
 
 - Face recognition now offers **two selectable schemes** under Options >
@@ -164,6 +176,10 @@ automatic model provisioning**.
 - Folder index states are now explicit: deliberate import / ask no more /
   never index are recorded in layers, and mistakenly excluded folders can
   be purged from the library in one click.
+- Face scanning upgrade: images are uprighted by EXIF orientation before
+  detection (rotated phone photos no longer miss faces), detection input
+  grows 640→1280 for better small-face recall, and the cluster assignment
+  threshold moves 0.5→0.6 so different people merge less eagerly.
 
 ### Fixed
 
@@ -183,6 +199,9 @@ automatic model provisioning**.
   placeholder files triggering online recalls during backfill.
 - Fix reading an empty configuration before migration completes, which
   left the updater without its server URL.
+- Fix photos with no detected faces staying at the head of the scan queue
+  forever and starving everything behind them (the "analyzed" mark is now
+  decoupled from whether faces were found).
 
 ## 0.2.0 (2026-11-03)
 
