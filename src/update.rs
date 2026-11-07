@@ -4,7 +4,8 @@
 //!
 //! 1. 统一配置 maliang.ini 里的 `UpdateURL` 指向服务端的版本清单(key=value 文本)。
 //!    配置文件优先取 exe 同目录(便携部署),否则取数据目录;环境变量
-//!    `MALIANG_UPDATE_URL` 可临时覆盖。没配 URL 就整个功能静默停用。
+//!    `MALIANG_UPDATE_URL` 可临时覆盖。配置文件不写这个键时用出厂默认地址,
+//!    显式留空才停用整个功能。
 //! 2. [`Updater`] 拉一条后台线程。启动后等一个**空闲窗口**(一段时间没有输入,
 //!    且扫描/导入/导出/服务装卸都不在跑)才发起检查;发现新版本先提示用户,
 //!    随后在后台按 HTTP Range 分段把包写到 `数据目录/update/pending/download.part`,
@@ -375,7 +376,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            url: String::new(),
+            // 出厂默认地址内置在程序里:清掉配置或全新安装也能直接检查更新、
+            // 下载模型,不会因本机配置丢失而失去这两项能力。
+            url: crate::db::DEFAULT_UPDATE_URL.into(),
             interval_hours: DEFAULT_INTERVAL_HOURS,
             idle_secs: DEFAULT_IDLE_SECS,
             auto_check: true,
@@ -383,7 +386,7 @@ impl Default for Config {
             proxy: "system".into(),
             restart_service: true,
             chunk_bytes: CHUNK_BYTES,
-            model_url: String::new(),
+            model_url: crate::db::DEFAULT_MODEL_URL.into(),
             path: PathBuf::new(),
         }
     }
@@ -395,7 +398,11 @@ impl Config {
             path,
             ..Config::default()
         };
-        c.url = kv.get("updateurl").cloned().unwrap_or_default();
+        // 键不存在 = 保持出厂默认;键存在但值为空 = 用户主动停用。
+        // 这样「配置文件里根本没提」和「明确留空」是两件事。
+        if let Some(v) = kv.get("updateurl") {
+            c.url = v.clone();
+        }
         c.interval_hours = kv
             .get("checkintervalhours")
             .and_then(|v| v.parse::<u64>().ok())
@@ -409,7 +416,9 @@ impl Config {
         c.auto_download = bool_of(kv.get("autodownload"), true);
         c.restart_service = bool_of(kv.get("restartservice"), true);
         c.proxy = kv.get("proxy").cloned().unwrap_or(c.proxy);
-        c.model_url = kv.get("modelurl").cloned().unwrap_or_default();
+        if let Some(v) = kv.get("modelurl") {
+            c.model_url = v.clone();
+        }
         c.chunk_bytes = kv
             .get("chunkmb")
             .and_then(|v| v.parse::<u64>().ok())
@@ -967,7 +976,7 @@ fn fetch_manifest(cfg: &Config) -> Result<Manifest, String> {
 
 fn fetch_manifest_with(agent: &ureq::Agent, cfg: &Config) -> Result<Manifest, String> {
     if cfg.url.is_empty() {
-        return Err("尚未配置 UpdateURL(见「打开配置文件」)".into());
+        return Err("UpdateURL 已置空,自动更新停用(见「打开配置文件」)".into());
     }
     let mut resp = agent
         .get(&cfg.url)
@@ -1583,7 +1592,7 @@ pub fn cli_check() -> Result<(), String> {
     let cfg = load_config();
     println!("配置文件:{}", cfg.path.display());
     if cfg.url.is_empty() {
-        println!("未配置 UpdateURL,自动更新处于停用状态");
+        println!("UpdateURL 已置空,自动更新处于停用状态");
         return Ok(());
     }
     println!("更新地址:{}", cfg.url);
@@ -1610,7 +1619,7 @@ pub fn cli_check() -> Result<(), String> {
 pub fn cli_download() -> Result<(), String> {
     let cfg = load_config();
     if cfg.url.is_empty() {
-        return Err("尚未配置 UpdateURL".into());
+        return Err("UpdateURL 已置空,无法下载".into());
     }
     let m = fetch_manifest(&cfg)?;
     println!("清单:{}", cfg.url);
@@ -2425,12 +2434,19 @@ mod tests {
         assert_eq!(c.interval_hours, DEFAULT_INTERVAL_HOURS);
         assert_eq!(c.idle_secs, DEFAULT_IDLE_SECS);
         assert!(c.auto_check && c.auto_download);
-        assert!(c.url.is_empty());
+        assert_eq!(c.url, crate::db::DEFAULT_UPDATE_URL);
         assert_eq!(c.chunk_bytes, CHUNK_BYTES);
         assert!(c.restart_service);
         assert_eq!(c.proxy, "system");
-        // 模型下载默认关:没填 ModelURL 时界面只给手动放置指引。
-        assert!(c.model_url.is_empty());
+        // 模型下载同样带出厂默认目录,清掉本机配置不会丢地址。
+        assert_eq!(c.model_url, crate::db::DEFAULT_MODEL_URL);
+        // 配置里明确留空 = 用户主动停用;与「根本没写这个键」区分开。
+        let off = Config::from_kv(
+            &parse_kv("UpdateURL=\nModelURL=\n"),
+            PathBuf::from("x.ini"),
+        );
+        assert!(off.url.is_empty());
+        assert!(off.model_url.is_empty());
         let c = Config::from_kv(
             &parse_kv("UpdateURL=https://a/b\nAutoCheck=0\nAutoDownload=no\nIdleDelaySeconds=3\nCheckIntervalHours=0\nProxy=none\nRestartService=0\nChunkMB=4\nModelURL=https://a/models/"),
             PathBuf::from("x.ini"),

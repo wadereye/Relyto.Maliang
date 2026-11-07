@@ -586,6 +586,9 @@ pub struct App {
     zoom_rx: Option<mpsc::Receiver<(i64, Option<image::RgbaImage>)>>,
     #[cfg(feature = "ai")]
     face_rx: Option<mpsc::Receiver<FaceScan>>,
+    /// 人脸扫描取消标志(连续扫描整库可能跑很久,得能中途停)。
+    #[cfg(feature = "ai")]
+    face_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// 人脸扫描本批进度(已走张数, 本批总张数)。
     #[cfg(feature = "ai")]
     face_prog: (usize, usize),
@@ -999,6 +1002,23 @@ fn link_connect() -> Result<crate::ipc::Client, String> {
     }
 }
 
+/// 右键菜单目标:网格行与快速查找命中两条路都能取齐同一组字段,
+/// 菜单本身只认这六个量,不再关心行从哪来(快速查找页因此能
+/// 直接复用图库网格的那份右键菜单)。
+struct CtxPhoto {
+    id: i64,
+    /// 文件全路径(资源管理器 / 编辑器 / 壁纸 / 隐藏都用它)。
+    path: String,
+    /// 所在目录(「纳入此目录(覆盖排除名单)」的判定对象)。
+    parent: String,
+    /// 视频走「播放」,其余走「预览」。
+    movie: bool,
+    /// 当前星标状态(决定菜单显示加还是取消)。
+    star0: bool,
+    /// 这张在不在多选里(批量加/去星标文案用;快速查找页恒为单张)。
+    selected: bool,
+}
+
 /// 快速查找结果行。
 ///
 /// 服务回的命中自带 size/mtime(这几列服务端本来就在内存里握着),
@@ -1145,6 +1165,30 @@ fn spawn_search_worker() -> (
         })
         .expect("启动检索线程失败");
     (req_tx, res_rx, h)
+}
+
+/// 明细列表专用的大小格式:统一 MB 口径(用户要求不再 KB/MB 混排)。
+/// 不足 0.1 MB 的文件保留两位小数,其余一位小数。
+fn fmt_size_mb(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb < 0.1 {
+        format!("{mb:.2} MB")
+    } else {
+        format!("{mb:.1} MB")
+    }
+}
+
+/// `photos.mtime` 的 Rust 侧归一(与 SQL 里的 MTIME_SQL 同一阈值口径):
+/// 历史/扫描器混着写秒、毫秒、微秒,统一折成 UNIX 秒供 fmt_mtime 用。
+fn norm_mtime_secs(raw: i64) -> u64 {
+    let v = if raw >= 100_000_000_000_000 {
+        raw / 1_000_000
+    } else if raw >= 100_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    };
+    v.max(0) as u64
 }
 
 /// 字节数的短格式(与导入面板的 KB/MB 口径一致,补 GB/B 两档)。
@@ -1726,6 +1770,7 @@ const ICON_LIGHT: &[(&str, &[u8])] = &[
     ),
     ("search", include_bytes!("../assets/icons/light/search.svg")),
     ("x", include_bytes!("../assets/icons/light/x.svg")),
+    ("refresh", include_bytes!("../assets/icons/light/refresh.svg")),
 ];
 const ICON_DARK: &[(&str, &[u8])] = &[
     (
@@ -1796,10 +1841,21 @@ const ICON_DARK: &[(&str, &[u8])] = &[
     ),
     ("search", include_bytes!("../assets/icons/dark/search.svg")),
     ("x", include_bytes!("../assets/icons/dark/x.svg")),
+    ("refresh", include_bytes!("../assets/icons/dark/refresh.svg")),
 ];
 
 /// 内置更新日志全文,「帮助 > 关于」里以 Markdown 渲染。
 const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
+
+/// 「关于」窗口用的更新日志:去掉文件头的 H1 标题与说明行(窗口里已另有
+/// 「更新日志」标题,避免重复显示),直接从第一个版本段开始。
+fn about_changelog_md() -> &'static str {
+    static MD: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    MD.get_or_init(|| {
+        let start = CHANGELOG_MD.find("\n## ").map(|i| i + 1).unwrap_or(0);
+        &CHANGELOG_MD[start..]
+    })
+}
 
 /// 取当前主题的图标字节;URI 带主题段,切主题即重载纹理。
 fn icon_source(name: &str) -> (&'static str, &'static [u8]) {
@@ -2289,6 +2345,8 @@ impl App {
             #[cfg(feature = "ai")]
             face_rx: None,
             #[cfg(feature = "ai")]
+            face_cancel: None,
+            #[cfg(feature = "ai")]
             face_prog: (0, 0),
             #[cfg(feature = "ai")]
             face_people: Vec::new(),
@@ -2388,6 +2446,18 @@ impl App {
             self.store.clone(),
             crate::thumbs::visible_dirs(),
         ));
+        // 首启补图顺序:先把常用目录(我的文档/我的图片/桌面)铺出来,
+        // 排空后才按「最新照片优先」兜底其余全库 —— 即使向导答的是
+        // 「全盘」,眼前的常用目录也是第一批出图,洪峰在后台慢慢补。
+        // 用户切进别的目录时会整体替换这份清单(见 publish_visible)。
+        if let Some(w) = &self.thumb_bg {
+            w.publish_visible(
+                crate::db::default_roots()
+                    .into_iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            );
+        }
         // 预览后台 worker(解码 + 落盘 previews/ 缓存,不阻塞 UI)
         self.preview_bg = Some(crate::thumbs::spawn_preview_worker(self.store.clone()));
         // 启动时静默导入新照片的 XMP sidecar(外部工具写的星标/标签,DB 权威不覆盖)
@@ -2426,20 +2496,22 @@ impl App {
                 self.start_scan_roots_ext(roots, "启动对账", true);
             }
         }
-        // 缩略图缓存 GC:清「盘上有文件、库里无此行」的孤儿(旧版本遗留、
-        // 历史清行没带走的那批)。硬排除清理这次真摘了行,或从来没跑过 GC
-        // 时才做一次大扫;后台线程跑,不挡启动。
+        // 缩略图缓存:数据目录迁走后,旧系统缓存要在后台搬到新落点;
+        // 孤儿 GC 与台账对账排在它后面串行跑 —— 否则「文件还没搬到、
+        // 台账却说丢了」会把整库缩略图重生成一遍。GC 只在硬排除清理
+        // 真摘了行、或从来没跑过时做一次大扫。
         {
             let purged = self
                 .store
                 .hard_purged
                 .load(std::sync::atomic::Ordering::Relaxed);
-            let first = self.store.get_setting("thumb_gc_v1").is_none();
-            if purged > 0 || first {
-                let store = self.store.clone();
-                let gctx = ctx.clone();
-                std::thread::spawn(move || {
-                    crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let need_gc = purged > 0 || self.store.get_setting("thumb_gc_v1").is_none();
+            let store = self.store.clone();
+            let gctx = ctx.clone();
+            std::thread::spawn(move || {
+                crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+                crate::db::auto_relocate_system_cache();
+                if need_gc {
                     let root = crate::db::cache_dir();
                     // 孤儿文件 GC + 台账缺失对账:前者清「文件在、行没了」的
                     // 垃圾,后者救「台账在、文件没了」的灰格子(缓存目录被
@@ -2447,9 +2519,9 @@ impl App {
                     let _ = crate::thumbs::gc_orphans(&store, &root);
                     let _ = crate::thumbs::gc_missing_tiers(&store, &root);
                     let _ = store.set_setting("thumb_gc_v1", "1");
-                    gctx.request_repaint();
-                });
-            }
+                }
+                gctx.request_repaint();
+            });
         }
         // 首次启动先问派生作用域(两档单选、无取消,必须答一次)。
         // 答完才落账 `dir_intent` 并发起首扫;`skip_initial_scan` 偏好短路 ——
@@ -3194,35 +3266,105 @@ impl App {
                             if resp.clicked() {
                                 self.name_sel = Some(h.path.clone());
                             }
-                            // 右键出应用内菜单:常用动作直达,系统原生的那一份
-                            // (Shell IContextMenu)也收在末项里,不丢功能。
+                            // 右键出应用内菜单。已入库的媒体命中(photos 表只收
+                            // 媒体)直接复用图库网格那份右键菜单 —— 预览/星标/
+                            // 相簿/壁纸一应俱全,末尾补两条文件级动作;未入库的
+                            // 文件与目录仍是文件菜单。系统原生那份(Shell
+                            // IContextMenu)两条路都收在末项里,不丢功能。
                             let mut open_clicked = false;
+                            let mut star_clicked = false;
+                            let mut preview_clicked = false;
+                            let mut ctx_id: Option<i64> = None;
                             resp.context_menu(|ui| {
-                                if ui.button("打开").clicked() {
-                                    open_clicked = true;
-                                    ui.close();
-                                }
-                                if ui
-                                    .button(if h.is_dir {
-                                        "打开文件夹"
-                                    } else {
-                                        "打开所在文件夹"
-                                    })
-                                    .clicked()
-                                {
-                                    revealed = Some(h.path.clone());
-                                    ui.close();
-                                }
-                                if ui.button("复制完整路径").clicked() {
-                                    ui.ctx().copy_text(h.path.clone());
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("系统右键菜单…").clicked() {
-                                    menu_for = Some(h.path.clone());
-                                    ui.close();
+                                // photo_id_at 是唯一索引点查,只在右键那一帧
+                                // 对那一行执行,平时零开销。
+                                let lib_id = if h.is_dir {
+                                    None
+                                } else {
+                                    self.store.photo_id_at(&h.path)
+                                };
+                                if let Some(pid) = lib_id {
+                                    let (star, kind) = self
+                                        .store
+                                        .photo_brief_by_id(pid)
+                                        .unwrap_or((0, 0));
+                                    let t = CtxPhoto {
+                                        id: pid,
+                                        path: h.path.clone(),
+                                        parent: Path::new(&h.path)
+                                            .parent()
+                                            .map(|d| d.to_string_lossy().into_owned())
+                                            .unwrap_or_default(),
+                                        movie: kind == i64::from(crate::video::kind::MOVIE),
+                                        star0: star != 0,
+                                        selected: false,
+                                    };
+                                    self.photo_ctx_menu(
+                                        ui,
+                                        &t,
+                                        &mut star_clicked,
+                                        &mut preview_clicked,
+                                    );
+                                    ctx_id = Some(pid);
+                                    ui.separator();
+                                    if ui.button("复制完整路径").clicked() {
+                                        ui.ctx().copy_text(h.path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("系统右键菜单…").clicked() {
+                                        menu_for = Some(h.path.clone());
+                                        ui.close();
+                                    }
+                                } else {
+                                    if ui.button("打开").clicked() {
+                                        open_clicked = true;
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button(if h.is_dir {
+                                            "打开文件夹"
+                                        } else {
+                                            "打开所在文件夹"
+                                        })
+                                        .clicked()
+                                    {
+                                        revealed = Some(h.path.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("复制完整路径").clicked() {
+                                        ui.ctx().copy_text(h.path.clone());
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("系统右键菜单…").clicked() {
+                                        menu_for = Some(h.path.clone());
+                                        ui.close();
+                                    }
                                 }
                             });
+                            if star_clicked {
+                                if let Some(pid) = ctx_id {
+                                    self.toggle_star(pid);
+                                }
+                            }
+                            if preview_clicked {
+                                // 与图库菜单同一语义:视频交给系统播放器,
+                                // 图片走下方的预览路由(库里那行已在手)。
+                                if let Some(pid) = ctx_id {
+                                    let movie = self
+                                        .store
+                                        .photo_brief_by_id(pid)
+                                        .map(|(_, k)| {
+                                            k == i64::from(crate::video::kind::MOVIE)
+                                        })
+                                        .unwrap_or(false);
+                                    if movie {
+                                        opened = Some(h.path.clone());
+                                    } else {
+                                        preview_req = Some(h.path.clone());
+                                    }
+                                }
+                            }
                             // 双击与菜单「打开」同一路由:目录直接进资源管理器;
                             // 图片请求本系统预览(库里有没有这行,表外再查);
                             // 视频与其余类型交给系统关联程序。
@@ -3392,7 +3534,7 @@ impl App {
                         ui.end_row();
                         ui.label("更新地址");
                         ui.label(if cfg.url.is_empty() {
-                            "未配置(自动更新停用)".to_string()
+                            "已停用(配置里留空)".to_string()
                         } else {
                             cfg.url.clone()
                         });
@@ -3475,7 +3617,7 @@ impl App {
                 ui.small("当前窗口继续运行,请尽快重新启动程序以使用新版本(服务与界面版本一致更稳)。");
                 if cfg.url.is_empty() {
                     ui.add_space(4.0);
-                    ui.small("在配置文件里填 UpdateURL=https://你的域名/清单地址 后即可启用。");
+                    ui.small("配置里把 UpdateURL 留空,自动更新已停用;填回地址即可启用。");
                 }
             });
 
@@ -4719,7 +4861,7 @@ impl App {
                     ui.small(format!("缺少 {det_f} / {rec_f}:该方案的权重许可不可再分发,只能自备"));
                 } else if self.models.model_base().is_empty() {
                     ui.small(format!(
-                        "缺少 {det_f} / {rec_f}:自行放入模型目录,或在 maliang.ini 填 ModelURL 后由程序下载"
+                        "缺少 {det_f} / {rec_f}:自行放入模型目录,或把 maliang.ini 里的 ModelURL 填回地址后由程序下载"
                     ));
                 } else {
                     ui.small(format!("可从服务端下载:{}", self.models.model_base()));
@@ -4849,9 +4991,14 @@ impl App {
         let (tx, rx) = mpsc::channel();
         self.face_rx = Some(rx);
         self.face_prog = (0, 0);
-        self.status = "正在人脸识别(扫描 200 张照片)…".into();
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.face_cancel = Some(cancel.clone());
+        let remaining = crate::faces::remaining_count(&store);
+        self.status = format!("正在人脸识别(全库连续扫描,剩余 {remaining} 张)…");
         std::thread::spawn(move || {
-            let res = crate::faces::scan_batch(&store, 200, &|done, total| {
+            // 连续扫描直到队列空:此前单批 200 张,无人脸照片永远卡住队列,
+            // 覆盖整个库要点几百次;face_done 标记修复后一次即可扫完,可取消。
+            let res = crate::faces::scan_all(&store, 200, &cancel, &|done, total| {
                 let _ = tx.send(FaceScan::Progress(done, total));
             })
             .map_err(|e| e.to_string());
@@ -6175,12 +6322,13 @@ impl App {
     }
 
     /// 设为桌面壁纸:后台解码原图 → EXIF 摆正 → 存临时 JPEG → SystemParametersInfoW。
-    fn set_wallpaper_for(&mut self, idx: usize) {
+    /// 按路径设壁纸(网格右键与快速查找右键共用;后台线程解码转 JPEG)。
+    fn set_wallpaper(&mut self, path: &str) {
         if self.wallpaper_rx.is_some() {
             self.status = "上一个壁纸设置还在进行中…".into();
             return;
         }
-        let path = PathBuf::from(&self.rows[idx].path);
+        let path = PathBuf::from(path);
         self.status = format!("正在设为桌面壁纸:{}…", path.display());
         let (tx, rx) = mpsc::channel();
         self.wallpaper_rx = Some(rx);
@@ -6464,7 +6612,17 @@ impl App {
 
     /// 切换单张星标(网格右键、预览窗与右栏抽屉共用同一条写库 + 旁文件链路)。
     fn toggle_star(&mut self, id: i64) {
-        let new = if self.star_of(id) != 0 { 0 } else { 1 };
+        // 不在当前视图的行(快速查找页右键的命中)退回查库,拿真实星标值,
+        // 否则第一次点击会按「未加星」算,把已加星的又设成加星。
+        let cur = match self.id_row.get(&id) {
+            Some(&idx) => self.rows[idx].star,
+            None => self
+                .store
+                .photo_brief_by_id(id)
+                .map(|(s, _)| s as i32)
+                .unwrap_or(0),
+        };
+        let new = if cur != 0 { 0 } else { 1 };
         let _ = timeline::set_star(&self.store, id, new);
         if let Some(&idx) = self.id_row.get(&id) {
             self.rows[idx].star = new;
@@ -7031,10 +7189,26 @@ impl App {
                         let sdir = crate::db::system_cache_dir();
                         ui.small(cdir.to_string_lossy().to_string());
                         ui.small(if cdir == sdir {
-                            "在系统缓存目录;数据目录迁走后会自动跟随新数据目录。"
+                            "在系统缓存目录;把数据目录迁走后会跟随到新数据目录的 cache\\ 子目录(重启后生效)。"
                         } else {
-                            "跟随数据目录(可用 MALIANG_CACHE_DIR 单独指定)。"
+                            "跟随数据目录(可用 MALIANG_CACHE_DIR 单独指定);旧缓存会在启动后自动搬到此处。"
                         });
+                        let (mig_state, mig_moved) = crate::db::cache_migration_status();
+                        match mig_state {
+                            1 => {
+                                ui.horizontal(|ui| {
+                                    ui.spinner();
+                                    ui.small("正在把旧缓存搬到新目录…");
+                                });
+                            }
+                            2 if mig_moved > 0 => {
+                                ui.small(format!("已从系统缓存目录搬来 {mig_moved} 个文件。"));
+                            }
+                            3 => {
+                                ui.small("上次自动搬运有文件被占用,旧位置留有残留,可用下方按钮重试。");
+                            }
+                            _ => {}
+                        }
                         // 整树遍历有成本:按 2 秒时间片采样,不每帧重算。
                         let fresh = match self.cache_usage {
                             Some((_, _, at)) => at.elapsed().as_secs_f32() < 2.0,
@@ -7048,13 +7222,21 @@ impl App {
                         if let Some((files, bytes, _)) = self.cache_usage {
                             ui.small(format!("{files} 个文件 · {}", fmt_size(bytes)));
                         }
-                        // 旧位置还有东西就提供一次性的搬运(可再生,但省一轮重解)。
+                        // 自动搬迁只处理四档缩略图;旧位置可能还剩历史备份
+                        // (*.reset-*),留一个手动入口由用户决定是否一起搬。
                         if cdir != sdir && crate::db::system_cache_has_content() {
-                            if ui.button("把旧缓存搬过来").clicked() {
+                            let busy = mig_state == 1;
+                            if ui
+                                .add_enabled(
+                                    !busy,
+                                    egui::Button::new("把旧位置剩余内容搬过来"),
+                                )
+                                .clicked()
+                            {
                                 match crate::db::migrate_cache_from(&sdir) {
                                     Ok((0, _)) => {
                                         self.status =
-                                            "旧缓存无新内容可搬(目标目录已是最新)".into();
+                                            "旧位置无新内容可搬(目标目录已是最新)".into();
                                     }
                                     Ok((n, cleared)) => {
                                         self.status = format!(
@@ -7069,6 +7251,9 @@ impl App {
                                 // 搬完立刻重采,别让面板显示旧数字。
                                 self.cache_usage = None;
                             }
+                            ui.small(
+                                "旧位置若有 *.reset-* 历史备份,后台不会自动搬;点此会整棵搬到新缓存目录并清掉来源。",
+                            );
                         }
                         ui.separator();
                         ui.small("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。");
@@ -7749,6 +7934,33 @@ impl App {
                 None => self.subtree_sel.as_deref() == Some(path.as_str()),
             };
         ui.horizontal(|ui| {
+            // 引导虚线(先画,压在内容底下):祖先层各一条竖虚线,
+            // 本层再一条横虚线接到三角钮 —— 父子层级一眼可见。
+            let line = egui::Stroke::new(1.0_f32, crate::theme::p().faint);
+            let left = ui.cursor().left();
+            let top = ui.cursor().top();
+            let cy = top + 10.0;
+            let mut segs: Vec<egui::Shape> = Vec::new();
+            for i in 0..depth {
+                let x = left + (i as f32) * 10.0 + 5.0;
+                segs.extend(egui::Shape::dashed_line(
+                    &[egui::pos2(x, top), egui::pos2(x, top + 20.0)],
+                    line,
+                    3.0,
+                    3.0,
+                ));
+            }
+            if depth > 0 {
+                let x0 = left + (depth as f32 - 1.0) * 10.0 + 5.0;
+                let x1 = left + (depth as f32) * 10.0 + 12.0;
+                segs.extend(egui::Shape::dashed_line(
+                    &[egui::pos2(x0, cy), egui::pos2(x1, cy)],
+                    line,
+                    3.0,
+                    3.0,
+                ));
+            }
+            ui.painter().extend(segs);
             ui.add_space((depth as f32) * 10.0);
             if !kids.is_empty() {
                 if ui
@@ -7892,7 +8104,11 @@ impl App {
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("刷新").clicked() {
+                if ui
+                    .add(tool_button("refresh", false))
+                    .on_hover_text("刷新最近更新")
+                    .clicked()
+                {
                     act_refresh = true;
                 }
                 if ui
@@ -7943,7 +8159,6 @@ impl App {
         folder: &str,
         date: &str,
         count: usize,
-        controls: bool,
     ) {
         let mut name = Path::new(folder.trim_end_matches(['\\', '/']))
             .file_name()
@@ -7977,8 +8192,7 @@ impl App {
                 );
             });
             // 参考件把动作按钮钉在组头右侧(槽位序照原版排版,从右往左)。
-            // 单文件夹视图再钉一组本视图专属的控制:文件名过滤框 + 详细/缩略图切换,
-            // 视觉上排在「放映本组幻灯片」前面(不再单占一行)。
+            // 文件名过滤框与详细/缩略图切换是视图级的,已提到滚动区之外常驻。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("mail", false))
@@ -8000,38 +8214,6 @@ impl App {
                     .clicked()
                 {
                     act_play = true;
-                }
-                if controls {
-                    if ui
-                        .add(tool_button("list", self.folder_details))
-                        .on_hover_text("详细列表视图(点列头排序)")
-                        .clicked()
-                    {
-                        self.set_folder_details(true);
-                    }
-                    if ui
-                        .add(tool_button("layout-grid", !self.folder_details))
-                        .on_hover_text("缩略图视图")
-                        .clicked()
-                    {
-                        self.set_folder_details(false);
-                    }
-                    ui.separator();
-                    ui.add(toolbar_icon("funnel"))
-                        .on_hover_text("只显示文件名含关键词的照片(仅当前文件夹)");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.folder_filter)
-                            .desired_width(180.0)
-                            .hint_text("在此文件夹内过滤文件名…"),
-                    );
-                    if !self.folder_filter.is_empty()
-                        && ui
-                            .add(tool_button("x", false))
-                            .on_hover_text("清除过滤")
-                            .clicked()
-                    {
-                        self.folder_filter.clear();
-                    }
                 }
             });
         });
@@ -8061,6 +8243,52 @@ impl App {
                 self.email_win = true;
             }
         }
+    }
+
+    /// 文件夹视图的常驻工具条(视图级,画在滚动区之外):
+    /// 文件名过滤框 + 详细/缩略图切换。滚动再远也钉在中央面板顶部,
+    /// 不属于某一个文件夹组 —— 铺开所有文件夹时明细切换不适用,置灰。
+    fn folder_toolbar_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            let show_all = self.folder_show_all;
+            if ui
+                .add_enabled(!show_all, tool_button("list", self.folder_details))
+                .on_hover_text("详细列表视图(点列头排序)")
+                .clicked()
+            {
+                self.set_folder_details(true);
+            }
+            if ui
+                .add_enabled(!show_all, tool_button("layout-grid", !self.folder_details))
+                .on_hover_text("缩略图视图")
+                .clicked()
+            {
+                self.set_folder_details(false);
+            }
+            ui.separator();
+            ui.add_enabled(!show_all, toolbar_icon("funnel"))
+                .on_hover_text("只显示文件名含关键词的照片(仅当前文件夹)");
+            ui.add_enabled(
+                !show_all,
+                egui::TextEdit::singleline(&mut self.folder_filter)
+                    .desired_width(240.0)
+                    .hint_text("在此文件夹内过滤文件名…"),
+            );
+            if !show_all
+                && !self.folder_filter.is_empty()
+                && ui.add(tool_button("x", false)).clicked()
+            {
+                self.folder_filter.clear();
+            }
+            if show_all {
+                ui.label(
+                    egui::RichText::new("铺开所有文件夹:选中左侧某个目录后可用过滤与明细视图。")
+                        .size(11.0)
+                        .color(crate::theme::p().muted),
+                );
+            }
+        });
+        ui.separator();
     }
 
     /// 切换单文件夹视图的详细/网格形态(设置项 folder_details,记住上次选择)。
@@ -8129,7 +8357,7 @@ impl App {
     }
 
     /// 详细列表视图(单文件夹视图的「详细」形态):
-    /// 文件名 / 拍摄日期 / 大小 三列 + 星标,点列头排序(再点同一列反向);
+    /// 文件名 / 创建日期 / 大小 三列 + 星标,点列头排序(再点同一列反向);
     /// 交互与网格一致:单击选中(双击进单图视图)、Ctrl+单击加减选、右键同一套上下文菜单。
     fn photo_details(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
         // 与网格同一套「显示优先」:屏幕上出现的目录照常消化纳入队列。
@@ -8142,7 +8370,7 @@ impl App {
             movie: bool,
             name: String,
             dir: String,
-            taken: String,
+            created: String,
             size: String,
         }
         let items: Vec<Row> = cells
@@ -8160,8 +8388,13 @@ impl App {
                         .unwrap_or(&r.path)
                         .to_string(),
                     dir: r.parent.clone(),
-                    taken: r.taken.clone().map(|t| t.replace('T', " ")).unwrap_or_default(),
-                    size: fmt_size(r.size.max(0) as u64),
+                    // 明细列显示「创建日期」,但 photos 表没有 ctime,只有
+                    // mtime(最后修改时间);照片文件的修改时间通常≈首次落盘,
+                    // 拿它当创建日期用。不用 EXIF 拍摄时间:截图/转存图大多
+                    // 没有拍摄时间,那一列会全空。
+                    created: fmt_mtime(norm_mtime_secs(r.mtime)),
+                    // 大小统一 MB 口径(不再 KB/MB 混排)。
+                    size: fmt_size_mb(r.size.max(0) as u64),
                 }
             })
             .collect();
@@ -8182,7 +8415,7 @@ impl App {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let cols = [
                     ("名称", name_w, timeline::SortBy::Name, false),
-                    ("拍摄日期", date_w, timeline::SortBy::Date, false),
+                    ("创建日期", date_w, timeline::SortBy::Recent, false),
                     ("大小", size_w, timeline::SortBy::Size, true),
                 ];
                 for (col_label, w, col, right) in cols {
@@ -8269,6 +8502,7 @@ impl App {
                 ui.put(
                     name_rect,
                     egui::Label::new(egui::RichText::new(&name_text).size(12.5).color(text))
+                        .halign(egui::Align::Min)
                         .wrap_mode(egui::TextWrapMode::Truncate),
                 )
                 .on_hover_text(&it.dir);
@@ -8279,9 +8513,9 @@ impl App {
                 ui.painter().text(
                     date_c,
                     egui::Align2::LEFT_CENTER,
-                    if it.taken.is_empty() { "—" } else { &it.taken },
+                    if it.created.is_empty() { "—" } else { &it.created },
                     egui::FontId::proportional(12.0),
-                    if it.taken.is_empty() { faint } else { muted },
+                    if it.created.is_empty() { faint } else { muted },
                 );
                 let size_r = egui::pos2(
                     rect.left() + 8.0 + name_w + 8.0 + date_w + size_w,
@@ -8307,12 +8541,18 @@ impl App {
                 let hit = ui.interact(rect, egui::Id::new(("detail-hit", it.id)), egui::Sense::click());
                 let mut star_clicked = false;
                 let mut preview_clicked = false;
+                let t = CtxPhoto {
+                    id: it.id,
+                    path: self.rows[it.idx].path.clone(),
+                    parent: it.dir.clone(),
+                    movie: it.movie,
+                    star0: it.star,
+                    selected,
+                };
                 hit.context_menu(|ui| {
                     self.photo_ctx_menu(
                         ui,
-                        it.idx,
-                        it.star,
-                        selected,
+                        &t,
                         &mut star_clicked,
                         &mut preview_clicked,
                     )
@@ -8444,25 +8684,19 @@ impl App {
     fn photo_ctx_menu(
         &mut self,
         ui: &mut egui::Ui,
-        idx: usize,
-        star0: bool,
-        selected: bool,
+        t: &CtxPhoto,
         star_clicked: &mut bool,
         preview_clicked: &mut bool,
     ) {
         if ui
-            .button(if self.rows[idx].kind == crate::video::kind::MOVIE {
-                "播放"
-            } else {
-                "预览"
-            })
+            .button(if t.movie { "播放" } else { "预览" })
             .clicked()
         {
             *preview_clicked = true;
             ui.close();
         }
-        let target = if star0 { 0 } else { 1 };
-        let batch = selected && self.sel.len() > 1;
+        let target = if t.star0 { 0 } else { 1 };
+        let batch = t.selected && self.sel.len() > 1;
         let label = if batch {
             if target == 1 {
                 format!("给选中的 {} 张加星标", self.sel.len())
@@ -8483,7 +8717,7 @@ impl App {
             ui.close();
         }
         if ui.button("在资源管理器中显示").clicked() {
-            show_in_explorer(&self.rows[idx].path);
+            show_in_explorer(&t.path);
             ui.close();
         }
         // 加入相簿(参考件 Add to Album;相簿不移动文件;已加入的打勾,点击移除)。
@@ -8494,7 +8728,7 @@ impl App {
             }
             let member: Vec<i64> = self
                 .store
-                .albums_of_photo(self.rows[idx].id)
+                .albums_of_photo(t.id)
                 .into_iter()
                 .map(|(a, _)| a)
                 .collect();
@@ -8507,10 +8741,10 @@ impl App {
                 };
                 if ui.button(label).clicked() {
                     if in_album {
-                        let _ = self.store.album_remove_photo(aid, self.rows[idx].id);
+                        let _ = self.store.album_remove_photo(aid, t.id);
                         self.fx_msg = format!("已移出相簿「{name}」");
                     } else {
-                        let _ = self.store.album_add_photo(aid, self.rows[idx].id);
+                        let _ = self.store.album_add_photo(aid, t.id);
                         self.fx_msg = format!("已加入相簿「{name}」");
                     }
                     ui.close();
@@ -8520,7 +8754,7 @@ impl App {
         if self.view == ViewKind::Albums {
             if let Some(a) = self.sel_album {
                 if ui.button("从相簿移除").clicked() {
-                    let _ = self.store.album_remove_photo(a, self.rows[idx].id);
+                    let _ = self.store.album_remove_photo(a, t.id);
                     ui.close();
                 }
             }
@@ -8528,7 +8762,7 @@ impl App {
         ui.separator();
         // 用编辑器打开(参考件 Open File(s) in an Editor)。
         if ui.button("用编辑器打开").clicked() {
-            let p = PathBuf::from(&self.rows[idx].path);
+            let p = PathBuf::from(&t.path);
             if !crate::win::shell_edit(&p) {
                 self.status = format!("无法打开(未关联编辑器):{}", p.display());
             }
@@ -8536,12 +8770,12 @@ impl App {
         }
         // 设为桌面壁纸(参考件 Set as Desktop)。
         if ui.button("设为桌面壁纸").clicked() {
-            self.set_wallpaper_for(idx);
+            self.set_wallpaper(&t.path);
             ui.close();
         }
         ui.separator();
         if ui.button("从图库中移除…").clicked() {
-            let id = self.rows[idx].id;
+            let id = t.id;
             self.sel.clear();
             self.sel.insert(id);
             self.confirm_remove = true;
@@ -8552,7 +8786,7 @@ impl App {
         // 「被动滚到过 / 点过一张图」不写账本,但用户亲手右键选这项 = 表态,
         // 与导入页同一档(`imported` + `import`)。硬层(回收站、自家缓存、
         // 参考件那 4 条)这里不给按钮 —— 给了也是点不开的死键。
-        let parent = self.rows[idx].parent.clone();
+        let parent = t.parent.clone();
         if !self.store.adoptable_dir(&parent, false) && self.store.adoptable_dir(&parent, true) {
             if ui.button("纳入此目录(覆盖排除名单)").clicked() {
                 let ok =
@@ -8570,7 +8804,7 @@ impl App {
         }
         // 坏文件出口(对齐经典图库坏图清单的
         // Hide / Don't Hide):立过案的文件不再每轮重试,这里给两个方向的开关。
-        let p = self.rows[idx].path.clone();
+        let p = t.path.clone();
         if self.store.is_bad_media(&p) {
             if ui.button("不隐藏此文件(重试缩略图)").clicked() {
                 self.status = match self.store.unmark_bad_media(&p) {
@@ -8588,7 +8822,7 @@ impl App {
         }
         // 属性(参考件右键菜单含属性项,置于末项;未开预览时属性窗取选中项)。
         if ui.button("属性…").clicked() {
-            let id = self.rows[idx].id;
+            let id = t.id;
             self.sel.clear();
             self.sel.insert(id);
             self.show_props = true;
@@ -8787,14 +9021,15 @@ impl App {
             self.open_photo_editor(id, movie);
         }
         hit.context_menu(|ui| {
-            self.photo_ctx_menu(
-                ui,
-                idx,
+            let t = CtxPhoto {
+                id,
+                path: self.rows[idx].path.clone(),
+                parent: self.rows[idx].parent.clone(),
+                movie: self.rows[idx].kind == crate::video::kind::MOVIE,
                 star0,
                 selected,
-                &mut star_clicked,
-                &mut preview_clicked,
-            )
+            };
+            self.photo_ctx_menu(ui, &t, &mut star_clicked, &mut preview_clicked)
         });
         if star_clicked {
             self.toggle_star(id);
@@ -9315,6 +9550,13 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 先给整帧铺一层底色:面板之间万一留出空隙,也不会露出窗口的黑色清屏色。
+        // 这一层画在最底层,所有面板照常盖在上面。
+        ctx.layer_painter(egui::LayerId::background()).rect_filled(
+            ctx.viewport_rect(),
+            0.0,
+            crate::theme::p().bg,
+        );
         // 每帧重置缩略图解码配额计数(预算由滚动速度在 CentralPanel 里定)。
         self.thumb_decode_count = 0;
         // 自动更新:空闲门控与后台事件回流放在帧首 —— 幻灯片/编辑视图会提前
@@ -9624,6 +9866,7 @@ impl eframe::App for App {
             }
             if let Some(res) = finished {
                 self.face_rx = None;
+                self.face_cancel = None;
                 self.face_prog = (0, 0);
                 match res {
                     Ok((np, nf)) => {
@@ -10303,7 +10546,7 @@ impl eframe::App for App {
                             self.updater.win_open = true;
                             ui.close();
                         }
-                        if ui.button("关于 Relyto.Maliang…").clicked() {
+                        if ui.button("关于 Maliang…").clicked() {
                             self.show_about = true;
                             ui.close();
                         }
@@ -10322,43 +10565,83 @@ impl eframe::App for App {
         egui::TopBottomPanel::top("gsearch")
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    egui::ComboBox::from_id_salt("top-name-class")
-                        .width(84.0)
-                        .selected_text(self.name_class.label())
-                        .show_ui(ui, |ui| {
-                            for c in crate::nameidx::FileClass::all() {
-                                if ui
-                                    .selectable_label(self.name_class == c, c.label())
-                                    .clicked()
-                                {
-                                    self.name_class = c;
-                                    // 换档即重查(缓存未命中时走后台线程)。
-                                    if !self.name_query.trim().is_empty() {
-                                        self.dispatch_name_search();
-                                    }
-                                }
-                            }
-                        });
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.name_query)
-                            .hint_text("全盘快速查找:文件名 / 文件夹名片段,即输即搜…")
-                            .desired_width(ui.available_width() - 6.0),
-                    );
-                    if resp.changed() {
-                        if self.name_query.trim().is_empty() {
+                // 一行排完:输入框在左、类别档位在右,共用同一条水平基线。
+                // 输入框按「可用宽 - 档位宽 - 间距」定尺寸,不再用「剩余宽 - 6」
+                // 那种估算 —— 文本控件自带内边距,估算偏大就会把档位挤歪或换行。
+                ui.with_layout(
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        let combo_w = 84.0;
+                        let clear_w = 26.0;
+                        let gap = ui.spacing().item_spacing.x;
+                        let edit_w = (ui.available_width()
+                            - combo_w
+                            - clear_w
+                            - gap * 2.0)
+                            .max(80.0);
+                        let resp = ui.add_sized(
+                            egui::vec2(edit_w, 24.0),
+                            egui::TextEdit::singleline(&mut self.name_query)
+                                .hint_text("全盘快速查找:文件名 / 文件夹名片段,即输即搜…"),
+                        );
+                        // 档位框钉进与输入框同高的 24px 槽里再垂直居中:
+                        // ComboBox 自身高度跟字体/内边距走,直接放进居中布局
+                        // 会和 24 高的输入框差半截 —— 套同高槽位后两者共用
+                        // 一条水平基线。
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(combo_w, 24.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                egui::ComboBox::from_id_salt("top-name-class")
+                                    .width(combo_w)
+                                    .selected_text(self.name_class.label())
+                                    .show_ui(ui, |ui| {
+                                        for c in crate::nameidx::FileClass::all() {
+                                            if ui
+                                                .selectable_label(
+                                                    self.name_class == c,
+                                                    c.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                self.name_class = c;
+                                                // 换档即重查(缓存未命中时走后台线程)。
+                                                if !self.name_query.trim().is_empty() {
+                                                    self.dispatch_name_search();
+                                                }
+                                            }
+                                        }
+                                    });
+                            },
+                        );
+                        // 清除按钮:一键清空搜索框并退出查找页(与手动删空
+                        // 输入框同一套状态复位)。没有内容时置灰。
+                        if ui
+                            .add_enabled(!self.name_query.is_empty(), tool_button("x", false))
+                            .on_hover_text("清除搜索内容")
+                            .clicked()
+                        {
+                            self.name_query.clear();
                             self.dispatch_name_search();
                             if self.view == ViewKind::Search {
                                 self.set_view(ViewKind::Timeline);
                             }
-                        } else {
-                            self.set_view(ViewKind::Search);
-                            self.dispatch_name_search();
-                            #[cfg(windows)]
-                            self.svc_nudge_on_search_entry();
                         }
-                    }
-                });
+                        if resp.changed() {
+                            if self.name_query.trim().is_empty() {
+                                self.dispatch_name_search();
+                                if self.view == ViewKind::Search {
+                                    self.set_view(ViewKind::Timeline);
+                                }
+                            } else {
+                                self.set_view(ViewKind::Search);
+                                self.dispatch_name_search();
+                                #[cfg(windows)]
+                                self.svc_nudge_on_search_entry();
+                            }
+                        }
+                    },
+                );
             });
 
         // ===== 底部状态栏:先于左右侧面板添加 → 拉通整个窗口宽度,
@@ -10427,8 +10710,17 @@ impl eframe::App for App {
                         let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
                         ui.separator();
                         ui.label(format!("正在扫描人物… {}%", (frac * 100.0).round() as i32))
-                            .on_hover_text(format!("本批 {d}/{t} 张"));
+                            .on_hover_text(format!(
+                                "本批 {d}/{t} 张 · 全库剩 {} 张",
+                                crate::faces::remaining_count(&self.store)
+                            ));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
+                        if let Some(c) = &self.face_cancel {
+                            if ui.button("取消人物扫描").clicked() {
+                                c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                self.status = "正在取消人物扫描…".into();
+                            }
+                        }
                     }
                     // 人脸模型下载进度:在下哪个文件、下了多少,状态栏一眼看到。
                     #[cfg(feature = "ai")]
@@ -10527,7 +10819,38 @@ impl eframe::App for App {
                         egui::CollapsingHeader::new(egui::RichText::new("文件夹").strong())
                             .default_open(true)
                             .show(ui, |ui| {
-                                self.nav_item(ui, "文件夹", ViewKind::Folder, Some(folders_n));
+                                // 常用位置:四个壳目录。点了直接定位到图库里
+                                // 对应的目录,目录没导入时状态栏给出明确提示。
+                                for (label, path) in crate::win::common_places() {
+                                    if ui
+                                        .selectable_label(false, label)
+                                        .on_hover_text("定位到这个常用位置")
+                                        .clicked()
+                                    {
+                                        self.goto_known_dir(path, label);
+                                    }
+                                }
+                                // 「所有文件夹」是视图级入口:中间栏一次铺开全部目录。
+                                // 不能走 nav_item —— 视图已经是 Folder 时 set_view 会
+                                // 提前返回,从某个具体目录点回来就铺不开了。
+                                let all_on = self.view == ViewKind::Folder && self.folder_show_all;
+                                let rt = egui::RichText::new(format!(
+                                    "所有文件夹 ({folders_n})"
+                                ))
+                                .color(if all_on {
+                                    crate::theme::p().accent_strong
+                                } else {
+                                    crate::theme::p().text
+                                });
+                                if ui
+                                    .selectable_label(all_on, if all_on { rt.strong() } else { rt })
+                                    .on_hover_text("中间栏一次铺开所有文件夹(每组一个相册头)")
+                                    .clicked()
+                                {
+                                    self.set_view(ViewKind::Folder);
+                                    self.folder_show_all = true;
+                                    self.subtree_sel = None;
+                                }
                             });
                         egui::CollapsingHeader::new(egui::RichText::new("其他素材").strong())
                             .default_open(true)
@@ -10719,7 +11042,25 @@ impl eframe::App for App {
                             ui.checkbox(&mut self.face_hide_low, "隐藏低质量");
                             ui.checkbox(&mut self.face_show_ignored, "显示已忽略");
                         });
-                        ui.label(format!("共 {} 簇", self.face_people.len()));
+                        ui.label(format!(
+                            "共 {} 簇 · 未分析 {} 张",
+                            self.face_people.len(),
+                            crate::faces::remaining_count(&self.store)
+                        ));
+                        // 全量重聚类:增量聚类只增不改,分错的簇不会自己长好;
+                        // 把全部向量按质量降序重分一遍(已命名按质心最近迁移)。
+                        if ui.button("重新聚类").clicked() {
+                            match crate::faces::recluster_all(&self.store, crate::faces::CLUSTER_THR)
+                            {
+                                Ok(n) => {
+                                    self.status = format!("重新聚类完成:共 {n} 簇");
+                                }
+                                Err(e) => self.status = format!("重新聚类失败: {e}"),
+                            }
+                            self.refresh_people_and_suggestions();
+                            self.sel_cluster = None;
+                            self.face_hits.clear();
+                        }
                         // 命名建议(未命名簇按质心相似度推荐)
                         if !self.face_sugs.is_empty() {
                             ui.separator();
@@ -10904,6 +11245,11 @@ impl eframe::App for App {
             );
             // 原版滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
             // (egui 会用 `state.offset` 记忆滚动位置,这里只在有目标时覆盖一次)。
+            // 文件夹视图先画视图级常驻工具条(过滤 + 明细/缩略图切换):
+            // 在滚动区之外,滚到哪都钉在顶部。
+            if self.view == ViewKind::Folder {
+                self.folder_toolbar_ui(ui);
+            }
             let mut gallery = egui::ScrollArea::vertical().id_salt("gallery");
             if let Some(t) = self.gallery_scroll_target.take() {
                 gallery = gallery.vertical_scroll_offset(t);
@@ -11179,7 +11525,7 @@ impl eframe::App for App {
                             // 每个文件夹一个相册组头 + 一组逐行缩略图。
                             let groups = self.take_folder_groups();
                             for (folder, idxs, date) in &groups {
-                                self.album_label(ui, folder, date, idxs.len(), false);
+                                self.album_label(ui, folder, date, idxs.len());
                                 ui.add_space(4.0);
                                 self.photo_grid(ui, &format!("fb-{folder}"), idxs);
                                 ui.add_space(16.0);
@@ -11239,7 +11585,7 @@ impl eframe::App for App {
                             Vec::new()
                         };
                         let cells: &[usize] = if filtered { &shown } else { &idxs };
-                        self.album_label(ui, &folder, &date, cells.len(), true);
+                        self.album_label(ui, &folder, &date, cells.len());
                         if filtered {
                             ui.label(
                                 egui::RichText::new(format!(
@@ -11702,7 +12048,7 @@ impl eframe::App for App {
         // 帮助 > 关于
         if self.show_about {
             let mut open = self.show_about;
-            egui::Window::new("关于 Relyto.Maliang")
+            egui::Window::new("关于 Maliang")
                 .open(&mut open)
                 .default_width(560.0)
                 .default_height(620.0)
@@ -11718,19 +12064,32 @@ impl eframe::App for App {
                         );
                         ui.vertical(|ui| {
                             ui.add_space(6.0);
-                            ui.heading("Relyto.Maliang");
+                            // 英文品牌名
+                            ui.label(
+                                egui::RichText::new("Maliang")
+                                    .size(18.0)
+                                    .strong(),
+                            );
+                            ui.add_space(2.0);
+                            // 主标语:大而醒目
+                            ui.label(
+                                egui::RichText::new("神笔马良,本地照片 AI 管家")
+                                    .size(24.0)
+                                    .strong(),
+                            );
+                            // 副标语:比主标语小,但仍醒目
+                            ui.label(
+                                egui::RichText::new("秒查速览、智能标签、对话搜图、一键搞定")
+                                    .size(15.0)
+                                    .strong(),
+                            );
+                            ui.add_space(4.0);
                             ui.label(format!(
-                                "版本 {} · Rust + egui 编写的本地照片管理应用",
+                                "当前版本 {} · Rust + egui 编写 · Apache 2.0 开源",
                                 env!("CARGO_PKG_VERSION")
                             ));
-                            ui.strong("神笔马良,本地照片 AI 管家");
-                            ui.label("秒查速览、智能标签、对话搜图、一键搞定");
                         });
                     });
-                    ui.separator();
-                    ui.label("功能:全盘扫描索引 / 时间线 / 文件夹 / 彩色标签 / 重复检测 / GPS 地理标记(KML)/ 文件夹管理器 / 索引备份与压缩 / 烘焙保存 / 导出 / WiFi 导入 / OCR / 人脸分类");
-                    ui.label("人脸:质量评分、半自动命名建议、忽略簇、算法版本迁移(见 视图 > 人脸)。");
-                    ui.label("经典五栏菜单(文件 / 编辑 / 视图 / 工具 / 帮助)。");
                     ui.separator();
                     ui.heading("更新日志");
                     egui::ScrollArea::vertical()
@@ -11738,7 +12097,7 @@ impl eframe::App for App {
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             egui_commonmark::CommonMarkViewer::new()
-                                .show(ui, &mut self.about_cache, CHANGELOG_MD);
+                                .show(ui, &mut self.about_cache, about_changelog_md());
                         });
                 });
             self.show_about = open;

@@ -11,7 +11,14 @@ use std::collections::HashMap;
 /// v3: 修复识别裁剪图预处理(to_rgb32f 0~1 值误按 0~255 归一化)。
 /// v4: 检测/识别切换 YuNet + AdaFace IR-50(替换非商用 antelopev2)为默认方案;
 ///     antelopev2 保留为可选方案,版本号连同方案名一起比对。
-pub const FACE_ALGO_VERSION: &str = "v4";
+/// v5: EXIF 方向摆正后再检测(竖拍手机照不再因人脸横躺而漏检);
+///     检测输入 640 → 1280(小脸检出率);聚类阈值 0.5 → 0.6;
+///     photos_todo 改按 photos.face_done 标记(没检出人脸的照片不再卡队列)。
+pub const FACE_ALGO_VERSION: &str = "v5";
+
+/// 聚类归属阈值(AdaFace 512 维余弦):同人通常 >0.6,异人 <0.3,
+/// 0.6 起步比 0.5 更不容易把不同的人并成一簇。命名建议另用 0.55。
+pub const CLUSTER_THR: f32 = 0.6;
 
 /// 当前人脸方案(选项 > 常规 选择,默认 YuNet + AdaFace)。
 pub fn current_algo(store: &Store) -> crate::ai::face::FaceAlgo {
@@ -25,9 +32,13 @@ pub fn algo_tag(store: &Store) -> String {
 
 pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
     store.read(|conn| {
+        // face_done = 已分析标记:**没检出人脸的照片也置 1**。此前用
+        // "faces 表里有没有行"判定,导致无人脸照片永远留在队头反复重跑,
+        // 后面的照片永远轮不到 —— 扫描看起来"只扫了一小部分"就是它。
+        // kind=0 只扫图片;视频没有人脸可检,不浪费模型推理。
         let mut st = match conn.prepare(
             "SELECT id, path FROM photos
-             WHERE id NOT IN (SELECT DISTINCT photo_id FROM faces)
+             WHERE face_done = 0 AND kind = 0
              ORDER BY id LIMIT ?1",
         ) {
             Ok(s) => s,
@@ -465,14 +476,45 @@ pub fn ignored_clusters(store: &Store) -> Vec<i64> {
 }
 
 /// 清空全部人脸数据(算法版本迁移:旧算法产物作废,整库重扫)。
+/// 同时把 photos.face_done 归零,否则清除后没有照片会重新进队列。
 pub fn wipe_faces(store: &Store) -> Result<()> {
     store.write(|conn| -> Result<()> {
         conn.execute("DELETE FROM face_templates", [])?;
         conn.execute("DELETE FROM faces", [])?;
         conn.execute("DELETE FROM people", [])?;
+        conn.execute("UPDATE photos SET face_done = 0", [])?;
         Ok(())
     })?;
     Ok(())
+}
+
+/// 全库未分析照片数(人物页/状态栏显示剩余量)。
+pub fn remaining_count(store: &Store) -> usize {
+    store.read(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM photos WHERE face_done = 0 AND kind = 0",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0)
+    })
+}
+
+/// 摆正后图里的点 → 未旋转原图坐标(`map_orient` 的逆):
+/// 2/3/4 镜像与 180° 自逆;5=转置、7=反对置均自逆;6 与 8 互逆。
+/// 入参 (w,h) 是**摆正后**的宽高(orient 5..=8 时 = 原图的 h,w)。
+fn map_unorient(x: f32, y: f32, w: f32, h: f32, orient: u32) -> (f32, f32) {
+    match orient {
+        2 => (w - 1.0 - x, y),
+        3 => (w - 1.0 - x, h - 1.0 - y),
+        4 => (x, h - 1.0 - y),
+        5 => (y, x),
+        6 => (y, w - 1.0 - x),
+        7 => (h - 1.0 - y, w - 1.0 - x),
+        8 => (h - 1.0 - y, x),
+        _ => (x, y),
+    }
 }
 
 /// 后台扫描一批未分析照片:每处理完一张就把(本批已走张数, 本批总张数)
@@ -492,36 +534,56 @@ pub fn scan_batch(
     };
     let mut face_count = 0;
     let mut photo_count = 0;
+    // 本批走过的照片(含解码失败/无脸的)统一记 face_done=1 ——
+    // 判定依据是"分析过",不是"检出过脸"。
+    let mut walked: Vec<i64> = Vec::with_capacity(total);
     for (i, (pid, path)) in todo.into_iter().enumerate() {
         // 进度按"走过的张数"算,跳过的(已有结果 / 解不开)也算走完,才不会卡住不动。
         let step = i + 1;
         if done.contains(&pid) {
             on_progress(step, total);
+            walked.push(pid);
             continue;
         }
-        let img = match image::open(&path) {
+        let p = std::path::Path::new(&path);
+        // EXIF 方向摆正:竖拍手机照不转的话人脸是横躺的,检测/嵌入都会失败。
+        // 旋转语义与 thumbs::apply_exif_rotation 一致(2/4 翻转,5-8 旋转)。
+        let orient = crate::exif::read_orientation(p);
+        let img = match image::open(p) {
             Ok(i) => i,
             Err(_) => {
                 on_progress(step, total);
+                walked.push(pid);
                 continue;
             }
+        };
+        let img = if orient == 1 {
+            img
+        } else {
+            crate::thumbs::apply_exif_rotation(img, orient)
         };
         let res = match faces_engine.analyze(&img) {
             Ok(r) => r,
             Err(_) => {
                 on_progress(step, total);
+                walked.push(pid);
                 continue;
             }
         };
+        // 库里统一存**未旋转原图**坐标(预览叠框处再按 EXIF 方向转一次),
+        // 所以检测框要从摆正后的图映射回原图;质量评分先用摆正后的框算。
+        let (rw, rh) = (img.width() as f32, img.height() as f32);
         for f in &res {
             let q = face_quality(&img, &f.det);
+            let (ax, ay) = map_unorient(f.det.x0, f.det.y0, rw, rh, orient);
+            let (bx, by) = map_unorient(f.det.x1, f.det.y1, rw, rh, orient);
             save_face(
                 store,
                 pid,
-                f.det.x0,
-                f.det.y0,
-                f.det.x1,
-                f.det.y1,
+                ax.min(bx),
+                ay.min(by),
+                ax.max(bx),
+                ay.max(by),
                 f.det.score,
                 q,
                 &f.emb,
@@ -529,10 +591,183 @@ pub fn scan_batch(
         }
         face_count += res.len();
         photo_count += 1;
+        walked.push(pid);
         on_progress(step, total);
     }
-    assign_clusters(store, 0.5)?;
+    if !walked.is_empty() {
+        let holders = vec!["?"; walked.len()].join(",");
+        let sql = format!(
+            "UPDATE photos SET face_done = 1 WHERE face_done = 0 AND kind = 0 AND id IN ({holders})"
+        );
+        let pv: Vec<&dyn rusqlite::ToSql> =
+            walked.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        store.write(move |conn| -> Result<()> {
+            conn.execute(&sql, pv.as_slice())?;
+            Ok(())
+        })?;
+    }
+    assign_clusters(store, CLUSTER_THR)?;
     Ok((photo_count, face_count))
+}
+
+/// 连续扫描直到库里没有未分析照片(批间聚类一次;cancel 置位后当批跑完即停)。
+/// 返回累计(照片数, 人脸数)。终止保证:批内所有照片(含解码失败的)都会
+/// 置 face_done=1,队列必然单调收缩,空批即退出。
+pub fn scan_all(
+    store: &Store,
+    cap: usize,
+    cancel: &std::sync::atomic::AtomicBool,
+    on_progress: &(dyn Fn(usize, usize) + Send + Sync),
+) -> Result<(usize, usize)> {
+    use std::sync::atomic::Ordering;
+    let (mut photo_total, mut face_total) = (0usize, 0usize);
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let (p, f) = scan_batch(store, cap, on_progress)?;
+        photo_total += p;
+        face_total += f;
+        if p == 0 && f == 0 {
+            break; // 队列已空(或剩余全是解不开的文件,也已标记走完)
+        }
+    }
+    Ok((photo_total, face_total))
+}
+
+/// 全量重聚类:库内全部未忽略的脸按质量降序重做一遍贪心聚类,覆盖旧簇号。
+/// 已命名簇的名字按"旧质心 → 新簇"最近匹配保留(低于 0.5 的不保)。
+/// 返回新簇数。
+pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
+    let mut faces: Vec<(i64, Vec<f32>, f32)> = store.read(|conn| -> Result<_> {
+        let mut st = conn.prepare(
+            "SELECT f.id, t.vec, COALESCE(f.quality,0.5) FROM faces f
+             JOIN face_templates t ON t.face_id=f.id
+             WHERE f.ignored=0",
+        )?;
+        let mut rows = st.query([])?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            let q: f64 = r.get(2)?;
+            out.push((id, blob_to_vec(&blob), q as f32));
+        }
+        Ok(out)
+    })?;
+    if faces.is_empty() {
+        return Ok(0);
+    }
+    // 质量降序、同质量按 id:高质量脸先当种子,簇心不被模糊脸带偏。
+    faces.sort_by(|a, b| {
+        b.2.partial_cmp(&a.2)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    // 簇心存**未归一化的加权和**,吸收新脸时增量更新,避免每步重算均值。
+    let mut clusters: Vec<(Vec<f32>, f32, usize)> = Vec::new(); // (加权和, 权重和, 张数)
+    let mut assign: HashMap<i64, i64> = HashMap::with_capacity(faces.len());
+    for (id, v, q) in &faces {
+        let w = q.max(0.05);
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, (sum, wsum, _)) in clusters.iter().enumerate() {
+            let m = mean_vec_weighted(&[(sum.clone(), *wsum)]);
+            let Some(m) = m else { continue };
+            let c = cos(&m, v);
+            if best.map(|(_, b)| c > b).unwrap_or(true) {
+                best = Some((ci, c));
+            }
+        }
+        match best {
+            Some((ci, c)) if c >= thr => {
+                let (sum, wsum, n) = &mut clusters[ci];
+                for (a, b) in sum.iter_mut().zip(v) {
+                    *a += b * w;
+                }
+                *wsum += w;
+                *n += 1;
+                assign.insert(*id, ci as i64);
+            }
+            _ => {
+                clusters.push((v.clone(), w, 1));
+                assign.insert(*id, (clusters.len() - 1) as i64);
+            }
+        }
+    }
+    // 写回新簇号(簇号 = 下标 + 1,与 assign_clusters 的 1 起编号一致)。
+    // 旧簇号→名字的读取(上面 named)必须在这次覆盖前完成,顺序不可换。
+    store.write(|conn| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut st = tx.prepare_cached("UPDATE faces SET cluster=?1 WHERE id=?2")?;
+            for (face_id, ci) in &assign {
+                st.execute(params![ci + 1, face_id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })?;
+    // 命名保留:旧簇(id)质心 → 新簇(下标)最近匹配。
+    // 新簇质心先一次算好,后面逐个旧名比余弦,避免反复重算均值。
+    let named: Vec<(String, Vec<f32>)> = store.read(|conn| -> Result<_> {
+        // 旧簇 id → (vecs, quality) 先聚合,名字按 id 另查。
+        let mut st = conn.prepare(
+            "SELECT f.cluster, t.vec, COALESCE(f.quality,0.5) FROM faces f
+             JOIN face_templates t ON t.face_id=f.id
+             JOIN people p ON p.id=f.cluster
+             WHERE f.ignored=0",
+        )?;
+        let mut rows = st.query([])?;
+        let mut acc: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
+        while let Some(r) = rows.next()? {
+            let cid: i64 = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            let q: f64 = r.get(2)?;
+            acc.entry(cid).or_default().push((blob_to_vec(&blob), q as f32));
+        }
+        let mut out = Vec::new();
+        for cid in acc.keys().copied().collect::<Vec<_>>() {
+            let name: Option<String> = conn
+                .query_row("SELECT name FROM people WHERE id=?1", params![cid], |r| {
+                    r.get(0)
+                })
+                .ok();
+            if let (Some(name), Some(m)) =
+                (name, mean_vec_weighted(&acc[&cid]))
+            {
+                out.push((name, m));
+            }
+        }
+        Ok(out)
+    })?;
+    let new_centroids: Vec<(i64, Vec<f32>)> = clusters
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (sum, wsum, _))| {
+            mean_vec_weighted(&[(sum.clone(), *wsum)]).map(|m| (i as i64 + 1, m))
+        })
+        .collect();
+    store.write(move |conn| -> Result<()> {
+        for (name, m) in &named {
+            let mut best: Option<(i64, f32)> = None;
+            for (cid, cm) in &new_centroids {
+                let c = cos(cm, m);
+                if best.as_ref().map(|(_, b)| c > *b).unwrap_or(true) {
+                    best = Some((*cid, c));
+                }
+            }
+            if let Some((cid, c)) = best {
+                if c >= 0.5 {
+                    conn.execute(
+                        "INSERT OR REPLACE INTO people(id,name) VALUES(?1,?2)",
+                        params![cid, name],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    Ok(clusters.len())
 }
 
 /// 未命名簇的命名建议:未命名簇质心与
@@ -773,6 +1008,97 @@ mod tests {
         assert_eq!(sugs[0].cluster, 2);
         assert!(sugs[0].score > 0.9, "score={}", sugs[0].score);
         assert_eq!(sugs[0].count, 1);
+    }
+
+    /// photos_todo 按 face_done/kind 过滤:没检出人脸的照片置 1 后不再重扫,
+    /// 视频不进队列 —— "扫描只扫一小部分"卡死问题的回归测试。
+    #[test]
+    fn photos_todo_respects_face_done_and_kind() {
+        let store = test_store();
+        let conn = store.test_conn();
+        // 1=待分析图片, 2=已分析图片, 3=视频
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size,face_done) VALUES(2,'b.jpg','.',0,1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size,kind) VALUES(3,'c.mp4','.',0,1,1)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let todo = photos_todo(&store, 10);
+        assert_eq!(
+            todo.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1],
+            "只应剩未分析的图片: {todo:?}"
+        );
+        assert_eq!(remaining_count(&store), 1);
+    }
+
+    /// map_unorient 是预览侧 map_orient 的逆:正着转过去再映射回来要还原。
+    #[test]
+    fn map_unorient_roundtrips() {
+        // 摆正方向表(与 app.rs::map_orient 一致,仅测试内复写)。
+        let fwd = |x: f32, y: f32, w: f32, h: f32, o: u32| -> (f32, f32) {
+            match o {
+                2 => (w - 1.0 - x, y),
+                3 => (w - 1.0 - x, h - 1.0 - y),
+                4 => (x, h - 1.0 - y),
+                5 => (y, x),
+                6 => (h - 1.0 - y, x),
+                7 => (h - 1.0 - y, w - 1.0 - x),
+                8 => (y, w - 1.0 - x),
+                _ => (x, y),
+            }
+        };
+        let (w, h) = (400.0f32, 300.0f32);
+        for o in 1..=8u32 {
+            let (dw, dh) = if (5..=8).contains(&o) { (h, w) } else { (w, h) };
+            for &(x, y) in &[(0.0, 0.0), (100.5, 50.25), (w - 1.0, h - 1.0)] {
+                let (dx, dy) = fwd(x, y, w, h, o);
+                let (rx, ry) = map_unorient(dx, dy, dw, dh, o);
+                assert!(
+                    (rx - x).abs() < 1e-3 && (ry - y).abs() < 1e-3,
+                    "orient {o}: ({x},{y}) → ({dx},{dy}) → ({rx},{ry})"
+                );
+            }
+        }
+    }
+
+    /// 全量重聚类:质量降序重分簇,已命名按质心最近迁移到新簇号。
+    #[test]
+    fn recluster_all_rebuilds_and_keeps_names() {
+        let store = test_store();
+        let conn = store.test_conn();
+        for (i, p) in ["a.jpg", "b.jpg", "c.jpg"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'.',0,1)",
+                params![(i + 1) as i64, p],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        // 张三(已命名)+ 一张同簇新脸(此前分在无名簇 2)应重聚为一簇;
+        // 正交脸自成另一簇。
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        rename_cluster(&store, 1, "张三").unwrap();
+        insert_face(&store, 2, &[0.9, 0.1, 0.0], 0.9, Some(2));
+        insert_face(&store, 3, &[0.0, 1.0, 0.0], 0.9, Some(3));
+        let n = recluster_all(&store, 0.6).unwrap();
+        assert_eq!(n, 2, "cos≈0.99 的两张聚一簇,正交一张: {n}");
+        let rows = people_overview(&store);
+        assert_eq!(rows.len(), 2);
+        let named = rows.iter().find(|r| r.person.is_some()).expect("名字应保留");
+        assert_eq!(named.person.as_deref(), Some("张三"));
+        assert_eq!(named.count, 2, "两张相似脸应同在新簇");
+        assert!(rows.iter().all(|r| r.count >= 1));
     }
 
     /// 忽略簇后不出现在列表/网格,恢复后回来。

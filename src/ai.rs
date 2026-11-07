@@ -410,7 +410,10 @@ pub mod face {
         /// 输出单张量 [1,N,15],每行 = x,y,w,h + 5×(x,y) 关键点 + 置信度,
         /// 像素坐标直出无需锚点解码;关键点顺序与 SCRFD 一致,对齐代码可复用。
         fn detect_yunet(&mut self, img: &image::DynamicImage) -> Result<Vec<Det>, String> {
-            const MAXSIDE: u32 = 640;
+            // 1280 而非 640:YuNet 内部自带 stride 金字塔,限制检出率的是
+            // 输入分辨率 —— 4000px 原图缩到 640 后小脸只剩 ~10px 基本检不出,
+            // 1280 能把线性检出下限翻倍(计算量 4 倍,后台扫描可接受)。
+            const MAXSIDE: u32 = 1280;
             let (w, h) = (img.width(), img.height());
             let scale = (MAXSIDE as f32 / w as f32)
                 .min(MAXSIDE as f32 / h as f32)

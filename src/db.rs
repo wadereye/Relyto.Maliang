@@ -51,6 +51,13 @@ const LEGACY_LOCATION_FILE: &str = "data.location";
 /// 11-07 统一配置前的旧升级配置名(曾放 exe 同目录或数据目录)。
 const LEGACY_UPDATE_FILE: &str = "update.ini";
 
+/// 出厂默认的版本清单地址。配置文件里不写 UpdateURL 就用它;
+/// 显式写成 `UpdateURL=`(空值)则停用自动更新,填别的地址可换源。
+/// 这样清掉本机配置或全新安装也能直接检查更新。
+pub const DEFAULT_UPDATE_URL: &str = "http://47.109.200.26/maliang/update/latest.ini";
+/// 出厂默认的服务端模型目录,规则同上:显式留空即回到手动放置。
+pub const DEFAULT_MODEL_URL: &str = "http://47.109.200.26/maliang/models/";
+
 /// 统一配置文件模板(首启无配置时写入;[location] 归本模块,[update] 节
 /// 供升级/模型下载用,解析端只认键不认节,节头仅作视觉分组)。
 pub const SETTINGS_TEMPLATE: &str = "\
@@ -59,16 +66,18 @@ pub const SETTINGS_TEMPLATE: &str = "\
 # 改完重启程序生效;「帮助 > 检查更新 > 打开配置文件」可直达。
 
 [location]
-# 数据目录:索引库、缩略图缓存、人脸模型都放这里。
-# 留空 = 默认(Windows: %APPDATA%\\Relyto\\Maliang)。
+# 数据目录:索引库、全盘索引、人脸模型放这里。
+# 留空 = 默认(Windows: %APPDATA%\\Relyto\\Maliang),此时缩略图缓存放系统缓存目录。
+# 目录迁走后,缩略图缓存也跟着放到这里的 cache\\ 子目录(重启后生效);
+# 旧系统缓存的四档缩略图会在下次启动后自动搬过来,历史备份 *.reset-* 保留原处。
 # 改动后重启,旧目录内容会自动搬到新目录,搬完旧目录会被删除。
 data_dir=
 
 [update]
-# UpdateURL 指向一份版本清单(纯文本 key=value),例如:
-#   UpdateURL=https://example.com/maliang/latest.ini
-# 留空 = 关闭自动更新。
-UpdateURL=
+# UpdateURL 指向一份版本清单(纯文本 key=value)。
+# 不写这一行 = 用程序内置的官方清单地址;改成自己的地址 = 换源;
+# 写成 UpdateURL=(空值) = 停用自动更新。
+UpdateURL=http://47.109.200.26/maliang/update/latest.ini
 
 # 两次自动检查之间的最小间隔(小时)。手动检查不受此限制。
 CheckIntervalHours=24
@@ -93,12 +102,12 @@ RestartService=1
 # 下载分段大小(MB)。慢网可调小到 1,让每段的时间预算更容易满足。
 ChunkMB=2
 
-# 模型下载目录:服务端放模型文件的目录,结尾带「/」,例如:
-#   ModelURL=https://example.com/maliang/models/
+# 模型下载目录:服务端放模型文件的目录,结尾带「/」。
 # 程序按固定文件名(face_det.onnx / face_rec.onnx)在这个目录下取文件,
-# 存进数据目录的 models\\。留空 = 不提供下载,界面只给手动放置指引。
+# 存进数据目录的 models\\。不写这一行 = 用程序内置的官方目录;
+# 写成 ModelURL=(空值) = 不提供下载,界面只给手动放置指引。
 # 建议用 https;模型由服务端自行选择与授权,程序只校验它能否被加载。
-ModelURL=
+ModelURL=http://47.109.200.26/maliang/models/
 ";
 
 /// 默认数据目录(marker 文件所在;env/marker 都不生效时它就是数据目录)。
@@ -212,19 +221,25 @@ fn read_marker_text(dir: &Path) -> Option<String> {
         .or_else(|| std::fs::read_to_string(dir.join(LEGACY_LOCATION_FILE)).ok())
 }
 
-/// 数据目录(索引库 + 模型)。优先级:MALIANG_DATA_DIR 环境变量 >
+/// 数据目录的**纯解析**(不建目录)。优先级:MALIANG_DATA_DIR 环境变量 >
 /// 用户默认目录下 maliang.ini 的 [location](选项页写入)>
 /// 机器级 maliang.ini(装服务时写入)> 默认目录
 /// (服务形态 = ProgramData,普通进程 = 用户 AppData)。
-pub fn data_dir() -> PathBuf {
+///
+/// 缓存落点与扫描排除每帧/每文件都要问一次路径,必须走这里,
+/// 不能让「查一下目录在哪」顺手把目录建出来。
+fn data_dir_loc() -> PathBuf {
     if let Some(v) = std::env::var_os("MALIANG_DATA_DIR") {
         if !v.is_empty() {
-            let p = PathBuf::from(v);
-            let _ = std::fs::create_dir_all(&p);
-            return p;
+            return PathBuf::from(v);
         }
     }
-    let p = resolve_data_dir(marker_data_dir(), machine_marker_dir(), service_mode());
+    resolve_data_dir(marker_data_dir(), machine_marker_dir(), service_mode())
+}
+
+/// 数据目录(索引库 + 模型),附带建目录。解析口径见 [`data_dir_loc`]。
+pub fn data_dir() -> PathBuf {
+    let p = data_dir_loc();
     let _ = std::fs::create_dir_all(&p);
     p
 }
@@ -525,14 +540,29 @@ pub fn system_cache_has_content() -> bool {
         .unwrap_or(false)
 }
 
-/// 缓存目录解析(纯函数,不含环境变量与建目录):数据目录被 `data.location`
-/// 迁走时缓存跟着走。缩略图虽然可再生,但体量不小(全库四档可达数 GB),
-/// 不该在用户把库搬到大盘之后还继续默默写满系统盘。
-fn cache_root_for(marker: Option<&Path>, system_cache: &Path) -> PathBuf {
-    match marker {
+/// 缓存目录解析(纯函数,不含环境变量与建目录):`Some` = 数据目录已迁走,
+/// 缓存跟到它的 cache 子目录;`None` = 仍在默认位置,沿用系统缓存目录。
+/// 缩略图虽可再生,但体量不小(全库四档可达数 GB),不该在用户把库搬到
+/// 大盘之后还继续默默写满系统盘。
+fn cache_root_for(relocated: Option<&Path>, system_cache: &Path) -> PathBuf {
+    match relocated {
         Some(d) => d.join(CACHE_SUBDIR),
         None => system_cache.to_path_buf(),
     }
+}
+
+/// 「数据目录是否已被迁走」的判定:与用户级默认目录一致就不算迁走
+/// (既有缓存继续留在系统缓存目录,不无谓失效);不一致才跟随。
+/// 单独抽出来是为了让机器级标记 / 环境变量 / 服务形态默认值这三条
+/// 来源都走同一判定 —— 只认用户级标记的话,「装服务时写下的机器级
+/// data_dir」这种部署读不到,缓存就会继续默默写满系统盘。
+fn relocated_data_dir(data: &Path, default: &Path) -> Option<PathBuf> {
+    (data != default).then(|| data.to_path_buf())
+}
+
+/// 按**生效数据目录**定位缓存落点(纯函数),与 [`data_dir`] 同口径。
+fn cache_root_for_data_dir(data: &Path, default: &Path, system_cache: &Path) -> PathBuf {
+    cache_root_for(relocated_data_dir(data, default).as_deref(), system_cache)
 }
 
 /// 缓存目录路径(缩略图四档),优先级与 [`cache_dir`] 完全一致,但**不建目录** ——
@@ -544,7 +574,7 @@ pub fn cache_dir_loc() -> PathBuf {
             return PathBuf::from(v);
         }
     }
-    cache_root_for(marker_data_dir().as_deref(), &system_cache_dir())
+    cache_root_for_data_dir(&data_dir_loc(), &default_data_dir(), &system_cache_dir())
 }
 
 /// 缓存目录(缩略图四档)。见 [`cache_dir_loc`] 的优先级,附带建目录。
@@ -556,15 +586,21 @@ pub fn cache_dir() -> PathBuf {
 
 /// 本应用**自己写数据**的目录候选(纯路径,不建目录),给扫描排除规则用。
 ///
-/// 要列三个而不是只列 [`cache_dir_loc`],是因为「谁在写缓存」和「谁在扫盘」
-/// 是两个进程:写缩略图的是 UI 进程(读用户级 `data.location` 标记),
-/// 做全盘发现的是常驻服务(LocalSystem 读不到用户级标记,只能读到机器级)。
-/// 少了机器级那一条,服务就会把自家缩略图当照片收进库。
+/// 要列全而不是只列 [`cache_dir_loc`],是因为「谁在写缓存」和「谁在扫盘」
+/// 是两个进程:写缩略图的是 UI 进程(读用户级配置),做全盘发现的是常驻
+/// 服务(LocalSystem 读不到用户级配置,只能读到机器级)。两种形态各自
+/// 解析出的落点、机器级默认落点、以及历史的系统缓存落点都要排除,
+/// 少一条服务就会把自家缩略图当照片收进库。
 pub fn own_cache_dirs() -> Vec<PathBuf> {
     let sys = system_cache_dir();
+    let dflt = default_data_dir();
+    // 另一进程形态(UI ↔ 服务)看到的生效目录可能不同:用户级标记只有
+    // 登录用户读得到。两个落点都列进排除表,免得自家缩略图被当照片收进库。
+    let other = resolve_data_dir(marker_data_dir(), machine_marker_dir(), !service_mode());
     let cands = [
         cache_dir_loc(),
-        cache_root_for(machine_marker_dir().as_deref(), &sys),
+        cache_root_for_data_dir(&other, &dflt, &sys),
+        cache_root_for_data_dir(&machine_default_dir(), &dflt, &sys),
         sys,
     ];
     let mut out: Vec<PathBuf> = Vec::with_capacity(cands.len());
@@ -682,6 +718,77 @@ fn copy_cache_missing(src: &Path, dst: &Path, moved: &mut usize, failed: &mut bo
     }
 }
 
+/// 缩略图四档的目录名(对应 `thumbs::Tier::dir_name`)。db 不依赖 thumbs,
+/// 这里写死并由测试反向核对。自动搬迁只认这四个目录 —— 旧位置里的
+/// `*.reset-*` 历史备份体量可能和缓存本身相当,是否清掉该由用户决定,
+/// 不该在后台静默移动/删除。
+const CACHE_TIER_DIRS: [&str; 4] = ["thumbs", "smallthumbs", "bigthumbs", "previews"];
+
+/// 启动后台缓存搬迁状态:0 = 未开始/无需搬,1 = 进行中,2 = 完成,3 = 部分失败。
+static CACHE_MIGRATION_STATE: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+static CACHE_MIGRATION_MOVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 给选项页读的搬迁状态 (状态码, 已搬文件数)。
+pub fn cache_migration_status() -> (u8, usize) {
+    use std::sync::atomic::Ordering;
+    (
+        CACHE_MIGRATION_STATE.load(Ordering::Relaxed),
+        CACHE_MIGRATION_MOVED.load(Ordering::Relaxed),
+    )
+}
+
+/// 把旧系统缓存里四个档位的缩略图搬到 `to`。只补缺、不覆盖;
+/// 全部成功后按档位清掉来源子目录,顶层目录与其它内容(reset 备份、
+/// 配置文件)保持原样。同步执行,调用方负责放进后台线程。
+fn relocate_tier_caches(from: &Path, to: &Path) -> (usize, bool) {
+    let mut moved = 0usize;
+    let mut failed = false;
+    for name in CACHE_TIER_DIRS {
+        let s = from.join(name);
+        if !s.is_dir() {
+            continue;
+        }
+        let d = to.join(name);
+        if std::fs::create_dir_all(&d).is_err() {
+            failed = true;
+            continue;
+        }
+        copy_cache_missing(&s, &d, &mut moved, &mut failed);
+    }
+    if failed {
+        return (moved, false);
+    }
+    for name in CACHE_TIER_DIRS {
+        let s = from.join(name);
+        if s.is_dir() {
+            remove_tree_best_effort(&s);
+        }
+    }
+    (moved, true)
+}
+
+/// 数据目录迁走后,启动时自动把旧系统缓存搬到新落点。
+/// 与手动「把旧缓存搬过来」整棵搬不同,这里只搬四个档位目录,
+/// 状态写进 [`cache_migration_status`] 供选项页显示。
+pub fn auto_relocate_system_cache() -> (usize, bool) {
+    use std::sync::atomic::Ordering;
+    let from = system_cache_dir();
+    let to = cache_dir_loc();
+    if same_dir(&from, &to) || !from.is_dir() {
+        return (0, true);
+    }
+    if !CACHE_TIER_DIRS.iter().any(|n| from.join(n).is_dir()) {
+        return (0, true);
+    }
+    CACHE_MIGRATION_STATE.store(1, Ordering::Relaxed);
+    let (moved, ok) = relocate_tier_caches(&from, &to);
+    CACHE_MIGRATION_MOVED.store(moved, Ordering::Relaxed);
+    CACHE_MIGRATION_STATE.store(if ok { 2 } else { 3 }, Ordering::Relaxed);
+    (moved, ok)
+}
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -720,7 +827,10 @@ CREATE TABLE IF NOT EXISTS photos (
     ext TEXT,
     -- L1 身份:fnv1a64("<盘符>:<FRN index>")。改名/移动时不变,
     -- 增量落库按它 upsert(path 只是属性,不是身份)。非 NTFS/历史行为 NULL。
-    frn64 INTEGER
+    frn64 INTEGER,
+    -- 人脸扫描「已分析」标记(0=待分析,1=已分析;没检出人脸也要置 1,
+    -- 否则待办队列永远卡在同批照片上)。清除人脸数据重扫时归零。
+    face_done INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_utc);
 CREATE INDEX IF NOT EXISTS idx_photos_parent ON photos(parent);
@@ -1260,6 +1370,11 @@ impl Store {
         // 这是「path 不再是唯一键」的落地方式。没有另起 uid64 的口径:uid64 的
         // 契约是「一经分配即不变、供外部引用」(见 backfill_uid64),换算法会毁掉它。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN frn64 INTEGER;");
+        // 人脸扫描「已分析」标记:没检出人脸的照片也要记 1,否则它们永远留在
+        // photos_todo 队头,每批重复分析、后面的照片永远轮不到(队列卡死)。
+        // 清除人脸数据重扫时随 wipe_faces 一并归零。
+        let _ = conn
+            .execute_batch("ALTER TABLE photos ADD COLUMN face_done INTEGER NOT NULL DEFAULT 0;");
         // P3-ui:相簿(参考件 Album;我方相簿是照片 id 的命名集合,不移动文件)。
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS albums (
@@ -3465,6 +3580,22 @@ impl Store {
         })
     }
 
+    /// 按 id 取右键菜单要用的行字段(星标 / 媒体类型)。
+    ///
+    /// 快速查找页把图库右键菜单借给已入库的媒体命中:菜单要显示
+    /// 「加星标还是取消星标」「预览还是播放」,这两样只认库里的行。
+    /// 路径与父目录由调用方自带(命中本来就是全路径),不必回查。
+    pub fn photo_brief_by_id(&self, id: i64) -> Option<(i64, i64)> {
+        self.read(|conn| {
+            conn.query_row(
+                "SELECT star, kind FROM photos WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+        })
+    }
+
     /// 拿账本复核一遍库里的行:把常用目录 / 用户导入目录里还没排队的抬进队列。
     ///
     /// 只做「升」,不再做「降」。派生状态只是排队进度,不是显示开关:
@@ -3708,6 +3839,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_template_ships_official_defaults() {
+        // 模板里的两行要和代码内置的默认常量一致,否则「看配置」和
+        // 「没配置文件时的实际行为」会给出不同地址。
+        assert!(SETTINGS_TEMPLATE.contains(&format!("UpdateURL={DEFAULT_UPDATE_URL}")));
+        assert!(SETTINGS_TEMPLATE.contains(&format!("ModelURL={DEFAULT_MODEL_URL}")));
+        let kv = crate::update::parse_kv(SETTINGS_TEMPLATE);
+        assert_eq!(kv.get("updateurl").unwrap(), DEFAULT_UPDATE_URL);
+        assert_eq!(kv.get("modelurl").unwrap(), DEFAULT_MODEL_URL);
+    }
+
+    #[test]
     fn rewrite_marker_preserves_update_section() {
         // 统一格式:替换 data_dir 两行,注释与 [update] 节原样保留。
         let src = "# 头注释\n[location]\ndata_dir=C:\\old\n\n[update]\nUpdateURL=http://a/latest.ini\nModelURL=http://a/models/\n";
@@ -3789,6 +3931,92 @@ mod tests {
             cache_root_for(Some(Path::new("D:\\maliang")), sys),
             PathBuf::from("D:\\maliang").join(CACHE_SUBDIR)
         );
+    }
+
+    /// 缓存落点必须按**生效**数据目录判定,不能只认用户级标记:
+    /// 机器级标记(装服务时写下的)、服务形态默认目录(ProgramData)、
+    /// 环境变量覆盖,这几条来源都要跟随。缺一条就会出现「库在 D:、
+    /// 缩略图却继续写满 C:」—— 而界面还写着会自动跟随。
+    #[test]
+    fn cache_root_follows_every_effective_data_dir_source() {
+        let sys = Path::new("C:\\Users\\x\\AppData\\Local\\Relyto\\Maliang");
+        let dflt = Path::new("C:\\Users\\x\\AppData\\Roaming\\Relyto\\Maliang");
+        // 没迁走:沿用历史落点,既有缓存不失效。
+        assert_eq!(cache_root_for_data_dir(dflt, dflt, sys), sys.to_path_buf());
+        // 用户级标记 / 机器级标记 / 服务形态默认值 / 任意显式目录,
+        // 只要偏离默认就跟随到 <数据目录>/cache。
+        let sources = [
+            resolve_data_dir(Some(PathBuf::from("D:\\user")), None, false),
+            resolve_data_dir(None, Some(PathBuf::from("D:\\machine")), false),
+            machine_default_dir(),
+            PathBuf::from("D:\\env_override"),
+        ];
+        for d in sources {
+            assert_ne!(d.as_path(), dflt, "样本本身必须代表「已迁走」: {d:?}");
+            assert_eq!(
+                cache_root_for_data_dir(&d, dflt, sys),
+                d.join(CACHE_SUBDIR),
+                "{d:?} 这条来源的缓存必须跟随"
+            );
+        }
+    }
+
+    /// 档位目录名写死在 db,反向核对 thumbs 模块,防止加档漏登记。
+    #[test]
+    fn cache_tier_dirs_match_thumbs_module() {
+        let src = include_str!("thumbs.rs");
+        for name in CACHE_TIER_DIRS {
+            assert!(
+                src.contains(&format!("\"{name}\"")),
+                "{name} 没在 thumbs.rs 的 dir_name 里出现,自动搬迁会漏这一档"
+            );
+        }
+    }
+
+    /// 自动搬迁只动四个档位目录:历史重置备份与顶层目录原样保留,
+    /// 不替用户静默删除体量相当的历史数据;目标已有同名文件不覆盖。
+    #[test]
+    fn auto_cache_relocation_moves_tiers_only() {
+        let base = std::env::temp_dir().join(format!("rk-auto-cache-{}", std::process::id()));
+        let from = base.join("old");
+        let to = base.join("new");
+        let _ = std::fs::remove_dir_all(&base);
+        for d in ["thumbs", "smallthumbs", "thumbs.reset-20261107"] {
+            std::fs::create_dir_all(from.join(d)).unwrap();
+        }
+        std::fs::write(from.join("thumbs").join("1.jpg"), b"A").unwrap();
+        std::fs::write(from.join("smallthumbs").join("2.jpg"), b"B").unwrap();
+        std::fs::write(from.join("thumbs.reset-20261107").join("9.jpg"), b"OLD").unwrap();
+
+        let (moved, ok) = relocate_tier_caches(&from, &to);
+        assert_eq!(moved, 2, "只搬两档: {moved}");
+        assert!(ok);
+        assert_eq!(std::fs::read(to.join("thumbs").join("1.jpg")).unwrap(), b"A");
+        assert_eq!(
+            std::fs::read(to.join("smallthumbs").join("2.jpg")).unwrap(),
+            b"B"
+        );
+        assert!(!from.join("thumbs").exists(), "搬完清空该档来源");
+        assert!(
+            from.join("thumbs.reset-20261107").join("9.jpg").exists(),
+            "历史备份保留原处"
+        );
+        assert!(from.exists(), "顶层目录不删");
+
+        // 目标已有同名文件不覆盖。
+        std::fs::create_dir_all(from.join("bigthumbs")).unwrap();
+        std::fs::write(from.join("bigthumbs").join("3.jpg"), b"OLD3").unwrap();
+        std::fs::create_dir_all(to.join("bigthumbs")).unwrap();
+        std::fs::write(to.join("bigthumbs").join("3.jpg"), b"KEPT").unwrap();
+        let (moved2, ok2) = relocate_tier_caches(&from, &to);
+        assert_eq!(moved2, 0);
+        assert!(ok2);
+        assert_eq!(
+            std::fs::read(to.join("bigthumbs").join("3.jpg")).unwrap(),
+            b"KEPT"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 数据目录优先级:用户标记 > 机器标记 > 按进程形态的默认目录。

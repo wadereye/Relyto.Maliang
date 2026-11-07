@@ -73,6 +73,10 @@ automatic model provisioning**.
   all configured in one `maliang.ini` (older data-location settings and
   `update.ini` are migrated automatically on first launch; the server
   manifest format ships as an example file).
+- The official manifest URL and models directory are built in as factory
+  defaults: a fresh install, or wiping the local configuration, no longer
+  disables update checks or model downloads. Set your own addresses in
+  `maliang.ini` to switch servers; an empty value disables that capability.
 - When auto-download is off, a new version is only announced and the
   user decides when to update.
 - `--version` prints the version for scripts; "check only" and
@@ -101,8 +105,9 @@ automatic model provisioning**.
   fetches them in a background thread with ranged resume; each file is
   really loaded once through the runtime before it is accepted, and files
   that fail to load are discarded.
-- Without that setting the app stays fully manual and ships no third-party
-  download links.
+- Setting `ModelURL` to an empty value restores fully manual placement;
+  the built-in address is the official distribution directory, and no
+  third-party download links are shipped.
 
 ### Changed
 

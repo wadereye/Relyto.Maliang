@@ -568,6 +568,26 @@ pub fn backfill_idle(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>>
     backfill_rows(store, Tier::Normal, rows)
 }
 
+/// 缩略图专用 rayon 池:线程数只给核数的四分之一,且每个线程降为
+/// BelowNormal。之前用全局池 —— 全局池线程按 Normal 优先级创建,首启
+/// 全盘补缩略图时把所有核吃满,UI 线程同等优先级抢不到时间片,整个
+/// 程序(乃至系统)卡到补齐为止。窄池 + 低优先级后,UI 永远优先拿核,
+/// 生成吞吐牺牲一点,换来「补图全程不卡界面」。
+fn thumb_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = (crate::win::cpu_count() / 4).clamp(1, 4);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("maliang-thumb-{i}"))
+            .start_handler(|_| {
+                crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal)
+            })
+            .build()
+            .expect("缩略图线程池初始化失败")
+    })
+}
+
 fn backfill_rows(
     store: &crate::db::Store,
     tier: Tier,
@@ -579,8 +599,8 @@ fn backfill_rows(
     let (ok, failed): (
         Vec<(i64, u64, Option<crate::scan::Derived>)>,
         Vec<(i64, &String, String)>,
-    ) = rows
-        .par_iter()
+    ) = thumb_pool().install(|| {
+        rows.par_iter()
         .filter_map(|(id, path)| {
             // 云盘占位文件(OneDrive / SeaFile 按需下载):生成缩略图要打开
             // 内容,会把占位文件整个拉下来。跳过且**不记账**——这不是坏文件,
@@ -602,7 +622,8 @@ fn backfill_rows(
                 Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
             })
         })
-        .partition_map(|either| either);
+        .partition_map(|either| either)
+    });
     for (id, path, why) in &failed {
         escalate_failure(store, *id, path, why);
     }
@@ -672,6 +693,12 @@ pub fn visible_dirs() -> VisibleDirs {
 const IDLE_BATCH: usize = 8;
 /// 闲时补齐两批之间的让出时间(毫秒)。
 const IDLE_GAP_MS: u64 = 120;
+/// 优先队列两批之间的让出时间(毫秒)。
+///
+/// 首启全盘补图是持续数分钟到数小时的洪峰,批与批之间若无缝衔接,
+/// UI 每帧都要从满负荷的后台解码里抢时间片。批间留一条呼吸缝,
+/// 一批 32 张的解码量也保证了 UI 侧「占位格逐批变清晰」的即时感。
+const BATCH_GAP_MS: u64 = 25;
 
 /// 常驻后台缩略图 worker 的对外句柄。
 ///
@@ -736,9 +763,10 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
         // 误判坏图的一次性销案放在 worker 线程里做:几千个文件要各读一次头,
         // 挂在 UI 线程上会卡住第一帧。
         reset_misfiled_bad_media_once(&store);
-        // 每批规模随核数缩放:批内是 rayon 并行的,单核机器给小批
-        // (一次补太多会长时间占住 DB 锁、拖慢 UI),多核机器给大批(少几轮往返)。
-        let batch = (crate::win::cpu_count() * 8).clamp(16, 128);
+        // 批内走专用窄池(见 `thumb_pool`),批规模取小批:一批完成 → 通知 UI
+        // 一次 → 占位格立刻换真图。大批只减少通信次数,却让单批解码拖长、
+        // 占住写库连接,首启全盘场景下 UI 会长时间看不到新图。
+        let batch = (crate::win::cpu_count() * 4).clamp(8, 32);
         let mut last_tier = Tier::Normal;
         while !stop2.load(Ordering::Relaxed) {
             let cur = tier2.load(Ordering::Relaxed);
@@ -752,6 +780,8 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
             let ids = backfill_tier(&store, t, &vis, batch).unwrap_or_default();
             if !ids.is_empty() {
                 let _ = tx.send(ids);
+                // 优先队列批间也让一下(BATCH_GAP_MS):洪峰期不与 UI 帧抢核。
+                std::thread::sleep(Duration::from_millis(BATCH_GAP_MS));
                 // 立刻继续下一批,直到这一轮补完。
                 continue;
             }

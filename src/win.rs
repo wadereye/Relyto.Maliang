@@ -355,12 +355,26 @@ pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     ]
 }
 
+/// 左栏「文件夹」分组里的常用位置:我的文档 / 桌面 / 我的图片 / 我的视频。
+///
+/// 与 `shell_shortcuts` 的区别:这一组只放真实存在的目录,不含「我的电脑」
+/// 这类没有落点的入口,点一下就能定位到图库里的对应目录。
+pub fn common_places() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
+    vec![
+        ("我的文档", known_path(FOLDERID::Documents)),
+        ("桌面", known_path(FOLDERID::Desktop)),
+        ("我的图片", known_path(FOLDERID::Pictures)),
+        ("我的视频", known_path(FOLDERID::Videos)),
+    ]
+}
+
 /// 壳目录枚举(Windows 用 KNOWNFOLDERID,其它平台退回家目录同名子目录)。
 #[derive(Clone, Copy)]
 enum FOLDERID {
     Desktop,
     Documents,
     Pictures,
+    Videos,
 }
 
 /// 单个壳目录路径;不存在(未重定向/未创建)返回 None。
@@ -370,13 +384,14 @@ fn known_path(which: FOLDERID) -> Option<std::path::PathBuf> {
         use windows::Win32::Foundation::HANDLE;
         use windows::Win32::System::Com::CoTaskMemFree;
         use windows::Win32::UI::Shell::{
-            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, SHGetKnownFolderPath,
-            KNOWN_FOLDER_FLAG,
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Pictures, FOLDERID_Videos,
+            SHGetKnownFolderPath, KNOWN_FOLDER_FLAG,
         };
         let fid = match which {
             FOLDERID::Desktop => &FOLDERID_Desktop,
             FOLDERID::Documents => &FOLDERID_Documents,
             FOLDERID::Pictures => &FOLDERID_Pictures,
+            FOLDERID::Videos => &FOLDERID_Videos,
         };
         // SAFETY: rfid 指向静态常量 GUID;htoken 传 NULL 表示当前用户。
         let pw = unsafe {
@@ -397,6 +412,7 @@ fn known_path(which: FOLDERID) -> Option<std::path::PathBuf> {
             FOLDERID::Desktop => "Desktop",
             FOLDERID::Documents => "Documents",
             FOLDERID::Pictures => "Pictures",
+            FOLDERID::Videos => "Videos",
         };
         let p = dirs::home_dir()?.join(name);
         p.is_dir().then_some(p)

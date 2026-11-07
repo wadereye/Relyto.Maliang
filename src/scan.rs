@@ -669,6 +669,27 @@ pub fn reconcile_missing(store: &Store, roots: &[PathBuf]) -> Vec<(i64, String)>
     store.drop_missing_paths(&in_roots).unwrap_or_default()
 }
 
+/// 扫描专用 rayon 池:核数的一半、每线程 BelowNormal。
+///
+/// 与缩略图同理(见 `crate::thumbs::thumb_pool`):全局池线程按 Normal
+/// 优先级创建,首启全盘扫描的 stat 洪峰会把所有核吃满,UI 线程同级
+/// 抢不到时间片。窄池 + 低优先级让扫描全程不挡界面,扫描本身只是
+/// 元数据读取,半数核的吞吐足够。
+fn scan_pool() -> &'static rayon::ThreadPool {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let n = (crate::win::cpu_count() / 2).clamp(2, 8);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .thread_name(|i| format!("maliang-scan-{i}"))
+            .start_handler(|_| {
+                crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal)
+            })
+            .build()
+            .expect("扫描线程池初始化失败")
+    })
+}
+
 pub fn scan_dir_ctrl(
     store: &Store,
     roots: &[PathBuf],
@@ -742,50 +763,52 @@ pub fn scan_dir_ctrl(
     let modified2 = modified.clone();
 
     // 取消后不再处理新文件,但已算出的记录全部保留(不丢已完成的工作)。
-    let collected: Vec<Option<Record>> = candidates
-        .into_par_iter()
-        .map(|p| {
-            // 取消检查:已取消就跳过剩余候选(在途记录照常保留)。
-            if ctrl2.is_cancelled() {
-                return None;
-            }
-            // ---- 快速路径:指纹一致则整条跳过(不读 EXIF、不解码) ----
-            let md = match std::fs::metadata(&p) {
-                Ok(m) => m,
-                Err(_) => return None,
-            };
-            let mtime = match md
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            {
-                Some(d) => d.as_millis() as i64,
-                None => return None,
-            };
-            let size = md.len() as i64;
-            let key = p.to_string_lossy().into_owned();
-            if let Some(&(osize, omtime)) = prints.get(&key) {
-                if osize == size && omtime == mtime {
-                    unchanged2.fetch_add(1, Ordering::Relaxed);
-                    counter2.fetch_add(1, Ordering::Relaxed);
-                    ctrl2.advance(1);
+    let collected: Vec<Option<Record>> = scan_pool().install(|| {
+        candidates
+            .into_par_iter()
+            .map(|p| {
+                // 取消检查:已取消就跳过剩余候选(在途记录照常保留)。
+                if ctrl2.is_cancelled() {
                     return None;
                 }
-                // 库里有但内容变了 → 算"修改"(变更日志)。
-                modified2.fetch_add(1, Ordering::Relaxed);
-            } else {
-                // 库里没有 → 算"新增"。
-                added2.fetch_add(1, Ordering::Relaxed);
-            }
-            // 取消检查:每处理 64 个文件查一次(原版分段查的思路)。
-            let n = counter2.fetch_add(1, Ordering::Relaxed);
-            ctrl2.advance(1);
-            if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
-                return None;
-            }
-            Some(read_record(&p, size, mtime))
-        })
-        .collect();
+                // ---- 快速路径:指纹一致则整条跳过(不读 EXIF、不解码) ----
+                let md = match std::fs::metadata(&p) {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                };
+                let mtime = match md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                {
+                    Some(d) => d.as_millis() as i64,
+                    None => return None,
+                };
+                let size = md.len() as i64;
+                let key = p.to_string_lossy().into_owned();
+                if let Some(&(osize, omtime)) = prints.get(&key) {
+                    if osize == size && omtime == mtime {
+                        unchanged2.fetch_add(1, Ordering::Relaxed);
+                        counter2.fetch_add(1, Ordering::Relaxed);
+                        ctrl2.advance(1);
+                        return None;
+                    }
+                    // 库里有但内容变了 → 算"修改"(变更日志)。
+                    modified2.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // 库里没有 → 算"新增"。
+                    added2.fetch_add(1, Ordering::Relaxed);
+                }
+                // 取消检查:每处理 64 个文件查一次(原版分段查的思路)。
+                let n = counter2.fetch_add(1, Ordering::Relaxed);
+                ctrl2.advance(1);
+                if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
+                    return None;
+                }
+                Some(read_record(&p, size, mtime))
+            })
+            .collect()
+    });
 
     let cancelled = ctrl.is_cancelled();
     let records: Vec<Record> = collected.into_iter().flatten().collect();
@@ -975,6 +998,13 @@ pub fn index_file_ctrl(
 ///
 /// 顺手按派生门算 `rich_state`:walkdir 与 MFT 两条发现路必须
 /// 共用同一个门,否则非 NTFS 卷会整个绕过作用域。
+/// 单事务落库的行数上限。
+///
+/// 全盘首扫可能一次带来几十万条记录:一条事务包到底,写连接锁要被
+/// 持有数秒到数十秒,期间 UI 线程的任何写操作(改设置、记账、摘行)
+/// 都得干等。按块拆事务,单块毫秒级提交,UI 的写延迟有界。
+const INSERT_CHUNK: usize = 4096;
+
 fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
     if records.is_empty() {
         return Ok(());
@@ -983,38 +1013,41 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
     let gate = crate::db::ScopeGate::load(store);
     // 注意:必须用 execute_batch —— rusqlite 的 `execute` 只接受单条语句,
     // 传多条会报 "Multiple statements provided"。
-    store.write(|conn| -> Result<()> {
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
-        let tx = conn.unchecked_transaction()?;
-        let mut st = tx.prepare_cached(
-            "INSERT INTO photos(path,parent,mtime,size,star,thumb_ok,uid64,kind,ext,rich_state)
-             VALUES(:path,:parent,:mtime,:size,0,0,:uid,:kind,:ext,:rich)
-             ON CONFLICT(path) DO UPDATE SET
-               mtime=:mtime, size=:size, kind=:kind,
-               uid64=COALESCE(photos.uid64, :uid),
-               rich_state=CASE
-                 WHEN photos.mtime<>:mtime AND photos.thumb_ok=1
-                      AND photos.rich_state<>3 THEN 1
-                 WHEN :rich<>1 THEN photos.rich_state
-                 WHEN photos.rich_state=0 THEN 1
-                 ELSE photos.rich_state END",
-        )?;
-        for r in records {
-            // uid64 = fnv1a64(path|size|mtime)。
-            // 用 `COALESCE(photos.uid64, :uid)` —— 已有 uid64 的行**保持不变**
-            // (标识是持久的,不应随内容变化而变;重新索引不应改变外部引用)。
-            let uid = crate::db::fnv1a64(&format!("{}|{}|{}", r.path, r.size, r.mtime));
-            let ext = crate::db::Store::ext_of(&r.path);
-            let rich = gate.rich_state_of(&r.path, &r.parent, ext.as_deref());
-            st.execute(rusqlite::named_params! {
-                ":path": r.path, ":parent": r.parent, ":mtime": r.mtime, ":size": r.size,
-                ":uid": uid as i64, ":kind": r.kind, ":ext": ext, ":rich": rich,
-            })?;
-        }
-        drop(st);
-        tx.commit()?;
-        Ok(())
-    })
+    for chunk in records.chunks(INSERT_CHUNK) {
+        store.write(|conn| -> Result<()> {
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+            let tx = conn.unchecked_transaction()?;
+            let mut st = tx.prepare_cached(
+                "INSERT INTO photos(path,parent,mtime,size,star,thumb_ok,uid64,kind,ext,rich_state)
+                 VALUES(:path,:parent,:mtime,:size,0,0,:uid,:kind,:ext,:rich)
+                 ON CONFLICT(path) DO UPDATE SET
+                   mtime=:mtime, size=:size, kind=:kind,
+                   uid64=COALESCE(photos.uid64, :uid),
+                   rich_state=CASE
+                     WHEN photos.mtime<>:mtime AND photos.thumb_ok=1
+                          AND photos.rich_state<>3 THEN 1
+                     WHEN :rich<>1 THEN photos.rich_state
+                     WHEN photos.rich_state=0 THEN 1
+                     ELSE photos.rich_state END",
+            )?;
+            for r in chunk {
+                // uid64 = fnv1a64(path|size|mtime)。
+                // 用 `COALESCE(photos.uid64, :uid)` —— 已有 uid64 的行**保持不变**
+                // (标识是持久的,不应随内容变化而变;重新索引不应改变外部引用)。
+                let uid = crate::db::fnv1a64(&format!("{}|{}|{}", r.path, r.size, r.mtime));
+                let ext = crate::db::Store::ext_of(&r.path);
+                let rich = gate.rich_state_of(&r.path, &r.parent, ext.as_deref());
+                st.execute(rusqlite::named_params! {
+                    ":path": r.path, ":parent": r.parent, ":mtime": r.mtime, ":size": r.size,
+                    ":uid": uid as i64, ":kind": r.kind, ":ext": ext, ":rich": rich,
+                })?;
+            }
+            drop(st);
+            tx.commit()?;
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
