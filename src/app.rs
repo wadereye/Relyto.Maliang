@@ -3262,7 +3262,11 @@ impl App {
                                     ui.add_sized([56.0, 56.0], egui::Label::new(icon));
                                 }
                             });
-                            let resp = row.response();
+                            // 表格行的 response 只是行内控件 response 的并集,
+                            // 而单元格里全是 Label 这类不感知点击的控件,
+                            // clicked/double_clicked/context_menu 因此永不触发。
+                            // 先对整行补一次点击感知,选中/双击/右键才活。
+                            let resp = row.response().interact(egui::Sense::click());
                             if resp.clicked() {
                                 self.name_sel = Some(h.path.clone());
                             }
