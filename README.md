@@ -5,6 +5,8 @@
 > Your local photo AI butler
 > Instant preview · Smart tags · Chat-to-search · One-click done
 
+**Official website & download**: <https://www.nicexm.com/maliang/>
+
 **Why this project exists.** Google Picasa was a truly great photo management and editing app — fast, simple, and a joy to use. Sadly, Google discontinued it in 2016; many photo tools have appeared since, but I never found one I truly liked. That's why Maliang (神笔马良) was born: written independently in Rust and released as open source, to carry that classic experience forward and add the capabilities the old tool never had.
 
 Maliang (神笔马良) is a desktop-first local photo management tool that aims to modernize the classic Picasa 3 experience: smoother browsing, smarter organization, and native, offline, privacy-first AI capabilities. All of your data stays on your own machine — nothing is uploaded to the cloud, and your private photos are never scanned and sent anywhere.
@@ -28,6 +30,7 @@ For feature requests or to join the community group, you can email me, or scan m
 - **Automatic updates**: while running, changes are tracked live via file system events; files added or removed while the app was closed are reconciled automatically at the next launch.
 - **Slideshow**: play the selected photos or the entire current view.
 - **Sorting & thumbnail size**: by capture date / filename, ascending or descending, normal / small.
+- **Multi-format support**: common image formats including JPG, PNG, WebP, GIF, PSD and more.
 
 ### Quick Search
 
@@ -35,6 +38,7 @@ For feature requests or to join the community group, you can email me, or scan m
 - **Filter by type**: all / images (RAW included) / videos / audio / archives / executables / documents.
 - **Global file search box**: type a filename anywhere to jump into quick search; results return in seconds even across millions of files.
 - **One-time authorization, silent background updates**: once registered as a scheduled task with administrator authorization, the index stays fresh automatically at boot; it can be revoked anytime under Options > General.
+- **Multiple quick-index fallbacks**: on Windows, NTFS drives use a fast scan; when NTFS is unavailable, an adjusted `walkdir` traversal serves as the fallback.
 
 ### Editing & Effects
 
@@ -45,9 +49,9 @@ For feature requests or to join the community group, you can email me, or scan m
 
 ### AI Capabilities (the `ai` feature is enabled by default, can be trimmed off)
 
-- **OCR text recognition**: text inside photos becomes searchable.
-- **Face organizing**: detection, clustering, quality scoring, semi-automatic naming suggestions, ignored clusters.
-- **CLIP semantic search**: bilingual Chinese/English descriptive search such as "find photos with cats".
+- **OCR text recognition**: text inside photos becomes searchable (not fully complete as of v0.3).
+- **Face organizing**: detection, clustering, quality scoring, semi-automatic naming suggestions, ignored clusters (multiple schemes implemented; the user chooses which model to use).
+- **CLIP semantic search**: bilingual Chinese/English descriptive search such as "find photos with cats" (not fully complete as of v0.3).
 
 ### Import & Export
 
@@ -292,7 +296,7 @@ Picasa is a trademark of Google LLC. This project is an **independent open sourc
 
 Maliang is an independently written implementation in Rust; this repository contains and distributes no Google source code, binaries, or asset files. Similarities in interface and interaction design are intended to preserve a familiar experience and to support data interoperability with Picasa (such as the classic `picasa.ini` file format).
 
-Adobe and Photoshop are trademarks or registered trademarks of Adobe Inc. Mentioning PSD / PSB here describes file-format compatibility only and implies no affiliation, authorization, sponsorship, or endorsement.
+Adobe and Photoshop are trademarks or registered trademarks of Adobe Inc. Mentioning PSD / PSB here describes file-format compatibility only and implies no affiliation, authorization, sponsorship, or endorsement, and makes no claim of Adobe compatibility certification.
 
 ## Third-Party Notices
 
