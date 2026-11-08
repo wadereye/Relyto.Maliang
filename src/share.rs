@@ -1,27 +1,25 @@
 //! 分享链路:邮件(Simple MAPI)与礼品光盘(IMAPI2)。
 //!
-//! 参考 Picasa 3 的分享实现:
+//! 分享实现:
 //! - **邮件 = Simple MAPI**:`LoadLibraryA("MAPI32.DLL")` + `GetProcAddress("MAPISendMail")`,
 //!   发送 flags=9(`MAPI_LOGON_UI|MAPI_DIALOG`),附件暂存 `temp\email\`,
 //!   文件名格式 `"%0*d-%s"`(序号零填充)。
 //! - **尺寸选项**:1600/1024/800。
-//! - **刻录 = IMAPI2**:走 IMAPI2 COM 文件系统映像接口;原版有 IMAPI2
-//!   引擎连接失败的错误提示。盘上卷标 "Picasa CD",JPEG 质量 85,
-//!   并提供盘上清单导出。
+//! - **刻录 = IMAPI2**:走 IMAPI2 COM 文件系统映像接口,
+//!   JPEG 质量 85,并提供盘上清单导出。
 //!
-//! 与原版的差异(实现口径):
-//! 1. 原版用 ANSI `MAPISendMail`;我方用同 DLL 的 `MAPISendMailW`(Vista+ 标准导出),
-//!    否则中文路径在 ANSI 代码页会丢字。flags/结构体逐字段对齐。
-//! 2. 原版 Gift CD 会复制幻灯播放器到盘上并写 `autorun.inf`;
-//!    我方没有盘上播放器,故**不写 autorun.inf**,只写照片 + `manifest.txt`
-//!    (原版同样在盘上输出清单文件)。
-//! 3. 原版刻录走插件 Primo 备援;我方只用 IMAPI2(与原版主引擎一致)。
+//! 实现口径说明:
+//! 1. 邮件用同 DLL 的 `MAPISendMailW`(Vista+ 标准导出),
+//!    否则中文路径在 ANSI 代码页会丢字。
+//! 2. 礼品光盘**不写 autorun.inf**,只写照片 + `manifest.txt`
+//!    盘上清单文件。
+//! 3. 刻录只用 IMAPI2。
 
 use crate::effects::FilterStack;
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
-/// 邮件/光盘尺寸档(参考件 Options > E-Mail 的 8 档列表
+/// 邮件/光盘尺寸档(8 档列表
 /// `160|320|480|640|800|1024|1200|1600`;默认 1024 像素)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareSize {
@@ -36,7 +34,7 @@ pub enum ShareSize {
 }
 
 impl ShareSize {
-    /// 最长边像素(参考件尺寸档列表)。
+    /// 最长边像素(尺寸档列表)。
     #[must_use]
     pub fn px(self) -> u32 {
         match self {
@@ -76,7 +74,7 @@ impl ShareSize {
         ShareSize::Px1600,
     ];
 
-    /// 按像素值取档(选项持久化用;未知值回退 1024 = 参考件默认档)。
+    /// 按像素值取档(选项持久化用;未知值回退默认档 1024)。
     #[must_use]
     pub fn from_px(px: u32) -> ShareSize {
         Self::ALL
@@ -86,7 +84,7 @@ impl ShareSize {
     }
 }
 
-/// 原版附件文件名格式 `"%0*d-%s"`:
+/// 附件文件名格式 `"%0*d-%s"`:
 /// 零填充序号(宽度 = 总数的十进制位数)-原文件名。
 #[must_use]
 pub fn share_file_name(index: usize, total: usize, stem: &str) -> String {
@@ -94,8 +92,7 @@ pub fn share_file_name(index: usize, total: usize, stem: &str) -> String {
     format!("{:0width$}-{stem}", index + 1, width = width)
 }
 
-/// JPEG 编码质量(原版刻录输出为 85;
-/// 邮件专属质量暂无对应资料,沿用同一常量)。
+/// JPEG 编码质量(刻录输出与邮件暂存共用同一常量)。
 pub const SHARE_JPEG_QUALITY: u8 = 85;
 
 /// 把条目(原图 + 可选效果栈)重采样到 `max_px` 内并编码为 JPEG 写入 `dir`。
@@ -106,7 +103,7 @@ pub fn stage_jpegs(
     dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     if items.is_empty() {
-        return Err(anyhow!("没有可分享的照片(原版 IDS_NO_IMAGES_TO_SEND)"));
+        return Err(anyhow!("没有可分享的照片"));
     }
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).with_context(|| format!("创建暂存目录失败: {}", dir.display()))?;
@@ -120,7 +117,7 @@ pub fn stage_jpegs(
             crate::effects::apply_stack(&mut rgba, stack);
         }
         let flat = image::DynamicImage::ImageRgba8(rgba);
-        // 重采样(原版统一导出管线有 "Resample-%d" 标记,tsv:761)
+        // 重采样
         let flat = if flat.width().max(flat.height()) > max_px {
             let (w, h) = if flat.width() >= flat.height() {
                 (
@@ -160,8 +157,8 @@ pub fn stage_jpegs(
     Ok(out)
 }
 
-/// 礼品光盘内容暂存:照片 + `manifest.txt` 清单(原版同样输出盘上清单)。
-/// **不写 autorun.inf**(原版指向盘上的幻灯播放器;我方无盘上播放器)。
+/// 礼品光盘内容暂存:照片 + `manifest.txt` 清单。
+/// **不写 autorun.inf**(无盘上播放器)。
 pub fn stage_gift_cd(
     items: &[(PathBuf, FilterStack)],
     max_px: u32,
@@ -239,16 +236,15 @@ mod win {
 
     /// 用系统默认邮件客户端打开带附件的撰写窗口。
     ///
-    /// 对齐原版:`mapi32.dll` 动态加载(MAPI 动态加载)+
+    /// `mapi32.dll` 动态加载(MAPI 动态加载)+
     /// 发送 flags=9(邮件发送,`MAPI_LOGON_UI|MAPI_DIALOG`)。
-    /// 差异:用 Unicode 导出 `MAPISendMailW`(中文路径不丢字),结构体逐字段对齐。
+    /// 用 Unicode 导出 `MAPISendMailW`(中文路径不丢字)。
     pub fn send_email(subject: &str, files: &[PathBuf]) -> Result<()> {
         if files.is_empty() {
-            return Err(anyhow!("没有附件(原版 IDS_NO_IMAGES_TO_SEND)"));
+            return Err(anyhow!("没有附件"));
         }
         unsafe {
-            // 原版把 mapi32.dll 句柄缓存在全局且从不 FreeLibrary,
-            // 我方同语义(进程退出由系统回收)。
+            // mapi32.dll 句柄不 FreeLibrary,进程退出由系统回收。
             let lib = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("MAPI32.DLL"))
                 .map_err(|e| anyhow!("加载 mapi32.dll 失败: {e}"))?;
             let proc = windows::Win32::System::LibraryLoader::GetProcAddress(
@@ -291,7 +287,7 @@ mod win {
                 n_file_count: files.len() as u32,
                 lp_files: file_descs.as_mut_ptr(),
             };
-            // flags = 9 = MAPI_LOGON_UI | MAPI_DIALOG(原版邮件发送)
+            // flags = 9 = MAPI_LOGON_UI | MAPI_DIALOG(邮件发送)
             let hr = send(0, 0, &mut msg, 9, 0);
             // SUCCESS_SUCCESS = 0
             if hr != 0 {
@@ -303,8 +299,7 @@ mod win {
 
     /// IMAPI2 刻录:把 `staging` 目录构建为镜像并写入第一个光驱。
     ///
-    /// 对齐原版 IMAPI2 实现(文件系统映像接口);卷标参考原版
-    /// (原版 "Picasa CD" → 我方 "Maliang CD")。
+    /// 走 IMAPI2 文件系统映像接口,卷标与客户端名由调用方传入。
     pub fn burn_folder(staging: &Path, label: &str, client: &str) -> Result<()> {
         unsafe {
             let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -312,7 +307,7 @@ mod win {
             let _guard = CoUninitGuard { do_uninit: init };
 
             let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_ALL)
-                .map_err(|e| anyhow!("无法连接 IMAPI2(原版同款错误文案场景): {e}"))?;
+                .map_err(|e| anyhow!("无法连接 IMAPI2: {e}"))?;
             let count = master
                 .Count()
                 .map_err(|e| anyhow!("IMAPI2 枚举光驱失败: {e}"))?;
@@ -339,7 +334,7 @@ mod win {
                 .Root()
                 .map_err(|e| anyhow!("取根目录失败: {e}"))?
                 .AddTree(&BSTR::from(staging.as_os_str().to_string_lossy().as_ref()), VARIANT_BOOL(0))
-                .map_err(|e| anyhow!("添加文件失败(原版 BurnCollection::CantAddFolder 同语义): {e}"))?;
+                .map_err(|e| anyhow!("添加文件失败: {e}"))?;
             let result = image
                 .CreateResultImage()
                 .map_err(|e| anyhow!("构建镜像失败: {e}"))?;
@@ -391,8 +386,8 @@ mod tests {
 
     #[test]
     fn share_size_px_matches_original_strings() {
-        // 原版 Options > E-Mail 尺寸档列表 160|320|480|640|800|1024|1200|1600,
-        // 默认档 1024("Same as multiple (1024 pixels)")。
+        // 尺寸档列表 160|320|480|640|800|1024|1200|1600,
+        // 默认档 1024。
         for px in [160, 320, 480, 640, 800, 1024, 1200, 1600] {
             assert_eq!(ShareSize::from_px(px).px(), px);
         }
@@ -401,7 +396,7 @@ mod tests {
 
     #[test]
     fn file_name_matches_original_format() {
-        // 原版 `"%0*d-%s"`:序号从 1 起,零填充宽度 = 总数十进制位数
+        // `"%0*d-%s"`:序号从 1 起,零填充宽度 = 总数十进制位数
         assert_eq!(share_file_name(0, 3, "a"), "1-a");
         assert_eq!(share_file_name(1, 12, "b"), "02-b");
         assert_eq!(share_file_name(11, 120, "c"), "012-c");
@@ -462,6 +457,6 @@ mod tests {
     fn stage_jpegs_rejects_empty() {
         let dir = std::env::temp_dir().join(format!("maliang-share-e-{}", std::process::id()));
         let err = stage_jpegs(&[], 800, &dir).unwrap_err();
-        assert!(err.to_string().contains("IDS_NO_IMAGES_TO_SEND"));
+        assert!(err.to_string().contains("没有可分享的照片"));
     }
 }

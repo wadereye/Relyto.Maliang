@@ -632,7 +632,7 @@ fn compile_query(q: &str) -> Vec<Term> {
 
 fn compile_term(tok: &str) -> Option<Term> {
     // **前导谓词管住整个词**:`ext:jpg|png` 是「扩展名 jpg 或 png」,不是
-    // 「扩展名 jpg 或名字含 png」。与参考件一致 —— 它先认出词的类型,再把
+    // 「扩展名 jpg 或名字含 png」。先认出词的类型,再把
     // **值**按未转义 `|` 切成候选数组去二分。
     if let Some((head, rest)) = tok.split_once(':') {
         let head: String = head.chars().map(|c| c.to_ascii_lowercase()).collect();

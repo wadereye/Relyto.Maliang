@@ -1,27 +1,13 @@
-//! 着色器族效果:同族效果共 10 项,本模块落地算法口径明确的 6 项。
-//!
-//! 六项共用三条约定(与参考件一致):
-//!
-//! 1. **逐像素重映射**:目标像素取自「进入本效果时的同一张图」,所以先克隆再写回,
-//!    不会出现边写边读的连锁位移。
-//! 2. **采样 = 钳位 + 取整**:坐标先钳进 `[0, 宽-1]` / `[0, 高-1]`,再四舍五入取整,
-//!    全程不做插值 —— 结果是「原图色彩的搬运」,不产生新色值(各效果的测试都锁了这条)。
-//! 3. **参数越界的两种处理**:有的效果直接整幅恒等返回(格长、角度出界),
-//!    有的钳到边界值再用(波纹块宽、HSL 三根轴)。逐条注明,不做「悄悄放宽」。
-//!
-//! 其余 4 项(自然饱和度 / 涂抹 / 催眠 / 可调阈值)算法仍有含糊处,暂不落地,
-//! 见 [`crate::effects::SHADER_PENDING`]。
+//! 图像着色器效果(六边形单元化、波纹、晶格、瀑布、HSL 等)的实现模块。
 
 use image::{Rgba, RgbaImage};
 
-/// √3,六边形格的行距系数。
+/// 六边形格的行距系数。
 const SQRT3: f32 = 1.7320508;
-/// √3/2,第二套六边形格的错位系数。
+/// 第二套六边形格的错位系数。
 const HALF_SQRT3: f32 = 0.8660254;
 
-/// 参考件的钳位口径:`v` 落在 `[0, max]` 内原样,越上界取 `max`,越下界取 `0`。
-///
-/// 不是随手写的 —— 非数(`NaN`)会落到「下界」一侧,与参考件把非法坐标读成左上角一致。
+/// 将 `v` 钳进 `[0, max]` 区间。
 fn clamp_lo_hi(v: f32, max: f32) -> f32 {
     if v >= 0.0 {
         if v <= max {
@@ -34,7 +20,7 @@ fn clamp_lo_hi(v: f32, max: f32) -> f32 {
     }
 }
 
-/// 对称轴上的钳位:`v` 越界时取 `±bound`(非数取下界)。
+/// 对称轴上的钳位:`v` 越界时取 `±bound`。
 fn clamp_sym(v: f32, bound: f32) -> f32 {
     if v >= -bound {
         if v <= bound {
@@ -47,7 +33,7 @@ fn clamp_sym(v: f32, bound: f32) -> f32 {
     }
 }
 
-/// 波纹块宽钳进 `1..100`(非数落到下界 1)。
+/// 波纹块宽钳进 `1..100`。
 fn clamp_grid(v: f32) -> f32 {
     if v >= 1.0 {
         if v > 100.0 {
@@ -70,13 +56,7 @@ fn sampled(src: &RgbaImage, x: f32, y: f32) -> Rgba<u8> {
     *src.get_pixel(ix.min(mx as u32), iy.min(my as u32))
 }
 
-/// 六边形单元化(HexCells)。
-///
-/// `cell` 是格长(像素)。`cell < 1` 时整幅恒等,与参考件一致。
-///
-/// 两套错位格:格 A 的格心在 `(W/2, H/2)` 的整数格点上,行距 `cell·√3`;
-/// 格 B 在 A 的基础上右移 `cell/2`、下移 `cell·√3/2`。每个像素取两格里
-/// **离自己更近的格心**那个像素(平局取格 B),块内不取均值。
+/// 六边形单元化(HexCells):按六边形格将整幅图像素单元化。
 pub fn hexcells(img: &mut RgbaImage, cell: f32) {
     if cell < 1.0 {
         return;
@@ -86,7 +66,6 @@ pub fn hexcells(img: &mut RgbaImage, cell: f32) {
     let cx = (w / 2) as f32;
     let cy = (h / 2) as f32;
     let row = cell * SQRT3;
-    // 格 B 的基点:相对格 A 错位半个格长、半个行距(√3/2·cell)。
     let bx = cx + cell * 0.5;
     let by = cy + cell * HALF_SQRT3;
     for y in 0..h {
@@ -107,13 +86,7 @@ pub fn hexcells(img: &mut RgbaImage, cell: f32) {
     }
 }
 
-/// 块状波纹(RippleBlocks)。
-///
-/// `ax`/`ay` 是横/纵振幅(像素),`bx`/`by` 是横/纵块宽(钳进 `1..100`),
-/// `ph_x`/`ph_y` 是相位(弧度)。位移公式:
-/// `sx = x + ax·sin(x/bx + ph_x)`、`sy = y + ay·cos(y/by + ph_y)`。
-///
-/// 名字里的「块」只是频率的分母,并没有真的分块。
+/// 块状波纹(RippleBlocks):按横纵正弦/余弦位移对整幅图做波纹扰动。
 pub fn ripple_blocks(img: &mut RgbaImage, ax: f32, ay: f32, bx: f32, by: f32, ph_x: f32, ph_y: f32) {
     let (w, h) = img.dimensions();
     let src = img.clone();
@@ -130,13 +103,7 @@ pub fn ripple_blocks(img: &mut RgbaImage, ax: f32, ay: f32, bx: f32, by: f32, ph
     }
 }
 
-/// 圆周边缘外翻(CircleSplash)。
-///
-/// 圆心取 `(W·fx, H·fy)`,`radius` 是圆周半径(像素)。
-/// 圆**外**的像素全部改成「同角度、圆周上」那个像素,圆**内**(含圆周本身)保持原样 ——
-/// 于是圆周边像水花一样向外甩成一圈放射条纹。
-///
-/// `radius` 出界(负数或大于 300)、圆心落在图外时整幅恒等。
+/// 圆周边缘外翻(CircleSplash):将圆外像素替换为同角度圆周上的像素。
 pub fn circle_splash(img: &mut RgbaImage, fx: f32, fy: f32, radius: f32) {
     let (w, h) = img.dimensions();
     if !(0.0..=300.0).contains(&radius) {
@@ -163,14 +130,7 @@ pub fn circle_splash(img: &mut RgbaImage, fx: f32, fy: f32, radius: f32) {
     }
 }
 
-/// 晶格化(Crystallize)。
-///
-/// `cell` 是格长(像素),出界(`> 300` 或 `< 1`)时整幅恒等。
-///
-/// 三套格网各给一个候选格心,取离当前像素最近的:**①** 转 18°(轴 0.951/0.309)、
-/// 基点 (2400, −100);**②** 转 30°(轴 0.866/0.5)、基点 (−100, 2400);
-/// **③** 不旋转、格长乘 0.95。比较顺序是 ②/① 先淘汰一个,再与 ③ 比 ——
-/// 平局保留先选的那个。三套格网叠在一起,块边界才不像规整方格。
+/// 晶格化(Crystallize):按三套叠加格网将整幅图像素单元化。
 pub fn crystallize(img: &mut RgbaImage, cell: f32) {
     let (w, h) = img.dimensions();
     if !(1.0..=300.0).contains(&cell) {
@@ -182,21 +142,17 @@ pub fn crystallize(img: &mut RgbaImage, cell: f32) {
         let fy = y as f32;
         for x in 0..w {
             let fx = x as f32;
-            // ① 18° 格网
             let (px, py) = (fx - 2400.0, fy + 100.0);
             let i = ((py * -0.309 + px * 0.951) / cell).floor() + 0.5;
             let j = ((px * 0.309 + py * 0.951) / cell).floor() + 0.5;
             let one = (i * cell * 0.951 + j * cell * 0.309 + 2400.0, i * cell * -0.309 + j * cell * 0.951 - 100.0);
-            // ② 30° 格网
             let (px, py) = (fx + 100.0, fy - 2400.0);
             let i = ((py * -0.5 + px * 0.866) / cell).floor() + 0.5;
             let j = ((px * 0.5 + py * 0.866) / cell).floor() + 0.5;
             let two = (i * cell * 0.866 + j * cell * 0.5 - 100.0, i * cell * -0.5 + j * cell * 0.866 + 2400.0);
-            // ②/① 取近(平局取 ①)
             let d1 = (one.0 - fx) * (one.0 - fx) + (one.1 - fy) * (one.1 - fy);
             let d2 = (two.0 - fx) * (two.0 - fx) + (two.1 - fy) * (two.1 - fy);
             let (mut bx, mut by) = if d1 <= d2 { one } else { two };
-            // ③ 无旋转格网
             let three = (
                 c3 * ((fx / c3).floor() + 0.5),
                 c3 * ((fy / c3).floor() + 0.5),
@@ -212,14 +168,7 @@ pub fn crystallize(img: &mut RgbaImage, cell: f32) {
     }
 }
 
-/// 瀑布折叠(Waterfall)。
-///
-/// 折叠线取 `(W·fx, H·fy)`,`angle` 决定把**哪一侧**的内容塌到线上(度):
-/// `0..90` 上线上方的行、`90..180` 下线右侧的列、`180..270` 下线下方的行、
-/// `270` 下线左侧的列。另一侧保持原样,线本身不变 —— **没有镜像**,
-/// 所以看到的是「一边被拽到线上」而不是对折。
-///
-/// `angle` 出界(负数或大于 270)、折叠线落在图外时整幅恒等。
+/// 瀑布折叠(Waterfall):按角度把折叠线一侧的内容塌到线上。
 pub fn waterfall(img: &mut RgbaImage, fx: f32, fy: f32, angle: f32) {
     let (w, h) = img.dimensions();
     if !(0.0..=270.0).contains(&angle) {
@@ -264,14 +213,7 @@ pub fn waterfall(img: &mut RgbaImage, fx: f32, fy: f32, angle: f32) {
     }
 }
 
-/// HSL 三通道滤镜(HslFilter)。
-///
-/// `hue` 是色相偏移(度,钳进 ±180,注意参考件是**减去**这个值),
-/// `sat` 是饱和度百分比偏移(钳进 ±100,乘性:`S' = S·(1 + sat/100)`),
-/// `lum` 是亮度百分比偏移(钳进 ±100,加性:`L' = L + lum/100`)。
-///
-/// 换算走标准 60° 扇区的 HSL,不引入我方其它效果的色彩模型;
-/// 透明度原样透传,四个通道各自钳回 `[0,1]` 后取整回 8 位。
+/// HSL 三通道滤镜(HslFilter):对色相、饱和度、亮度三轴做偏移调整。
 pub fn hsl_filter(img: &mut RgbaImage, hue: f32, sat: f32, lum: f32) {
     let hue = clamp_sym(hue, 180.0);
     let sat = clamp_sym(sat, 100.0);
@@ -284,8 +226,6 @@ pub fn hsl_filter(img: &mut RgbaImage, hue: f32, sat: f32, lum: f32) {
         let min = r.min(g).min(b);
         let delta = max - min;
         let light = (max + min) * 0.5;
-        // 色相:参考件只在「红为最大」那一支把角绕回 [0,360),另两支不绕 ——
-        // 另外两支的取值本来就落在 [60,180] / [180,300],绕不绕都一样。
         let mut h = if max == min {
             0.0
         } else if r == max {
@@ -333,7 +273,7 @@ pub fn hsl_filter(img: &mut RgbaImage, hue: f32, sat: f32, lum: f32) {
     }
 }
 
-/// 把色相分量绕回一圈(只补/减一次,不是取模)。
+/// 把色相分量绕回一圈。
 fn wrap(t: f32) -> f32 {
     if t >= 0.0 {
         if t > 1.0 {
@@ -363,7 +303,7 @@ fn hue_channel(t: f32, q: f32, p: f32) -> f32 {
 mod tests {
     use super::*;
 
-    /// 一张每个像素色值都不重复的渐变图,用来分辨「搬运」还是「混色」。
+    /// 生成像素色值互不相同的渐变测试图。
     fn gradient(w: u32, h: u32) -> RgbaImage {
         let mut img = RgbaImage::new(w, h);
         for y in 0..h {
@@ -383,7 +323,7 @@ mod tests {
         img
     }
 
-    /// 采样类效果的共同底线:结果里不许出现原图没有的色值。
+    /// 断言输出图只使用原图已有的色值。
     fn assert_only_existing_colors(out: &RgbaImage, src: &RgbaImage) {
         let mut palette: std::collections::HashSet<[u8; 4]> = std::collections::HashSet::new();
         for p in src.pixels() {
@@ -403,13 +343,11 @@ mod tests {
         let src = gradient(16, 16);
         let mut img = src.clone();
         hexcells(&mut img, 4.0);
-        // 格心 (W/2, H/2) 采样到自己 → 颜色不变
         assert_eq!(
             img.get_pixel(8, 8).0,
             src.get_pixel(8, 8).0,
             "格心应保持自身颜色"
         );
-        // 右邻一格:离格 A 中心更近,应被换成格心颜色
         assert_eq!(
             img.get_pixel(9, 8).0,
             src.get_pixel(8, 8).0,
@@ -430,11 +368,11 @@ mod tests {
     #[test]
     fn ripple_blocks_shifts_only_the_amplified_axis() {
         let src = gradient(16, 16);
-        // 振幅为 0:恒等(块宽钳位不参与判断)
+        // 振幅为 0:恒等
         let mut none = src.clone();
         ripple_blocks(&mut none, 0.0, 0.0, 20.0, 20.0, 0.0, 0.0);
         assert_eq!(none.as_raw(), src.as_raw(), "两根振幅都是 0 时应恒等");
-        // 只给横轴振幅:x 列为 0 的像素 sin(0)=0,不该动;其余横向位移
+        // 只给横轴振幅
         let mut img = src.clone();
         ripple_blocks(&mut img, 3.0, 0.0, 20.0, 20.0, 0.0, 0.0);
         for y in 0..16 {
@@ -450,7 +388,7 @@ mod tests {
 
     #[test]
     fn ripple_blocks_clamps_the_block_width() {
-        // 块宽小于 1 钳到 1,负块宽同样钳到 1 —— 两者结果必须一致
+        // 块宽小于 1 与负块宽结果必须一致
         let src = gradient(16, 16);
         let mut a = src.clone();
         let mut b = src.clone();
@@ -470,7 +408,6 @@ mod tests {
         // 圆心(半径内)与圆周上的像素保持原样
         assert_eq!(img.get_pixel(8, 8).0, src.get_pixel(8, 8).0, "圆内应原样");
         assert_eq!(img.get_pixel(8, 12).0, src.get_pixel(8, 12).0, "圆周本身原样");
-        // (8,0) 到圆心距离 8,同角方向圆周点是 (8,4)
         assert_eq!(
             img.get_pixel(8, 0).0,
             src.get_pixel(8, 4).0,
@@ -525,7 +462,7 @@ mod tests {
         let src = gradient(16, 16);
         let mut img = src.clone();
         waterfall(&mut img, 0.5, 0.5, 0.0);
-        // 角度 <90:线上方的行全部塌到 (x, H/2)
+        // 角度 <90:上方行塌到折叠线
         for x in 0..16 {
             assert_eq!(
                 img.get_pixel(x, 3).0,
@@ -533,7 +470,7 @@ mod tests {
                 "上方行应塌到折叠线"
             );
         }
-        // 线下方保持原样(没有镜像)
+        // 线下方保持原样
         assert_eq!(img.get_pixel(3, 12).0, src.get_pixel(3, 12).0, "另一侧应原样");
         assert_eq!(img.get_pixel(3, 8).0, src.get_pixel(3, 8).0, "折叠线本身不变");
     }
@@ -541,12 +478,12 @@ mod tests {
     #[test]
     fn waterfall_quadrants_pick_the_collapsing_axis() {
         let src = gradient(16, 16);
-        // 90..180:线右侧的列塌到 (W/2, y)
+        // 90..180:线右侧的列塌到线上
         let mut img = src.clone();
         waterfall(&mut img, 0.5, 0.5, 120.0);
         assert_eq!(img.get_pixel(15, 2).0, src.get_pixel(8, 2).0, "右侧应塌到线上");
         assert_eq!(img.get_pixel(2, 15).0, src.get_pixel(2, 15).0, "左侧应原样");
-        // 270:线左侧的列塌到 (W/2, y)
+        // 270:线左侧的列塌到线上
         let mut img = src.clone();
         waterfall(&mut img, 0.5, 0.5, 270.0);
         assert_eq!(img.get_pixel(0, 2).0, src.get_pixel(8, 2).0, "左侧应塌到线上");
@@ -571,7 +508,7 @@ mod tests {
     #[test]
     fn hsl_filter_rotates_hue_by_the_signed_axis() {
         let mut img = RgbaImage::from_pixel(1, 1, Rgba([255, 0, 0, 128]));
-        // 参考件是 H' = H − hue,故 hue=180 把红转成青
+        // hue=180 把红转成青
         hsl_filter(&mut img, 180.0, 0.0, 0.0);
         let p = img.get_pixel(0, 0).0;
         assert_eq!(p[0], 0, "红色转 180° 后红通道应归零,实得 {}", p[0]);
@@ -581,14 +518,14 @@ mod tests {
 
     #[test]
     fn hsl_filter_saturates_and_lightens_on_the_documented_axes() {
-        // sat = −100 → S' = 0 → 三通道同值(去色),且亮度不变
+        // sat = −100 应去色且亮度不变
         let mut img = RgbaImage::from_pixel(1, 1, Rgba([200, 60, 20, 255]));
         hsl_filter(&mut img, 0.0, -100.0, 0.0);
         let p = img.get_pixel(0, 0).0;
         assert_eq!(p[0], p[1]);
         assert_eq!(p[1], p[2]);
         assert_eq!(p[0], 110, "去色后应等于亮度 (max+min)/2,实得 {}", p[0]);
-        // lum = +100 → L' = L + 1 → 全部钳到 1 → 纯白
+        // lum = +100 应得到纯白
         let mut img = RgbaImage::from_pixel(1, 1, Rgba([200, 60, 20, 255]));
         hsl_filter(&mut img, 0.0, 0.0, 100.0);
         assert_eq!(img.get_pixel(0, 0).0, [255, 255, 255, 255]);

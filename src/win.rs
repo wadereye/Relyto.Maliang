@@ -1,6 +1,6 @@
 //! Windows 平台能力封装(卷类型分流 / 线程优先级 / Shell 缩略图 / 控制台挂载)。
 //!
-//! 对应原版 Picasa 3 的三处参考结论：
+//! 三处设计结论：
 //! - 卷类型分流用 `GetLogicalDriveStringsA` + `GetDriveTypeA` 分流卷类型,
 //!   **网络盘(DRIVE_REMOTE)完全不扫**;固定盘按 `GetVolumeInformationA` 读文件系统,
 //!   FAT/FAT32/NTFS 之外的(KODAK 卷等)才收录。
@@ -26,7 +26,7 @@ pub enum DriveType {
 }
 
 impl DriveType {
-    /// 原版卷类型分流的实际策略:
+    /// 卷类型分流的实际策略:
     /// - DRIVE_REMOTE(网络盘)→ **不收录**
     /// - DRIVE_CDROM / DRIVE_NO_ROOT_DIR / DRIVE_UNKNOWN → 不收录
     /// - DRIVE_REMOVABLE(移动硬盘/U盘/相机卡)→ 收录
@@ -334,14 +334,14 @@ pub fn is_cloud_placeholder(p: &std::path::Path) -> bool {
 
 /// 取用户壳目录(我的文档 / 图片 / 桌面),按存在性过滤。
 ///
-/// 对应参考件首启默认扫描范围 —— 安装文案原文:
+/// 首启默认扫描范围 —— 安装文案原文:
 /// "Only search My Documents, My Pictures, and the Desktop"。
-/// 参考件首启只登记这三个壳目录,绝不扫盘根;扩大范围由用户手动添加。
+/// 首启只登记这三个壳目录,绝不扫盘根;扩大范围由用户手动添加。
 pub fn known_dirs() -> Vec<std::path::PathBuf> {
     SHELL_DIRS.iter().filter_map(|f| known_path(*f)).collect()
 }
 
-/// 工具栏「查看选项」的壳目录快捷键(参考件 View 菜单里的
+/// 工具栏「查看选项」的壳目录快捷键(View 菜单里的
 /// Desktop / My Documents / My Pictures / My Computer 四项)。
 ///
 /// 「我的电脑」在经典图库里是浏览树根(可下探任意盘);我方左栏是图库树,
@@ -419,10 +419,10 @@ fn known_path(which: FOLDERID) -> Option<std::path::PathBuf> {
     }
 }
 
-/// `known_dirs` 的三件套(顺序沿用参考件:文档、图片、桌面)。
+/// `known_dirs` 的三件套(顺序:文档、图片、桌面)。
 const SHELL_DIRS: [FOLDERID; 3] = [FOLDERID::Documents, FOLDERID::Pictures, FOLDERID::Desktop];
 
-/// 用系统关联的编辑器打开文件(参考件「Open File(s) in an Editor」)。
+/// 用系统关联的编辑器打开文件。
 ///
 /// ShellExecuteW 的 `edit` 动词:文件类型关联了编辑器时用编辑器,
 /// 未关联时退回 `open`(用默认程序打开)。
@@ -458,7 +458,7 @@ pub fn shell_edit(path: &Path) -> bool {
     }
 }
 
-/// 把图片文件设为桌面壁纸(参考件「Set as Desktop」)。
+/// 把图片文件设为桌面壁纸。
 ///
 /// `SystemParametersInfoW(SPI_SETDESKWALLPAPER)`:路径必须是位图文件
 /// (JPG 现代系统可用);调用方负责先把当前照片渲染成 JPEG 落盘。
@@ -490,9 +490,8 @@ pub fn set_wallpaper(path: &Path) -> bool {
 
 /// 用系统关联程序打开文件。
 ///
-/// 视频播放的**等效替代**:原版在库内用 DirectShow filter graph
-/// 渲染到一个视频子窗口,我方不内嵌视频管线,改为交给系统默认播放器 ——
-/// 与原版「能看」的目标一致,差异在于不内嵌视频管线,特效与体量从简。
+/// 视频播放路径:库内不内嵌视频渲染管线,交给系统默认播放器打开 ——
+/// 以最简体量实现「能看」的目标。
 ///
 /// 返回是否成功(ShellExecuteW 返回值 > 32 视为成功)。
 pub fn shell_open(path: &Path) -> bool {
@@ -1089,8 +1088,7 @@ fn elevated_self(flag: &str) -> Result<(), String> {
 ///
 /// 走 Windows Shell 的 COM 路线:`SHCreateItemFromParsingName` →
 /// `IShellItemImageFactory::GetImage` → `HBITMAP` → `GetDIBits` 取 BGRA 像素。
-/// 原版走 `IThumbnailProvider` 的 `BindToHandler` 变体,此处用
-/// `IShellItemImageFactory`(等价能力,接口更直接)。
+/// 取缩略图选用 `IShellItemImageFactory` 接口(能力等价,调用更直接)。
 ///
 /// 返回 `(BGRA 像素缓冲, 宽, 高)`(与 GDI `BITMAPINFO` 的 32bpp 一致)。
 /// 非 Windows、Shell 未就绪、或该格式无缩略图提供程序时返回 `None`。
@@ -1419,7 +1417,7 @@ mod tests {
 
     #[test]
     fn drive_type_policy_matches_original() {
-        // 原版:网络盘不扫、光驱不扫;固定盘/移动盘扫。
+        // 网络盘不扫、光驱不扫;固定盘/移动盘扫。
         assert!(!DriveType::Remote.scannable());
         assert!(!DriveType::CdRom.scannable());
         assert!(!DriveType::Unknown.scannable());

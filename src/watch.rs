@@ -1,17 +1,17 @@
 //! 监听文件夹:事件驱动(自研 `ReadDirectoryChangesW`,见 [`crate::fswatch`])
 //! + 降级轮询。
 //!
-//! 对齐原版 Picasa3 的两段参考结论:
+//! 设计结论:
 //! - 目录监视初始化 + 目录变更事件源:动态加载 `ReadDirectoryChangesW`,
 //!   **其返回值作为开关** —— 拿不到就用轮询兜底(降级门控)。
 //! - 目录项枚举:变更后按 `FindNextFileW` 的粒度逐个文件取属性入库,
 //!   而不是整目录重扫(本模块的 `scan::index_file` 就是这个粒度)。
 //!
-//! 实现:自研 `fswatch`(与原版同款内核 API)。此前用 notify-debouncer-full,
+//! 实现:自研 `fswatch`(内核 API)。此前用 notify-debouncer-full,
 //! 其 Windows 后端在监听目录里删文件时偶发进程级硬崩溃(
 //! 到复现;上游修复只在 9.0-rc),故换成自研实现。若监听失败(网络盘、
 //! 不支持的文件系统、权限不足),自动回落到原来的 30s 轮询路径 ——
-//! 即原版的"降级门控"。
+//! 即"降级门控"。
 //!
 //! 事件粒度:收到变更事件后只处理**受影响的目录**(其父目录),逐文件入库,
 //! 避免整棵子树重扫(扫描本身已有"未变文件快速路径",但仍要走目录树)。
@@ -76,7 +76,7 @@ fn prune(e: &walkdir::DirEntry, excl: &crate::scan::Exclusions) -> bool {
 /// 快照差异 → (新增数, 修改数, 变化的文件路径)。
 ///
 /// 删除**不计**:轮询快照分不清"重命名"与"删除+新增",
-/// 自动删行会丢星标/标签等元数据(原版靠改名配对保住,见点 4)。
+/// 自动删行会丢星标/标签等元数据(靠改名配对保住,见点 4)。
 /// 删除对账只走事件驱动路径(事件源已把改名配对成 Modify)。
 ///
 /// 连路径一起返回是为了让 30s 兜底能**只处理变化的那些目录**:
@@ -180,7 +180,7 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                 }
 
                 // 等待事件(短超时,便于及时感知 watched 表变化;
-                // 原版的变更检测是秒级的(约 1000ms 一次))。
+                // 变更检测是秒级的(约 1000ms 一次)。
                 // **基线比对兜底**仍按 30s 周期做(见下面的 poll 计时)。
                 match fsw.recv_batch(Duration::from_millis(1000)) {
                     Ok(items) => {
@@ -253,7 +253,7 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
         }
         #[cfg(not(windows))]
         {
-            // 非 Windows 没有 fswatch:直接走纯轮询(原版的回落路径)。
+            // 非 Windows 没有 fswatch:直接走纯轮询(回落路径)。
             mode2.store(MODE_POLL, Ordering::SeqCst);
             let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
             let mut last_poll = std::time::Instant::now();
@@ -328,7 +328,7 @@ fn affected_dirs(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {    let 
     out
 }
 
-/// 逐文件入库(事件驱动的粒度:原版 `FindNextFileW` 一次一个目录项)。
+/// 逐文件入库(事件驱动的粒度:`FindNextFileW` 一次一个目录项)。
 /// 返回新增/变更的文件数。被排除的目录整棵剪掉(与 [`snapshot`] 同一份规则)。
 fn scan_dirs(store: &Store, dirs: &[PathBuf], excl: &crate::scan::Exclusions) -> usize {
     let mut n = 0usize;

@@ -8,24 +8,23 @@ use std::time::Duration;
 
 /// 缩略图档位。
 ///
-/// 缩略图档位分派:原版是 **8 档枚举**,每档落到**三张缓存表**之一
+/// 缩略图档位分派:多档枚举,每档落到对应的缓存子目录
 /// (小 / 大 / 预览),缓存与索引分离。
 ///
-/// 参考原版的像素值常量:**256**、**512**、**192**。
-/// 我方取 4 档常用值(小 96 / 中 256 / 大 512 / 预览 1024),
+/// 取 4 档常用像素值(小 96 / 中 256 / 大 512 / 预览 1024),
 /// 目录分层对应三档缓存:
 /// - `thumbs/`    → 小档
 /// - `bigthumbs/` → 大档
 /// - `previews/`  → 预览档
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    /// 小档 96px —— 对应原版的小档缓存。
+    /// 小档 96px。
     Small,
-    /// 中档 256px —— 原版主力档,也是我方默认。
+    /// 中档 256px —— 默认档。
     Normal,
-    /// 大档 512px —— 原版大档缓存。
+    /// 大档 512px。
     Big,
-    /// 预览档 1024px —— 原版预览档缓存。
+    /// 预览档 1024px。
     Preview,
 }
 
@@ -40,7 +39,7 @@ impl Tier {
         }
     }
 
-    /// 该档的缓存子目录名(对应原版的多档缓存表)。
+    /// 该档的缓存子目录名。
     ///
     /// ⚠️ Small 与 Normal **不能**共用目录:两者尺寸不同(96/256),
     /// 同名文件会互相覆盖 —— 切一次小档就把中档缓存冲掉。
@@ -330,11 +329,10 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
     if crate::video::is_video(src) {
         return decode_via_shell_sized(src, target)
             .map(|i| (i, 1))
-            // Shell 拿不到帧(解码器缺失等)→ 显式失败,与原版
-            // "missing/loading movie" 占位语义一致(媒体类型判定)。
+            // Shell 拿不到帧(解码器缺失等)→ 显式失败,由上层显示占位。
             .ok_or_else(|| anyhow::anyhow!("视频抽帧失败(Shell 无解码器): {}", src.display()));
     }
-    // 2) 内嵌 EXIF 缩略图(对应原版 "Use EXIF thumbnails")。
+    // 2) 内嵌 EXIF 缩略图。
     if let Some(t) = crate::exif::read_jpeg_embedded_thumb(src)
         .and_then(|b| image::load_from_memory(&b).ok())
         .filter(|t| embedded_ok(t.width(), t.height(), target))
@@ -424,7 +422,7 @@ pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImag
 /// 生成指定档位的缩略图;返回 dHash。
 ///
 /// dHash **只在中档(Normal)计算** —— 它是全图感知哈希,与显示档位无关,
-/// 没必要每档重算(原版 dHash/uid64 也只算一次存在 DB 列里)。
+/// 没必要每档重算。
 /// 其余档位返回 0。
 pub fn generate_tier(tier: Tier, id: i64, src: &Path) -> Result<u64> {
     let size = tier.size();
@@ -440,7 +438,7 @@ pub fn generate_tier(tier: Tier, id: i64, src: &Path) -> Result<u64> {
     Ok(dhash)
 }
 
-/// 等比缩样到 256x256 内,居中贴浅灰画布(Picasa 式 letterbox)。
+/// 等比缩样到 256x256 内,居中贴浅灰画布(letterbox)。
 /// 返回 (dHash):由缩样图(letterbox 之前)计算,避免边框干扰梯度。
 pub fn generate(id: i64, src: &Path) -> Result<u64> {
     generate_tier(Tier::Normal, id, src)
@@ -479,7 +477,7 @@ fn flatten_on_bg(img: &image::DynamicImage, bg: image::Rgb<u8>) -> image::RgbIma
     out
 }
 
-/// 把已缩样的图居中贴到 size×size 浅灰画布并落盘(Picasa 式 letterbox)。
+/// 把已缩样的图居中贴到 size×size 浅灰画布并落盘(letterbox)。
 /// 目录不存在则先建。
 fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathBuf) -> Result<()> {
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([248, 248, 248]));
@@ -495,7 +493,7 @@ fn save_letterboxed(size: u32, fit: &image::DynamicImage, path: std::path::PathB
 
 /// 用 Windows Shell 缩略图扩展解码到指定尺寸（相机 RAW 等 image crate 解不了的格式）。
 ///
-/// 与原版一致的做法:走 COM `IThumbnailProvider`,
+/// 走 COM `IThumbnailProvider`,
 /// 借系统已安装的相机厂商 RAW 解码器出图。Shell 未就绪时返回 None。
 fn decode_via_shell_sized(src: &Path, size: u32) -> Option<image::DynamicImage> {
     let (bgra, w, h) = crate::win::shell_thumbnail(src, size)?;
@@ -543,8 +541,7 @@ pub fn backfill(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
 /// 批量生成指定档位缺失的缩略图。
 ///
 /// 返回成功生成的 id 列表。Normal 档会顺带回写 `thumb_ok=1`、`dhash` 与
-/// `rich_state=2`;其余档位只记 `thumb_tiers` 表(对应原版的三张缓存表各自
-/// 独立记账)。
+/// `rich_state=2`;其余档位只记 `thumb_tiers` 表(各档独立记账)。
 ///
 /// `visible` 是当前可见目录清单,只影响 Normal 档的取行顺序
 /// (可见优先 + 全库兜底,见 [`crate::db::Store::missing_tier`])。
@@ -560,7 +557,7 @@ pub fn backfill_tier(
 
 /// 闲时低速补齐:优先队列排空后,把其余目录的缩略图提前做好。
 ///
-/// 参考件的文件夹切换快,是因为打开时缓存早已落盘、只按索引取字节;
+/// 打开时缓存早已落盘、只按索引取字节,文件夹切换才快;
 /// 若一律等用户切过去才补,每次进新文件夹都要现等生成。这里在空闲时
 /// 一小批一小批铺过去,任何可见目录 / 新导入一出现就立刻让位。
 pub fn backfill_idle(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
@@ -659,8 +656,8 @@ fn backfill_rows(
 /// 派生失败记账,累计到阈值就立案进坏媒体台账。
 ///
 /// 立案后 `rich_state` 变 3、行出队,不再每轮重试同一张坏图;
-/// 网格右键给「隐藏此文件 / 不隐藏」两个出口(对齐参考件
-/// 坏图清单的 Hide / Don't Hide 两态),后者删台账并把行放回待派生。
+/// 网格右键给「隐藏此文件 / 不隐藏」两个出口(Hide / Don't Hide 两态),
+/// 后者删台账并把行放回待派生。
 fn escalate_failure(store: &crate::db::Store, id: i64, path: &str, why: &str) {
     if store.mark_thumb_fail(id) < crate::db::BAD_MEDIA_THRESHOLD {
         return;
@@ -743,14 +740,14 @@ fn reset_misfiled_bad_media_once(store: &crate::db::Store) {
 
 /// 启动**常驻**缩略图后台线程(+ 多档 + 作用域队列)。
 ///
-/// 行为(对齐原版 Picasa 的"缩略图缓存后台生成"):
+/// 行为(缩略图缓存后台生成):
 /// - 补齐的是**派生门放行的行**(`rich_state=1`),不再是"所有 `thumb_ok=0`";
 /// - 之后每 2 秒查一次库,发现新增/变更照片就继续补(扫描后自动补齐);
 /// - 每批完成后通过 `done` 通道通知 UI,UI 据此清掉对应纹理缓存并重绘网格;
 /// - **档位可变**:UI 改 `tier` 后,worker 下一轮就改补那一档
-///   (原版切档时按需从对应档位的缓存取,缺则生成 —— 三档各自独立记账)。
+///   按需从对应档位的缓存取,缺则生成 —— 各档独立记账)。
 ///
-/// 线程优先级降为 BelowNormal,不与 UI 抢核(与原版一致的做法)。
+/// 线程优先级降为 BelowNormal,不与 UI 抢核。
 pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> ThumbWorker {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
@@ -858,12 +855,12 @@ pub fn regen(store: &crate::db::Store, id: i64) -> Result<()> {
 
 // ===== 预览缓存 =====
 
-/// 预览图的最长边(像素)。原版预览图是独立的缓存表。
+/// 预览图的最长边(像素)。预览图是独立的缓存档。
 pub const PREVIEW_SIZE: u32 = 1024;
 
 /// 预览缓存文件路径(落盘 `previews/{id}.jpg`)。
 ///
-/// 原版把预览图存进独立的块文件库,我方用同构的独立目录 + 同名 jpg。
+/// 预览图存进独立的缓存目录 + 同名 jpg。
 pub fn preview_path(id: i64) -> PathBuf {
     tier_path(Tier::Preview, id)
 }
@@ -912,10 +909,8 @@ pub struct PreviewWorker {
 /// 没有就发请求给这个 worker,worker 在后台解码 + 落盘,
 /// 完成后通过通道回报,UI 再加载纹理。
 ///
-/// 这样 UI 线程**不做解码**(原来同步 `image::open` 4K 原图会卡住界面几百毫秒)。
-///
-/// 对应原版 `PicasaPhotoViewer.exe` 独立进程 + `previews.db` 的分工:
-/// 原版把预览解码放在**独立进程**里,我方用后台线程达到同样效果(不阻塞 UI)。
+/// 这样 UI 线程**不做解码**(原来同步 `image::open` 4K 原图会卡住界面几百毫秒),
+/// 预览解码在后台线程完成(不阻塞 UI)。
 pub fn spawn_preview_worker(store: Arc<crate::db::Store>) -> PreviewWorker {
     let (req_tx, req_rx) = mpsc::channel::<(i64, String)>();
     let (done_tx, done_rx) = mpsc::channel::<(i64, Result<bool, String>)>();
@@ -1355,7 +1350,7 @@ mod tests {
         assert_eq!(Tier::Normal.size(), 256);
         assert_eq!(Tier::Big.size(), 512);
         assert_eq!(Tier::Preview.size(), 1024);
-        // 大档与小档目录不同(对应原版三张表分开记账)。
+        // 大档与小档目录不同(各档分开记账)。
         assert_ne!(Tier::Big.dir_name(), Tier::Normal.dir_name());
         assert_ne!(Tier::Preview.dir_name(), Tier::Normal.dir_name());
         // 档位越大建议 LRU 越小(显存预算 192MB)。
@@ -1479,7 +1474,7 @@ mod tests {
         build_preview(id, &src).expect("应生成预览");
         let got = load_preview_cached(id).expect("应能读回预览");
         assert!(got.width() <= PREVIEW_SIZE && got.height() <= PREVIEW_SIZE);
-        // 预览落在 previews 目录(对应原版预览档缓存)。
+        // 预览落在 previews 目录。
         assert!(preview_path(id).exists());
         assert!(preview_path(id).to_string_lossy().contains("previews"));
 

@@ -1,6 +1,6 @@
-//! WPD(Windows Portable Devices)设备枚举 —— 对齐原版「从设备导入」。
+//! WPD(Windows Portable Devices)设备枚举 —— 「从设备导入」。
 //!
-//! # 参考来源：Picasa 3 的设备导入（WPD）
+//! # 行为说明
 //!
 //! 本模块对 WPD 的使用**全部通过 GUID 常量 + `CoCreateInstance`**,不依赖
 //! 任何名字字符串。所用 GUID 为 Windows 公开常量:
@@ -29,7 +29,7 @@
 //! # 我方实现范围(实现口径)
 //!
 //! 1. **设备枚举**(本文件):`IPortableDeviceManager::GetDevices` + 每设备的
-//!    FriendlyName/Description/Manufacturer —— 对齐WPD 管理器/WPD 设备信息。
+//!    FriendlyName/Description/Manufacturer(WPD 管理器/WPD 设备信息接口)。
 //! 2. **客户端信息**:沿用 fmtid/pid 结构,name 换成 `Maliang`,版本号用我方 0.1。
 //! 3. **统一列表**:WPD 设备 + 可移动盘符卷合成一个列表。
 //! 4. **不做文件传输**:本项目无 WIA;真要拷文件时走
@@ -57,12 +57,12 @@ mod imp {
 
     /// 构造客户端信息 `IPortableDeviceValues`。
     ///
-    /// 对齐WPD 属性集:
+    /// WPD 属性集键值:
     /// - pid 2 = WPD_CLIENT_NAME(字符串)
     /// - pid 3 = major / pid 4 = minor / pid 5 = revision(整数)
     /// - pid 8 = WPD_CLIENT_SECURITY_QUALITY_OF_SERVICE = 0x20000
     ///
-    /// (coclass GUID 与原版一致:`PortableDeviceValues` = `{0C15D503-...}`,
+    /// (coclass GUID:`PortableDeviceValues` = `{0C15D503-...}`,
     /// windows crate 常量 `0x0c15d503_d017_47ce_9016_7b3f978721cc` 吻合。)
     pub fn client_values() -> Result<IPortableDeviceValues> {
         unsafe {
@@ -86,7 +86,7 @@ mod imp {
     pub struct WpdDevice {
         /// 设备 ID(WPD 的 PnP 串,如 `\\?\usb#vid_...`)。
         pub device_id: String,
-        /// 友好名(原版 `GetDeviceFriendlyName`;失败回落设备 ID)。
+        /// 友好名(`GetDeviceFriendlyName`;失败回落设备 ID)。
         pub friendly_name: String,
         /// 厂商描述(可能为空)。
         pub description: String,
@@ -96,20 +96,20 @@ mod imp {
 
     /// 枚举全部便携设备。
     ///
-    /// 对齐WPD 管理器(创建 Manager)+ WPD 设备信息(迭代设备,
+    /// 走 WPD 管理器(创建 Manager)+ WPD 设备信息(迭代设备,
     /// 设备 ID/名称经 `WideCharToMultiByte(CP_UTF8)` 转多字节 —— 我方直接
-    /// 转 UTF-8 String,等价)。coclass GUID 与原版一致:
+    /// 转 UTF-8 String,等价)。coclass GUID:
     /// `PortableDeviceManager` = `{0AF10CEC-2ECD-4B92-9581-34F6AE0637F3}`
     /// (crate 常量 `0x0af10cec_2ecd_4b92_9581_34f6ae0637f3` 吻合)。
     ///
     /// **双栈语义**:失败返回 `Err`,调用方(`devices_unified`)捕获后继续用
-    /// 盘符卷 —— 对齐原版「WPD 失败仅清标志,不中断」(WPD 设备枚举)。
+    /// 盘符卷 —— WPD 失败仅清标志,不中断(尽力而为)。
     pub fn devices() -> Result<Vec<WpdDevice>> {
-        let _ = client_values()?; // 与原版一致:创建 Manager 前先构造 client info
+        let _ = client_values()?; // 创建 Manager 前先构造 client info
         unsafe {
             let manager: IPortableDeviceManager =
                 CoCreateInstance(&PortableDeviceManager, None, CLSCTX_INPROC_SERVER)?;
-            // 第一次调用拿数量(原版同款两段式:GetDevices(NULL,&n) → 分配 → 再调)
+            // 第一次调用拿数量(两段式:GetDevices(NULL,&n) → 分配 → 再调)
             let mut count: u32 = 0;
             manager
                 .GetDevices(std::ptr::null_mut(), &mut count)
@@ -129,8 +129,8 @@ mod imp {
 
             let mut out = Vec::with_capacity(ids.len());
             for id in ids {
-                // 友好名:原版WPD 设备信息里设备 ID 与名称都转 UTF-8;
-                // 名称取不到时回落设备 ID(与原版「名称为空仍列出」一致)。
+                // 友好名:设备 ID 与名称都转 UTF-8;
+                // 名称取不到时回落设备 ID(名称为空仍列出)。
                 let friendly =
                     query_string(&manager, &id, 0).unwrap_or_else(|| id.clone());
                 let description = query_string(&manager, &id, 1).unwrap_or_default();
@@ -175,7 +175,7 @@ mod imp {
         }
     }
 
-    /// 取走 CoTaskMemAlloc 的宽字符串并释放(原版同款:对象 ID 是
+    /// 取走 CoTaskMemAlloc 的宽字符串并释放(对象 ID 是
     /// CoTaskMem 分配的宽字符串,见宽字符串分配的
     /// `Next(...) + CoTaskMemFree`)。
     fn take_pwstr(p: PWSTR) -> String {
@@ -206,14 +206,13 @@ pub use imp::WpdDevice;
 
 /// 统一设备列表:WPD 设备 + 可移动盘符卷。
 ///
-/// 对齐原版「WPD + WIA 统一列表」(设备列表合成):
-/// 两类来源构造成**同一种记录**追加进同一数组。我方用
-/// `DeviceEntry` 替代原版的设备信息结构,盘符卷替代原版 WIA 通道。
+/// 设备列表合成:两类来源构造成**同一种记录**追加进同一数组,
+/// WPD 设备与盘符卷统一由 `DeviceEntry` 表示。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeviceEntry {
     /// WPD/MTP 便携设备(相机、手机)。
     Portable(WpdDevice),
-    /// 可移动盘符卷(U 盘、SD 卡读卡器 —— 原版的可移动盘检测通道)。
+    /// 可移动盘符卷(U 盘、SD 卡读卡器)。
     Volume(std::path::PathBuf),
 }
 
@@ -247,17 +246,17 @@ impl DeviceEntry {
     }
 }
 
-/// 全部可导入设备(WPD 失败不中断,尽力而为 —— 对齐WPD 设备枚举)。
+/// 全部可导入设备(WPD 失败不中断,尽力而为)。
 #[must_use]
 pub fn devices_unified() -> Vec<DeviceEntry> {
     let mut out = Vec::new();
-    // WPD 通道:失败仅静默(原版就是清标志继续)
+    // WPD 通道:失败仅静默(清标志继续)
     #[cfg(windows)]
     match imp::devices() {
         Ok(ds) => out.extend(ds.into_iter().map(DeviceEntry::Portable)),
         Err(_) => {}
     }
-    // 盘符卷通道(对应原版的可移动盘检测)
+    // 盘符卷通道(可移动盘检测)
     out.extend(
         crate::device::removable_volumes()
             .into_iter()
@@ -290,7 +289,7 @@ mod tests {
     #[cfg(windows)]
     fn enumerate_devices_does_not_panic() {
         // 真机环境可能一台设备都没有;本测试只验证 COM 链路不崩、
-        // 返回值合法(空列表或若干设备)。对齐原版「WPD 尽力而为」。
+        // 返回值合法(空列表或若干设备);WPD 尽力而为。
         let r = devices_unified();
         let n = r.len();
         for e in &r {

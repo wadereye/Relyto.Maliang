@@ -1,49 +1,4 @@
-//! 色调曲线引擎:自然三次样条 + 四通道曲线 + 曝光。
-//!
-//! # 行为要点
-//!
-//! | 我方实现 | 环节 | 说明 |
-//! |---|---|---|
-//! | `Curve` 控制点 | 曲线控制点的构造 | 点 = `{x, y}` 两个 f32 |
-//! | 曲线容器 | 曲线容器的组织 | 点数组 / 点数 / M 数组 / M 计数 / 派生缓存 |
-//! | `spline()` 自然三次样条 | 样条求值 | M-形式求值 + 二分定位 |
-//! | M[] 求解 | 样条系数求解 | 自然边界 `M₀=M_{n-1}=0`,三对角 Thomas 消元 |
-//! | 256 项 LUT | 查找表构建 | 每次 apply 现算;按 B / G / R 各一张 |
-//! | 4 曲线合成 | 四曲线合成 | Master 先算得公共 `m`,R/G/B **各自以同一个 m 为输入** |
-//! | 曝光曲线点 | 曝光整形点 | 正档 4 点 / 负档 4 点,写入 Master 槽 |
-//! | 曝光迭代 | 曝光迭代 | 迭代 N+1 次,末两步按小数权重 `w` 线性混合 |
-//! | 舍入 | 查找表构建 | `round(x) = (int)(x+0.5)`,随后 clamp `[0,255]` |
-//!
-//! # 关键结论(与直觉相反,勿按直觉改)
-//!
-//! 1. **插值是自然三次样条(natural cubic spline,M-形式)**,不是线性、不是单调三次
-//!    (PCHIP/Fritsch-Carlson)、不是 Catmull-Rom。
-//!    求解器**无任何斜率符号判断或钳制** → **不保单调**。
-//! 2. **不钳制到端点**:二分查找只保证落在某段 `[x_lo, x_hi]`,输入超出控制点 x 范围时
-//!    取端点段做**多项式外插**(`u` 或 `v` 可 >1 / <0)。
-//! 3. **全程在 sRGB 码值域(0..255)求值**,无 gamma 编码/解码、无线性光域转换。
-//! 4. **4 条曲线不是串联,也不是加权混合**:Master 先算出公共中间值 `m`,
-//!    R/G/B 三条曲线**各自以同一个 m 为输入**独立求值 → 完全并行、互不影响。
-//! 5. **曝光曲线点与 预设 `MasterCurve` 点合并进同一 Master 槽**,作为**一条样条**统一求值。
-//!
-//! # 公式
-//!
-//! ```text
-//! // 自然三次样条 M-形式(v 落在 [x_lo, x_hi])
-//! h = x_hi - x_lo
-//! u = (x_hi - v) / h
-//! w = (v - x_lo) / h
-//! S(v) = y_lo·u + y_hi·w + (h²/6)·[ M_lo·(u³−u) + M_hi·(w³−w) ]
-//!
-//! // M 由三对角系统解出,自然边界 M₀ = M_{n−1} = 0
-//! h_i M_{i−1} + 2(h_{i−1}+h_i) M_i + h_i M_{i+1} = 6·[ (y_{i+1}−y_i)/h_i − (y_i−y_{i−1})/h_{i−1} ]
-//!
-//! // 主流程(i = 0..255)
-//! m   = MasterSpline_曝光迭代(i)
-//! R   = clamp(round(RedSpline(m)))    // R 通道查找表
-//! G   = clamp(round(GreenSpline(m)))  // G 通道查找表
-//! B   = clamp(round(BlueSpline(m)))   // B 通道查找表
-//! ```
+//! 色调曲线引擎:三次样条插值 + 四通道曲线 + 曝光调整。
 
 /// 一个曲线控制点。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -69,7 +24,7 @@ impl Curve {
         Curve { points: Vec::new() }
     }
 
-    /// 从控制点构造(原版曲线控制点的构造逐点追加)。
+    /// 从控制点构造。
     pub fn from_points(points: &[Point]) -> Curve {
         Curve {
             points: points.to_vec(),
@@ -80,11 +35,7 @@ impl Curve {
         self.points.is_empty()
     }
 
-    /// 求值(原版样条求值)。
-    ///
-    /// - 空曲线 → 恒等返回 `x`(样条求值)。
-    /// - 单点 → 恒等(无区间可插值)。
-    /// - 越界 → **外插**(不钳制),与原版一致。
+    /// 对曲线求值;空曲线或单点恒等返回,越界取端点段外插。
     pub fn eval(&self, x: f32) -> f32 {
         let n = self.points.len();
         if n < 2 {
@@ -92,7 +43,6 @@ impl Curve {
         }
         let m = self.second_derivatives();
         // 二分查找:定位使 x[lo] <= x <= x[hi] 的区间。
-        // 原版在 x 越界时取端点段(下标 0 或 n-2)。
         let (lo, hi) = if x <= self.points[0].x {
             (0, 1)
         } else if x >= self.points[n - 1].x {
@@ -124,16 +74,13 @@ impl Curve {
         y_lo * u + y_hi * w + ((u * u * u - u) * m_lo + (w * w * w - w) * m_hi) * (h * h) / 6.0
     }
 
-    /// 二阶导数 M[](原版样条系数求解,自然边界 `M₀=M_{n−1}=0`)。
-    ///
-    /// 每次调用现算(与 Picasa 3 的"懒计算后缓存"行为等价)。
+    /// 求解样条各控制点的二阶导数(自然边界条件)。
     fn second_derivatives(&self) -> Vec<f32> {
         let n = self.points.len();
         let mut m = vec![0f32; n];
         if n < 3 {
             return m;
         }
-        // 标准自然样条三对角系统,Thomas 消元。
         let mut sub = vec![0f32; n]; // c'
         let mut diag = vec![0f32; n]; // b
         let mut sup = vec![0f32; n]; // a
@@ -156,7 +103,7 @@ impl Curve {
             }
             sup[i] = h_next;
         }
-        // 回代(自然边界 M₀ = M_{n-1} = 0 → 边界方程退化为 diag[1]·M₁ = rhs[1])
+        // 回代
         for i in (1..n - 1).rev() {
             m[i] = (rhs[i] - sup[i] * m[i + 1]) / diag[i];
         }
@@ -165,11 +112,7 @@ impl Curve {
     }
 }
 
-/// 4 条色调曲线(Master / Red / Green / Blue)+ 曝光。
-///
-/// 四条曲线 + 曝光档位:
-/// Master / Red / Green / Blue 四条曲线,
-/// 外加曝光整数档与曝光小数权重两个槽。
+/// 4 条色调曲线(Master / Red / Green / Blue)+ 曝光档位。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Curves {
     pub master: Curve,
@@ -194,9 +137,7 @@ impl Curves {
             && self.exposure == 0.0
     }
 
-    /// 曝光整数档 `N` 与小数权重 `w`(原版曝光档位与权重)。
-    ///
-    /// 原版把 `stops` 拆成整数档 `N` 与小数权重 `w`,再迭代 N+1 次。
+    /// 把曝光值拆为整数档与小数权重。
     fn exposure_parts(&self) -> (u32, f32) {
         let e = self.exposure;
         if e == 0.0 {
@@ -208,10 +149,7 @@ impl Curves {
         (n, w)
     }
 
-    /// Master 槽的完整点集:曝光整形点(若有)在前 + 预设 MasterCurve 点在后。
-    ///
-    /// 原版四曲线合成:曝光整形点先写曝光 4 点,
-    /// 预设曲线追加再把 预设 Master 点**追加**到同一槽 → 作为**一条样条**统一求值。
+    /// 构造 Master 槽的完整点集:曝光整形点在前,主曲线点在后。
     fn master_spline(&self) -> Curve {
         let mut pts: Vec<Point> = Vec::new();
         if self.exposure != 0.0 {
@@ -221,12 +159,7 @@ impl Curves {
         Curve { points: pts }
     }
 
-    /// Master 求值(含曝光迭代,原版曝光迭代)。
-    ///
-    /// ```text
-    /// v_{k+1} = MasterSpline(v_k),迭代 N+1 次
-    /// m = v_N + w·(v_{N+1} − v_N)
-    /// ```
+    /// Master 求值:按曝光整数档迭代,末两步按小数权重混合。
     fn master_value(&self, x: f32) -> f32 {
         let spline = self.master_spline();
         if spline.is_empty() {
@@ -247,9 +180,7 @@ impl Curves {
         last + w * (v - last)
     }
 
-    /// 构建 256 项 LUT(原版查找表构建)。
-    ///
-    /// 返回 `[[r,g,b]; 256]`,索引即输入码值。
+    /// 构建 256 项查找表,索引即输入码值。
     pub fn build_lut(&self) -> [[u8; 3]; 256] {
         let mut lut = [[0u8; 3]; 256];
         let has_any = !self.master.is_empty()
@@ -275,9 +206,7 @@ impl Curves {
     }
 }
 
-/// 原版舍入 + 钳位(查找表构建)。
-///
-/// `round(x) = (int)(x + 0.5)`(round-half-up),随后 clamp 到 `[0,255]`。
+/// 舍入并钳位到 [0,255]。
 fn clamp_u8(v: f32) -> u8 {
     let r = (v + 0.5).floor();
     if r <= 0.0 {
@@ -289,9 +218,7 @@ fn clamp_u8(v: f32) -> u8 {
     }
 }
 
-/// 曝光整形点(取自内置资源包 `exposure.pos` / `exposure.neg`)。
-///
-/// 档位为 0 时返回空(此时清空 Master 槽)。
+/// 读取曝光整形控制点;档位为 0 时返回空。
 pub fn exposure_points(stops: f32) -> Vec<Point> {
     if stops == 0.0 {
         return Vec::new();
@@ -300,12 +227,7 @@ pub fn exposure_points(stops: f32) -> Vec<Point> {
     crate::assets::pairs(key).into_iter().map(|(x, y)| Point::new(x, y)).collect()
 }
 
-/// 把 LUT 应用到图像(逐像素查表)。
-///
-/// 查找表按**通道分别**建:`lut[i] = (R'(i), G'(i), B'(i))`,
-/// 其中 `R'(i)` 是红色通道输入 `i` 时的输出。因此查表时
-/// **每个通道用自己的码值索引**,只取自己那一列 ——
-/// 不能三通道共用同一个索引,否则纯主曲线的预设会把彩色图整成灰度。
+/// 把 LUT 应用到图像,每个通道用自己的码值索引查表。
 pub fn apply_lut(img: &mut image::RgbaImage, lut: &[[u8; 3]; 256]) {
     for p in img.pixels_mut() {
         let (r, g, b) = (p[0] as usize, p[1] as usize, p[2] as usize);
@@ -324,18 +246,14 @@ pub fn apply_curves(img: &mut image::RgbaImage, c: &Curves) {
     apply_lut(img, &lut);
 }
 
-// ===== 内置滤镜曲线预设(数据取自资源包 `assets/presets.dat`) =====
+// ===== 内置滤镜曲线预设 =====
 
-/// 内置滤镜预设的曲线数据(控制点存放在资源包,勿随意改动)。
-///
-/// 每个预设由 4 条曲线组成,对应资源包里的
-/// `curve.<预设名>.master` / `.red` / `.green` / `.blue` 四段;
-/// 段内数值按 `x0 y0 x1 y1 …` 成对排列。空段表示该通道恒等。
+/// 内置滤镜预设的曲线数据。
 pub mod presets {
     use super::{Curve, Curves, Point};
     use crate::assets;
 
-    /// 从资源包读一条曲线;段不存在或为空时返回恒等曲线。
+    /// 读取一条曲线;段不存在或为空时返回恒等曲线。
     fn curve_of(name: &str) -> Curve {
         let pts: Vec<Point> = assets::pairs(name).into_iter().map(|(x, y)| Point::new(x, y)).collect();
         if pts.is_empty() {
@@ -345,7 +263,7 @@ pub mod presets {
         }
     }
 
-    /// 从资源包读一组四通道曲线。
+    /// 读取一组四通道曲线。
     fn curves_of(prefix: &str) -> Curves {
         Curves {
             master: curve_of(&format!("curve.{prefix}.master")),
@@ -356,9 +274,7 @@ pub mod presets {
         }
     }
 
-    /// 参数化预设:按 `curve.<名>.form` 段的 `[y 基准, 参数基准, 增益]`
-    /// 调整中间控制点的 y 值(其余点不变):
-    /// `y = y 基准 + (参数 − 参数基准) × 增益`。
+    /// 参数化预设:按参数调整 Master 曲线中间控制点的 y 值。
     fn apply_form(prefix: &str, param: f32) -> Curves {
         let mut c = curves_of(prefix);
         let form = assets::f64s(&format!("curve.{prefix}.form"));
@@ -469,7 +385,7 @@ mod tests {
 
     #[test]
     fn spline_extrapolates_beyond_endpoints() {
-        // 原版越界**不钳制** → 端点段外插。
+        // 越界不钳制,端点段外插。
         let c = Curve::from_points(&[
             Point::new(0.0, 0.0),
             Point::new(100.0, 100.0),

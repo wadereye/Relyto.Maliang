@@ -69,8 +69,7 @@ pub fn copy_all(paths: &[PathBuf], dest: &Path) -> (usize, Vec<String>) {
 
 /// 导出时套用效果栈(把渲染结果写到目标目录,**不改原图**)。
 ///
-/// 原版的"保存"会把编辑结果写回原文件;我方为安全起见只提供
-/// 「导出为带效果副本」,原图与 `photos.filters` 保持不变。
+/// 为安全起见只提供「导出为带效果副本」,原图与 `photos.filters` 保持不变。
 ///
 /// 栈为空 → 直接复制(与 `copy_all` 等价)。
 pub fn copy_all_with_effects(

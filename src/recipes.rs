@@ -1,33 +1,4 @@
-//! 滤镜配方(recipe)—— 参考 Picasa 3 的成组调色效果。
-//!
-//! 与 [`crate::oneclick`] 的区别:oneclick 是一个滑块驱动的单一调整,
-//! 本模块是**一串固定顺序的像素操作 + 一组默认参数**拼成的完整风格,
-//! 更接近参考产品里"一键套用"的那些滤镜。
-//!
-//! # 强度模型
-//!
-//! 每个配方都有 `amount`(0~100),语义统一为**与处理结果的不透明度混合**:
-//! `out = src + (styled − src)·amount/100`。这与参考产品里各配方的
-//! "淡出"滑杆等价(淡出 0 → 全量,淡出 100 → 原图)。
-//!
-//! 少数配方会**改变画布尺寸**(加边框、投影、旋转),这类配方无法按像素混合,
-//! `amount` 只控制内部装饰的轻重,不改尺寸。
-//!
-//! # 实现口径(哪些是简化)
-//!
-//! - **光晕合成**([`glow_edge`]):参考产品的内光晕是三通道分离 + 多级半径累积的
-//!   合成器,合成混合模式未公开。此处按「边缘渐变遮罩 + 颜色线性混合」实现,
-//!   半径与强度参数照配方取值。
-//! - **棕褐色滤镜色**([`crate::oneclick::apply_bw`] 的 `filtercolor`):
-//!   参考产品可给灰度加单色偏移,参数语义未公开,此处按纯亮度归一化处理。
-//! - **漫画网点**([`comic`]):参考配方是双层错位网点遮罩 + 加色合成的完整半色调,
-//!   此处简化为「方块降采样 + 色阶压缩」,不做网点形状模拟。
-//! - **调色板量化**([`quantize_palette`]):按逐层降低位深的分桶聚合实现,
-//!   桶内取原色均值;参考产品同属八叉树式的分层聚合思路。
-//!
-//! # 像素约定
-//!
-//! 全模块按 **RGBA8** 处理,混合模式在 `0..=255` 域上定义(见 [`Blend`])。
+//! 滤镜配方(recipe):一组固定顺序的像素操作拼成的完整风格化效果。
 
 use image::{Rgba, RgbaImage};
 
@@ -36,35 +7,32 @@ use image::{Rgba, RgbaImage};
 // ---------------------------------------------------------------------------
 
 /// 图层混合模式。
-///
-/// 全部在 `0..=255` 域上按通道独立计算 —— 参考产品的混合器就是这么定的:
-/// 没有 sRGB 线性化,也不做 gamma 校正。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Blend {
-    /// 直接覆盖。
+/// 直接覆盖。
     Normal,
-    /// `a·b/255`。
+/// `a·b/255`。
     Multiply,
-    /// `255 − (255−a)(255−b)/255`。
+/// `255 − (255−a)(255−b)/255`。
     Screen,
-    /// 以底层为条件的对比度倍增:底层暗时走 multiply,亮时走 screen。
+/// 以底层为条件的对比度倍增:底层暗时走 multiply,亮时走 screen。
     Overlay,
-    /// `a + b`(饱和到 255)。
+/// `a + b`(饱和到 255)。
     Add,
-    /// `a − b`(饱和到 0)。
+/// `a − b`(饱和到 0)。
     Subtract,
-    /// 取暗。
+/// 取暗。
     Darken,
-    /// 取亮。
+/// 取亮。
     Lighten,
-    /// 以顶层为条件的强对比:顶层暗时走 multiply,亮时走 screen。
+/// 以顶层为条件的强对比:顶层暗时走 multiply,亮时走 screen。
     HardLight,
-    /// 柔光:顶层 0.5 附近近似不变,两端缓推,不产生硬边。
+/// 柔光:顶层 0.5 附近近似不变,两端缓推,不产生硬边。
     SoftLight,
 }
 
 impl Blend {
-    /// 单通道混合。
+/// 单通道混合。
     fn ch(self, base: f32, top: f32) -> f32 {
         match self {
             Blend::Normal => top,
@@ -111,7 +79,7 @@ impl Blend {
         }
     }
 
-    /// 按名字解析(不区分大小写);未知名字按 [`Blend::Normal`] 处理。
+/// 按名字解析(不区分大小写);未知名字按 [`Blend::Normal`] 处理。
     pub fn parse(s: &str) -> Blend {
         match s.to_ascii_lowercase().as_str() {
             "multiply" => Blend::Multiply,
@@ -184,7 +152,7 @@ pub struct Mask {
 }
 
 impl Mask {
-    /// 建立全 0 遮罩。
+/// 建立全 0 遮罩。
     pub fn new(w: u32, h: u32) -> Mask {
         Mask {
             w,
@@ -193,12 +161,12 @@ impl Mask {
         }
     }
 
-    /// 尺寸。
+/// 尺寸。
     pub fn dimensions(&self) -> (u32, u32) {
         (self.w, self.h)
     }
 
-    /// 读一点(越界返回 0)。
+/// 读一点(越界返回 0)。
     pub fn at(&self, x: u32, y: u32) -> f32 {
         if x >= self.w || y >= self.h {
             return 0.0;
@@ -227,11 +195,6 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
 }
 
 /// 圆形渐变遮罩:圆心处取 `inner_alpha`,半径 `outer_radius` 之外取 `outer_alpha`,
-/// 中间按 `smoothstep` 过渡。
-///
-/// 半径单位是像素;`inner_radius > outer_radius` 时自动交换,
-/// 因此 `inner_alpha > outer_alpha`(由内向外衰减)与反向遮罩都能表达 ——
-/// 后者正是"只处理圆外"的情形。
 pub fn circular_mask(
     w: u32,
     h: u32,
@@ -263,9 +226,6 @@ pub fn circular_mask(
 }
 
 /// 边缘衰减遮罩:图像四边为 1,向内按 `width` 像素平滑过渡到 0。
-///
-/// 用于"画面边缘处理"(内光晕 / 暗角 / 边缘模糊),四条边取最小值,
-/// 所以四角衰减最强 —— 与参考产品边缘类配方的观感一致。
 pub fn edge_mask(w: u32, h: u32, width: f32) -> Mask {
     let mut m = Mask::new(w, h);
     let t = width.max(0.5);
@@ -287,15 +247,6 @@ pub fn edge_mask(w: u32, h: u32, width: f32) -> Mask {
 // ---------------------------------------------------------------------------
 
 /// 可分离盒式模糊,横纵半径可不同。
-///
-/// 半径以像素计,内部四舍五入到整数核宽;边界按夹取处理(不引入黑边)。
-/// 参考产品的模糊算子就是盒式的(可分离 + 2 的幂级快速路径),
-/// 不是高斯 —— 所以大半径下边缘不会溢出,但方块感会比高斯明显。
-/// 参考模糊算子的**阶梯量化**:amount<1 → 0;否则量化到
-/// {2.065, 3.0625, 4.13, 5.13} 四档(半径离散化,非连续 sigma)。
-///
-/// **实现口径**:升档阈值未见公开资料,这里取等距 1/2/3/4 假定;
-/// 档位数值是内置的离散化常数,可由资源包覆盖。
 pub fn blur_ladder(amount: f32) -> f32 {
     if amount < 1.0 {
         return 0.0;
@@ -317,7 +268,6 @@ pub fn blur_ladder(amount: f32) -> f32 {
 
 pub fn box_blur(img: &mut RgbaImage, rx: f32, ry: f32) {
     let (w, h) = img.dimensions();
-    // 参考约束:实际半径先钳到图像尺寸的一半(rx 对宽、ry 对高)。
     let rx = rx.round().max(0.0).min(w as f32 / 2.0) as i32;
     let ry = ry.round().max(0.0).min(h as f32 / 2.0) as i32;
     if rx > 0 {
@@ -356,16 +306,6 @@ fn box_blur_axis(img: &mut RgbaImage, r: i32, horizontal: bool) {
 }
 
 /// 全直方图自动色阶:三个通道各自把 `[min,max]` 线性铺满 `[0,255]`。
-///
-/// 与 [`crate::oneclick::apply_autocontrast`](带分位裁剪)不同,这里
-/// **不做百分比裁剪** —— 拉伸更彻底,适合风格化配方当第一道工序。
-/// 自动色阶:每通道**独立**全直方图拉伸(参考口径)。
-///
-/// - `low` = 首个非零 bin,`high` = 末个非零 bin(无百分比裁剪);
-/// - `raw = 1.0 + 255·(i−low)/(high−low)` 后截断 —— 所以 `i=low` 输出 **1** 而非 0,
-///   `i=high` 得 256 → 钳到 255;
-/// - `low == high`(常数图)→ 该通道 LUT 全填 0xff(全白);
-/// - 全黑图(直方图全零)→ LUT 全零,保持黑色。
 pub fn auto_fix(img: &mut RgbaImage) {
     let mut hist = [[0u32; 256]; 3];
     for p in img.pixels() {
@@ -404,10 +344,6 @@ fn luma8(p: &Rgba<u8>) -> f32 {
 }
 
 /// 渐变映射:把亮度当索引,在给定色阶之间线性插值。
-///
-/// 站点位置**强制均匀铺满 `0..255`**(`n` 个色阶 → 第 `i` 个落在 `i·255/(n−1)`),
-/// 与参考产品的两色/多色映射一致 —— 所以它不受"自定义站点位置"影响,
-/// 色阶数量才是唯一的自由度。
 pub fn gradient_map(img: &mut RgbaImage, stops: &[[u8; 3]]) {
     if stops.is_empty() {
         return;
@@ -442,9 +378,6 @@ pub fn gradient_map(img: &mut RgbaImage, stops: &[[u8; 3]]) {
 }
 
 /// HSV 渐变映射:站点位置**按给定值**落位,色相沿最短弧插值。
-///
-/// 站点用 `(position, (h, s, v))` 表示,`position` 取 `0..255`,
-/// `h` 取 `0..360`, `s`/`v` 取 `0..=100`。`hue_offset` 整体旋转色相。
 pub fn hsv_gradient_map(img: &mut RgbaImage, stops: &[(f32, (f32, f32, f32))], hue_offset: f32) {
     if stops.is_empty() {
         return;
@@ -485,7 +418,6 @@ pub fn hsv_gradient_map(img: &mut RgbaImage, stops: &[(f32, (f32, f32, f32))], h
         *slot = hsv_to_rgb(c.0, c.1 / 100.0, c.2 / 100.0);
     }
 
-    // 参考口径:索引是**输入像素的 R 通道字节**(不是亮度);
     // 观感上 G/B 两张查找表等同,只有 R 通道参与 —— 我方从
     // 单张 LUT 写回 RGB,视觉上等价于「以 R 索引的整色映射」。
     for p in img.pixels_mut() {
@@ -525,16 +457,6 @@ pub fn two_tone(img: &mut RgbaImage, black: [u8; 3], white: [u8; 3]) {
 }
 
 /// 局部对比度(大半径非锐化掩模)。
-///
-/// ```text
-/// blur    = box_blur(orig, radius, radius)
-/// detail  = orig − blur
-/// out     = orig + strength · detail
-/// ```
-///
-/// `strength` 取 1.0 附近是"轻微提细节",取 3.0 以上开始有明显 HDR 观感。
-/// 半径大(数十像素)时只影响明暗结构,不放大噪点 —— 这与小半径锐化的
-/// 观感差异正是这类配方想要的。
 pub fn local_contrast(img: &mut RgbaImage, radius: f32, strength: f32) {
     if strength == 0.0 || radius <= 0.0 {
         return;
@@ -550,43 +472,13 @@ pub fn local_contrast(img: &mut RgbaImage, radius: f32, strength: f32) {
     }
 }
 
-/// 局部对比度 —— **参考的两支嵌套形式**(滑杆口径就是参考的 `c`)。
-///
-/// 参考的 LocalContrast 不是单公式,而是两支嵌套依次复合:
-///
-/// ```text
-/// blur = Blur(orig, radius)                    // 先记下 orig 与 blur 两张图
-/// 支一 subtract:(blur − orig)·c  复合回 ⇒ blur + (orig − blur)·c
-/// 支二 add :(orig − blur)·c  复合回 ⇒ blur + 2c·(orig − blur)
-/// ```
-///
-/// 与 [`local_contrast`] 的 USM 形式 `orig + s·(orig − blur)` 属同一族,
-/// 换算关系 **`s = 2c − 1`**(回归锁 `local_contrast_strength_maps_to_reference_contrast`)。
-/// 两个推论:`c = 0.5` 严格还原原图;`c = 0` 得到纯模糊图。
-///
-/// 参考滑杆量程:`radius` 1.3~40(缺省 15)、`c` 1~3(缺省 1.5)。
-///
-/// **实现口径**:嵌套语义按「子级结果以该 BlendMode 复合进父画布」解读,
-/// 各支作用的中间画布顺序取自官方滤镜描述的书写次序;
-/// 若复合方向另有讲究,结果会差一个常数倍,目前无样本可校验。
+/// 局部对比度(嵌套双支形式)。
 pub fn local_contrast_ref(img: &mut RgbaImage, radius: f32, contrast: f32) {
     // 直接换算成 USM 的强度再走同一条实现,避免两处公式写歪。
     local_contrast(img, radius, 2.0 * contrast - 1.0);
 }
 
 /// 阴影 / 高光(Shadow & Highlight)。
-///
-/// 参考的三根滑杆:Radius(`range 1.0` + `log 250.0`)、Shadow %、Highlight %(均 `range 1.0`);
-/// 对数滑杆按常规口径折算:`radius = 1 · 250^raw`(raw 为滑杆 0..1)。
-///
-/// ```text
-/// mean = box_blur(src, radius)          // 局部均值 = 该像素"本该有的"亮度
-/// mean > v → 暗部:out = v + shadow · (mean − v)     // 向均值上抬
-/// mean < v → 亮部:out = v + highlight · (mean − v)  // 向均值回落 = 压高光
-/// ```
-///
-/// **实现口径**:参考只公开了三根滑杆的存在与量程,内部实现没有对应资料。上面这条"以局部均值为参照、分别向均值靠拢"的公式属本项目重构,
-/// 其好处是平坦区(局部均值等于自身)天然恒等,不会产生额外的晕圈。
 pub fn shadow_highlight(img: &mut RgbaImage, radius: f32, shadow: f32, highlight: f32) {
     if radius <= 0.0 || (shadow == 0.0 && highlight == 0.0) {
         return;
@@ -605,18 +497,7 @@ pub fn shadow_highlight(img: &mut RgbaImage, radius: f32, shadow: f32, highlight
     }
 }
 
-/// 边缘检测(描边):参考的三步装配,**白底黑边**。
-///
-/// ```text
-/// ① Blur(2, 2)
-/// ② 双向 Sobel:horizontal 分支 = clamp(128 + gx·scale/2),
-///    vertical 分支同构(128 偏置使平坦区落在 128)
-/// ③ 三角曲线 {0→0, 128→255, 255→0}:平坦区(128)映到 **255 白**,
-///    强边缘(0/255)映到 **0 黑**;两支按 Multiply 合成
-/// ```
-///
-/// 输出是灰度图(`R=G=B`)。注意与早期实现的两点差异:强边缘趋黑
-/// (不是回白),且先模糊再取梯度。
+/// 边缘检测(描边):白底黑边。
 pub fn edge_detect_b(img: &mut RgbaImage, detail: f32) {
     let (w, h) = img.dimensions();
     if w < 3 || h < 3 {
@@ -661,22 +542,6 @@ pub fn edge_detect_b(img: &mut RgbaImage, detail: f32) {
 }
 
 /// 径向模糊(变焦模糊):以 (`cx`,`cy`) 为中心把画面按递增倍率叠若干层再取均值。
-///
-/// ```text
-/// N       = min(30, amount + 5)                  // 叠加层数
-/// step    = floor(W · amount / 200)              // 最外层的放大像素数
-/// d_k     = step · k / N            (k = 1..N)   // 第 k 层在宽、高上各外扩 d_k 像素
-/// x_scale = 1 / (1 + d_k / W)
-/// y_scale = 1 / (1 + d_k / H)
-/// out     = mean( orig(c + (p − c) · (x_scale, y_scale)) )
-/// ```
-///
-/// 三处容易写错的细节:
-///
-/// - 外扩量是**宽、高各加 d 像素**,不是等比缩放。倍率分别是 `(W+d)/W`
-///   与 `(H+d)/H`,所以非正方形画面会有轻微各向异性。
-/// - 层从 `d = step/N` 起,**没有 d = 0 的清晰底图**,因此任何强度下中心也会被带动。
-/// - 每层权重相同(等权平均),没有按层衰减。
 pub fn radial_blur(img: &mut RgbaImage, cx: f32, cy: f32, amount: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -717,9 +582,6 @@ pub fn radial_blur(img: &mut RgbaImage, cx: f32, cy: f32, amount: f32) {
 }
 
 /// 线性(方向)模糊:沿给定角度做多次等比采样后取均值。
-///
-/// `angle` 以度为单位,0 = 水平向右;`length` 是采样跨度(像素)。
-/// 层数随跨度增加但封顶,避免大跨度时过度拖慢。
 pub fn linear_blur(img: &mut RgbaImage, angle: f32, length: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 || length <= 0.0 {
@@ -757,19 +619,15 @@ pub fn linear_blur(img: &mut RgbaImage, angle: f32, length: f32) {
 /// 方向性调整的种类。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DirKind {
-    /// 亮度:整体按权重缩放。
+/// 亮度:整体按权重缩放。
     Brightness,
-    /// 饱和度:向亮度收敛的比例按权重变化。
+/// 饱和度:向亮度收敛的比例按权重变化。
     Saturation,
-    /// 锐度:权重高于 1 的一侧加强锐化。
+/// 锐度:权重高于 1 的一侧加强锐化。
     Sharpen,
 }
 
 /// 方向性调整:沿左右/上下做一个线性渐变,越靠一侧效果越强。
-///
-/// `lr` / `tb` 取值 −1~1,正数表示"右侧 / 下侧更强"。
-/// `strength` 是 0~1 的总体强度。两轴同时给值时按线性叠加
-/// (右上角最强、左下角最弱),与参考的「Left to Right + Top to Bottom」两滑杆一致。
 pub fn directional_adjust(img: &mut RgbaImage, lr: f32, tb: f32, strength: f32, kind: DirKind) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 || strength <= 0.0 {
@@ -822,9 +680,6 @@ pub fn directional_adjust(img: &mut RgbaImage, lr: f32, tb: f32, strength: f32, 
 }
 
 /// 焦点柔化:圆心附近保持清晰,越往外叠得越多。
-///
-/// `inner` 是"仍然清晰"的半径(占短边比例),`outer` 是模糊到满强度的半径。
-/// 参考的「Soft Focus」用一只定位点指定圆心,这里按同一语义用归一化坐标。
 pub fn soft_focus(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32, amount: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 || amount <= 0.0 {
@@ -849,9 +704,6 @@ pub fn soft_focus(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32,
 }
 
 /// 焦点去色:圆内保留色彩,圆外转成灰度。
-///
-/// `inner` / `outer` 与 [`soft_focus`] 同义;`outer − inner` 越小过渡越硬,
-/// 对应参考里那条「Sharpness」滑杆。
 pub fn focal_bw(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32) {
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
@@ -881,10 +733,6 @@ pub fn focal_bw(img: &mut RgbaImage, cx: f32, cy: f32, inner: f32, outer: f32) {
 }
 
 /// 方块化:先缩到 `1/block`,再按**最近邻**放大回原尺寸。
-///
-/// 缩小时走双线性(参考的缩放算子默认开平滑),
-/// 放大时显式关平滑 —— 只有关掉才得到硬块边界。两步合起来,
-/// 每块的颜色取的是**块中心那个采样点**,不是块内均值。
 
 pub fn pixelate(img: &mut RgbaImage, block: f32) {
     let (w, h) = img.dimensions();
@@ -902,10 +750,6 @@ pub fn pixelate(img: &mut RgbaImage, block: f32) {
 }
 
 /// 调色板量化(色阶压缩)。
-///
-/// 做法:逐层降低每通道位深做分桶,直到桶数不超过 `steps`,每桶取原色均值。
-/// `depth` 只作为起始位深上限。桶数仍超限时,保留像素最多的若干桶,
-/// 其余映射到色距最近的保留桶 —— 不会因为极端参数而退化成全黑。
 pub fn quantize_palette(img: &mut RgbaImage, steps: u32, depth: u32) {
     use std::collections::HashMap;
     let steps = steps.max(2);
@@ -1000,12 +844,6 @@ pub fn quantize_palette(img: &mut RgbaImage, steps: u32, depth: u32) {
 }
 
 /// 生成一层噪声(0~255),用于各种颗粒配方。
-///
-/// **实现口径**:参考的噪声算子是**加性**的(`v += rand % (max−min+1) + min`,
-/// min/max 缺省 0/255);我方走「噪声层 + Multiply/Lighten 合成」的配方语义,
-/// 五个调用点(胶片颗粒等)的低幅区间在加性语义下会整体过曝,故保留合成
-/// 路线并在此声明差异。参考通道掩码 bit0/1/2 = R/G/B、bit3 = A;mono 标志
-/// 让四通道共用同一随机值 —— 见 `apply_noise_layer` 的 mono/独立抽样两分支。
 fn noise_layer(img: &RgbaImage, seed: u32, low: u8, high: u8) -> Vec<u8> {
     let (lo, hi) = if low <= high { (low, high) } else { (high, low) };
     let mut rng = crate::oneclick::Mt19937::new(seed);
@@ -1032,7 +870,6 @@ fn apply_noise_layer(
     let noise = noise_layer(img, seed, low, high);
     let mut layer = img.clone();
     if gray {
-        // mono:三通道共用同一随机值(参考 mono 标志语义)
         for (i, p) in layer.pixels_mut().enumerate() {
             p[0] = noise[i];
             p[1] = noise[i];
@@ -1054,10 +891,6 @@ fn apply_noise_layer(
 }
 
 /// 内光晕:画面边缘向 `color` 渐变。
-///
-/// `falloff` 是过渡宽度(像素),`strength` 直接缩放混合比例。
-/// 参考产品的内光晕合成器未公开混合模式,这里用线性混合 ——
-/// 对暗角(黑色)与白边(白色)两种典型用法观感一致。
 pub fn glow_edge(img: &mut RgbaImage, color: [u8; 3], falloff: f32, strength: f32, alpha: f32) {
     let (w, h) = img.dimensions();
     let m = edge_mask(w, h, falloff);
@@ -1071,15 +904,6 @@ pub fn glow_edge(img: &mut RgbaImage, color: [u8; 3], falloff: f32, strength: f3
 }
 
 /// 加边框:画布四周外扩,先铺外框色,再内嵌一层内框色。
-///
-/// `outer_t` / `inner_t` 以"1024 宽参考像素"计,按画面短边等比缩放,
-/// 这样同一配方在预览图与全分辨率下观感一致。
-/// `corner_radius > 0` 时把画面四角修圆(`outer` 色填充圆角外的部分)。
-/// `caption_h > 0` 时在底部额外留一条同色底边(拍立得式说明栏)。
-///
-/// **实现口径**(与参考的已知差异):参考按 **imageWidth** 缩放
-/// 且第三个值**不参与缩放**;我方统一按短边缩放、三个值都缩 ——
-/// 竖幅照片的边条会比参考略宽。
 #[allow(clippy::too_many_arguments)]
 pub fn border_frame(
     img: &RgbaImage,
@@ -1163,22 +987,6 @@ pub fn round_corners(img: &mut RgbaImage, radius: f32, fill: [u8; 3]) {
 }
 
 /// 投影:画布外扩一圈背景色,在偏移位置画一层模糊后的画面剪影。
-///
-/// `distance` / `blur` 与边框厚度同口径(1024 宽参考像素),
-/// `angle` 为投影方向(度,0 = 向右,90 = 向下)。
-///
-/// # 剪影从哪来
-///
-/// **实现口径**(与参考的已知差异):参考是 9 参数(另有
-/// mode / 强度 / 质量档),我方 6 个;参考的横向/纵向模糊半径分开,
-/// 我方合并为一个 `blur`;参考做两遍填充,我方单遍。
-///
-/// 参考实现的投影参数只有「阴影色 / 背景色 / 不透明度 / 距离 / 角度 /
-/// 横向与纵向模糊半径 / 强度 / 质量档」,**没有任何"用哪个通道做遮罩"的开关**。
-/// 也就是说剪影固定取**画面的不透明区域**(对本项目这种整幅不透明的照片
-/// 就是整块画布矩形),不取亮度、也不取绿通道。所以纯黑照片与纯白照片
-/// 打出来的阴影形状必须完全一样 —— 这是下面 `drop_shadow_shape_ignores_color`
-/// 那条测试要守的约束。
 #[allow(clippy::too_many_arguments)]
 pub fn drop_shadow(
     img: &RgbaImage,
@@ -1250,11 +1058,6 @@ pub fn drop_shadow(
 }
 
 /// 旋转(度,顺时针为正),`pad = true` 时扩大画布避免裁角。
-///
-/// **实现口径**(与参考的已知差异):① 不接受弧度入参;
-/// ② 没有「接近 90° 倍数直接交换宽高」的快速分支 —— 90° 整数旋转因
-/// `cos≈4.4e-8` 的浮点残差会让画布多出 1px;如需像素级精确的 90° 旋转,
-/// 应在调用方走裁切/转置路径。
 pub fn rotate(img: &mut RgbaImage, deg: f32, pad: bool, border: [u8; 3]) -> RgbaImage {
     let (w, h) = img.dimensions();
     let rad = deg.to_radians();
@@ -1312,9 +1115,6 @@ pub fn crop_center(img: &RgbaImage, cw: u32, ch: u32) -> RgbaImage {
 }
 
 /// 最近邻缩放,取样口径与 [`resize`] 一致(`(dst + 0.5)·scale − 0.5`)。
-///
-/// 不用 `image::imageops::resize` 的最近邻:它按 `dst · src/dst` 直接取整,
-/// 与大图比例不整除时块宽会一顿一顿地跳。按像素中心对齐才能得到等宽块。
 pub fn resize_nearest(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     let nw = nw.max(1);
@@ -1334,15 +1134,6 @@ pub fn resize_nearest(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
 }
 
 /// 双线性缩放到指定尺寸。
-///
-/// 几何是**像素中心对齐**:目标像素 `x` 对应源坐标 `(x + 0.5)·W/nw − 0.5`,
-/// 两个方向各自有独立的比例,不做等比钳制。这与参考实现的取样点完全一致
-/// (`src = (dst + 0.5) · scale + t`,`t` 使像素中心落在源像素中心)。
-///
-/// 参考实现里缩放有两条路:默认开平滑时走 2×2 双线性(8 位定点分数,
-/// `a + ((b − a)·f >> 8)`);显式关平滑(`smoothing="false"`)时退化成
-/// **最近邻**——方块化的放大那一步就是这么关掉的。这里只提供双线性版本,
-/// 需要最近邻时用 [`resize_nearest`](取样口径与这里一致)。
 pub fn resize(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
     let (w, h) = img.dimensions();
     let nw = nw.max(1);
@@ -1375,18 +1166,7 @@ pub fn resize(img: &RgbaImage, nw: u32, nh: u32) -> RgbaImage {
     })
 }
 
-/// 单色红外:参考的三步嵌套链,缺一步都不算。
-///
-/// ```text
-/// ① ColorMatrix 只保留绿通道(R'=0、B'=0、G'=G)
-/// ② Blur(r=5.0)
-/// ③ ColorMatrix 三行相同 [k, 2.0, −1−k, 0, 0](k 缺省 −0.5,行和 = 1)
-/// ```
-///
-/// ② 之后 R/B 已是 0,③ 在数学上退化为 `2·G` —— 但保留矩阵形式,
-/// 与参考的装配顺序一一对应;`red_weight` 因此在链路上无视觉影响
-/// (这点未能确认)。终值是**纯绿通道派生的单色**,
-/// 没有 Screen 光晕 —— 我方早期那层光晕已删除。
+/// 单色红外:绿通道主导的单色效果。
 pub fn infrared(img: &mut RgbaImage, red_weight: f32) {
     let k = red_weight;
     // ① 只保留绿通道
@@ -1502,17 +1282,11 @@ pub fn default_amount(name: &str) -> f32 {
 }
 
 /// 应用配方;`amount` 为 0~100 的强度。
-///
-/// 等价于 [`apply_with`] 加 [`Blend::Normal`]。
 pub fn apply(img: &mut RgbaImage, name: &str, amount: f32) -> bool {
     apply_with(img, name, amount, Blend::Normal)
 }
 
 /// 应用配方,并把结果按 `mode` 与原图回混。
-///
-/// `mode` 是处理结果与**原图**的混合模式:`Normal` 即普通的不透明度回混;
-/// 换成 `Overlay` / `Screen` 之类可以做出更轻透的风格(见 [`Blend::parse`])。
-/// 返回 `false` 表示名字不认识(调用方据此走别的分支)。
 pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> bool {
     let a = (amount.clamp(0.0, 100.0)) / 100.0;
     let orig = img.clone();
@@ -1528,7 +1302,6 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         "punch" => {
             crate::effects::apply_color_matrix(img, -20.0, 40.0, 20.0);
         }
-        // 画框:外黑内白的双层边框(厚度按 1024 宽参考像素)
         "frame" => {
             let out_img = border_frame(img, [0, 0, 0], 20.0, [255, 255, 255], 5.0, 0.0, 0.0);
             *img = out_img;
@@ -1568,7 +1341,6 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         "film_grain" => {
             apply_noise_layer(img, 1, 229, 255, true, Blend::Multiply, 1.0);
         }
-        // 强动态:参考的 HDR 就是同一个局部对比算子,滑杆缺省 radius=20、contrast=3
         "hdr" => {
             local_contrast_ref(img, 20.0, 3.0);
         }
@@ -1656,7 +1428,6 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         }
         // 夜视仪:自动色阶 → 黑绿映射 → 内光晕 → 亮部噪声
         //
-        // 光晕半径按画面长边的 0.233 倍取(参考配方的 `35·0.02·max/3`),
         // 强度 1.5 让增益到顶,所以边缘是纯黑压暗而不是半透明覆盖。
         "night_vision" => {
             auto_fix(img);
@@ -1710,20 +1481,16 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
             crate::effects::apply_color_matrix(&mut layer, 0.0, 28.0, 25.0);
             composite(img, &layer, Blend::Normal, a);
         }
-        // 柔化(Soften):参考是模糊算子(xblur = yblur = Impact·20/50)
         // 以**普通不透明度** `(100−Fade)·0.8/100` 盖回原图,不带混合模式、不带曲线。
         // Impact 缺省 50 → 半径 20;Fade 缺省 50 → 0.4(范围上限 0.8)。
         //
-        // 参考还有一支画笔遮罩(Mask),本项目没有笔刷 UI,故整幅施加。
         "bloom" => {
             let mut layer = img.clone();
             box_blur(&mut layer, 20.0, 20.0);
             composite(img, &layer, Blend::Normal, 0.8);
         }
-        // 托伊相机款(Lomo):参考滤镜描述里是三步依次作用 —
         //   ① 黑色**内发光**:半径 = 35·0.02·长边/2 = 0.35·长边,强度 1.1;
         //   ② **圆形渐变遮罩**下的 Blur(20):内径 = 长边/4,
-        //      外径 = 长边/2·(2 − blur/100),参考滑杆缺省 50 → 0.75·长边;
         //   ③ 色彩矩阵:饱和 +20 / 对比 +35 / 亮度 +5。
         // 遮罩是「内实外虚」,所以只有中心被模糊,四角保持清晰。
         "lomo" => {
@@ -1743,19 +1510,16 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
             composite_masked(img, &layer, &m, Blend::Normal, 1.0);
             crate::effects::apply_color_matrix(img, 5.0, 35.0, 20.0);
         }
-        // 奥顿柔焦(Orton-ish):参考是**嵌套操作** ——
         // `Blur(bloom)` 以 **Overlay** 混合回原图 → 再叠一条亮度曲线
         // `[(0,0), (128, 128+(B−50)·75/50), (255,255)]`。Bloom 缺省 25、Brightness
         // 缺省 50(此时中点是 (128,128),曲线恒等)。
         //
         // 与 `bloom`(柔化)的差异**只在混合模式**:这里是 Overlay,那里是普通不透明度。
-        // 参考的 Brightness 滑杆我方不单独暴露,固定取缺省值 —— 见 `default_amount`。
         "orton" => {
             let mut layer = img.clone();
             box_blur(&mut layer, 25.0, 25.0);
             composite(img, &layer, Blend::Overlay, 1.0);
         }
-        // 暗角(Vignette):参考是**内发光**(纯黑),
         // `innerglow=true`、strength 缺省 1.4(量程 1~2)、
         // 羽化半径 = Blur·0.02·长边/4,Blur 缺省 35 → **0.175·长边**。
         //
@@ -1856,7 +1620,7 @@ fn border_asym(
 mod tests {
     use super::*;
 
-    /// 造一张有横向渐变 + 局部色块的测试图(纯色图会被直方图类算子退化成无操作)。
+/// 造一张有横向渐变 + 局部色块的测试图(纯色图会被直方图类算子退化成无操作)。
     fn sample(w: u32, h: u32) -> RgbaImage {
         RgbaImage::from_fn(w, h, |x, y| {
             let r = (x * 255 / w.max(1)) as u8;
@@ -1941,18 +1705,7 @@ mod tests {
         assert_eq!(center[3], 255, "中心像素被误伤");
     }
 
-    /// 参考的 LocalContrast 不是单公式,而是**两支嵌套**依次作用:
-    ///
-    /// ```text
-    /// blur = Blur(orig, r)
-    /// 支一(subtract):(blur − orig)·c   →  以 subtract 复合回:bg = blur + (orig−blur)·c
-    /// 支二(add) :(orig − blur)·c   →  以 add      复合回:bg + (orig−blur)·c
-    /// 合计 :blur + 2c·(orig − blur)
-    /// ```
-    ///
-    /// 于是与常见的 USM 形式 `orig + s·(orig−blur)` 是**同一族**,换算关系
-    /// `s = 2c − 1`。两条推论被下面的断言锁死:
-    /// `c = 0.5` 必须严格还原原图;`s = 2c − 1` 必须逐字节等价。
+/// 局部对比在 c=0.5 时严格还原原图。
     #[test]
     fn local_contrast_reference_is_identity_at_half() {
         let mut img = sample(24, 24);
@@ -2090,10 +1843,6 @@ mod tests {
 }
 
 /// 手动生成观感样张:设置 `MALIANG_SRC`(源图)与 `MALIANG_OUT`(输出目录)
-/// 后执行 `cargo test --offline -- --ignored dump_recipe_samples`。
-///
-/// 逐个配方写出单图,并拼一张总览图 `_sheet.png`(便于一次性比对)。
-/// 只用于人工比对观感,不参与常规测试。
 #[cfg(test)]
 #[test]
 #[ignore = "手动生成样张"]
@@ -2263,9 +2012,7 @@ mod canvas_recipe_tests {
 mod focus_op_tests {
     use super::*;
 
-    /// 手动导出各"焦点/方向"类算子的观感样张:
-    /// 设 `MALIANG_SRC` / `MALIANG_OUT` 后跑
-    /// `cargo test --offline -- --ignored dump_focus_samples`。
+/// 手动导出各"焦点/方向"类算子的观感样张:
     #[test]
     #[ignore = "手动生成样张"]
     fn dump_focus_samples() {
@@ -2394,10 +2141,7 @@ mod focus_op_tests {
 mod sampler_tests {
     use super::*;
 
-    /// 径向模糊:放大层从 step/N 起、到 step 为止,层数 min(30, amount+5)。
-    ///
-    /// 用中心外的一个亮点看拖影:强度越大,亮点被拉成的径向拖尾越长;
-    /// 同时因为取样点是**最近邻**,拖尾上的像素值不会凭空变亮或翻转。
+/// 径向模糊:放大层从 step/N 起、到 step 为止,层数 min(30, amount+5)。
     #[test]
     fn radial_blur_streak_grows_with_amount() {
         let mut base = RgbaImage::from_pixel(64, 24, Rgba([0, 0, 0, 255]));
@@ -2443,10 +2187,7 @@ mod sampler_tests {
         assert_eq!(img.into_raw(), base.into_raw());
     }
 
-    /// 方块化:每块取块中心的采样点,不是块内均值。
-    ///
-    /// 用**奇数**块宽(3)时块中心正好落在某个源像素上,可以精确断言;
-    /// 偶数块宽的中心落在两个像素之间,必然是个混合值。
+/// 方块化:每块取块中心的采样点,不是块内均值。
     #[test]
     fn pixelate_samples_block_centre() {
         let mut img = RgbaImage::from_pixel(9, 9, Rgba([0, 0, 0, 255]));
@@ -2477,7 +2218,7 @@ mod sampler_tests {
         }
     }
 
-    /// 双线性缩放:像素中心对齐。1:1 缩放必须原样返回。
+/// 双线性缩放:1:1 缩放必须原样返回。
     #[test]
     fn resize_identity_preserves_pixels() {
         let src = RgbaImage::from_fn(9, 7, |x, y| {
@@ -2487,7 +2228,7 @@ mod sampler_tests {
         assert_eq!(out.into_raw(), src.clone().into_raw());
     }
 
-    /// 2 倍放大:新像素落在源像素中心之间,应等于左右两个源像素的中值。
+/// 2 倍放大:新像素落在源像素中心之间,应等于左右两个源像素的中值。
     #[test]
     fn resize_double_uses_pixel_centres() {
         let src = RgbaImage::from_pixel(2, 1, Rgba([0, 0, 0, 255]));
@@ -2504,7 +2245,7 @@ mod sampler_tests {
         assert!((m1 - 150).abs() <= 2, "第三个像素应为 150,实得 {m1}");
     }
 
-    /// 投影的剪影只取不透明区域,与画面颜色无关。
+/// 投影的剪影只取不透明区域,与画面颜色无关。
     #[test]
     fn drop_shadow_shape_ignores_color() {
         const BG: [u8; 3] = [226, 226, 226];
@@ -2538,10 +2279,7 @@ mod sampler_tests {
         assert!(shadowed > 0, "照片外圈没有画出任何阴影,测试证明不了东西");
     }
 
-    /// 第 4 项-b:`Orton` 与 `Soften` 必须拆成两条链路。
-    ///
-    /// 参考里它们是两种完全不同的算子:Orton = 模糊图以 **Overlay** 混合回来
-    /// (再叠一条亮度曲线);`Soften` = 模糊图按**普通不透明度**盖回原图。
+/// 第 4 项-b:`Orton` 与 `Soften` 必须拆成两条链路。
     #[test]
     fn orton_and_soften_are_distinct_recipes() {
         // 用渐变图做基准:平坦图模糊后仍是平坦图,`Soften`(普通不透明度回混)
@@ -2582,8 +2320,7 @@ mod sampler_tests {
         assert_ne!(a.as_raw(), b.as_raw(), "同为 50 强度时两者也必须不同");
     }
 
-    /// 第 4 项-c:参考的 `Vignette` 是**内发光**(Glow, 纯黑),
-    /// 与我方自主设计的 smoothstep 暗角是两件东西,应各自独立存在。
+/// vignette_glow 与自主 smoothstep 暗角是独立的两件事。
     #[test]
     fn reference_vignette_is_an_inner_glow() {
         let flat = || image::RgbaImage::from_pixel(32, 32, image::Rgba([180, 180, 180, 255]));
@@ -2604,9 +2341,7 @@ mod sampler_tests {
 
     // ===== 第 5 项:3.4 批量清理(六条失败断言,实现后转绿)=====
 
-    /// 5-a:AutoFix 的 `+1.0` 与 `low==high → 全白`。
-    /// 参考:`raw = (int)(1.0 + 255*(i−low)/(high−low))`,i=low 输出 **1** 不是 0;
-    /// `low==high`(常数图)→ LUT 全填 0xff(全白),不是保持原样。
+/// 5-a:AutoFix 的 `+1.0` 与 `low==high → 全白`。
     #[test]
     fn auto_fix_uses_reference_lut_conventions() {
         // 常数图 → 全白
@@ -2628,7 +2363,7 @@ mod sampler_tests {
         assert_eq!(img.get_pixel(1, 0)[0], 255, "最高 bin 应映射到 255");
     }
 
-    /// 5-b:HSVGradientMap 的索引量是**输入像素的 R 通道字节**,不是亮度。
+/// 5-b:HSVGradientMap 的索引量是**输入像素的 R 通道字节**,不是亮度。
     #[test]
     fn hsv_gradient_map_indexes_by_red_byte() {
         let stops = vec![(0.0f32, (0.0f32, 100.0f32, 0.0f32)), (255.0, (120.0, 100.0, 100.0))];
@@ -2651,8 +2386,7 @@ mod sampler_tests {
         assert_ne!(a.get_pixel(0, 0), c.get_pixel(0, 0), "R 不同则输出应不同");
     }
 
-    /// 5-c:Infrared 走参考三步链(只留绿 → 模糊 → 矩阵),终值是
-    /// **纯绿通道派生的单色**,红蓝通道不参与,也没有 Screen 光晕。
+/// infrared 终值为纯绿通道派生的单色。
     #[test]
     fn infrared_derives_from_green_channel_only() {
         let mk = |r: u8, g: u8, b: u8| {
@@ -2668,8 +2402,7 @@ mod sampler_tests {
         assert!(bright > dark, "绿通道越亮输出应越亮:{dark} → {bright}");
     }
 
-    /// 5-d:EdgeDetectionB = 先 Blur(2,2) → 双向 Sobel(各经 +128 偏置与三角曲线)
-    /// → 合成。平坦区必须**纯白**,强边缘趋黑(不是回白)。
+/// 5-d:EdgeDetectionB = 先 Blur(2,2) → 双向 Sobel(各经 +128 偏置与三角曲线)
     #[test]
     fn edge_detect_b_flats_are_white_and_edges_are_dark() {
         // 平坦图 → 全白
@@ -2693,7 +2426,7 @@ mod sampler_tests {
         assert!(edge_col < flat_col, "边缘应比平坦区暗,实得 边缘={edge_col} 平坦={flat_col}");
     }
 
-    /// 5-e:噪声的非 mono 模式必须三通道**独立抽样**,不能是同一数组的循环移位。
+/// 5-e:噪声的非 mono 模式必须三通道**独立抽样**,不能是同一数组的循环移位。
     #[test]
     fn noise_non_mono_samples_channels_independently() {
         let mut img = image::RgbaImage::new(8, 8);
@@ -2727,8 +2460,7 @@ mod sampler_tests {
         assert!(shift_hits <= 1, "检测到循环移位特征:{shift_hits}/62");
     }
 
-    /// 5-f:模糊半径的两条参考约束 —— 滑块量经**阶梯量化**,实际半径
-    /// **钳到图像尺寸的一半**。
+/// 模糊半径经阶梯量化,并钳到图像尺寸的一半。
     #[test]
     fn blur_ladder_and_half_size_clamp() {
         // 阶梯:合法档位只有 0 与四个量化值
@@ -2748,9 +2480,7 @@ mod sampler_tests {
         }
     }
 
-    /// 登记表的两向一致性 —— 防止出现「`apply` 认得、`is_recipe` 不认」的不可达配方。
-    ///
-    /// 分支清单直接从本文件源码里解析,不另抄一份常量表,避免以后两处漂移。
+/// 登记表的两向一致性 —— 防止出现「`apply` 认得、`is_recipe` 不认」的不可达配方。
     fn dispatch_arms() -> Vec<String> {
         // 同 effects 的那个坑:先统一换行风格,`"\n}\n"` 才稳定匹配。
         let src = include_str!("recipes.rs").replace("\r\n", "\n");
@@ -2806,14 +2536,7 @@ mod sampler_tests {
         }
     }
 
-    /// `Lomo`(托伊相机款抖动暗角)在 84 项参考滤镜里没有对应实现 —— 补齐。
-    ///
-    /// 参考链(取自官方滤镜描述,三步依次作用):
-    ///  1. 黑色**内发光**:半径 = 35·0.02·长边/2 = 0.35·长边,强度 1.1
-    ///  2. 圆形渐变遮罩下的 **Blur(20)**:遮罩内径 = 长边/4,外径 = 长边/2·(2 − blur/100)
-    ///  3. 色彩矩阵:饱和 +20 / 对比 +35 / 亮度 +5
-    ///
-    /// 断言只锁这三件事的**可观测后果**,不锁内部写法。
+/// Lomo(托伊相机款):中心模糊与四角压暗。
     #[test]
     fn lomo_blurs_the_center_and_darkens_the_corners() {
         // 高频条纹:中心被 Blur(20) 抚平」后,相邻列的差异应显著变小。
@@ -2868,3 +2591,4 @@ mod sampler_tests {
         );
     }
 }
+

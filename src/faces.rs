@@ -1,4 +1,4 @@
-//! 人脸存储 / 增量聚类 / 质量评分 / 命名建议(对应原版 FR 特性)。
+//! 人脸存储 / 增量聚类 / 质量评分 / 命名建议。
 //! 能力映射:质量评分、命名建议、忽略簇、算法版本迁移(wipe_faces)。
 use crate::ai::face::{Det, Faces};
 use crate::db::Store;
@@ -91,7 +91,7 @@ pub fn save_face(
     })
 }
 
-/// 人脸质量评分 [0,1](对应原版 facequality):
+/// 人脸质量评分 [0,1]:
 /// 0.35*检测置信度 + 0.30*尺寸分(短边 48px 满分) + 0.35*锐度分。
 /// 锐度 = 人脸框内 32x32 灰度的拉普拉斯方差,经 var/(var+400) 饱和映射。
 /// 低质量脸不丢弃,但在聚类中以低权重参与(见 assign_clusters)。
@@ -431,7 +431,7 @@ pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// 忽略/恢复整个簇(对应原版 ignoreface:误检簇一键排除)。
+/// 忽略/恢复整个簇(误检簇一键排除)。
 pub fn ignore_cluster(store: &Store, cluster: i64, ignored: bool) -> Result<()> {
     store.write(|conn| -> Result<()> {
         conn.execute(
@@ -1138,7 +1138,7 @@ mod tests {
         assert_eq!(people_overview(&store).len(), 1, "恢复后回来");
     }
 
-    /// 低质量脸以低权重参与质心,不把簇心拉偏(对应原版 facequality 用途)。
+    /// 低质量脸以低权重参与质心,不把簇心拉偏。
     #[test]
     fn weighted_centroid_resists_low_quality_outlier() {
         let store = test_store();

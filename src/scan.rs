@@ -1,9 +1,9 @@
 //! 全盘扫描与索引 upsert(只读原文件,不复制不移动)
 //!
-//! 扫描策略(与 Picasa 3 的行为一致):
+//! 扫描策略:
 //! 1. **未变文件快速路径**:按 path+size+mtime 命中库内记录即跳过,不重解码 EXIF。
 //! 2. **EXIF 单次读取**:一次打开解析出全部字段(同一 IFD 取多字段)。
-//! 3. **排除规则**:对齐 Picasa 3 的目录排除规则(windows/winnt/temp/Program Files/Originals)
+//! 3. **排除规则**:目录排除规则(windows/winnt/temp/Program Files/Originals)
 //!    + 用户自定义排除目录。
 //! 4. **线程优先级**:扫描线程降为 BelowNormal,不与 UI 抢核。
 //! 5. **RAW 支持**:白名单含相机 RAW;image crate 解不了的走 Windows Shell 缩略图。
@@ -100,7 +100,7 @@ pub fn is_media_ext(ext: &str) -> bool {
 
 /// 初始化时依次入集的 4 条排除,**不可关**。
 ///
-/// 单独成组而不是混进 [`Exclusions::default`]:这 4 条是参考件的硬编码口径,
+/// 单独成组而不是混进 [`Exclusions::default`]:这 4 条是硬编码口径,
 /// 用户设置只能往上加、不能减;把它们命名出来,快路(MFT 展开)与慢路
 /// (walkdir)才可能共用同一份判定而不各自抄一遍。
 pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picasaoriginals"];
@@ -141,7 +141,7 @@ pub const SOFT_EXCLUDES: [&str; 4] = ["AppData", "temp", "npm-cache", "local-cac
 /// 以及这一行要不要留在库里)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcludeLayer {
-    /// 任何入口都不放行,而且不进库:参考件那 4 条硬编码 +
+    /// 任何入口都不放行,而且不进库:那 4 条硬编码 +
     /// [`HARD_EXCLUDES_OURS`] + 点开头的隐藏目录 + 自家产出目录。
     Hard,
     /// [`SOFT_EXCLUDES`] 与用户自定义排除项 —— **用户亲手指向时让路**。
@@ -153,12 +153,12 @@ pub enum ExcludeLayer {
 
 /// 扫描排除规则(目录名匹配,大小写不敏感)。
 ///
-/// 参考件的默认排除列表只有 4 项(见 [`HARD_EXCLUDES`])。
+/// 默认排除列表只有 4 项(见 [`HARD_EXCLUDES`])。
 /// 它不踩系统目录的真正原因是**默认扫描范围极窄**(只登记
 /// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
 /// 而非靠排除规则拦截。
 ///
-/// 我方默认表是参考件口径的**刻意超集**,并分两档(见 [`ExcludeLayer`]):
+/// 我方默认表是**刻意超集**,并分两档(见 [`ExcludeLayer`]):
 /// [`HARD_EXCLUDES_OURS`] 里的目录(回收站现代名 $RECYCLE.BIN、系统与程序
 /// 目录、依赖目录)按定义不会有用户的照片 —— 连库都不进;
 /// [`SOFT_EXCLUDES`] 里的(`AppData` 一类)默认不派生,但用户亲手指向时放行。
@@ -360,7 +360,7 @@ pub struct Record {
     pub mtime: i64,
     pub size: i64,
     /// 媒体类型:`video::kind::PHOTO`(0)=图片,`video::kind::MOVIE`(1)=视频。
-    /// 对齐原版记录类型的"是否视频"二分(原版 7 种子类型对应不同解码路径,
+    /// 记录类型的"是否视频"二分(7 种子类型对应不同解码路径,
     /// 我方只有一条 Shell 路径,无须细分)。
     pub kind: i32,
 }
@@ -372,7 +372,7 @@ pub struct Derived {
     pub height: Option<i32>,
     pub taken_utc: Option<String>,
     pub rot: i32,
-    /// GPS(十进制度;无定位 None) — 对应原版 lat/long 列。
+    /// GPS(十进制度;无定位 None) — 对应 lat/long 列。
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     /// 相机型号(Make+Model)。
@@ -392,16 +392,15 @@ pub struct ScanSummary {
 
 /// 扫描进度与取消控制。
 ///
-/// 对齐原版两处参考结论:
+/// 扫描进度与取消控制的两处设计:
 /// - 扫描进度:**预计算 `1.0/total` 倒数**,
-///   之后每次上报只做一次浮点乘法(不反复做整数除法)。本结构采用同一思路:
-///   `total` 设定后立即算出 `inv_total`,进度 = `done * inv_total`。
+///   之后每次上报只做一次浮点乘法(不反复做整数除法)。`total` 设定后立即算出
+///   `inv_total`,进度 = `done * inv_total`。
 /// - 目录扫描 + 取消检查:
 ///   取消标志是**独立于工作线程的原子字节**,热路径每处理 N 个文件查一次;
 ///   取消时停止批量入库。
 ///
-/// 进度是**原子计数**而非回调 —— UI 线程读时无锁,与原版
-/// 进度接口的解耦思路一致。
+/// 进度是**原子计数**而非回调 —— UI 线程读时无锁。
 #[derive(Debug)]
 pub struct ScanControl {
     /// 总候选文件数(遍历完目录树后确定)。
@@ -433,7 +432,7 @@ impl ScanControl {
         }
     }
 
-    /// 设定总量并预计算倒数(与原版一致的核心优化)。
+    /// 设定总量并预计算倒数(核心优化)。
     pub fn set_total(&self, total: usize) {
         self.total.store(total, Ordering::Relaxed);
         // total=0 时倒数取 0(进度恒 0,避免除零)。
@@ -517,7 +516,7 @@ fn load_fingerprints(store: &Store) -> HashMap<String, (i64, i64)> {
 /// 并行扫描多个根目录,仅记录存在的图像文件(增量 upsert 交给数据库)
 ///
 /// - 未变文件(path+size+mtime 与库内一致)直接跳过,不重解码 EXIF、不写库。
-/// - 扫描线程降优先级(BelowNormal),避免与 UI 抢核(与原版一致的做法)。
+/// - 扫描线程降优先级(BelowNormal),避免与 UI 抢核。
 /// - `ctrl` 提供进度上报与取消。
 pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
     let ctrl = Arc::new(ScanControl::new());
@@ -526,8 +525,8 @@ pub fn scan_dir(store: &Store, roots: &[PathBuf]) -> Result<ScanSummary> {
 
 /// 带进度与取消的扫描。
 ///
-/// 取消语义(对齐原版扫描取消检查):
-/// - **遍历阶段**每 64 个目录项查一次取消标志(原版同样是分段查,不是每文件一次);
+/// 取消语义:
+/// - **遍历阶段**每 64 个目录项查一次取消标志(分段查,不是每文件一次);
 /// - **并行处理阶段**用 rayon 的 `collect::<Result<Vec<_>,_>>()`,
 ///   任一线程发现取消即整体短路;
 /// - 取消时**已算出的记录照常入库**(已完成的工作不丢),
@@ -707,7 +706,7 @@ pub fn scan_dir_ctrl(
 
     let mut excluded_dirs = 0usize;
     let mut candidates: Vec<PathBuf> = Vec::new();
-    // 遍历阶段的可取消性:目录项计数(原版按文件队列分段查取消)。
+    // 遍历阶段的可取消性:目录项计数(按文件队列分段查取消)。
     let mut visit_counter = 0usize;
     'outer: for r in roots {
         // MFT 快路:索引在位且根可定位 → 免逐目录枚举;定位失败回退 walkdir。
@@ -724,7 +723,7 @@ pub fn scan_dir_ctrl(
         let it = WalkDir::new(r)
             .into_iter()
             .filter_entry(|e| {
-                // 目录级排除:命中即整棵子树跳过(对齐原版做法)
+                // 目录级排除:命中即整棵子树跳过
                 if e.file_type().is_dir() {
                     let name = e.file_name().to_string_lossy();
                     let own = excl.under_own_prefix(e.path());
@@ -799,7 +798,7 @@ pub fn scan_dir_ctrl(
                     // 库里没有 → 算"新增"。
                     added2.fetch_add(1, Ordering::Relaxed);
                 }
-                // 取消检查:每处理 64 个文件查一次(原版分段查的思路)。
+                // 取消检查:每处理 64 个文件查一次。
                 let n = counter2.fetch_add(1, Ordering::Relaxed);
                 ctrl2.advance(1);
                 if ctrl2.should_stop(n) && ctrl2.is_cancelled() {
@@ -908,7 +907,7 @@ fn image_dimensions(p: &Path) -> Option<(i32, i32)> {
 }
 
 /// RAW 等 image crate 解不了的格式:借 Windows Shell 缩略图扩展取尺寸
-/// (与原版一致的 COM 路线)。
+/// (COM 路线)。
 fn shell_dimensions(p: &Path) -> Option<(i32, i32)> {
     let (_bgra, w, h) = crate::win::shell_thumbnail(p, 256)?;
     Some((w as i32, h as i32))
@@ -917,8 +916,8 @@ fn shell_dimensions(p: &Path) -> Option<(i32, i32)> {
 /// 索引**单个**文件(事件驱动用)。
 ///
 /// 事件驱动(watch)拿到的是"哪个文件变了",不是"哪个目录变了";
-/// 这里只处理这一个文件,不做整树遍历 —— 这是原版目录项枚举的粒度
-/// (`FindNextFileW` 一次拿一个目录项的属性)。
+/// 这里只处理这一个文件,不做整树遍历 —— 目录项枚举的粒度
+/// 是 `FindNextFileW` 一次拿一个目录项的属性。
 ///
 /// 返回 `true` 表示该文件被写入了索引(新文件或内容有变)。
 pub fn index_file(store: &Store, path: &Path) -> Result<bool> {
@@ -1121,7 +1120,7 @@ mod tests {
 
     #[test]
     fn default_exclusions_are_stable() {
-        // 原版目录排除规则
+        // 目录排除规则
         let e = Exclusions::default();
         assert!(e.excludes_dir("Windows"));
         assert!(e.excludes_dir("winnt"));
@@ -1278,7 +1277,7 @@ mod tests {
 
     /// 视频必须真的能入库 —— 目录扫描与单文件入库两条路径都要放行视频。
     ///
-    /// 收录判定按扩展名分流(与参考一致),不解码文件本身,所以这里用一个
+    /// 收录判定按扩展名分流,不解码文件本身,所以这里用一个
     /// 只有文件头的占位 .mp4 就够了。
     #[test]
     fn video_files_are_indexed() {
@@ -1426,7 +1425,7 @@ mod tests {
 
     // ===== 进度与取消 =====
 
-    /// 进度:预计算倒数 + 乘法(原版扫描进度的核心优化)。
+    /// 进度:预计算倒数 + 乘法(扫描进度的核心优化)。
     #[test]
     fn scan_control_progress_uses_reciprocal() {
         let c = ScanControl::new();
@@ -1444,7 +1443,7 @@ mod tests {
         assert_eq!(c.fraction(), 1.0);
     }
 
-    /// total=0 不能除零(原版倒数缓存也有这个保护)。
+    /// total=0 不能除零(倒数缓存也有这个保护)。
     #[test]
     fn scan_control_zero_total_is_safe() {
         let c = ScanControl::new();

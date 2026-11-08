@@ -894,8 +894,8 @@ CREATE TABLE IF NOT EXISTS settings (
     v TEXT NOT NULL
 );
 -- 变更日志(P1-12):记录扫描/事件驱动的变更历史,可回溯。
--- 原版的变更日志只存在内存队列里,写盘 CSV 也只是瞬时快照 —— 不可回溯。
--- 这里做成**持久化 + 带时间戳 + 可查询**的版本(超出原版)。
+-- 变更日志只存在内存队列里,写盘 CSV 也只是瞬时快照 —— 不可回溯。
+-- 这里做成**持久化 + 带时间戳 + 可查询**的版本。
 CREATE TABLE IF NOT EXISTS changes (
     id INTEGER PRIMARY KEY,
     ts INTEGER NOT NULL,        -- Unix 毫秒
@@ -906,7 +906,7 @@ CREATE TABLE IF NOT EXISTS changes (
 CREATE INDEX IF NOT EXISTS idx_changes_ts ON changes(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_changes_path ON changes(path);
 -- P2-15 持久化扫描队列:扫描根在启动扫描时登记、完成后删除;
--- 应用中途退出时残留的条目在下次启动自动续扫(原版扫描器是进程内
+-- 应用中途退出时残留的条目在下次启动自动续扫(扫描器是进程内
 -- 持久化队列,进程重启后仍可继续;
 -- 「扫描不阻塞 UI」由既有后台线程方案保证)。
 CREATE TABLE IF NOT EXISTS scan_queue (
@@ -915,7 +915,7 @@ CREATE TABLE IF NOT EXISTS scan_queue (
     scope TEXT NOT NULL DEFAULT '',
     enqueued_ts INTEGER NOT NULL     -- Unix 毫秒
 );
--- 各档缩略图的完成状态(P1-9):对应原版的三张缓存表
+-- 各档缩略图的完成状态(P1-9):三张缓存表
 -- (三张缩略图缓存表)。
 -- tier 取值 0=Small(96) 1=Normal(256) 2=Big(512) 3=Preview(1024)。
 -- photos.thumb_ok 保留给 Normal 档(向后兼容既有代码与测试)。
@@ -930,7 +930,7 @@ CREATE TABLE IF NOT EXISTS thumb_tiers (
 --        never(明确不纳入)
 -- source:initial_scan_dialog / default_shell / import / click(记账来源,可解释)
 -- needs_refresh:目录级失效位(索引版本不匹配或用户强制刷新时置 1,
---        该目录的行整体退回待派生;对齐原版按目录重做缩略图的粒度)
+--        该目录的行整体退回待派生;按目录重做缩略图的粒度)
 CREATE TABLE IF NOT EXISTS dir_intent (
     path           TEXT    PRIMARY KEY,  -- 目录路径(不带结尾分隔符)
     volume         TEXT,                 -- 卷根,如 'D:\\'(全盘索引按卷记账用)
@@ -1346,7 +1346,7 @@ impl Store {
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lon REAL;");
         // uid64 持久唯一标识(64 位无符号整数列)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN uid64 INTEGER;");
-        // 效果栈列(原版记录表里的 `filters` 列)。
+        // 效果栈列(`filters` 列)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN filters TEXT;");
         // 视频标记列(NOT NULL 带默认值,旧行自动 0=图片)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;");
@@ -1357,7 +1357,7 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;",
         );
-        // P3-ui:标题(参考件 Caption;幻灯片/属性面板/缩略图说明显示)。
+        // P3-ui:标题(缩略图说明;幻灯片/属性面板显示)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN caption TEXT;");
         // 派生作用域两列:rich_state 是 L3 门控的唯一开关(0 未纳入 / 1 待派生 /
         // 2 已派生 / 3 坏文件),ext 让小写扩展名判定不必再逐条切字符串。
@@ -1375,7 +1375,7 @@ impl Store {
         // 清除人脸数据重扫时随 wipe_faces 一并归零。
         let _ = conn
             .execute_batch("ALTER TABLE photos ADD COLUMN face_done INTEGER NOT NULL DEFAULT 0;");
-        // P3-ui:相簿(参考件 Album;我方相簿是照片 id 的命名集合,不移动文件)。
+        // P3-ui:相簿(相簿是照片 id 的命名集合,不移动文件)。
         let _ = conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS albums (
                 id INTEGER PRIMARY KEY,
@@ -1740,7 +1740,7 @@ impl Store {
         })
     }
 
-    /// 新建相簿,返回 id(重名返回既有 id,与参考件「不能重名」一致)。
+    /// 新建相簿,返回 id(重名返回既有 id)。
     pub fn album_create(&self, name: &str) -> Result<i64> {
         let name = name.to_string();
         self.write(move |conn| {
@@ -1904,7 +1904,7 @@ impl Store {
         Ok(())
     }
 
-    /// 读某张照片的效果栈(原版 `filters` 列)。
+    /// 读某张照片的效果栈(`filters` 列)。
     pub fn get_filters(&self, photo_id: i64) -> Option<String> {
         self.read(move |conn| {
             conn.query_row(
@@ -2581,7 +2581,7 @@ impl Store {
     /// 同串恒返回同 id;新串 append 分配新 id(= 当前长度)。
     ///
     /// 落盘时**先查 `string_pool` 的唯一索引**,命中即复用,
-    /// 未命中才分配新 id 并插入 —— 这就是原版的"查重"。
+    /// 未命中才分配新 id 并插入 —— 这就是"查重"。
     ///
     /// 批量落库不走这里(逐条一次写事务太慢),走 [`Store::intern_batch`]
     /// (内存 `PoolSet` 先去重,每个唯一值只发一次 SQL);
@@ -2590,7 +2590,7 @@ impl Store {
     pub fn intern(&self, pool: &str, value: &str) -> Result<i64> {
         let (pool, value) = (pool.to_string(), value.to_string());
         self.write(move |conn| {
-            // 查重(原版字符串查重哈希的链上精确比较)
+            // 查重(字符串查重哈希的链上精确比较)
             if let Ok(id) = conn.query_row(
                 "SELECT value_id FROM string_pool WHERE pool=?1 AND value=?2",
                 rusqlite::params![pool, value],
@@ -2598,7 +2598,7 @@ impl Store {
             ) {
                 return Ok(id);
             }
-            // append 分配:下一个可用下标(原版字符串查重哈希)
+            // append 分配:下一个可用下标(字符串查重哈希)
             let next: i64 = conn.query_row(
                 "SELECT COALESCE(MAX(value_id) + 1, 0) FROM string_pool WHERE pool=?1",
                 rusqlite::params![pool],
@@ -2616,7 +2616,7 @@ impl Store {
     ///
     /// 返回与 `items` 等长同序的 `(池名, 池 id)`。
     ///
-    /// 这正是原版「先入内存池、落盘时才整体重算」的意义:
+    /// 这正是「先入内存池、落盘时才整体重算」的意义:
     /// 一万行照片若只有 5 种相机型号,内存池把 1 万次查询压成 5 次。
     pub fn intern_batch(&self, items: &[(String, String)]) -> Result<Vec<(String, i64)>> {
         if items.is_empty() {
@@ -2679,7 +2679,7 @@ impl Store {
         Ok(next)
     }
 
-    /// 按 id 取回池中字符串。原版池内按 id 取串。
+    /// 按 id 取回池中字符串。池内按 id 取串。
     pub fn pooled_value(&self, pool: &str, id: i64) -> Option<String> {
         self.read(move |conn| {
             conn.query_row(
@@ -2819,7 +2819,7 @@ impl Store {
         for (pool, id, val) in &rows {
             let got = set.intern(pool, val);
             // 自检:append-only 契约 —— 池 id 必须等于库里的 value_id。
-            // 这不是多余断言,而是"id = 数组下标"这条原版语义
+            // 这不是多余断言,而是"id = 数组下标"这条语义
             // (字符串查重哈希) 的运行时护栏:
             // 若库里出现空洞/乱序,说明有别处绕过池直接写了 value_id。
             debug_assert_eq!(got, *id, "池 id 应等于 value_id(append-only 契约)");
@@ -2861,7 +2861,7 @@ impl Store {
                 .collect();
             rows
         };
-        // 内存池先算重映射 —— 这是原版的实际路径:
+        // 内存池先算重映射 —— 这是实际路径:
         // 内存池被重写(整池序列化),
         // 再整体落盘。SQL 侧只是这个结果的持久化。
         let mut mem = crate::pool::ColumnPool::new();
@@ -3431,7 +3431,7 @@ impl Store {
     /// 这个目录能不能写进派生作用域账本。
     ///
     /// 分两层:
-    /// - **硬层**(参考件 4 条 + 回收站现代名 + 自家产出目录)任何入口都不放行;
+    /// - **硬层**(4 条 + 回收站现代名 + 自家产出目录)任何入口都不放行;
     /// - **软层**(AppData / Program Files / temp / node_modules / 点开头目录 /
     ///   用户自定义排除)只在 `deliberate=true` —— 用户在文件夹管理器里选中它、
     ///   或对着占位格右键「纳入此目录」—— 才放行。
@@ -3826,7 +3826,7 @@ fn dir_like(dir: &str) -> (String, String) {
 ///
 /// 默认扫描范围:用户壳目录(我的文档 / 图片 / 桌面)。
 ///
-/// 对应参考件首启口径 —— 安装文案原文
+/// 首启口径 —— 安装文案原文
 /// "Only search My Documents, My Pictures, and the Desktop":
 /// 首启只登记这三个壳目录并扫描一次;扩大范围由用户在文件夹管理器手动添加。
 /// **绝不返回盘根** —— 盘根会把系统 / 应用数据目录整卷拖进库。
@@ -4272,7 +4272,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// 参考件口径:默认扫描范围是壳目录(我的文档/图片/桌面),
+    /// 默认扫描范围是壳目录(我的文档/图片/桌面),
     /// 绝不返回盘根 —— 盘根会把系统/应用数据目录整卷拖进库。
     #[test]
     fn default_roots_are_shell_dirs_never_drive_roots() {
@@ -4285,7 +4285,7 @@ mod tests {
         }
     }
 
-    /// 参考件首启行为:范围只落账一次,之后由用户在文件夹管理器自管。
+    /// 首启行为:范围只落账一次,之后由用户在文件夹管理器自管。
     #[test]
     fn first_run_scope_seeds_once() {
         let store = Store::open_mem().unwrap();
@@ -4387,7 +4387,7 @@ mod tests {
         assert!(store.adoptable_dir("/home/me/Photos/coco", false), "普通照片目录该放行");
         assert!(!store.adoptable_dir("", true), "空路径不是一条目录");
 
-        // 硬排除:点开头目录 / 参考件同名目录 / 我们的系统目录 —— deliberate 也救不回来。
+        // 硬排除:点开头目录 / 同名目录 / 我们的系统目录 —— deliberate 也救不回来。
         for d in [
             "/home/me/.cache/pkg",
             "/mnt/win/$RECYCLE.BIN/S-1-5-21-1",
@@ -5075,7 +5075,7 @@ mod tests {
         let store = Store::open_mem().unwrap();
         assert_eq!(store.intern(POOL, "Nikon D850").unwrap(), 0);
         assert_eq!(store.intern(POOL, "Canon R5").unwrap(), 1);
-        // 同串恒返回同 id(对齐原版字符串查重哈希的查重)
+        // 同串恒返回同 id(对齐字符串查重哈希的查重)
         assert_eq!(store.intern(POOL, "Nikon D850").unwrap(), 0);
         assert_eq!(store.pooled_value(POOL, 0).as_deref(), Some("Nikon D850"));
         assert_eq!(store.pooled_value(POOL, 99), None);

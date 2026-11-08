@@ -1,6 +1,6 @@
 //! 滚动阻尼:把"逐事件像素位移"整形成"平滑速度",供缩略图网格限速跟随。
 //!
-//! 下列常量与曲线形状取自 Picasa 3 的观感(参考其行为,非移植其代码),
+//! 下列常量与曲线形状按长期打磨的滚动手感选取,
 //! 以保证迁移过来的用户对滚动手感不产生明显差异。
 //!
 //! # 阻尼算法
@@ -78,7 +78,7 @@ pub const MAX_THUMB_DECODE_PER_FRAME: usize = 64;
 /// 一帧几百毫秒 —— 「让 UI 永不阻塞」在大档上等于没做。
 pub const MAX_THUMB_DECODE_BYTES_PER_FRAME: usize = 16 * 1024 * 1024;
 
-/// 阻尼计算的浮点常量(取自内置资源包 `scroll.damp`)。
+/// 阻尼计算的浮点常量。
 mod consts {
     use crate::assets::scroll_damp;
 
@@ -123,15 +123,15 @@ pub struct ContentMetrics {
 }
 
 impl ContentMetrics {
-    /// 可视范围 `hi - lo`(对应原版的计算)。
+    /// 可视范围 `hi - lo`。
     pub fn range(&self) -> f32 {
         self.hi - self.lo
     }
 }
 
-/// 滚动阻尼器(对应 Picasa 3 滚动限速节点的**计算部分**)。
+/// 滚动阻尼器。
 ///
-/// 保留原版的两个关键状态:
+/// 保留两个关键状态:
 /// - `vel`:阻尼整形后的像素速度;
 /// - `has_content`:是否已挂内容对象(未挂 → 范围视为 0)。
 #[derive(Clone, Debug, Default)]
@@ -142,7 +142,7 @@ pub struct ScrollThrottle {
     pub has_content: bool,
     /// 内容对象的度量。
     pub content: Option<ContentMetrics>,
-    /// 滚动模式(原版由滚动容器写入;本项目不消费它,保留以对齐原始布局)。
+    /// 滚动模式(本项目不消费,保留字段以兼容布局)。
     #[allow(dead_code)]
     pub mode: u8,
 }
@@ -164,16 +164,15 @@ impl ScrollThrottle {
         self.has_content = true;
     }
 
-    /// 核心阻尼函数(与 Picasa 3 行为一致)。
+    /// 核心阻尼函数。
     ///
     /// `delta` 是**一次事件的像素位移**(见模块文档的参数语义说明)。
     ///
-    /// ⚠️ 与原版的**唯一**刻意差异:原版在"无内容对象"时 `range == 0`,
-    /// 会触发 `0/0 → NaN` 并把 NaN 写进速度状态;这里在无内容时直接
-    /// 返回 0.0,避免 NaN 污染下游。**有内容对象时行为与原版完全一致。**
+    /// 无内容对象时(`range == 0` 会触发 `0/0 → NaN`)直接
+    /// 返回 0.0,避免 NaN 污染下游。
     pub fn damp(&mut self, delta: f32) -> f64 {
         if delta == 0.0 {
-            // 原版:delta==0 → 立即复位 vel 并返回。
+            // delta==0 → 立即复位 vel 并返回。
             self.vel = 0.0;
             return 0.0;
         }
@@ -195,7 +194,7 @@ impl ScrollThrottle {
         };
 
         if range == 0.0 {
-            // 原程序此处是 0/0 = NaN;我们直接归零(见函数文档说明)。
+            // 此处若不处理会得到 0/0 = NaN;直接归零(见函数文档说明)。
             self.vel = 0.0;
             return 0.0;
         }
@@ -211,7 +210,7 @@ impl ScrollThrottle {
         if v < consts::ease_scale() {
             v = (v / consts::ease_scale()).powf(consts::exp_ease() as f64) * consts::ease_scale();
         }
-        // 恢复符号(原版在 ease-out 之后执行)
+        // 恢复符号(ease-out 之后执行)
         if neg {
             v = -v;
         }
@@ -220,7 +219,7 @@ impl ScrollThrottle {
         v
     }
 
-    /// 复位(原版的唯一复位方式就是 `damp(0.0)`,等价于焦点切换时的复位 / 销毁时的复位的调用)。
+    /// 复位(即 `damp(0.0)`,焦点切换 / 销毁时调用)。
     pub fn reset(&mut self) {
         self.vel = 0.0;
     }
@@ -228,7 +227,7 @@ impl ScrollThrottle {
 
 /// 计算 `throttle/throttlethumb` 的质心位移增量。
 ///
-/// 缩略图质心位移算法(与 Picasa 3 行为一致):
+/// 缩略图质心位移算法:
 ///
 /// ```text
 /// node_box    = 节点自身的变换后包围盒(40 字节 = 5 个 POINT,取 [0] 与 [2])
@@ -237,11 +236,10 @@ impl ScrollThrottle {
 ///        - (content_box[0] + content_box[2]) * 0.5) * 2.7
 /// ```
 ///
-/// 注意 `* 0.5` 出现**两次**:这是 int→double 隐式提升
-/// 一并算进表达式导致的显示效果,语义上就是"取包围盒首尾两点的中点"。
+/// 注意 `* 0.5` 出现**两次**:语义上就是"取包围盒首尾两点的中点"。
 ///
 /// `node_box` / `content_box` 均为 5 个 POINT 的**滚动轴**分量
-/// (原版结构为 5×POINT;这里只取滚动轴上的两个端点,放在槽位 0 与 2)。
+/// (这里只取滚动轴上的两个端点,放在槽位 0 与 2)。
 pub fn thumb_delta(node_box: &[i32; 5], content_box: &[i32; 5]) -> f32 {
     let node_mid = (node_box[0] as f64 + node_box[2] as f64) * consts::mid();
     let content_mid = (content_box[0] as f64 + content_box[2] as f64) * consts::mid();
@@ -249,12 +247,12 @@ pub fn thumb_delta(node_box: &[i32; 5], content_box: &[i32; 5]) -> f32 {
     ((node_mid - content_mid) * consts::gain()) as f32
 }
 
-/// 滚动限速器(本项目对 Picasa 3 滚动阻尼的等价落地)。
+/// 滚动限速器。
 ///
-/// 职责链(与原版一致):
-/// 1. `thumb_delta`:按原版缩略图质心位移算法的质心算法算出**这次滚动事件的像素位移**
-///    (含原版的 × 2.7 调用方增益);
-/// 2. `ScrollThrottle::damp`:按原版阻尼计算的阻尼曲线把它整形成**平滑速度**;
+/// 职责链:
+/// 1. `thumb_delta`:按缩略图质心位移算法算出**这次滚动事件的像素位移**
+///    (含 × 2.7 调用方增益);
+/// 2. `ScrollThrottle::damp`:按阻尼曲线把它整形成**平滑速度**;
 /// 3. `decode_budget`:用平滑速度决定"本帧允许同步解码多少张缩略图"。
 #[derive(Clone, Debug)]
 pub struct ScrollSmoother {
@@ -305,10 +303,10 @@ impl ScrollSmoother {
 
     /// 喂入**当前滚动偏移**(px,内容坐标系)与内容总长,返回整形后的速度(px/帧)。
     ///
-    /// 内部完全按原版两步走:
+    /// 内部按两步走:
     /// - `thumb_delta(node_now, content) - thumb_delta(node_prev, content)`
-    ///   = 节点质心在两帧之间的位移 × 2.7(原版调用方增益);
-    /// - `damp(delta)` → 原版阻尼计算的阻尼曲线。
+    ///   = 节点质心在两帧之间的位移 × 2.7(调用方增益);
+    /// - `damp(delta)` → 阻尼曲线。
     pub fn feed_offset(&mut self, offset: f32, content_len: f32) -> f64 {
         self.set_content_len(content_len);
         // 节点包围盒 = 视口在内容坐标系里的区间 [offset, offset + viewport]。
@@ -319,7 +317,7 @@ impl ScrollSmoother {
             0,
             0,
         ];
-        // 原版是"节点质心 vs 内容质心",这里逐帧求差 → 得到本次事件的像素位移。
+        // "节点质心 vs 内容质心",逐帧求差 → 得到本次事件的像素位移。
         let disp_now = thumb_delta(&node, &self.content);
         if self.reanchor {
             // 复位后的第一帧:只把基准挪到当前位置,不产生位移。
@@ -333,7 +331,7 @@ impl ScrollSmoother {
         let raw = disp_now - disp_prev;
         self.last_raw = raw;
         if raw == 0.0 {
-            // 原版:delta==0 → 复位速度状态。
+            // delta==0 → 复位速度状态。
             self.th.reset();
             return 0.0;
         }
@@ -347,7 +345,7 @@ impl ScrollSmoother {
         self.th.damp(raw)
     }
 
-    /// 复位(对应原版焦点切换时的复位 / 销毁时的复位的复位调用)。
+    /// 复位(焦点切换 / 销毁时调用)。
     ///
     /// 只清速度与位移读数,基准留给下一帧重锚 —— 直接把基准写成 0
     /// 会让"停在半路的图库"在下一帧算出一个根本不存在的位移。
@@ -401,7 +399,7 @@ mod tests {
         (a - b).abs() <= eps
     }
 
-    /// 原版的 `0.3` 是 **float** 常量(`0x3E99999A`),不是 f64 的 0.3。
+    /// `0.3` 按 **float**(f32)精度理解,不是 f64 的 0.3。
     /// 期望值必须用同一个常量算,否则会有 ~1e-6 的偏差。
     const EXP_SOFT_F32: f32 = 0.3;
 
@@ -490,7 +488,7 @@ mod tests {
         assert!(approx(pos.abs(), neg.abs(), 1e-12), "正负同幅应等幅反号");
     }
 
-    /// delta == 0 → 复位(对齐原版)。
+    /// delta == 0 → 复位。
     #[test]
     fn damp_zero_resets_velocity() {
         let mut th = ScrollThrottle::new();
@@ -507,7 +505,7 @@ mod tests {
         assert_eq!(th.vel, 0.0, "delta==0 必须复位 vel");
     }
 
-    /// 无内容对象 → 归零(原程序此处会产生 NaN,本项目刻意规避)。
+    /// 无内容对象 → 归零(避免 NaN 传播,本项目刻意规避)。
     #[test]
     fn damp_without_content_is_zero_not_nan() {
         let mut th = ScrollThrottle::new();
@@ -588,7 +586,7 @@ mod tests {
         );
     }
 
-    /// 限速器:偏移不变 → 速度归零(原版 `damp(0)` 复位)。
+    /// 限速器:偏移不变 → 速度归零(`damp(0)` 复位)。
     #[test]
     fn smoother_resets_when_offset_unchanged() {
         let mut s = ScrollSmoother::new(600.0, 6000.0);

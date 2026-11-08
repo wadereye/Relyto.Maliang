@@ -17,7 +17,7 @@ pub struct PhotoRow {
     pub height: Option<i32>,
     /// 相机型号(EXIF Make/Model 合并,预览信息行)。
     pub cam: String,
-    /// 标题(参考件 Caption;缩略图说明/幻灯片/属性面板显示)。
+    /// 标题:缩略图说明/幻灯片/属性面板显示。
     pub caption: String,
     /// GPS 坐标(十进制度;无定位为 None)。
     pub lat: Option<f64>,
@@ -40,14 +40,13 @@ pub struct PhotoRow {
 }
 
 /// `photos.mtime` 的归一表达式。历史数据里这一列有 UNIX 秒与毫秒两种写法,
-/// 直接比大小会让单位大的那批永远排在最前(参考件只登记听目录下的少量
-/// 文件夹,不会撞上这个问题)。阈值按量级区分秒 / 毫秒 / 微秒,小数值原样保留。
+/// 直接比大小会让单位大的那批永远排在最前。阈值按量级区分秒 / 毫秒 / 微秒,小数值原样保留。
 const MTIME_SQL: &str = "CASE WHEN p.mtime >= 100000000000000 THEN p.mtime / 1000000
                               WHEN p.mtime >= 100000000000 THEN p.mtime / 1000
                               ELSE p.mtime END";
 
-/// 排序方式(工具栏「查看选项」> 排序;对应原版 View 菜单里的
-/// 四个排序项:按拍摄日期 / 最近 / 按尺寸 / 按名称)。
+/// 排序方式(工具栏「查看选项」> 排序;四个排序项:
+/// 按拍摄日期 / 最近 / 按尺寸 / 按名称)。
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum SortBy {
     /// 拍摄日期(`Sort by &Creation Date`,默认,新在前)。
@@ -61,7 +60,7 @@ pub enum SortBy {
     Name,
 }
 
-/// 视图过滤(参考件搜索框右端那排可叠加的开关:星标 / 人脸 / 视频 / 地理标记,
+/// 视图过滤(可叠加的开关:星标 / 人脸 / 视频 / 地理标记,
 /// 加上搜索框文本;全默认 = 显示全部)。
 #[derive(Debug, PartialEq, Eq, Clone, Default)]
 pub struct Filters {
@@ -73,7 +72,7 @@ pub struct Filters {
     pub movies: bool,
     /// 只显示有地理标记的照片。
     pub geotagged: bool,
-    /// 搜索框文本(参考件同框的输入 + 自动补全;空串 = 不过滤。
+    /// 搜索框文本(带自动补全;空串 = 不过滤。
     /// 匹配路径 / 标题 / 标签名)。
     pub text: String,
 }
@@ -82,7 +81,7 @@ impl SortBy {
     /// 菜单顺序沿用「查看选项」:Date、Recent Changes、Size、Name。
     pub const ALL: [SortBy; 4] = [SortBy::Date, SortBy::Recent, SortBy::Size, SortBy::Name];
 
-    /// 菜单文案(参考件 `Sort by &Creation Date` 等,去掉助记符 &)。
+    /// 菜单文案(按拍摄日期 / 最近更改 / 大小 / 文件名)。
     pub fn label(self) -> &'static str {
         match self {
             SortBy::Date => "按拍摄日期",
@@ -198,7 +197,7 @@ pub fn load_query(
     if filters.geotagged {
         where_sql.push("p.lat IS NOT NULL AND p.lon IS NOT NULL");
     }
-    // 搜索框文本:命中路径、标题或标签名任一即可(参考件的库内搜索范围)。
+    // 搜索框文本:命中路径、标题或标签名任一即可(库内搜索范围)。
     let text = filters.text.trim();
     let has_text = !text.is_empty();
     if has_text {
@@ -243,7 +242,7 @@ pub fn load_query(
         order
     );
     // 相机型号走字符串池 —— 行里只存 `cam_id`(INTEGER),
-    // 字符串本体在 `string_pool` 里去重存一份(对齐原版的池化列)。
+    // 字符串本体在 `string_pool` 里去重存一份(池化列)。
     // LEFT JOIN 保证:未池化的历史行(cam 有值、cam_id 为 NULL)仍能显示。
     let pat = format!("%{}%", like_escape(text));
     // ?2 只在有搜索文本时出现在 SQL 里,参数也必须同步 —— 绑一个查询里
@@ -297,15 +296,15 @@ fn under_root(parent: &str, root: &str) -> bool {
 }
 
 /// 首页「最近更新」的成员 id:数量有上限的虚拟相册,而不是把全库按时间
-/// 铺一遍(参考件的 `Recently Updated` 与星标、已发邮件同族,成员随扫描
+/// 铺一遍(与星标、已发邮件同族,成员随扫描
 /// 增量维护,启动直接读已落盘的缩略图库)。
 ///
 /// 两条入组门槛:
 /// 1. **该档缩略图已经落盘**(`thumb_ok=1`) —— 磁盘上还没图的一律不进
 ///    相册,首屏因此不会出现「等派生」的灰格子。派生状态不设门槛:
 ///    有缓存就该显示,跟它在不在批量派生计划里无关。
-/// 2. **落在已登记的监听根内**(参考件默认只登记我的文档 / 图片 / 桌面
-///    三个壳目录)。全盘索引会把构建产物、开发资源图标、临时夹具一起收进库,
+/// 2. **落在已登记的监听根内**(避免把开发资源、临时夹具等
+///    一起收进库)。全盘索引会把构建产物、开发资源图标、临时夹具一起收进库,
 ///    它们的 mtime 永远最新,不圈范围就会把首页铺满非素材。
 ///    `roots` 为空表示用户还没登记任何目录,此时退回不限范围。
 ///
@@ -373,7 +372,6 @@ fn folder_of(path: &str) -> Option<&str> {
 
 /// 组的显示日期:组内最早的拍摄时间(`taken_utc` 前 10 字 = 日期);
 /// 组内全无 EXIF 拍摄时间时返回空串,由 UI 显示张数而非假日期。
-/// 参考件的相册头用「相册日期」(album date),即组内最早拍摄日期。
 pub fn group_date(rows: &[PhotoRow], idx: &[usize]) -> String {
     let mut best: Option<&str> = None;
     for i in idx {
@@ -617,7 +615,7 @@ pub fn tags_of(store: &Store, id: i64) -> Result<Vec<String>> {
 }
 
 /// 标签及照片数、颜色(视图 > 标签 左侧列表面板)。
-/// color 对应原版彩色标签(color:red..gray),None = 无颜色。
+/// color 对应彩色标签(color:red..gray),None = 无颜色。
 #[derive(Clone, Debug)]
 pub struct TagInfo {
     pub name: String,
@@ -819,7 +817,7 @@ mod tests {
         assert_eq!(load_all(&store).unwrap()[0].star, 0);
     }
 
-    /// 彩色标签 set/读回(原版 color:red..gray)。
+    /// 彩色标签 set/读回(color:red..gray)。
     #[test]
     fn tag_color_roundtrip() {
         let store = Store::open_mem().unwrap();
@@ -1346,7 +1344,7 @@ mod tests {
         assert_eq!(order(SortBy::Recent, true), ["y.jpg", "z.jpg", "a.jpg"]);
     }
 
-    /// 组头分组:组序与组内序都跟随排序方式(参考件平铺视图即按当前排序铺组)。
+    /// 组头分组:组序与组内序都跟随排序方式(平铺视图即按当前排序铺组)。
     /// 组头日期 = 组内最早拍摄日期(不是最新)。
     #[test]
     fn by_folder_keeps_sort_order_and_group_date() {

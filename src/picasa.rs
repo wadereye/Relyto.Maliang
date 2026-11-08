@@ -1,6 +1,6 @@
-//! Picasa.ini 互操作(保守子集):
+//! 图库 .ini 互操作(保守子集):
 //!   [图片名] 节内写 rotate= 与 star=。
-//! Picasa 真实格式尚未完全确认(rect64 未验证);仅保证我们写出的
+//! 该格式尚未完全确认(rect64 未验证);仅保证我们写出的
 //! 内容可以被本程序自己读回。XMP sidecar 仍是权威通道。
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;

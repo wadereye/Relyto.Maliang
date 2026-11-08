@@ -1,50 +1,8 @@
 //! 照片效果系统:效果栈的序列化 / 反序列化 / 落库 / 复制粘贴 / 撤销重做。
-//!
-//! # 行为要点
-//!
-//! | 我方实现 | 环节 | 说明 |
-//! |---|---|---|
-//! | 效果栈 | 效果栈序列化 | 序列化 `name=value;` 逐项拼接 |
-//! | 反序列化 | 效果参数反序列化 | 先按 `;` 切、再按 `=` 切,名称**大小写不敏感** |
-//! | 落库列 `photos.filters` | 效果字段落库 | `filters` 与 `width`/`height`/`rotate`/`crop` 并列的普通 TEXT 列 |
-//! | 复制/粘贴所有效果 | 效果复制粘贴 | 复制单张 → 粘贴给多张;效果**不能作用于电影** |
-//! | 撤销/重做 | 编辑历史 | 粒度是**命名编辑项**,非逐帧快照 |
-//! | 亮度/对比度/饱和度 | 亮度/对比度/饱和度 | 参数名 `contrast`/`brightness`/`saturation`(联动开关未实现,见下) |
-//! | 3×3 色彩矩阵 | 3×3 色彩矩阵 | 3×3 矩阵 + 2 个平移量 |
-//! | 曝光/暗部 | 曝光/暗部 | 参数名 `exposure`/`blacks` |
-//! | 锐化核 | 3×3 锐化核 | `a=clamp(v,0,100)/(-100)`,中心 `1-8a`,8 邻域 `a`(核和=1) |
-//! | 模糊 | 高斯模糊 | `sigma=radius*3`,三次 box 宽度 `sigma*{0.3,0.7,0.9}+1` |
-//!
-//! # 约定与限制
-//!
-//! - **白平衡不从 EXIF 读取**:`crate::exif` 的元数据里没有这一项;
-//!   色调上的冷暖调整走独立的 `colortemp` 效果项(见 [`apply_color_temp`]
-//!   的转发)。此前这里写着「白平衡属于 EXIF 元数据(见 `crate::exif`)」,
-//!   是指向一个并不存在的字段,已更正。
-//! - 参考有个「亮度/对比度联动」开关(`ContrastAndBrightnessLinked`),
-//!   我方既没有这个参数、也没有可靠来源还原它的算法 ——
-//!   此前文档写成「只存储该标志」并不属实,这里更正为**未实现**。
-//! - 序列化格式用 `name=value;`;**多参数项**用 `name=k1=v1,k2=v2`
-//!   (参数打包方式属我方约定)。
-//!
-//! # 效果实现说明
-//!
-//! 1. **曲线**:32 个滤镜的色调曲线由 4 条曲线组成
-//!    (`MasterCurve`/`RedCurve`/`GreenCurve`/`BlueCurve`),控制点见 `crate::curves::presets`。
-//! 2. **曲线插值**:自然三次样条(M-形式,自然边界),已实现于 `crate::curves`。
-//! 3. **`bw` / `sepia` / `grain`** 的算法已实现于 `crate::oneclick`。
-//! 4. **暂无对应资料的 3 项**:`warm` 的色值/矩阵系数、`unsharp` 的 USM 半径/阈值、
-//!    `grain` 的 low/high/seed 默认值。详见 `crate::oneclick` 模块文档。
 
 use std::collections::BTreeMap;
 
 /// 像素处理参数(滑块值)。
-///
-/// 约定:
-/// - `brightness` / `contrast` / `saturation` / `blacks`: `-100..=100`
-/// - `exposure`: 档位(stops),`-3.0..=3.0`
-/// - `sharpen`: `0..=100`(原版核参数 clamp 到 `[0,100]`)
-/// - `blur`: 半径(像素),`0.0..=20.0`
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Adjust {
     pub brightness: f32,
@@ -125,22 +83,13 @@ fn fmt(v: f32) -> String {
 }
 
 /// 效果栈的一项:命名编辑项 + 自己的参数。
-///
-/// 每个效果项分别取名称与取值
-/// (效果栈序列化);名称是**大小写不敏感**的
-/// (效果名匹配)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Effect {
     pub name: String,
     pub params: BTreeMap<String, String>,
 }
 
-/// 已知的一键效果名 **`apply_effect` 中有分派分支**的那一批。
-///
-/// ⚠️ 每新增一个分派分支都必须同步这里 —— 测试
-/// `every_known_effect_touches_pixels` 会在两者漂移时失败,用来防止再度出现
-/// 「名字能被识别、但没有落地实现」的静默空操作(历史上 `tilt` /
-/// `shadow` 就是这么漏掉的)。
+/// 已知的一键效果名:在 `apply_effect` 中有分派分支的那一批。
 pub const PIXEL_EFFECTS: &[&str] = &[
     "bw",
     "sepia",
@@ -201,11 +150,7 @@ pub const PIXEL_EFFECTS: &[&str] = &[
     "hslfilter",
 ];
 
-/// 着色器族效果共 10 项,我方已落地的 6 项
-/// (算法口径已在行为层面确定,实现见 [`crate::shaders`])。
-///
-/// 这 6 个名字必须同时出现在 [`PIXEL_EFFECTS`] 与 `apply_effect` 的分支里,
-/// 由 `shaders_ledger_stays_consistent` 守住。
+/// 着色器族效果中已落地的 6 项(实现见 [`crate::shaders`])。
 #[cfg(test)]
 pub const SHADER_EFFECTS: &[&str] = &[
     "hexcells",
@@ -226,29 +171,18 @@ pub const SHADER_PENDING: &[&str] = &[
 ];
 
 /// `tilt`(Straighten)滑杆满量程对应的角度。
-///
-/// 参考只公开了这根滑杆的量程(range 2.0 / offset 1.0),到角度的换算系数
-/// 暂无对应资料 —— 这里取 ±15° 作为"够用且不会一下子转过头"的取值。
 const TILT_MAX_DEG: f32 = 15.0;
 
-/// 登记在案、**刻意不改像素**的效果名。
-///
-/// 这些名字有自己的语义(例如 `movie` 只做时间区间裁剪),在渲染管线里
-/// 落到别处生效,故不算 bug;清单之外的名字若不动像素,测试会报错。
+/// 登记在案、刻意不改像素的效果名(清单外的名字若不动像素,测试会报错)。
 #[cfg(test)]
 const DOCUMENTED_NOOPS: &[&str] = &[
     // 视频裁剪是**时间过滤**语义,参数交给 `crate::video::MovieTrim` 处理。
     "movie",
 ];
 
-/// 参考产品随发行包自带的滤镜清单(取自其滤镜描述文件,共 84 项)。
-///
-/// 用途只有一个:把「参考有而我方没有」变成可断言的事实,
-/// 避免下一轮再靠人工数一遍。具体分档见 [`support_of`]。
+/// 已知效果名清单(用于自检分类是否齐全)。
 #[cfg(test)]
 pub const REFERENCE_IDS: &[&str] = &[
-    // 「编辑历史」类:参考里是历史记录的条目类型;在我方效果链等价于编辑历史,
-    // 其中 crop / rot 已按可执行像素效果落地(见 PIXEL_EFFECTS),其余维持不做。
     "save", "crop64", "crop", "redeye", "retouch", "picnik", "rot",
     // 常规调整 / 工具 / 一键效果
     "debug", "triple", "triple2", "triple3", "finetune", "finetune2", "colorfix",
@@ -265,11 +199,7 @@ pub const REFERENCE_IDS: &[&str] = &[
     "Vignette", "moviestart", "movieend",
 ];
 
-/// 参考里有、但我方**明确不做**的效果名。
-///
-/// 不做的理由统一写在下表;这些名字必须同时满足两点(测试已锁):
-/// 既不在像素效果表里,也不是可执行的配方 —— 否则就是「认得名字却不改像素」
-/// 的半吊子状态。
+/// 我方明确不做的效果名(测试已锁定分类)。
 pub const REFERENCE_ONLY: &[&str] = &[
     // 需要**笔刷 / 选区**交互才能有意义,UI 成本远高于算法本身
     "redeye",
@@ -285,16 +215,11 @@ pub const REFERENCE_ONLY: &[&str] = &[
     // (`start` / `end`,见 `crate::video::MovieTrim`)。
     "moviestart",
     "movieend",
-    // 参考内部的调试项
+    // 内部的调试项
     "debug",
 ];
 
-/// 参考滤镜名 → 我方**配方名**的对应表。
-///
-/// 参考的内部 id 有两种写法:不带下划线的大驼峰(`CrossProcess`)与全小写
-/// (`focalpixelate`),而我方配方一律用小写下划线。这张表把两者的对应关系
-/// 显式写出来 —— 此前只能凭注释里的一句话去猜,现在是可断言的事实
-/// (见 `recipe_aliases_point_at_real_recipes`)。
+/// 外部滤镜名 → 我方**配方名**的对应表。
 pub const RECIPE_ALIASES: &[(&str, &str)] = &[
     ("boost", "punch"),
     ("border", "frame"),
@@ -319,11 +244,10 @@ pub const RECIPE_ALIASES: &[(&str, &str)] = &[
     ("soften", "bloom"),
     ("comicize", "comic"),
     ("crossprocess", "cross_process"),
-    // 注:参考的 `Vignette` 由配方 `vignette_glow` 承载;`vignette` 这个
-    // 名字保留给我方自主设计的平滑暗角(效果表里的独立一项),不在此抢占。
+    // 注:`vignette` 保留给我方自主设计的平滑暗角(效果表里的独立一项)。
 ];
 
-/// 一个参考滤镜名对应的我方配方名(大小写不敏感);无对应则返回 `None`。
+/// 把外部滤镜名映射到我方配方名(大小写不敏感);无对应则返回 `None`。
 pub fn recipe_for(name: &str) -> Option<&'static str> {
     let low = name.to_ascii_lowercase();
     RECIPE_ALIASES
@@ -335,17 +259,15 @@ pub fn recipe_for(name: &str) -> Option<&'static str> {
 /// 一个效果名在我方的落地状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
-    /// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
+/// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
     Pixel,
-    /// 参考有、我方明确不做;理由见 [`REFERENCE_ONLY`]。
+/// 我方明确不做的效果名;理由见 [`REFERENCE_ONLY`]。
     ReferenceOnly,
-    /// 既不在参考清单里我方也不认得 —— 通常是拼错或来路不明的名字。
+/// 不在已知清单里、我方也不认得的名字(通常拼错或来路不明)。
     Unknown,
 }
 
 /// 判断一个效果名的落地状态,供 UI 标注与自检使用。
-///
-/// UI 用它把效果栈里的「暂不支持」项标出来,而不是让用户以为已经生效。
 pub fn support_of(name: &str) -> Support {
     let low = name.to_ascii_lowercase();
     if PIXEL_EFFECTS.contains(&low.as_str())
@@ -361,8 +283,7 @@ pub fn support_of(name: &str) -> Support {
 }
 
 impl Effect {
-    /// 新建一个"增强"效果项(原版顶层滤镜名 `enhance`,
-    /// 见效果参数校验)。
+    /// 新建一个"增强"效果项。
     pub fn enhance(a: &Adjust) -> Effect {
         let mut params = BTreeMap::new();
         for (k, v) in a.params() {
@@ -375,9 +296,6 @@ impl Effect {
     }
 
     /// 新建一个"色调曲线"效果项。
-    ///
-    /// 曲线数据以控制点形式序列化进参数表,形如
-    /// `master=x,y;x,y|red=...`。
     pub fn curves(c: &crate::curves::Curves) -> Effect {
         let mut params = BTreeMap::new();
         params.insert("master".into(), encode_points(&c.master.points));
@@ -434,9 +352,7 @@ impl Effect {
         }
     }
 
-/// 该项是否为一键效果(原版 oneclick)。
-///
-/// 除逐项列出的名字外,`crate::recipes` 里的成组配方同样按一键效果对待。
+/// 该项是否为一键效果。
 pub fn is_oneclick(&self) -> bool {
     if crate::recipes::is_recipe(&self.name) {
         return true;
@@ -446,7 +362,7 @@ pub fn is_oneclick(&self) -> bool {
 }
 }
 
-/// 曲线控制点序列化:`x,y;x,y`(原版用 `{x,y}` 数组,此处为紧凑等价形)。
+/// 曲线控制点序列化:`x,y;x,y`。
 fn encode_points(pts: &[crate::curves::Point]) -> String {
     pts.iter()
         .map(|p| format!("{},{}", p.x, p.y))
@@ -491,7 +407,7 @@ impl FilterStack {
         self.items.is_empty()
     }
 
-    /// 追加一项(同名项替换,对应原版"同名效果项覆盖"语义)。
+    /// 追加一项(同名项替换)。
     pub fn push(&mut self, e: Effect) {
         if let Some(slot) = self
             .items
@@ -530,8 +446,6 @@ impl FilterStack {
     }
 
     /// 序列化为 `name=k=v,k=v;name2=...`。
-    ///
-    /// 原版形状(效果栈序列化):参数格式化("%s=%s%c",name,value,';')`。
     pub fn serialize(&self) -> String {
         let mut out = String::new();
         for it in &self.items {
@@ -585,9 +499,6 @@ impl FilterStack {
 }
 
 /// 撤销/重做栈。
-///
-/// 撤销粒度是**命名编辑项**,不是逐帧像素快照;
-/// 每次"提交一个效果项"入栈一项。
 #[derive(Debug, Default)]
 pub struct EditStack {
     /// 已提交的历史(栈顶为最近一次)。
@@ -652,17 +563,6 @@ impl EditStack {
 // ===== 像素算子 =====
 
 /// 3×3 锐化(unsharp)核。
-///
-/// ```text
-/// v    = clamp(value, 0, 100)
-/// a    = v / -100.0
-/// 核   = [ a  a  a
-///          a 1-8a a
-///          a  a  a ]      (核和 = 1,保亮度)
-/// ```
-///
-/// 注意:`a` 为负 → 中心 `1-8a > 1`、邻域为负 → 这是**锐化**核;
-/// value 越大越锐(原版 slider 0..100)。
 pub fn sharpen_kernel(value: f32) -> [[f32; 3]; 3] {
     let v = value.clamp(0.0, 100.0);
     let a = v / -100.0;
@@ -675,9 +575,6 @@ pub fn sharpen_kernel(value: f32) -> [[f32; 3]; 3] {
 }
 
 /// 三次 box blur 的等效半径。
-///
-/// 形状参数取自内置资源包:`blur.sigma_scale`(sigma 系数)与
-/// `blur.box_factors`(三段 box 的宽度系数)。
 pub fn blur_box_radii(radius: f32) -> [i32; 3] {
     let sigma = radius.clamp(0.0, 20.0)
         * crate::assets::f64s("blur.sigma_scale").first().copied().unwrap_or(3.0) as f32;
@@ -693,10 +590,7 @@ pub fn blur_box_radii(radius: f32) -> [i32; 3] {
     out
 }
 
-/// 把调整应用到 RGBA 图(原地)。
-///
-/// 顺序:色彩矩阵(对比度 → 亮度 → 饱和度)→ 曝光 → 暗部 → 锐化 → 模糊。
-/// 原版的 op 树顺序无对应资料,此处为确定性顺序。
+/// 把调整应用到 RGBA 图(原地),顺序为色彩矩阵 → 曝光 → 暗部 → 锐化 → 模糊。
 pub fn apply(img: &mut image::RgbaImage, adj: &Adjust) {
     let a = adj.clamped();
     if a.is_identity() {
@@ -720,24 +614,6 @@ pub fn apply(img: &mut image::RgbaImage, adj: &Adjust) {
 }
 
 /// 3×3 色彩矩阵(对比度 / 亮度 / 饱和度)。
-///
-/// 原版数学形态(3×3 色彩矩阵):3×3 矩阵 + 平移量,见参考的
-/// `SimpleColorMatrix`(矩阵右乘序列 `M × Sat × ContrastBright × Hue`)。
-/// 亮度/对比度/饱和度三项按**同一矩阵 + 平移**表达,顺序与参考一致。
-///
-/// - **对比度**(参考合并式 `out = g·in + 127.5·(1−g)`,等价于以
-///   **中灰 127.5 为轴**的线性缩放):`k = 1 + contrast/100`,`out = k·(v − 127.5) + 127.5`。
-///   由此中灰**保持不动**,`contrast = −100` 时整图折叠到中灰。
-///   ⚠️ 早期版本在这里多计了一次 `+(1−k)·128` 平移,导致 +100 把中灰压成纯黑、
-///   −100 把整图推成纯白;现有回归锁见 `contrast_keeps_midgray_and_folds_to_midgray`。
-/// - **饱和度**:参考是**非对称**的 `s' = 1 + (sat > 0 ? 3·sat : sat) / 100`
-///   (正方向 3 倍增益),亮度权重取全库统一的 `(0.3086, 0.6094, 0.082)` ——
-///   **不是** Rec.709 的 `(0.2126, 0.7152, 0.0722)`,否则与 `bw` / `tint` 口径不一致。
-/// - **亮度**:平移量 `brightness/100 × 127.5`(维持既有 UI 量程,未改)。
-///
-/// **实现口径**:参考对比度走的是一张 101 项非线性增益表 `T(x)`(`g = 1 + T(x)`,
-/// `T(0)=0`、`T(50)=1.0`、`T(100)=10.0`),表值暂无对应资料 —— 此处保留**线性** `k`。
-/// 因此正对比度滑块的手感比参考更温和,这是已知的简化,不是漏实现。
 pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
     let k = 1.0 + contrast / 100.0; // 对比度:以中灰 127.5 为轴的线性缩放
     let boff = brightness / 100.0 * 127.5; // 亮度:平移量
@@ -765,15 +641,7 @@ pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast:
     }
 }
 
-/// 曝光:走**曝光曲线**(样条)路径,与 `curves` 里的曝光点表共用一套实现。
-///
-/// 原版曝光是**色调曲线级的三条 DSP 整形**,不是线性乘法:先把 `stops` 拆成
-/// 整数档 `N` 与小数权重 `w`,把曝光点表写进 Master 槽后按自然三次样条求值,
-/// 迭代 `N+1` 次并在末两步按 `w` 线性混合。点表取自内置资源包:
-/// `exposure.pos` / `exposure.neg`。
-///
-/// ⚠️ 过去这里另有一份线性 `2^stops` 实现,导致库内有两套曝光口径、
-/// `curves::exposure_points` 在 Adjust 路径上不可达 —— 现已合并成本函数。
+/// 曝光:通过曝光曲线(样条)调整图像亮度。
 pub fn apply_exposure(img: &mut image::RgbaImage, stops: f32) {
     let c = crate::curves::Curves {
         exposure: stops.clamp(-3.0, 3.0),
@@ -783,9 +651,6 @@ pub fn apply_exposure(img: &mut image::RgbaImage, stops: f32) {
 }
 
 /// 暗部(blacks):正值抬亮暗部、负值压暗暗部。
-///
-/// 原版是 4 条色调曲线(四色调曲线合成),曲线数据无对应资料,
-/// 我方用线性暗部提压近似,**不伪造曲线表**。
 pub fn apply_blacks(img: &mut image::RgbaImage, blacks: f32) {
     let k = (blacks / 100.0).clamp(-1.0, 1.0);
     for p in img.pixels_mut() {
@@ -803,7 +668,7 @@ pub fn apply_blacks(img: &mut image::RgbaImage, blacks: f32) {
     }
 }
 
-/// 锐化:按原版 3×3 unsharp 核对邻域卷积(边缘按夹取处理)。
+/// 锐化:对邻域作 3×3 unsharp 卷积(边缘按夹取处理)。
 pub fn apply_sharpen(img: &mut image::RgbaImage, value: f32) {
     let k = sharpen_kernel(value);
     let (w, h) = (img.width() as i32, img.height() as i32);
@@ -833,12 +698,7 @@ pub fn apply_sharpen(img: &mut image::RgbaImage, value: f32) {
     }
 }
 
-/// 三次 box blur(高斯近似)—— 对齐原版 `sigma=r*3` + 三段 box 的结构。
-///
-/// **口径说明**:这只服务调整面板的 `Adjust.blur` 滑杆(参数语义是
-/// 「sigma 系数 + 三段宽度系数」,来自我方资源包);效果算子 `blur` 已改走
-/// 参考的阶梯量化 + 盒式模糊路径(见 `apply_effect` 与 `recipes::blur_ladder`),
-/// 两条路径不要再互相污染。
+/// 三次 box blur(高斯近似)。
 pub fn blur3pass(img: &mut image::RgbaImage, radius: f32) {
     let radii = blur_box_radii(radius);
     for r in radii {
@@ -894,21 +754,14 @@ fn box_blur_v(img: &mut image::RgbaImage, r: i32) {
     }
 }
 
-/// 一次性把效果栈应用到图(等价于原版 op 树整体渲染)。
-///
-/// 原版效果栈是"参数 + op 树",渲染时**按栈顺序逐项施加**;
-/// 同名项在 `push` 时已合并(原版按名字查找覆盖),故此处无重复。
+/// 一次性把效果栈按顺序应用到图。
 pub fn apply_stack(img: &mut image::RgbaImage, st: &FilterStack) {
     for it in &st.items {
         apply_effect(img, it);
     }
 }
 
-/// 读取组合效果的一个滑杆值:参数是**滑杆原值**(0..1),
-/// 按参考的 `<range>` / `<offset>` 折算成物理量 `raw·range − offset`。
-///
-/// 参考里带 `<offset>` 的滑杆,`offset` 恰好是 `range` 的一半(如 range 2.0 /
-/// offset 1.0),说明带偏移的滑杆是**双向**的、原值 0.5 即中位。
+/// 读取组合效果的一个滑杆值,按量程与偏移折算成物理量。
 fn combo_val(e: &Effect, key: &str, raw_default: f32, range: f32, offset: f32) -> f32 {
     let raw = e
         .params
@@ -919,10 +772,6 @@ fn combo_val(e: &Effect, key: &str, raw_default: f32, range: f32, offset: f32) -
 }
 
 /// 高光 / 阴影响应值 → 色阶的白点 / 黑点。
-///
-/// **实现口径**:参考只公开了这两根滑杆的存在与量程(0.48),到黑白点的
-/// 折算系数暂无对应资料。此处按标准色阶语义线性折算
-/// (高光下调白点、阴影上抬黑点),方向确定、系数属我方重构。
 fn highlights_shadows(e: &Effect) -> (f32, f32) {
     let h = combo_val(e, "highlights", 0.0, 0.48, 0.0);
     let s = combo_val(e, "shadows", 0.0, 0.48, 0.0);
@@ -930,9 +779,6 @@ fn highlights_shadows(e: &Effect) -> (f32, f32) {
 }
 
 /// `finetune` / `finetune2`:补光 → 高光 / 阴影 → 色温。
-///
-/// 两者的差别只在**色温轴的宽度**:参考 finetune 是 range 1.0 / offset 0.5
-/// (−0.5..0.5),finetune2 是 range 2.0 / offset 1.0(−1..1)。
 fn tuning_combo(img: &mut image::RgbaImage, e: &Effect, wide_axis: bool) {
     let fl = combo_val(e, "fill", 0.0, 1.0, 0.0);
     if fl > 0.0 {
@@ -1007,18 +853,13 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         "unsharp" | "unsharp2" => {
             // unsharp 与 unsharp2 是**同一个**锐化操作,
             // 差异仅在滑块量程(1.0 vs 3.0)与全分辨率/慢速标志。
-            //
-            // 原版公式:USM = 原图 + amount·(原图 − 高斯模糊),
-            // amount 为 8.8 定点(256 = 1.0)。**amount 为负即锐化、为正即模糊**,
-            // 与常见 USM 实现的符号相反 —— 这是原版的确切行为。
-            // 滑块值 60 对应 amount = −round(60·256/100) ≈ −154(约 0.6 倍锐化)。
             let v = oneclick_amount(e, 60.0);
             if v > 0.0 {
                 let amount = -(v.clamp(0.0, 100.0) * 256.0 / 100.0).round();
                 crate::oneclick::apply_unsharp_usm(img, amount);
             }
         }
-        // ===== 补入的原版一键效果(行为已确认)=====
+        // ===== 其余一键效果 =====
         "autocontrast" => crate::oneclick::apply_autocontrast(img, 255),
         "enhance_auto" => crate::oneclick::apply_autocontrast(img, 252),
         "autolight" => crate::oneclick::apply_autolight(img),
@@ -1031,7 +872,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let s = oneclick_amount(e, 50.0) / 100.0;
             crate::oneclick::apply_fill_light(img, s, 0.25);
         }
-        // ===== 参考清单里的独立单滑杆项 =====
+        // ===== 独立单滑杆项 =====
         //
         // `contrast`(Contrast):只有一根**双向**对比度滑杆(range 1.0 / offset 0.5),
         // 原值 0.5 是中位(恒等);折算后 −0.5..0.5 线性映射到色彩矩阵的
@@ -1040,20 +881,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let v = combo_val(e, "contrast", 0.5, 1.0, 0.5) * 200.0;
             crate::effects::apply_color_matrix(img, 0.0, v, 0.0);
         }
-        // ===== 组合效果:滑杆清单沿用同类滤镜的常见参数命名,各接自己的滑杆 =====
-        //
-        // | id | 参考滑杆(依次为 id=0/1/2/3) | 我方接线 |
-        // |---|---|---|
-        // | `triple` | 亮度(range 2.0 / offset 1.0)、对比度(1.0 / 0.5)、补光 | 色彩矩阵(亮度+对比度)→ 补光 |
-        // | `triple2` | 补光、黑点、白点(默认 1.0) | 补光 → 色阶(黑白点) |
-        // | `triple3` | 补光、高光(0.48)、阴影(0.48) | 补光 → 色阶(高光/阴影折算) |
-        // | `finetune` | 补光、高光、阴影、色温(1.0 / 0.5) | 补光 → 高光/阴影 → 色温 |
-        // | `finetune2` | 同上,色温轴宽一倍(2.0 / 1.0) | 同上(色温折算不同) |
-        // | `colorfix` | 白场吸管 + 色温(1.0 / 0.5) | von Kries 校色 → 色温 |
-        //
-        // **实现口径**:参考只公开了「有哪些滑杆」与其量程/偏移,
-        // 高光 / 阴影 两根滑杆到色阶的折算系数暂无对应资料 ——
-        // 这里按「负=压、正=提」的方向线性折算到白点 / 黑点,属我方重构。
+        // ===== 组合效果:各接自己的滑杆 =====
         "finetune" | "finetune2" => {
             tuning_combo(img, e, e.name.eq_ignore_ascii_case("finetune2"));
         }
@@ -1073,7 +901,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             if fl > 0.0 {
                 crate::oneclick::apply_fill_light(img, fl, 0.25);
             }
-            // 黑点 / 白点:白点的参考默认值就是 1.0(见 XML 的 `<default>`)
+            // 黑点 / 白点:白点默认值为 1.0。
             let black = combo_val(e, "black", 0.0, 1.0, 0.0);
             let white = combo_val(e, "white", 1.0, 1.0, 0.0);
             if black > 0.0 || white < 1.0 {
@@ -1098,11 +926,8 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 crate::oneclick::apply_color_temp(img, temp, 0.0);
             }
         }
-        // 倾斜校正(Straighten):参考是一根双向滑杆(range 2.0 / offset 1.0),
-        // 即 raw 0..1 → −1..1,中位不旋转。
-        //
-        // **实现口径**:滑杆到角度的换算系数暂无对应资料,此处按 ±15° 满量程
-        // 线性折算;调用方也可以用 `angle` 参数直接给度数来绕过折算。
+        // 倾斜校正(Straighten):双向滑杆映射到 ±15° 满量程,中位不旋转;
+        // 也可用 `angle` 参数直接给度数。
         "tilt" => {
             let deg = match e.params.get("angle").and_then(|v| v.parse::<f32>().ok()) {
                 Some(d) => d,
@@ -1116,9 +941,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 *img = rotated;
             }
         }
-        // 90° 直角旋转(参考编辑历史条目 rot 的可执行形态;「Rotate Clockwise /
-        // Counterclockwise」菜单与按钮都落到它)。quarter:1 = 顺时针,2 = 180°,
-        // 3 = 逆时针;精确转置,不发生 tilt 那样的画布扩边。
+        // 90° 直角旋转;quarter:1 = 顺时针,2 = 180°,3 = 逆时针。
         "rot" => {
             let q = e
                 .params
@@ -1133,10 +956,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 _ => {}
             }
         }
-        // 裁剪(参考编辑历史条目 crop 的可执行形态;改画布尺寸,不做像素回混)。
-        // 参数 x / y / w / h 是**显示方向图像的归一化分数**(0..1)——
-        // 与分辨率无关,预览(1024 档)/导出(全分辨率)共用同一组数值;
-        // 裁剪矩形相对"链上此点"的图像,与参考编辑历史按序回放的语义一致。
+        // 裁剪:按归一化分数(x / y / w / h,0..1)裁掉画布,不做像素回混。
         "crop" => {
             let p = |k: &str, def: f32| {
                 e.params
@@ -1156,8 +976,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
                 *img = image::imageops::crop(img, x, y, w, h).to_image();
             }
         }
-        // 阴影 / 高光:参考三根滑杆 Radius / Shadow % / Highlight %。
-        // 只给通用强度滑杆 `amount` 时,按"两端同幅度"处理。
+        // 阴影 / 高光:只给通用强度滑杆 `amount` 时按"两端同幅度"处理。
         "shadow" => {
             let radius = e
                 .params
@@ -1174,8 +993,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             };
             crate::recipes::shadow_highlight(img, radius, sh, hi);
         }
-        // 反相(Invert Colors):参考就是一条 Master 曲线 `[(0,255), (255,0)]`
-        // (见 `<effect>` 的曲线调整节点),数据已在资源包。
+        // 反相(Invert Colors):使用一条 Master 曲线 `[(0,255), (255,0)]`。
         "invert" => {
             crate::curves::apply_curves(img, &crate::curves::presets::invert());
         }
@@ -1186,23 +1004,18 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         }
         "blur" => {
             let v = oneclick_amount(e, 50.0) / 100.0;
-            // 参考口径:滑杆量经阶梯量化(档位 {2.065, 3.0625, 4.13, 5.13}),
-            // 再走与 recipes 同一条盒式模糊(内部含半图钳制)—— 库内两条
-            // 模糊口径在效果算子这条路上已合并。
+            // 滑杆量经阶梯量化后走盒式模糊。
             let r = crate::recipes::blur_ladder(v * 8.0);
             if r > 0.0 {
                 crate::recipes::box_blur(img, r, r);
             }
         }
-        // glow / glow2:参考的光晕算子内部参数无对应资料,
-        // 我方固定走 gamma 0.5 + 模糊 + 混回的中性光晕,不读 amount、
-        // 阈值写死 128,后续如有资料再校准。
+        // glow / glow2:固定走 gamma 0.5 + 模糊 + 混回的中性光晕。
         "glow" | "glow2" => {
             crate::oneclick::apply_glow(img, 128.0);
         }
         "colortemp" => {
-            // 原版双轴:temp = Cool to Warm(−0.5..0.5)、white = White Shift(0..1)。
-            // 兼容旧数据:只存了 amount(0..100)时按 50 = 中性折算到冷暖轴。
+            // 双轴:temp = 冷暖(−0.5..0.5)、white = 白移(0..1);兼容旧数据按 amount 折算。
             let parse = |key: &str| e.params.get(key).and_then(|v| v.parse::<f32>().ok());
             let temp = match parse("temp") {
                 Some(t) => t,
@@ -1212,8 +1025,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             crate::oneclick::apply_color_temp(img, temp, white);
         }
         "sat" => {
-            // 原版语义:s = 滑块值 + 1,只有 s < 1 才增强饱和度。
-            // 此处把 amount(0..100,0 = 不变,100 = 最强)映射到 s = 1 − amount/100·0.99。
+            // 把 amount(0..100)映射到饱和度系数 s = 1 − amount/100·0.99。
             let v = oneclick_amount(e, 0.0);
             let s = 1.0 - (v.clamp(0.0, 100.0) / 100.0) * 0.99;
             crate::oneclick::apply_saturation(img, s);
@@ -1235,8 +1047,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let c = parse_color(e.params.get("color")).unwrap_or([0xff, 0xc0, 0x80]);
             crate::oneclick::apply_radtint(img, 0.5, 0.5, c);
         }
-        // 伽马校正:参考的 Level 滑杆量程 2.0、偏移 1.0,
-        // 即实际指数 = 1 + 滑块值;这里把 amount 映射到 1 + 0.9 的最大偏移。
+        // 伽马校正:amount 映射到指数 1 + 0.9 的最大偏移。
         "gamma" => {
             let v = oneclick_amount(e, 0.0) / 100.0;
             crate::oneclick::apply_gamma(img, 1.0 + v * 0.9);
@@ -1285,10 +1096,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let v = oneclick_amount(e, 50.0) / 100.0;
             crate::recipes::directional_adjust(img, lr, tb, v, kind);
         }
-        // 彩虹:先去饱和,再按亮度走完整一圈色相。
-        //
-        // 参考的滑杆量程 256、缺省 0,语义是色相起点(0~255 对应 0°~360°),
-        // 这里把 amount 映射到同一起点偏移。
+        // 彩虹:先去饱和,再按亮度走完整一圈色相,amount 为色相起点偏移。
         "rainbow" => {
             crate::effects::apply_color_matrix(img, 0.0, 0.0, -100.0);
             let off = oneclick_amount(e, 0.0) / 100.0 * 255.0;
@@ -1316,9 +1124,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             }
         }
         // ===== 着色器族(实现见 `crate::shaders`)=====
-        // 这一族的参数在原版里是**按位置排的数值数组**,没有键名也没有滑杆界面,
-        // 所以「出厂缺省」无对应资料。这里用 `p0..p5` 的位置键名接外部传参,
-        // 取不到时落到我方选定的可见缺省值(不是恒等),便于在效果栈里一眼看出生效。
+        // 这一族用 `p0..p5` 的位置键名接外部传参,取不到时落到选定的可见缺省值。
         "hexcells" => crate::shaders::hexcells(img, shader_axis(e, 0, 24.0)),
         "rippleblocks" => crate::shaders::ripple_blocks(
             img,
@@ -1350,9 +1156,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
         ),
         _ => {
             // 成组配方(见 `crate::recipes`):一个名字对应一串固定顺序的操作,
-            // 强度由 `amount`(0~100)统一控制 —— 与"淡出"滑杆语义等价;
-            // 可选 `blend` 参数指定结果与原图的混合模式。
-            // 先认参考滤镜名(如 `CrossProcess`),再认我方配方名。
+            // 强度由 `amount`(0~100)统一控制,可选 `blend` 参数指定混合模式。
             let resolved = recipe_for(&e.name);
             let target = resolved.unwrap_or(&e.name);
             if crate::recipes::is_recipe(target) {
@@ -1381,9 +1185,6 @@ fn oneclick_amount(e: &Effect, default: f32) -> f32 {
 }
 
 /// 着色器族的位置参数(`p0`…`p5`)。
-///
-/// 原版把这族的参数存成一个不记键名的数值数组,键名是我方为了效果栈可
-/// 序列化而定的;越界与缺省的判断留在各算子内部,不在这里改口径。
 fn shader_axis(e: &Effect, index: usize, default: f32) -> f32 {
     e.params
         .get(&format!("p{index}"))
@@ -1405,9 +1206,7 @@ fn parse_color(s: Option<&String>) -> Option<[u8; 3]> {
 
 // ===== 与索引库交互的纯函数(便于测试) =====
 
-/// 把一组调整**提交**到指定照片:写入 `photos.filters` 列。
-///
-/// 返回写入的条数。恒等调整(全 0)不写入 —— 与原版"不为空效果建编辑项"一致。
+/// 把一组调整提交到指定照片,写入 `photos.filters` 列,返回写入条数。
 pub fn commit_adjust(
     store: &crate::db::Store,
     ids: &[i64],
@@ -1436,12 +1235,12 @@ pub fn read_stack(store: &crate::db::Store, id: i64) -> FilterStack {
     }
 }
 
-/// "复制所有效果":从**单张**照片取效果栈(原版要求恰好选中一张)。
+/// "复制所有效果":从单张照片取效果栈。
 pub fn copy_from(store: &crate::db::Store, id: i64) -> FilterStack {
     read_stack(store, id)
 }
 
-/// "粘贴所有效果":把效果栈写给多张照片(原版效果批量应用)。
+/// "粘贴所有效果":把效果栈写给多张照片。
 pub fn paste_to(
     store: &crate::db::Store,
     ids: &[i64],
@@ -1478,7 +1277,6 @@ mod tests {
 
     #[test]
     fn sharpen_kernel_matches_original_formula() {
-        // a = clamp(v,0,100)/(-100);中心 1-8a;8 邻域 a;核和 = 1
         let k = sharpen_kernel(50.0);
         assert!((k[1][1] - 5.0).abs() < 1e-6, "中心应为 1-8a=5, got {}", k[1][1]);
         assert!((k[0][0] + 0.5).abs() < 1e-6);
@@ -1494,7 +1292,6 @@ mod tests {
 
     #[test]
     fn blur_radii_follow_sigma_formula() {
-        // sigma = r*3;box 宽度 = sigma*f+1 → 半径 (w-1)/2
         let r = blur_box_radii(1.0);
         // sigma=3 → box 宽 1.9 / 3.1 / 3.7 → 半径 0 / 1 / 1
         assert_eq!(r, [0, 1, 1]);
@@ -1517,7 +1314,7 @@ mod tests {
         st.push(Effect::enhance(&a));
         let s = st.serialize();
         assert!(s.contains("enhance="), "序列化应含项名: {s}");
-        assert!(s.ends_with(';'), "原版格式每项以 ';' 结尾: {s}");
+        assert!(s.ends_with(';'), "序列化格式每项以 ';' 结尾: {s}");
         let back = FilterStack::parse(&s);
         assert_eq!(back.items.len(), 1);
         assert_eq!(back.items[0].name, "enhance");
@@ -1605,9 +1402,6 @@ mod tests {
     }
 
     /// B3:饱和度必须是**非对称**的 —— 正方向按 3 倍增益走。
-    ///
-    /// 参考的确切规则:`s' = 1 + (sat > 0 ? 3·sat : sat) / 100`。
-    /// 于是 `sat = +100` → `s' = 4`(不是线性式的 2);负方向仍是线性。
     #[test]
     fn positive_saturation_gain_is_tripled() {
         let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([140, 120, 130, 255]));
@@ -1618,10 +1412,6 @@ mod tests {
     }
 
     /// B8:调整面板的曝光必须走**曝光曲线**(样条)路径,而不是线性 `2^stops`。
-    ///
-    /// 参考的曝光点表:`pos (0,17)(47,81)(129,186)(221,255)`、
-    /// `neg (13,0)(116,74)(208,156)(255,221)`。输入 100 经曲线约为
-    /// **+1 档 → 149**(−1 档 → 63),而线性乘法会给出 200 / 50。
     #[test]
     fn exposure_runs_through_the_curve_spline() {
         let run = |e: f32| {
@@ -1639,20 +1429,11 @@ mod tests {
     }
 
     /// B9:5 个组合效果不能塌成同一件事 —— 各自的滑杆必须只影响自己。
-    ///
-    /// 参考的滑杆清单(取自官方 `<filter>` 描述):
-    /// `triple` = 亮度 / 对比度 / 补光;`triple2` = 补光 / 黑点 / 白点;
-    /// `triple3` = 补光 / 高光 / 阴影;`finetune` = 补光 / 高光 / 阴影 / 色温;
-    /// `finetune2` = 同上但色温轴宽一倍;`colorfix` = 白场校色 + 色温。
-    ///
-    /// 参数一律按**滑杆原值**(0..1)传入,再按参考的 `<range>` / `<offset>`
-    /// 折算成物理量 —— 例如 finetune 的色温轴 range=1.0/offset=0.5,
-    /// 滑杆 0..1 映射到 −0.5..0.5;finetune2 是 range=2.0/offset=1.0,映射到 −2..2。
     #[test]
     fn combo_effects_are_individually_wired() {
         // 注意:`temp` 传的是**滑杆原值**(0..1),0.5 即中位(中性);
         // finetune / finetune2 / colorfix 按各自的 range / offset 折算。
-        // 构造效果项:`param` 为空时用参考的零档默认。
+        // 构造效果项:`param` 为空时用零档默认。
         fn mk(name: &str, params: &[(&str, &str)]) -> Effect {
             let mut m = BTreeMap::new();
             for (k, v) in params {
@@ -1715,7 +1496,7 @@ mod tests {
             "finetune2 的色温轴比 finetune 宽一倍,不应得到同一色温"
         );
 
-        // zerostate:不给参数时,5 个照明/微调类效果都应是恒等(参考 zerostate 语义)
+        // zerostate:不给参数时,5 个照明/微调类效果都应是恒等
         let identity = image::RgbaImage::from_pixel(24, 24, image::Rgba([40, 90, 160, 255])).into_raw();
         for name in ["triple", "triple2", "triple3", "finetune", "finetune2"] {
             assert_eq!(run(name, &[]), identity, "{name} 的零档应是恒等");
@@ -1747,9 +1528,6 @@ mod tests {
     }
 
     /// B8(续):曝光必须**随档位单调**,且迭代结果始终落在 0..255 内。
-    ///
-    /// 负向点表末端是 (255,221) —— 即使 −3 档也不会把 250 压到纯黑,这是
-    /// 曝光曲线本身的行为(负档只是整条曲线的 mild 压缩),不是钳位遗漏。
     #[test]
     fn exposure_extremes_stay_monotonic_and_in_range() {
         let run = |e: f32| {
@@ -1850,7 +1628,7 @@ mod tests {
         assert!(img.get_pixel(0, 0)[0] > 100);
     }
 
-    /// 恒等调整不落库(原版不为空效果建编辑项)。
+    /// 恒等调整不落库(空效果不建编辑项)。
     #[test]
     fn identity_commit_writes_nothing() {
         let store = mem_store_with_photos(1);
@@ -1859,7 +1637,7 @@ mod tests {
         assert_eq!(store.get_filters(1), None);
     }
 
-    /// 复制 → 粘贴 → 撤销 → 重做 全链路(对齐原版 Copy/Paste All Effects + EditStack)。
+    /// 复制 → 粘贴 → 撤销 → 重做 全链路。
     #[test]
     fn copy_paste_undo_redo_flow() {
         let store = mem_store_with_photos(3);
@@ -1938,9 +1716,7 @@ mod tests {
         // 饱和度 -100 → 灰度(R==G==B)
         assert_eq!(px[0], px[1], "饱和度 -100 应变灰");
         assert_eq!(px[1], px[2]);
-        // 灰度值 = 提亮后三通道的 luma —— 必须用**本项目统一权重**
-        // (0.3086/0.6094/0.082),不是 Rec.709:早前这里写死 Rec.709,
-        // 等于把当时色彩矩阵用错权重的缺陷固化成了断言。
+        // 灰度值 = 提亮后三通道的 luma,使用本项目统一权重(0.3086/0.6094/0.082)。
         let w = crate::oneclick::luma_weights();
         let orig_luma = w[0] * 200.0 + w[1] * 80.0 + w[2] * 60.0;
         let bright_luma = w[0] * 263.75 + w[1] * 143.75 + w[2] * 123.75;
@@ -1972,9 +1748,6 @@ mod tests {
     }
 
     /// 第 2 项-a:`tilt`(Straighten)不能再是静默空操作。
-    ///
-    /// 参考的 `<filter id="tilt">` 只有一根双向滑杆(range 2.0 / offset 1.0),
-    /// 所以转动的角度必须随滑块变化,而不是恒为 0。
     #[test]
     fn tilt_straightens_the_image() {
         let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 255]));
@@ -2138,8 +1911,7 @@ mod tests {
         );
     }
 
-    /// 第 4 项-a:`Invert` —— 参考是 Master 曲线 `[(0,255), (255,0)]`,
-    /// 曲线数据已在 `crate::curves::presets::invert()`,只差这条接线。
+    /// 第 4 项-a:`Invert` —— 使用 Master 曲线 `[(0,255), (255,0)]` 反相。
     #[test]
     fn invert_effect_negates_the_image() {
         let run = |pix: image::Rgba<u8>| {
@@ -2169,8 +1941,7 @@ mod tests {
         );
     }
 
-    /// 第 9 项-b:`contrast` 是参考滤镜清单里的独立一项(只有一根双向对比度滑杆),
-    /// 此前完全没有实现 —— 补上并按参考滑杆口径接线。
+    /// 第 9 项-b:`contrast` 是双向对比度滑杆,已接到色彩矩阵的对比度。
     #[test]
     fn reference_contrast_is_wired_to_the_matrix_contrast() {
         let base = || {
@@ -2195,7 +1966,7 @@ mod tests {
             );
             img
         };
-        // 参考滑杆 range 1.0 / offset 0.5 ⇒ 原值 0.5 是中位(恒等)
+        // 双向对比度滑杆,中位(0.5)为恒等
         let mid = run("0.5");
         let base_bytes = base().into_raw();
         assert_eq!(mid.as_raw(), &base_bytes, "滑杆居中时应恒等");
@@ -2239,7 +2010,7 @@ mod tests {
                 "别名 {from} 指向的配方 {to} 不存在"
             );
             // 别名不能抢占已有的效果名:`apply_effect` 的显式分支优先于兜底,
-            // 一旦重名,参考名会落到另一种算法上,而这正是 `vignette` 的情况。
+            // 一旦重名,外部名会落到另一种算法上,而这正是 `vignette` 的情况。
             assert!(
                 !crate::effects::PIXEL_EFFECTS.contains(from)
                     && !crate::recipes::is_recipe(from),
@@ -2250,7 +2021,7 @@ mod tests {
             // 同强度两条路径应逐像素一致
             let ran_a = crate::recipes::apply(&mut a, from, 100.0);
             let ran_b = crate::recipes::apply(&mut b, to, 100.0);
-            // 参考名不进 recipes 的分派(那边只认我方配方名),走 effects 的别名解析
+            // 外部名不进 recipes 的分派(那边只认我方配方名),走 effects 的别名解析
             assert!(!ran_a, "{from} 应由 effects 侧别名解析,不该在 recipes 里被直接认下");
             assert!(ran_b, "{to} 应是可执行配方");
             let mut c = sample();
@@ -2328,10 +2099,7 @@ mod tests {
         }
     }
 
-    /// 第 9 项-a:参考滤镜清单(84 项)的落地状态必须**可机读**而不是靠记性。
-    ///
-    /// 关键是把「知道但不做」(需要笔刷交互 / 外部服务已关停 / 属于编辑历史项)
-    /// 与「压根没见过」区分开 —— 后者通常是拼错的效果名,应当能被揪出来。
+    /// 第 9 项-a:效果名清单的落地状态必须**可机读**而不是靠记性。
     #[test]
     fn reference_filter_ids_are_all_classified() {
         for id in crate::effects::REFERENCE_IDS {
@@ -2339,7 +2107,7 @@ mod tests {
             assert_ne!(
                 got,
                 crate::effects::Support::Unknown,
-                "参考滤镜 {id} 既无实现也没登记为「暂不支持」"
+                "滤镜 {id} 既无实现也没登记为「暂不支持」"
             );
         }
     }
@@ -2392,7 +2160,7 @@ mod tests {
     }
 
     /// 第 2 项-b:着色器族的台账必须自洽 —— 已落地的 6 项在效果表里,
-    /// 未闭环的 4 项在效果表外,两边合起来正好是参考那一族的 10 项。
+    /// 未闭环的 4 项在效果表外,两边合起来共 10 项。
     #[test]
     fn shaders_ledger_stays_consistent() {
         for name in crate::effects::SHADER_EFFECTS {
@@ -2418,7 +2186,7 @@ mod tests {
         assert_eq!(
             crate::effects::SHADER_EFFECTS.len() + crate::effects::SHADER_PENDING.len(),
             10,
-            "参考的着色器族共 10 项,台账缺了或多出来说明分档漂了"
+            "着色器族共 10 项,台账缺了或多出来说明分档漂了"
         );
     }
 

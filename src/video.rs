@@ -1,6 +1,6 @@
-//! 视频支持 —— 扩展名识别 + 记录类型语义(参考 Picasa 3)。
+//! 视频支持:扩展名识别 + 记录类型语义。
 //!
-//! ## 参考来源：Picasa 3 的视频处理
+//! ## 行为说明
 //!
 //! - **扩展名池**(判定时逐一匹配):
 //!   `avi divx asf mpg mpeg ty mts m2t m2ts mmv m2v mkv mod tod tp ts mp4 3gp 3g2 mov wmv`
@@ -11,12 +11,12 @@
 //!   - `0xb`/`0xc` = WMV/ASF 系(ASF 头解析,ASF 头解析)
 //!   - `10`/`0x1d` = DirectShow 通用视频
 //!   - `0x17` = 视频,但缩略图走疑似网络加载器(视频缩略图加载)——语义未完全确认
-//! - **缩略图**:原版走外部进程(DirectShow 渲染 + IPC 回传 + JPEG 编码,
+//! - **缩略图**:走外部进程(DirectShow 渲染 + IPC 回传 + JPEG 编码,
 //!   最多等 60 秒)。
 //!   **我方等效**:Windows Shell 视频缩略提供程序(`win::shell_thumbnail`,
 //!   底层同为系统 DirectShow 系编解码),无需外部进程。
-//! - **播放**:原版走库内 DirectShow filter graph 渲染到播放子窗口。
-//!   **我方等效**:Shell 关联程序打开(`win::shell_open`)—— 库内视频渲染管线
+//! - **播放**:走库内 DirectShow filter graph 渲染到播放子窗口的设计,
+//!   我方等效实现为 Shell 关联程序打开(`win::shell_open`)—— 库内视频渲染管线
 //!   体量过大,当前未实现。
 //! - **moviestart/movieend** = 编辑串里的 hex64 值(按 64 位十六进制解析),
 //!   播放时作时间过滤裁剪,**不修改原视频像素**。
@@ -25,8 +25,8 @@
 //!
 //!   两个值是 **100 纳秒计数**(10 MHz,即 DirectShow 的 `REFERENCE_TIME`),
 //!   **10 000 000 = 1 秒**。两处换算相互印证:
-//!   - 原版 trim UI 文本用 `值 / 10 000 000` 得到秒数,拼成 `"起秒/止秒"` 显示;
-//!   - 原版把值交给播放器前同样做 `/ 10 000 000.0`。
+//!   - trim UI 文本用 `值 / 10 000 000` 得到秒数,拼成 `"起秒/止秒"` 显示;
+//!   - 值交给播放器前同样做 `/ 10 000 000.0`。
 //!
 //!   序列化形态:`moviestart=%I64x` / `movieend=%I64x`(16 进制,读回用 `sscanf("%I64x")`,
 //!   读写都不做缩放)。视频导出路径另有一个 `值 / 1000`(100 ns → µs)用于时间码运算。
@@ -40,8 +40,8 @@ pub const MOVIE_TICKS_PER_SEC: i64 = 10_000_000;
 
 /// 视频裁剪区间(单位 = 100 纳秒,见 [`MOVIE_TICKS_PER_SEC`])。
 ///
-/// 对应原版编辑串里的 `moviestart` / `movieend` 一对。
-/// 原版的语义是**时间过滤**:播放与导出只取 `[start, end]` 这一段,
+/// 编辑串里的 `moviestart` / `movieend` 一对。
+/// 语义是**时间过滤**:播放与导出只取 `[start, end]` 这一段,
 /// 不改动原文件像素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MovieTrim {
@@ -91,7 +91,7 @@ impl MovieTrim {
         }
     }
 
-    /// 序列化成原版编辑串片段:`moviestart=%I64x;movieend=%I64x;`(16 进制小写)。
+    /// 序列化成编辑串片段:`moviestart=%I64x;movieend=%I64x;`(16 进制小写)。
     pub fn serialize(&self) -> String {
         format!(
             "moviestart={:x};movieend={:x};",
@@ -119,7 +119,7 @@ impl MovieTrim {
         m
     }
 
-    /// 从原版编辑串里解析(找不到对应键时返回 `None`)。
+    /// 从编辑串里解析(找不到对应键时返回 `None`)。
     ///
     /// 只认 `moviestart=` / `movieend=` 前缀,值是 16 进制 64 位整数。
     pub fn parse(filters: &str) -> Option<MovieTrim> {
@@ -142,7 +142,7 @@ impl MovieTrim {
         }
     }
 
-    /// UI 用的 `"起秒 / 止秒"` 文本(一位小数),与原版 trim 面板同形。
+    /// UI 用的 `"起秒 / 止秒"` 文本(一位小数)。
     pub fn label(&self) -> String {
         format!("{:.1} / {:.1}", self.start_secs(), self.end_secs())
     }
@@ -165,8 +165,8 @@ pub fn is_video(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// 数据库 `photos.kind` 的取值(对齐原版记录类型的"是否视频"二分;
-/// 原版 7 种视频子类型对应不同解码路径,我方只有一条 Shell 路径,无须细分)。
+/// 数据库 `photos.kind` 的取值("是否视频"二分;
+/// 本项目只有一条 Shell 解码路径,无须细分子类型)。
 pub mod kind {
     /// 图片。
     pub const PHOTO: i32 = 0;
@@ -180,11 +180,11 @@ mod tests {
 
     #[test]
     fn ext_set_matches_original_pool() {
-        // 参考原版:21 个扩展名,顺序如常量。
+        // 21 个扩展名,顺序如常量。
         assert_eq!(MOVIE_EXTS.len(), 21);
         // 三处独立来源里点名的格式必须在内
         for e in ["avi", "mpg", "wmv", "mov", "mp4", "mts", "mkv", "3gp"] {
-            assert!(MOVIE_EXTS.contains(&e), "{e} 必须在原版扩展名池里");
+            assert!(MOVIE_EXTS.contains(&e), "{e} 必须在扩展名池里");
         }
         // 图片扩展名绝不能混进来
         for e in ["jpg", "png", "nef", "cr2"] {
@@ -201,7 +201,7 @@ mod tests {
         assert!(!is_video(Path::new("a.jpg")));
         assert!(!is_video(Path::new("a.nef")));
         assert!(!is_video(Path::new("noext")));
-        // 原版 `ty`(TiVo)与 `mmv`(MicroMV)这类冷门格式也要认
+        // `ty`(TiVo)与 `mmv`(MicroMV)这类冷门格式也要认
         assert!(is_video(Path::new("tivo.ty")));
         assert!(is_video(Path::new("sony.mmv")));
     }

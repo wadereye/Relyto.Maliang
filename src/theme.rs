@@ -1,6 +1,6 @@
 //! 全局主题:两套配色,同一套版式。
 //!
-//! - `灰色`(默认):取自 Picasa 的中性灰面(#F3F3F3)+ 选中蓝(#25648B),亮色方案。
+//! - `灰色`(默认):中性灰面(#F3F3F3)+ 选中蓝(#25648B),亮色方案。
 //! - `蓝黑`:同一版式的暗色方案,点缀换成科技感的浅蓝。
 //!
 //! 配色通过 `Kind` 在运行时切换(`选项 > 常规`),取色一律走 `theme::p()`,
@@ -18,7 +18,7 @@ pub const IMAGE_RADIUS: u8 = 6;
 /// 当前配色方案。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
-    /// 灰面浅底(Picasa 风),默认。
+    /// 灰面浅底,默认。
     Gray,
     /// 蓝黑暗底,科技感点缀。
     Blue,
@@ -97,7 +97,7 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Picasa 灰:中性灰面 + 选中蓝。
+    /// 灰面:中性灰面 + 选中蓝。
     const GRAY: Palette = Palette {
         kind: Kind::Gray,
         bg: Color32::from_rgb(0xED, 0xED, 0xED),

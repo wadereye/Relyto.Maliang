@@ -1,7 +1,7 @@
 /// 一张照片的全部 EXIF 元数据(单次打开、单次解析)。
 ///
-/// 与原版一致的效率取向:`FindNextFileW` 一次拿全属性,
-/// EXIF 也只解析一次再分发出多个字段(原版是从同一个 IFD 结构里取的)。
+/// 效率取向:`FindNextFileW` 一次拿全属性,
+/// EXIF 也只解析一次再分发出多个字段。
 /// 我方原先 `read_taken`/`read_orientation`/`read_gps`/`read_cam` 各自开一次文件
 /// 解析一次 EXIF(每文件 4 次 IO),这里合并为 1 次。
 #[derive(Debug, Clone, Default)]
@@ -166,7 +166,7 @@ fn gps_coord(exif: &exif::Exif, val_tag: exif::Tag, ref_tag: exif::Tag, neg_ref:
 }
 
 /// 提取 JPEG 内嵌 EXIF 缩略图(IFD1 的 JPEGInterchangeFormat/Length)。
-/// 对应原版 "Use EXIF thumbnails" 加速:首扫免全图解码。
+/// 用内嵌 EXIF 缩略图加速:首扫免全图解码。
 /// 仅处理 JPEG 压缩的缩略图(相机原图最常见);缺失/非 JPEG 返回 None。
 ///
 /// 只认 **IFD1**:JPEG 的 IFD0 描述的是主图本身,它的 StripOffsets 指向

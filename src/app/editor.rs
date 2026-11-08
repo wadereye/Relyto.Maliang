@@ -1,4 +1,4 @@
-//! 单图编辑视图(参考 Picasa 3 的 View and Edit 版式)。
+//! 单图编辑视图。
 //!
 //! 打开预览后整页接管:顶部导航 + 邻片小图,左栏分类工具 / 撤销重做 /
 //! 直方图与相机信息,中间效果预览,右栏常驻属性,底部邻片胶片带。
@@ -965,7 +965,7 @@ impl App {
         Some(t)
     }
 
-    /// 右栏常驻属性面板(参考件右栏:标题栏 + 属性清单 + 底部页签)。
+    /// 右栏常驻属性面板:标题栏 + 属性清单 + 底部页签。
     fn editor_props_ui(&mut self, ctx: &egui::Context, id: i64) {
         egui::SidePanel::right("editor_props")
             .exact_width(RIGHT_W)

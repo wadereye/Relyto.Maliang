@@ -371,7 +371,7 @@ fn main() -> eframe::Result {
         }
     };
 
-    // UI 线程提优先级(与原版一致:UI 线程 ABOVE_NORMAL,
+    // UI 线程提优先级(UI 线程 ABOVE_NORMAL,
     // 扫描/缩略图后台线程 BELOW_NORMAL —— 交互永远优先于后台计算)。
     win::set_current_thread_priority(win::Priority::AboveNormal);
 

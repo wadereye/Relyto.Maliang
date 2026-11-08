@@ -1,4 +1,4 @@
-//! 双状态保存烘培:重写原图(旋转打包、q90 重编码),先备份原版。
+//! 双状态保存烘培:重写原图(旋转打包、q90 重编码),先备份。
 //! 备份目录:`<同级>/photooriginals/<mtime 时间戳>.jpg`,绝不覆盖已有备份。
 use crate::db::Store;
 use anyhow::{anyhow, Context, Result};
@@ -8,7 +8,7 @@ pub struct Baked {
     /// 被重写的原图路径(预留:GUI 完成提示)。
     #[allow(dead_code)]
     pub path: String,
-    /// 原版备份位置(预留:GUI 完成提示)。
+    /// 备份位置(预留:GUI 完成提示)。
     #[allow(dead_code)]
     pub backup: String,
 }
@@ -146,7 +146,7 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
 
 /// 把 epoch 秒格式化成**本地时间**的 `YYYYMMDD-HHMMSS`(备份文件名)。
 ///
-/// 备份文件放在 `<原图同级>/photooriginals/`,名字取自原图的 mtime ——
+/// 备份文件放在 `<原图同级>/photooriginals/`,名字取自原图的修改时间。
 /// 用本地时间才和资源管理器里看到的"修改日期"对得上。
 fn chrono_fmt(epoch_secs: i64) -> String {
     use chrono::TimeZone;

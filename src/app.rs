@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc};
 mod editor;
 use editor::{EditorTab, Histogram};
 
-/// 视图模式(视图菜单,参照 Picasa:最近更新/时间线/人物/标签/文件夹)。
+/// 视图模式(视图菜单:最近更新/时间线/人物/标签/文件夹)。
 /// Faces/Semantic 仅 ai 构建的菜单会构造;无 ai 时变体存在但无人构造,允许死代码。
 #[derive(PartialEq, Clone, Copy)]
 enum ViewKind {
@@ -18,7 +18,7 @@ enum ViewKind {
     Timeline,
     Folder,
     Duplicates,
-    /// 相簿(参考件 Album:照片的命名集合,不动文件)。
+    /// 相簿:照片的命名集合,不动文件。
     Albums,
     #[allow(dead_code)]
     Faces,
@@ -46,7 +46,7 @@ impl ViewKind {
     }
 }
 
-/// 整页(参考件把"看照片"和"取照片"做成两套整页面板互切:
+/// 整页("看照片"和"取照片"做成两套整页面板互切:
 /// 主页是图库,导入页占满中央区并换掉左栏;菜单/工具栏/状态栏不动)。
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum PageKind {
@@ -127,7 +127,7 @@ impl PeopleSort {
     }
 }
 
-/// 右栏抽屉的四个面板(参考件右抽屉的属性 / 标签 / 人物 / 地点四页)。
+/// 右栏抽屉的四个面板(属性 / 标签 / 人物 / 地点四页)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum DrawerTab {
     /// 照片属性 + 标题。
@@ -309,7 +309,7 @@ pub struct App {
     // —— 菜单相关状态 ——
     sel: BTreeSet<i64>,
     /// 最近一次单击/Ctrl+单击命中的照片 id(Shift+单击连选的基准;
-    /// 参考件点选习惯:单击只选一张,Ctrl 加减选,Shift 从基准连选)。
+    /// 点选习惯:单击只选一张,Ctrl 加减选,Shift 从基准连选)。
     sel_anchor: Option<i64>,
     sort_by: timeline::SortBy,
     sort_rev: bool,
@@ -357,7 +357,7 @@ pub struct App {
     /// 监听模式(事件驱动 / 降级轮询)—— 供 UI 展示。
     watch_mode: Option<Arc<std::sync::atomic::AtomicU8>>,
     watch_on: Arc<AtomicBool>,
-    /// 滚动限速器(与 Picasa 3 一致的位移阻尼)。
+    /// 滚动限速器(位移阻尼)。
     /// 滚动时按整形后的速度调节"本帧允许解码的缩略图数量",
     /// 滚动越快解码越少 → 大图库滚动不卡顿(限速节点的等价作用)。
     scroll_throttle: crate::scroll::ScrollSmoother,
@@ -472,7 +472,7 @@ pub struct App {
     show_ocr_boxes: bool,
     /// 预览叠框缓存(照片 id, 归一化框 + 标签)。
     preview_boxes: Option<(i64, Vec<((f32, f32, f32, f32), String)>)>,
-    // —— 预览缩放/平移(参考件 View and Edit 单图视图:滚轮缩放、拖拽平移、
+    // —— 预览缩放/平移(单图编辑视图:滚轮缩放、拖拽平移、
     // 双击切换适应窗口/100% 像素)——
     /// 缩放系数:1.0 = 适应窗口;上限 8 倍。
     preview_zoom: f32,
@@ -500,28 +500,28 @@ pub struct App {
     crop_cw: String,
     crop_ch: String,
     crop_cname: String,
-    // —— 幻灯片放映(对应原版 视图 > 幻灯片放映:可调间隔与循环开关)——
+    // —— 幻灯片放映(可调间隔与循环开关)——
     /// 放映中(全屏接管主区)。
     slideshow: bool,
     /// 上次自动切换时刻。
     slide_last: std::time::Instant,
     /// 暂停(空格切换)。
     slide_pause: bool,
-    /// 每张停留秒数(原版默认间隔暂无对应资料,取 3 秒)。
+    /// 每张停留秒数(默认 3 秒)。
     slide_interval: f32,
     /// 循环放映(设置项 slideshow_loop,默认开)。
     slide_loop: bool,
-    // —— 标题(Caption,参考件)——
+    // —— 标题(Caption)——
     /// 预览窗标题编辑缓冲(照片 id, 文本)。
     caption_edit: Option<(i64, String)>,
-    /// 缩略图下方显示标题(参考件 Thumbnail captions;设置项 thumb_captions)。
+    /// 缩略图下方显示标题(设置项 thumb_captions)。
     thumb_captions: bool,
-    // —— 相簿(参考件 Album)——
+    // —— 相簿(Album)——
     /// 当前查看的相簿。
     sel_album: Option<i64>,
     /// 新建相簿输入框。
     album_input: String,
-    // —— 属性 / 选项窗口(原版 File > Properties / Tools > Options 等价物)——
+    // —— 属性 / 选项窗口 ——
     show_props: bool,
     show_options: bool,
     /// 选项窗口当前页签(0 常规 / 1 电子邮件 / 2 幻灯片)。
@@ -529,7 +529,7 @@ pub struct App {
     /// 缓存目录占用(文件数, 字节数)+ 采样时刻。整树遍历不放在每帧里跑,
     /// 选项页打开时按时间片刷新(迁移完立刻重采)。
     cache_usage: Option<(usize, u64, std::time::Instant)>,
-    /// 文件夹视图树形形态(参考件左栏可逐级展开的那棵树;设置项 folder_tree,缺省树形)。
+    /// 文件夹视图树形形态(左栏可逐级展开的树;设置项 folder_tree,缺省树形)。
     folder_tree: bool,
     /// 中间栏是否一次铺开所有文件夹(每组一个相册组头)。
     /// 左栏点了具体文件夹即收窄为该组;左栏「全部文件夹」再铺回去。
@@ -547,8 +547,7 @@ pub struct App {
     /// 递归语义:选中父级 = 中间栏聚合显示本目录+全部子孙目录的照片,
     /// 一路点下去逐级收窄;Some 时优先于 selected_folder 槽位。
     subtree_sel: Option<String>,
-    /// 左栏每行画该目录的缩略图(参考件 View > Show Thumbnails in Library;
-    /// 设置项 tree_thumbs)。
+    /// 左栏每行画该目录的缩略图(设置项 tree_thumbs)。
     tree_thumbs: bool,
     /// 文件夹树的节点缓存(键 = rows_gen;逐帧重建是 O(目录数×层级) 的白活)。
     folder_tree_cache: FolderTree,
@@ -556,7 +555,7 @@ pub struct App {
     tree_open: HashSet<String>,
     /// 树行缩略图纹理缓存(按照片 id;随当前档位变化,数量有上限就整体丢弃)。
     tree_texs: HashMap<i64, egui::TextureHandle>,
-    /// 当前整页(参考件是主面板与导入面板两套整页互切,不是弹窗)。
+    /// 当前整页(主面板与导入面板两套整页互切,不是弹窗)。
     page: PageKind,
     /// 导航历史栈(后/前进逐站回退;每站记住整页 + 视图 + 左栏选中)。
     nav_hist: Vec<NavStop>,
@@ -570,7 +569,7 @@ pub struct App {
     import_sel: BTreeSet<usize>,
     /// 最近一次浏览过的导入源(历史站退回导入页时用它恢复清单)。
     last_import_src: String,
-    /// 人物列表排序方式(参考件 Sort People by Name / Amount / Top 10)。
+    /// 人物列表排序方式(按姓名 / 数量 / 前 10)。
     people_sort: PeopleSort,
     /// 工具栏「新建相册」弹窗(选中照片时把选中项一并放进新相册)。
     album_new_win: bool,
@@ -681,10 +680,10 @@ pub struct App {
     frame_dirs: Vec<String>,
     /// `frame_dirs` 的去重键(大写归一路径)。
     frame_dirs_seen: std::collections::HashSet<String>,
-    // —— 单图编辑视图(参考 Picasa 3 的 View and Edit:左工具 / 中预览 / 右属性)——
+    // —— 单图编辑视图(左工具 / 中预览 / 右属性)——
     /// 左栏工具分类页。
     editor_tab: EditorTab,
-    /// 右栏属性面板显隐(参考件属性面板标题栏的收展按钮)。
+    /// 右栏属性面板显隐(标题栏的收展按钮)。
     editor_props: bool,
     /// 底部胶片带显隐。
     editor_film: bool,
@@ -1568,7 +1567,7 @@ const MAX_ADOPT_QUEUE: usize = 256;
 const MAX_VISIBLE_DIRS: usize = 32;
 
 /// 把任意长宽比的缩略图裁成正方形(取中间部分)。
-/// 图库的网格不再用它(参考件保留宽高比),但放大态的预览格仍需要方图。
+/// 图库的网格不再用它(保留宽高比),但放大态的预览格仍需要方图。
 fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
     let (w, h) = (tw.max(1) as f32, th.max(1) as f32);
     if w > h {
@@ -1582,7 +1581,7 @@ fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
     }
 }
 
-/// 首页虚拟相册的成员上限(参考件的 Recently Updated 带数量上限,超出淘汰最旧)。
+/// 首页虚拟相册的成员上限(超出淘汰最旧)。
 const RECENT_LIMIT: usize = 250;
 
 /// 相册头日期:`YYYY-MM-DD` → `YYYY年M月D日`;没有 EXIF 日期时原样返回空串。
@@ -1599,7 +1598,7 @@ fn cn_date(s: &str) -> String {
 }
 
 /// 行式缩略图布局的一行:每项 (rows 下标, 该格宽) 与本行统一高。
-/// 参考件不把照片裁成正方形:同行等高,各自按宽高比取宽,行尾贴近右边界。
+/// 不把照片裁成正方形:同行等高,各自按宽高比取宽,行尾贴近右边界。
 struct ThumbRow {
     cells: Vec<(usize, f32)>,
     h: f32,
@@ -1879,7 +1878,7 @@ fn toolbar_icon(name: &str) -> egui::Image<'static> {
         .fit_to_exact_size(egui::vec2(18.0, 18.0))
 }
 
-/// 组头图标(参考件组头那枚大一号的目录图标)。
+/// 组头图标(大一号的目录图标)。
 fn album_icon(name: &str, size: f32) -> egui::Image<'static> {
     let (tag, bytes) = icon_source(name);
     let half = if crate::theme::p().is_light { "l" } else { "d" };
@@ -2111,7 +2110,7 @@ impl App {
     const GRANT_BLUE_DARK: egui::Color32 = egui::Color32::from_rgb(0x2C, 0x5F, 0x8A);
 
     pub fn new(cc: &eframe::CreationContext<'_>, store: Arc<Store>) -> Self {
-        // 配色:默认 Picasa 灰,可切蓝黑(设置项 ui_theme,入口在 选项 > 常规)。
+        // 配色:默认灰色,可切蓝黑(设置项 ui_theme,入口在 选项 > 常规)。
         let ui_theme = store
             .get_setting("ui_theme")
             .and_then(|v| crate::theme::Kind::from_key(&v))
@@ -2127,12 +2126,12 @@ impl App {
             .get_setting("thumb_captions")
             .map(|v| v != "0")
             .unwrap_or(false);
-        // 缺省树形(参考件左栏即树);显式选过平铺的库存的是 "0",不受影响。
+        // 缺省树形;显式选过平铺的库存的是 "0",不受影响。
         let folder_tree = store
             .get_setting("folder_tree")
             .map(|v| v != "0")
             .unwrap_or(true);
-        // 左栏缩略图:参考件默认在库里显示,这里同样默认开。
+        // 左栏缩略图:默认在库里显示。
         let tree_thumbs = store
             .get_setting("tree_thumbs")
             .map(|v| v != "0")
@@ -2155,7 +2154,7 @@ impl App {
             .get_setting("drawer_tab")
             .and_then(|v| DrawerTab::from_key(&v))
             .unwrap_or_default();
-        // 排序与视图过滤同属"怎么看图库",重启后保持(参考件亦记忆视图状态)。
+        // 排序与视图过滤同属"怎么看图库",重启后保持。
         let sort_by = store
             .get_setting("sort_by")
             .and_then(|v| timeline::SortBy::from_key(&v))
@@ -2163,7 +2162,7 @@ impl App {
         let filters =
             timeline::Filters::from_setting(&store.get_setting("view_filters").unwrap_or_default());
         let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
-        // P3-ui:邮件默认尺寸从设置读(选项 > 电子邮件;参考件默认 1024)。
+        // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
             store
                 .get_setting("email_size_px")
@@ -3451,7 +3450,7 @@ impl App {
         None
     }
 
-    /// 平铺 / 树形一对互斥档(参考件同一开关的两态:平铺列表或多级树)。
+    /// 平铺 / 树形一对互斥档(同一开关的两态:平铺列表或多级树)。
     fn set_folder_tree(&mut self, tree: bool) {
         if self.folder_tree == tree {
             return;
@@ -3685,7 +3684,7 @@ impl App {
         }
     }
 
-    /// 「查看选项」里的壳目录快捷键(参考件 Desktop / My Docs / My Pictures / My Computer):
+    /// 「查看选项」里的壳目录快捷键(桌面 / 我的文档 / 我的图片 / 我的电脑):
     /// 目录已在图库里 → 跳到该文件夹页;没导入 → 只给提示,不擅自扩扫描范围。
     /// 进入一个目录(点击懒加载 + 可见优先)。
     ///
@@ -3832,7 +3831,7 @@ impl App {
         }
     }
 
-    /// 顶部工具条(参考件主界面顶部那一排),左→右:
+    /// 顶部工具条,左→右:
     /// 导入 · 新建相簿 · 放映 · 平铺/树形 · 查看选项 ▾ …… 过滤四开关 · 尺寸滑块 · 搜索框 · 活动灯。
     fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -3856,7 +3855,7 @@ impl App {
                 self.nav_forward();
             }
             ui.separator();
-            // 参考件的主「导入」按钮开的是整页导入面板(选源 → 看清单 → 入库),
+            // 主「导入」按钮开的是整页导入面板(选源 → 看清单 → 入库),
             // 直接挑文件夹的一次性入口仍在 文件 菜单里。
             let on_import = self.page == PageKind::Import;
             if ui
@@ -3913,7 +3912,7 @@ impl App {
             {
                 self.fx_panel = !self.fx_panel;
             }
-            // —— 右端成组控件:参考件从右往左依次是 活动灯 → 搜索框 → 滑块 → 过滤开关 ——
+            // —— 右端成组控件:从右往左依次是 活动灯 → 搜索框 → 滑块 → 过滤开关 ——
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 // 二选一的配色开关:浅色显月亮(点了变暗),暗色显太阳(点了变亮)。
                 let dark = !crate::theme::p().is_light;
@@ -3935,7 +3934,7 @@ impl App {
                     crate::theme::switch(ctx, next);
                     let _ = self.store.set_setting("ui_theme", next.key());
                 }
-                // 右栏抽屉开关(参考件工具栏的属性面板按钮;抽屉内四页签见右栏)。
+                // 右栏抽屉开关(工具栏的属性面板按钮;抽屉内四页签见右栏)。
                 if ui
                     .add(tool_button("panel-right", self.drawer_open))
                     .on_hover_text("属性面板")
@@ -3956,7 +3955,7 @@ impl App {
                 }
                 // 库内搜索框已取消(与全盘快速查找重复,统一走顶部整条搜索)。
                 ui.separator();
-                // 滑块(参考件的缩放滑块);档位即已缓存的缩略图尺寸。
+                // 缩放滑块;档位即已缓存的缩略图尺寸。
                 let mut idx = self.thumb_tier as i32;
                 let slider = egui::Slider::new(&mut idx, 0..=3)
                     .show_value(false)
@@ -4134,7 +4133,7 @@ impl App {
             .map(|(i, r)| (r.id, i))
             .collect();
         // 首页相册成员:启动时从库里读「已有落盘缩略图」的那批,不把全库按时间
-        // 铺一遍(参考件的 Recently Updated 是带上限的虚拟相册)。多取几个候选,
+        // 铺一遍(带上限的虚拟相册)。多取几个候选,
         // 让硬排除名单把历史脏行挡在相册外;余下的按 SQL 给的时间次序收进清单。
         let watched = self.store.watched_stats();
         let roots: Vec<String> = watched.iter().map(|(p, _)| p.clone()).collect();
@@ -4177,7 +4176,7 @@ impl App {
 
     /// 重扫当前全部监听目录。
     ///
-    /// 参考件没有「扫全盘」概念:范围只经文件夹管理器扩大,
+    /// 范围只经文件夹管理器扩大,
     /// 这里提供对已登记范围的一键重扫入口(不新增范围)。
     fn start_scan_full(&mut self) {
         let roots: Vec<PathBuf> = self
@@ -4295,7 +4294,7 @@ impl App {
         self.nav_at = self.nav_hist.len() - 1;
     }
 
-    /// 整页切换(参考件把看图与取图做成两套整页面板互切,不是弹窗)。
+    /// 整页切换(看图与取图做成两套整页面板互切,不是弹窗)。
     fn go_page(&mut self, page: PageKind) {
         if self.page == page {
             return;
@@ -4392,7 +4391,7 @@ impl App {
 
     /// 导入页左栏:源列表(我的文件夹 / 设备 / 盘根 / 浏览其他文件夹)。
     ///
-    /// 占掉图库页那栏的位置 —— 参考件的导入面板同样把左侧换成源选择,
+    /// 占掉图库页那栏的位置 —— 导入面板把左侧换成源选择,
     /// 菜单、工具栏与状态栏保持原位。
     fn import_sources_ui(&mut self, ui: &mut egui::Ui) {
         crate::theme::section_title(ui, "选择源");
@@ -5608,7 +5607,7 @@ impl App {
             ui.label("先打开一张照片");
             return;
         };
-        // 打开新照片时,把已存的效果载入草稿(原版打开照片即显示其效果)。
+        // 打开新照片时,把已存的效果载入草稿(打开照片即显示其效果)。
         // 只在**换照片**时载入 —— 否则会把用户正在拖的滑块冲掉。
         if self.fx_draft_id != Some(id) {
             self.fx_draft_id = Some(id);
@@ -5735,7 +5734,7 @@ impl App {
         if !st.is_empty() {
             ui.small("本张已应用:");
             for it in &st.items {
-                // 参考里有但没做的项(如需笔刷交互)要显式标出,别让用户以为已生效
+                // 未实现的项(如需笔刷交互)要显式标出,别让用户以为已生效
                 let tag = match crate::effects::support_of(&it.name) {
                     crate::effects::Support::ReferenceOnly => "暂不支持",
                     crate::effects::Support::Unknown => "未知名",
@@ -5875,7 +5874,7 @@ impl App {
 
     /// 曲线区 UI。
     ///
-    /// 预设曲线数据为内置常量(与 Picasa 3 的滤镜观感对齐)。
+    /// 预设曲线数据为内置常量。
     fn fx_curves_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         if self.fx_curve_draft_id != Some(id) {
             self.fx_curve_draft_id = Some(id);
@@ -6099,7 +6098,7 @@ impl App {
 
     /// 视频裁剪面板(trim UI)。
     ///
-    /// 单位说明:原版 `moviestart` / `movieend` 是 **100 纳秒计数**
+    /// 单位说明:`moviestart` / `movieend` 以 **100 纳秒为计数单位**
     /// (10 000 000 = 1 秒);面板上用秒显示,落库时换算回 100 ns。
     /// 裁剪是**时间过滤**语义 —— 播放/导出只取这一段,不改原文件像素。
     fn fx_trim_ui(&mut self, ui: &mut egui::Ui, id: i64) {
@@ -6129,7 +6128,7 @@ impl App {
             }
         }
         ui.heading("视频裁剪");
-        ui.small("起点 / 终点(秒)。原版单位为 100 纳秒,此处按秒操作。");
+        ui.small("起点 / 终点(秒)。内部以 100 纳秒为单位,此处按秒操作。");
         let mut changed = false;
         changed |= ui
             .add(
@@ -6231,7 +6230,7 @@ impl App {
         self.fx_applied_sig = None;
     }
 
-    /// 90° 直角旋转(参考件的「Rotate Clockwise / Counterclockwise」)。
+    /// 90° 直角旋转(顺时针 / 逆时针)。
     ///
     /// 效果栈的同名项会被替换,所以先把既有 `rot` 的 quarter 累加再提交 ——
     /// 连点两次顺时针 = 180°,四次回到原位(quarter 归零时直接移除该项)。
@@ -6270,7 +6269,7 @@ impl App {
     }
 
     /// 读取自定义裁剪比例(设置项「custom_crop_ratios」,格式 name|w|h 分号分隔)。
-    /// 对应参考件 Add Custom Aspect Ratio 对话框的持久化。
+    /// 对应「添加自定义比例」对话框的持久化。
     fn load_custom_ratios(store: &Store) -> Vec<(String, f32, f32)> {
         let Some(s) = store.get_setting("custom_crop_ratios") else {
             return Vec::new();
@@ -6296,7 +6295,7 @@ impl App {
         let _ = self.store.set_setting("custom_crop_ratios", &s.join(";"));
     }
 
-    /// 进入幻灯片放映(参考件 View > Slideshow:当前视图逐张全屏放映)。
+    /// 进入幻灯片放映(当前视图逐张全屏放映)。
     /// 间隔 / 循环来自设置项(选项对话框可改)。
     fn start_slideshow(&mut self) {
         if self.view_ids().is_empty() {
@@ -6372,7 +6371,7 @@ impl App {
     }
 
     /// 属性详情:名称 / 位置 / 大小+修改日期 + Property-Value 两列清单。
-    /// 浮动属性窗与右栏抽屉「属性」页共用(参考件属性窗上半部)。
+    /// 浮动属性窗与右栏抽屉「属性」页共用(属性详情部分)。
     fn props_detail_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         let Some(&idx) = self.id_row.get(&id) else {
             ui.small("该照片不在当前视图。");
@@ -6404,7 +6403,7 @@ impl App {
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         );
-        // 大小 + 修改日期(参考件 Size 行)。
+        // 大小 + 修改日期。
         if let Ok(md) = std::fs::metadata(&path) {
             let kb = md.len() as f64 / 1024.0;
             let size_s = if kb >= 1024.0 {
@@ -6425,7 +6424,7 @@ impl App {
             ui.small(format!("{size_s}    修改:{mtime}"));
         }
         ui.separator();
-        // Property / Value 两列清单(参考件 list 控件)。
+        // Property / Value 两列清单。
         egui::Grid::new("props-grid").num_columns(2).show(ui, |ui| {
             ui.label("类型");
             ui.label(if kind == crate::video::kind::MOVIE {
@@ -6475,7 +6474,7 @@ impl App {
         });
     }
 
-    /// 属性窗口(参考件 File > Properties:文件名 / 位置 / 大小+日期 /
+    /// 属性窗口(文件名 / 位置 / 大小+日期 /
     /// Property-Value 列表 / 上一张-下一张)。
     fn props_ui(&mut self, ctx: &egui::Context) {
         let id = match self.preview {
@@ -6506,7 +6505,7 @@ impl App {
             .show(ctx, |ui| {
                 self.props_detail_ui(ui, id);
                 ui.separator();
-                // 上一张 / 下一张(参考件 nav 行:"x of x files")。
+                // 上一张 / 下一张(序号行)。
                 ui.horizontal(|ui| {
                     if ui.button("◀ 上一张").clicked() {
                         self.step_preview(-1);
@@ -6532,7 +6531,7 @@ impl App {
         self.show_props = props_open && self.show_props;
     }
 
-    /// 标题编辑(参考件 Caption:失焦或回车即保存)。
+    /// 标题编辑(失焦或回车即保存)。
     /// 单图预览与右栏抽屉「属性」页共用同一份 caption_edit 草稿。
     fn caption_editor(&mut self, ui: &mut egui::Ui, id: i64) {
         if self.caption_edit.as_ref().map(|(k, _)| *k) != Some(id) {
@@ -6557,7 +6556,7 @@ impl App {
         }
     }
 
-    /// 标签编辑(参考件 Tag 面板:输入框 + 色标 + 点 ✕ 移除)。
+    /// 标签编辑(输入框 + 色标 + 点 ✕ 移除)。
     fn tags_editor(&mut self, ui: &mut egui::Ui, id: i64) {
         ui.horizontal(|ui| {
             ui.label("标签:");
@@ -6645,7 +6644,7 @@ impl App {
         ui.small("这里显示它的属性、标签、人物与拍摄地点。");
     }
 
-    /// 右栏抽屉(参考件右栏面板:属性 / 标签 / 人物 / 地点 四页签,
+    /// 右栏抽屉(属性 / 标签 / 人物 / 地点 四页签,
     /// 面板头「»」收起,当前页签记忆到设置项 drawer_tab)。
     fn drawer_ui(&mut self, ctx: &egui::Context) {
         egui::SidePanel::right("props")
@@ -6729,7 +6728,7 @@ impl App {
         });
     }
 
-    /// 抽屉「标签」页:本张标签增删 + 库内已有标签一键套用(参考件 Tag 面板)。
+    /// 抽屉「标签」页:本张标签增删 + 库内已有标签一键套用。
     fn drawer_tags_ui(&mut self, ui: &mut egui::Ui) {
         let Some(id) = self.drawer_target() else {
             Self::drawer_need_photo(ui);
@@ -6774,7 +6773,7 @@ impl App {
             return;
         };
         let mut faces = crate::faces::photo_faces(&self.store, id);
-        // 大脸在前(参考件把最大的人脸当主脸显示)。
+        // 大脸在前(最大的人脸当主脸显示)。
         faces.sort_by(|a, b| {
             let area = |r: &(f32, f32, f32, f32)| (r.2 - r.0).max(0.0) * (r.3 - r.1).max(0.0);
             area(&b.rect)
@@ -6911,8 +6910,7 @@ impl App {
         }
     }
 
-    /// 选项窗口(参考件 options 窗:General / E-Mail / Slideshow 等页签;
-    /// 本项目为全本地,Network / Web Albums / Name Tags 页签不适用,不设)。
+    /// 选项窗口(常规 / 电子邮件 / 幻灯片 三页签)。
     fn options_ui(&mut self, ctx: &egui::Context) {
         let mut opts_open = self.show_options;
         egui::Window::new("选项")
@@ -6929,7 +6927,7 @@ impl App {
                 ui.separator();
                 match self.options_tab {
                     0 => {
-                        // 常规(参考件 General:本项目取本地适用项)。
+                        // 常规页(本地适用项)。
                         if ui
                             .checkbox(&mut self.export_with_effects, "导出时套用已保存的效果")
                             .changed()
@@ -6956,7 +6954,7 @@ impl App {
                             self.rebuild();
                         }
                         ui.separator();
-                        // 配色:默认 Picasa 灰;暗色方案为浅蓝点缀。切换即存。
+                        // 配色:默认灰色;暗色方案为浅蓝点缀。切换即存。
                         ui.heading(egui::RichText::new("配色").size(14.0));
                         ui.horizontal(|ui| {
                             for k in [crate::theme::Kind::Gray, crate::theme::Kind::Blue] {
@@ -7264,7 +7262,7 @@ impl App {
                         ui.small("索引备份 / 压缩在「工具 > 图库维护」里。");
                     }
                     1 => {
-                        // 电子邮件(参考件 E-Mail:8 档尺寸列表,默认 1024)。
+                        // 电子邮件(8 档尺寸列表,默认 1024)。
                         ui.label("邮件附件默认尺寸(发送窗口仍可临时改):");
                         let cur_px = self.email_size.px();
                         for s in crate::share::ShareSize::ALL {
@@ -7280,8 +7278,7 @@ impl App {
                         }
                     }
                     _ => {
-                        // 幻灯片放映:原版同样提供循环开关与间隔设置;
-                        // 间隔的具体数值暂无对应资料,默认 3 秒。
+                        // 幻灯片放映:提供循环开关与间隔设置,默认 3 秒。
                         let mut itv = self
                             .store
                             .get_setting("slideshow_interval")
@@ -7319,7 +7316,7 @@ impl App {
         if !self.slide_pause {
             let elapsed = self.slide_last.elapsed().as_secs_f64();
             if elapsed >= interval {
-                // 不循环时放到尾张即退出(与原版行为一致)。
+                // 不循环时放到尾张即退出。
                 let last = *ids.last().unwrap();
                 if !self.slide_loop && self.preview == Some(last) {
                     self.slideshow = false;
@@ -7368,7 +7365,7 @@ impl App {
                         egui::Color32::WHITE,
                     );
                 }
-                // 点击前进(参考件放映的翻页交互)。
+                // 点击前进。
                 if resp.clicked() {
                     self.step_preview(1);
                     self.slide_last = std::time::Instant::now();
@@ -7407,7 +7404,7 @@ impl App {
             });
     }
 
-    /// 应用裁剪(把归一化矩形写进效果链;对应参考件 Crop 工具的 Apply)。
+    /// 应用裁剪(把归一化矩形写进效果链)。
     fn commit_crop(&mut self, id: i64) {
         let Some([ax, ay, bx, by]) = self.crop_rect.take() else {
             return;
@@ -7464,13 +7461,13 @@ impl App {
     /// - 其余量:`0.5` 是包围盒中点系数、`2.7` 是调用方增益、
     ///   `-2.4` 是阻尼系数、`0.3`/`4.25` 是两个 `powf` 指数、`100` 是分支阈值。
     ///
-    /// 本项目用 egui `ScrollArea`(自带虚拟化与惯性),因此把原版的
-    /// "限速"作用等价实现为**解码预算**:滚动越快 → 每帧同步解码越少。
+    /// 本项目用 egui `ScrollArea`(自带虚拟化与惯性),把"限速"作用
+    /// 等价实现为**解码预算**:滚动越快 → 每帧同步解码越少。
     fn update_scroll_throttle(&mut self, offset_y: f32, viewport_h: f32, content_h: f32) {
         self.last_viewport_h = viewport_h;
         self.last_content_h = content_h;
         self.scroll_throttle.set_viewport(viewport_h);
-        // 逐帧的质心位移 × 2.7 → 原版阻尼曲线 → 平滑速度。
+        // 逐帧的质心位移 × 2.7 → 阻尼曲线 → 平滑速度。
         // 这条路径对应缩略图滚动事件
         // (唯一走缩略图质心位移算法质心算法的事件,滚动事件处理)。
         let vel = self.scroll_throttle.feed_offset(offset_y, content_h);
@@ -7838,7 +7835,7 @@ impl App {
         }
     }
 
-    /// 预览缩放/平移复位(换照片、关闭预览时调用;参考件换图回到适应窗口)。
+    /// 预览缩放/平移复位(换照片、关闭预览时调用;换图回到适应窗口)。
     fn preview_reset_zoom(&mut self) {
         self.preview_zoom = 1.0;
         self.preview_pan = egui::Vec2::ZERO;
@@ -8052,7 +8049,7 @@ impl App {
         }
     }
 
-    /// 左栏一条导航项(参考件每个条目后带 `(n)` 计数)。
+    /// 左栏一条导航项(条目后带 `(n)` 计数)。
     fn nav_item(&mut self, ui: &mut egui::Ui, label: &str, v: ViewKind, count: Option<usize>) {
         let active = self.view == v;
         let text = match count {
@@ -8077,8 +8074,7 @@ impl App {
     }
 
     /// 首页「最近更新」的相册头:标题 + 日期 + 张数,右侧挂放映 / 邮件 / 重算。
-    /// 参考件把这一组控件固定放在相册缩略图上方(`album_title`、`info_text`、
-    /// 右侧动作槽),文件夹视图的组头与之同构。
+    /// 这一组控件固定放在相册缩略图上方,文件夹视图的组头与之同构。
     fn recent_header(&mut self, ui: &mut egui::Ui) {
         let n = self.recent_idxs.len();
         let sub = if self.recent_date.is_empty() {
@@ -8148,7 +8144,7 @@ impl App {
         }
     }
 
-    /// 组头(参考件每个相册上方那行:大图标 + 名称 + 日期,图标偏移照原版排版):
+    /// 组头(每个相册上方那行:大图标 + 名称 + 日期):
     /// 大号目录图标 + 文件夹名 + 组内最早拍摄日期与张数,右侧挂本组动作按钮。
     ///
     /// `date` 由调用方缓存好传进来(见 `take_folder_groups`):逐帧扫全组找最早日期
@@ -8195,7 +8191,7 @@ impl App {
                         .selectable(false),
                 );
             });
-            // 参考件把动作按钮钉在组头右侧(槽位序照原版排版,从右往左)。
+            // 动作按钮钉在组头右侧(从右往左排列)。
             // 文件名过滤框与详细/缩略图切换是视图级的,已提到滚动区之外常驻。
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -8306,7 +8302,7 @@ impl App {
             .set_setting("folder_details", if details { "1" } else { "0" });
     }
 
-    /// 点选语义(网格格子与详细列表行共用;对齐参考件的点选习惯):
+    /// 点选语义(网格格子与详细列表行共用):
     /// 单击 = 只选这一张(替换选区);Ctrl+单击 = 加入/移出;
     /// Shift+单击 = 从上次单击处到当前张连选(在**当前视图范围内**取,
     /// 基准不在本视图里就退化为只选当前张;基准本身不移动)。
@@ -8342,7 +8338,7 @@ impl App {
         self.sel_anchor = Some(id);
     }
 
-    /// 双击打开(参考件双击 = 进 View and Edit 单图视图;视频不进库内渲染,
+    /// 双击打开(双击 = 进单图编辑视图;视频不进库内渲染,
     /// 交给系统关联播放器)。与快速查找页双击同一套状态复位。
     fn open_photo_editor(&mut self, id: i64, movie: bool) {
         if movie {
@@ -8564,7 +8560,7 @@ impl App {
                 if hit.clicked() {
                     // 单击只是选中,与网格一致;缺缓存的行由渲染帧按张排队,
                     // 不再因为派生状态去做「纳入目录」这一步。
-                    // 点选语义与网格一致(参考件习惯):单击只选、Ctrl 加减选、Shift 连选。
+                    // 点选语义与网格一致:单击只选、Ctrl 加减选、Shift 连选。
                     let (ctrl, shift) = ui
                         .input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
                     self.select_by_click(it.id, ctrl, shift);
@@ -8582,9 +8578,9 @@ impl App {
         });
     }
 
-    /// 照片网格(参考件的行式排布:同行等高、各格按宽高比取宽、行尾铺满)。
+    /// 照片网格(行式排布:同行等高、各格按宽高比取宽、行尾铺满)。
     ///
-    /// 缩略图档位(Picasa 3 用 8 档,本项目取 4 档常用值)决定基准行高。
+    /// 缩略图档位(4 档常用值)决定基准行高。
     /// 行式布局的行高会随铺满系数浮动,所以先把整批的行算出来再按行虚拟化。
     fn photo_grid(&mut self, ui: &mut egui::Ui, salt: &str, cells: &[usize]) {
         // 显示优先:先把屏幕上排队等纳入的目录消化掉几个(写账 + 放行 + 交给后台优先派生),
@@ -8684,7 +8680,7 @@ impl App {
         }
     }
 
-    /// 照片右键上下文菜单(参照 Picasa 图片菜单的常用项)。
+    /// 照片右键上下文菜单(常用项)。
     fn photo_ctx_menu(
         &mut self,
         ui: &mut egui::Ui,
@@ -8724,7 +8720,7 @@ impl App {
             show_in_explorer(&t.path);
             ui.close();
         }
-        // 加入相簿(参考件 Add to Album;相簿不移动文件;已加入的打勾,点击移除)。
+        // 加入相簿(相簿不移动文件;已加入的打勾,点击移除)。
         ui.menu_button("加入相簿…", |ui| {
             let albums = self.store.albums();
             if albums.is_empty() {
@@ -8764,7 +8760,7 @@ impl App {
             }
         }
         ui.separator();
-        // 用编辑器打开(参考件 Open File(s) in an Editor)。
+        // 用编辑器打开。
         if ui.button("用编辑器打开").clicked() {
             let p = PathBuf::from(&t.path);
             if !crate::win::shell_edit(&p) {
@@ -8772,7 +8768,7 @@ impl App {
             }
             ui.close();
         }
-        // 设为桌面壁纸(参考件 Set as Desktop)。
+        // 设为桌面壁纸。
         if ui.button("设为桌面壁纸").clicked() {
             self.set_wallpaper(&t.path);
             ui.close();
@@ -8788,8 +8784,8 @@ impl App {
         // 软排除目录的显式出口(AppData 也要能访问)。
         //
         // 「被动滚到过 / 点过一张图」不写账本,但用户亲手右键选这项 = 表态,
-        // 与导入页同一档(`imported` + `import`)。硬层(回收站、自家缓存、
-        // 参考件那 4 条)这里不给按钮 —— 给了也是点不开的死键。
+        // 与导入页同一档(`imported` + `import`)。硬层(回收站、自家缓存)
+        // 这里不给按钮 —— 给了也是点不开的死键。
         let parent = t.parent.clone();
         if !self.store.adoptable_dir(&parent, false) && self.store.adoptable_dir(&parent, true) {
             if ui.button("纳入此目录(覆盖排除名单)").clicked() {
@@ -8824,7 +8820,7 @@ impl App {
             };
             ui.close();
         }
-        // 属性(参考件右键菜单含属性项,置于末项;未开预览时属性窗取选中项)。
+        // 属性(置于末项;未开预览时属性窗取选中项)。
         if ui.button("属性…").clicked() {
             let id = t.id;
             self.sel.clear();
@@ -8883,7 +8879,7 @@ impl App {
         };
         let mut star_clicked = false;
         let mut preview_clicked = false;
-        // 缩略图说明(参考件 Thumbnail captions 视图开关)。
+        // 缩略图说明(视图开关)。
         let caption: Option<String> = if self.thumb_captions {
             let cap = self.rows[idx].caption.trim();
             if cap.is_empty() {
@@ -8916,7 +8912,7 @@ impl App {
             .rect_filled(rect, crate::theme::CARD_RADIUS, card_fill);
         let img_rect =
             egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(w, h));
-        // 参考件保留照片本身的宽高比:等比缩进到格子里,不居中裁切。
+        // 保留照片本身的宽高比:等比缩进到格子里,不居中裁切。
         // 缺档时 fit_rect 就是整格,占位块仍铺满格子。
         let fit_rect = match &tex {
             Some(t) => {
@@ -9014,7 +9010,7 @@ impl App {
         if hit.clicked() {
             // 单击只是选中。缺缓存的那一格渲染时已按张排进后台队列,
             // 不需要再靠点击去「纳入目录」,也没有点不动的情况。
-            // 点选语义对齐参考件:单击只选一张,Ctrl 加减选,Shift 连选;
+            // 点选语义:单击只选一张,Ctrl 加减选,Shift 连选;
             // 双击才进单图视图(见下方 double_clicked)。
             let (ctrl, shift) =
                 ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
@@ -9678,8 +9674,8 @@ impl eframe::App for App {
                             .collect::<Vec<_>>()
                             .join("、")
                     );
-                    // 设备列表缓存失效(原版 WM_DEVICECHANGE 链路同样
-                    // 会重建设备列表);若导入窗口开着,下次重绘即看到新设备。
+                    // 设备列表缓存失效(WM_DEVICECHANGE 链路会重建设备列表);
+                    // 若导入窗口开着,下次重绘即看到新设备。
                     self.refresh_import_devices();
                     self.start_scan_roots(roots, "新接入的设备");
                 } else {
@@ -9941,7 +9937,7 @@ impl eframe::App for App {
             };
             ctx.request_repaint_after(std::time::Duration::from_millis(ms));
         }
-        // 键盘快捷键(参照 Picasa;有文本输入焦点时不拦截)
+        // 键盘快捷键(有文本输入焦点时不拦截)
         if !ctx.wants_keyboard_input() {
             let (
                 sel_all,
@@ -10011,8 +10007,7 @@ impl eframe::App for App {
                 }
                 if rot_cw || rot_ccw {
                     if let Some(id) = self.preview {
-                        // 自定绑定:原版旋转命令无键盘快捷键(主循环加速表恒空,
-                        // 旋转命令名仅被菜单构建器引用);按 Windows 图库惯例补
+                        // 旋转命令按 Windows 图库惯例补
                         // Ctrl+R / Ctrl+Shift+R,只在预览窗生效。
                         self.preview_rotate(id, if rot_cw { 1 } else { 3 });
                     }
@@ -10021,7 +10016,7 @@ impl eframe::App for App {
             // 7 个滚动事件在这里派发
             // (按事件名匹配 + 派发;
             //  缩略图滚动事件走缩略图质心位移算法)。
-            // 本项目把前 6 个接成键盘翻页/跳转,语义与原版一一对应。
+            // 本项目把前 6 个接成键盘翻页/跳转。
             if self.preview.is_none() {
                 if page_up {
                     self.dispatch_throttle_event(crate::scroll::SCROLL_EVENTS[2]);
@@ -10046,7 +10041,7 @@ impl eframe::App for App {
         }
 
         // 单图编辑视图:打开预览后整页接管,返回图库即恢复常规面板。
-        // 版式取自参考件 View and Edit:左工具 / 中预览 / 右属性,
+        // 版式:左工具 / 中预览 / 右属性,
         // 顶部导航与底部邻片条常驻,工具不必再从菜单里翻出来。
         if self.preview.is_some() {
             self.editor_ui(ctx);
@@ -10059,7 +10054,7 @@ impl eframe::App for App {
             return;
         }
 
-        // ===== 菜单栏(结构参照 Picasa 3:文件/编辑/视图/工具/帮助) =====
+        // ===== 菜单栏(文件/编辑/视图/工具/帮助) =====
         egui::TopBottomPanel::top("menu")
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| {
@@ -10079,7 +10074,7 @@ impl eframe::App for App {
                     ui.separator();
                     // —— 文件 ——
                     ui.menu_button("文件(F)", |ui| {
-                        // 属性(参考件 File > Properties 窗)。
+                        // 属性窗口。
                         if ui
                             .add_enabled(
                                 self.preview.is_some() || !self.sel.is_empty(),
@@ -10106,7 +10101,7 @@ impl eframe::App for App {
                         if scanning {
                             ui.spinner();
                         }
-                        // 参考件没有「扫全盘」概念:范围只经文件夹管理器扩大,
+                        // 范围只经文件夹管理器扩大,
                         // 这里只重扫已登记的监听目录,不新增范围。
                         ui.small(format!(
                             "监听 {} 个目录;扩大范围请用「添加文件夹到图库」",
@@ -10171,7 +10166,7 @@ impl eframe::App for App {
                                 ui.close();
                             }
                             ui.separator();
-                            ui.small("网络上传:原版依赖已停运的云相册服务,目前无可用对等实现。");
+                            ui.small("网络上传:目前无可用实现。");
                         });
                         ui.separator();
                         if ui
@@ -10266,7 +10261,7 @@ impl eframe::App for App {
                             self.set_view(ViewKind::Timeline);
                             ui.close();
                         }
-                        // 相簿(参考件 Album 列表)。
+                        // 相簿列表。
                         if ui
                             .selectable_label(self.view == ViewKind::Albums, "相簿")
                             .clicked()
@@ -10314,12 +10309,12 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        // 幻灯片放映(参考件 View > Slideshow:当前视图逐张全屏)。
+                        // 幻灯片放映(当前视图逐张全屏)。
                         if ui.button("幻灯片放映").clicked() {
                             self.start_slideshow();
                             ui.close();
                         }
-                        // 缩略图说明(参考件 Thumbnail captions)。
+                        // 缩略图说明。
                         if ui
                             .checkbox(&mut self.thumb_captions, "缩略图说明")
                             .changed()
@@ -10358,7 +10353,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.menu_button("缩略图", |ui| {
-                            // 多档缩略图(与 Picasa 3 一致的四个视图尺寸菜单项)。
+                            // 多档缩略图(四个视图尺寸菜单项)。
                             for tier in crate::thumbs::ALL_TIERS {
                                 if ui
                                     .selectable_label(self.thumb_tier == tier, tier.label())
@@ -10383,7 +10378,7 @@ impl eframe::App for App {
                     });
                     // —— 工具 ——
                     ui.menu_button("工具(T)", |ui| {
-                        // 选项(参考件 Tools > Options,分页设置窗)。
+                        // 选项(分页设置窗)。
                         if ui.button("选项…").clicked() {
                             self.show_options = true;
                             ui.close();
@@ -10691,7 +10686,7 @@ impl eframe::App for App {
                         ui.separator();
                         ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
                     }
-                    // 进度条 + 取消按钮(百分比照原版说法,明细挂悬停;
+                    // 进度条 + 取消按钮(百分比显示,明细挂悬停;
                     // 扫描与导入共用通道,动词跟着任务走)。
                     if let Some(ctrl) = &self.scan_ctrl {
                         let (done, total) = ctrl.counts();
@@ -10773,7 +10768,7 @@ impl eframe::App for App {
                 });
         }
 
-        // 左侧导航面板(参考件左栏分类列表:常驻,内容随选中项切换)。
+        // 左侧导航面板(分类列表:常驻,内容随选中项切换)。
         #[cfg(feature = "ai")]
         if self.view == ViewKind::Faces && self.face_people.is_empty() && self.face_rx.is_none() {
             self.refresh_people_and_suggestions();
@@ -10784,14 +10779,14 @@ impl eframe::App for App {
             .width_range(196.0..=360.0)
             .frame(crate::theme::side_frame())
             .show(ctx, |ui| {
-                // 导入页:左栏换成源选择(参考件的获取面板同样换掉左栏,
-                // 右栏抽屉/效果面板也一并收起,见对应开关)。
+                // 导入页:左栏换成源选择,
+                // 右栏抽屉/效果面板也一并收起,见对应开关。
                 if self.page == PageKind::Import {
                     self.import_sources_ui(ui);
                     return;
                 }
                 crate::theme::section_title(ui, "库");
-                // 参考件左栏是四个可折叠分组头(相册 / 人物 / 文件夹 / 其他素材),
+                // 左栏是四个可折叠分组头(相册 / 人物 / 文件夹 / 其他素材),
                 // 每条带 (n) 计数;分组区限高,下面留给随视图切换的明细面板。
                 let recent_n = self.recent_idxs.len();
                 let folders_n = self.folders.len();
@@ -10900,7 +10895,7 @@ impl eframe::App for App {
                                 // 只有装了照片的目录才是可选项(点父级 = 展开)。
                                 self.folder_tree_ui(ui, ctx);
                             } else {
-                                // 扁平文件夹视图(参考件左栏的平铺列表)。
+                                // 扁平文件夹视图(平铺列表)。
                                 for (i, f) in self.folders.clone().iter().enumerate() {
                                     let on = !self.folder_show_all && self.selected_folder == i;
                                     if ui.selectable_label(on, f).clicked() {
@@ -10916,7 +10911,7 @@ impl eframe::App for App {
                             }
                         });
                     }
-                    // 相簿(参考件 Album 列表;相簿是照片 id 的命名集合,不动文件)。
+                    // 相簿(照片 id 的命名集合,不动文件)。
                     ViewKind::Albums => {
                         crate::theme::section_title(ui, "相簿");
                         let albums = self.store.albums();
@@ -11240,14 +11235,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             // 滚动限速(位移阻尼限速)。
             // 上一帧记下的滚动偏移 + 视口高 + 内容高 → 逐帧质心位移 × 2.7
-            // → 原版阻尼曲线 → 平滑速度 → 换算成本帧的缩略图解码预算。
-            // 滚动越快 → 预算越低 → 大图库滚动不掉帧(原版限速节点的等价作用)。
+            // → 阻尼曲线 → 平滑速度 → 换算成本帧的缩略图解码预算。
+            // 滚动越快 → 预算越低 → 大图库滚动不掉帧(限速节点的等价作用)。
             self.update_scroll_throttle(
                 self.last_scroll_y,
                 self.last_viewport_h,
                 self.last_content_h,
             );
-            // 原版滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
+            // 滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
             // (egui 会用 `state.offset` 记忆滚动位置,这里只在有目标时覆盖一次)。
             // 文件夹视图先画视图级常驻工具条(过滤 + 明细/缩略图切换):
             // 在滚动区之外,滚到哪都钉在顶部。
@@ -11290,7 +11285,7 @@ impl eframe::App for App {
                         let months = std::mem::take(&mut self.months);
                         for (label, idxs) in &months {
                             ui.add_space(6.0);
-                            // 日期分组头(参考件时间线用弱化的小标题,不与缩略图抢视线)。
+                            // 日期分组头(弱化的小标题,不与缩略图抢视线)。
                             ui.label(
                                 egui::RichText::new(label)
                                     .size(13.0)
@@ -11442,7 +11437,7 @@ impl eframe::App for App {
                                         }
                                     }
                                 });
-                                // 忽略/恢复(对应原版 ignoreface:误检簇一键排除)
+                                // 忽略/恢复(误检簇一键排除)
                                 ui.horizontal(|ui| {
                                     if ui.button("忽略此簇").clicked() {
                                         let _ = crate::faces::ignore_cluster(&self.store, c, true);
@@ -11525,7 +11520,7 @@ impl eframe::App for App {
                     }
                     ViewKind::Folder => {
                         if self.folder_show_all {
-                            // 平铺图库(参考件):一次铺开所有文件夹,
+                            // 平铺图库:一次铺开所有文件夹,
                             // 每个文件夹一个相册组头 + 一组逐行缩略图。
                             let groups = self.take_folder_groups();
                             for (folder, idxs, date) in &groups {
@@ -11645,7 +11640,7 @@ impl eframe::App for App {
                 }
             });
             // 把本帧的实际滚动偏移 / 视口高 / 内容高记下来,
-            // 下一帧用来算逐帧质心位移(原版缩略图质心位移算法的算法)。
+            // 下一帧用来算逐帧质心位移(缩略图质心位移算法)。
             self.last_scroll_y = out.state.offset.y;
             self.last_viewport_h = out.inner_rect.height();
             self.last_content_h = out.content_size.y;
@@ -11688,7 +11683,7 @@ impl eframe::App for App {
         }
         self.wifi_panel = wifi_open;
 
-        // 工具栏「新建相簿」(参考件 New Album from selected:有选中就同时放入照片)。
+        // 工具栏「新建相簿」(有选中就同时放入照片)。
         if self.album_new_win {
             let mut open = self.album_new_win;
             let mut close = false;
@@ -11751,7 +11746,7 @@ impl eframe::App for App {
                 .default_width(520.0)
                 .show(ctx, |ui| {
                     ui.small(
-                        "WPD 便携设备(相机/手机)+ 可移动磁盘统一列表;原版设备列表合成",
+                        "WPD 便携设备(相机/手机)+ 可移动磁盘统一列表",
                     );
                     ui.horizontal(|ui| {
                         if ui.button("刷新").clicked() {
@@ -11770,7 +11765,7 @@ impl eframe::App for App {
                     ui.separator();
                     if self.import_devices.is_empty() {
                         ui.label("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。");
-                        ui.small("提示:WPD 服务不可用时只显示盘符卷 —— 原版同样是尽力而为(WPD 设备枚举)。");
+                        ui.small("提示:WPD 服务不可用时只显示盘符卷(WPD 设备枚举尽力而为)。");
                     } else {
                         // 索引先行:避免闭包里同时借 self.import_devices 和 self.store
                         let entries: Vec<crate::wpd::DeviceEntry> = self.import_devices.clone();
@@ -11806,7 +11801,7 @@ impl eframe::App for App {
             self.show_import_devices = open;
         }
 
-        // 邮件发送窗口(尺寸档与原版 1600/1024/800 一致)。
+        // 邮件发送窗口(尺寸档 1600/1024/800)。
         if self.email_win {
             let mut open = self.email_win;
             egui::Window::new("以邮件发送")
@@ -11814,7 +11809,7 @@ impl eframe::App for App {
                 .default_width(420.0)
                 .show(ctx, |ui| {
                     ui.small(
-                        "把当前视图的照片缩放为 JPEG,交给系统默认邮件客户端(原版 Simple MAPI 链路,MAPI 动态加载)。",
+                        "把当前视图的照片缩放为 JPEG,交给系统默认邮件客户端(Simple MAPI 链路,MAPI 动态加载)。",
                     );
                     ui.separator();
                     ui.label("附件尺寸:");
@@ -11839,7 +11834,7 @@ impl eframe::App for App {
             self.email_win = open;
         }
 
-        // 礼品光盘窗口(原版「Create a Gift CD…」,IMAPI2 刻录)。
+        // 礼品光盘窗口(IMAPI2 刻录)。
         if self.cd_win {
             let mut open = self.cd_win;
             egui::Window::new("制作礼品光盘")
@@ -11911,7 +11906,7 @@ impl eframe::App for App {
                         });
                     }
                     ui.separator();
-                    ui.small("说明:原版的变更日志只存内存,不可回溯;此处为持久化增强版。");
+                    ui.small("说明:变更日志持久化存储,可回溯。");
                 });
             self.show_changes = open;
         }
@@ -11958,11 +11953,11 @@ impl eframe::App for App {
             self.show_bad_media = open;
         }
 
-        // P3-ui:属性窗口(原版 File > Properties 等价物)。
+        // 属性窗口。
         if self.show_props {
             self.props_ui(ctx);
         }
-        // P3-ui:选项窗口(options 等价物)。
+        // 选项窗口。
         if self.show_options {
             self.options_ui(ctx);
         }
@@ -12180,7 +12175,7 @@ impl eframe::App for App {
                         }
                     });
                     ui.small("提示:移除只删除数据库索引,磁盘文件原样保留;重新扫描会再次加入。");
-                    // 扫描排除规则(对齐 Picasa 3 的目录排除规则)+ 监听模式。
+                    // 扫描排除规则 + 监听模式。
                     let excl = crate::scan::Exclusions::from_store(&self.store);
                     ui.separator();
                     ui.label("扫描时排除的目录");
@@ -12192,13 +12187,13 @@ impl eframe::App for App {
                             for name in excl.names() {
                                 ui.horizontal(|ui| {
                                     ui.label(name);
-                                    // 内置默认项不可删 —— 与 Picasa 3 行为一致。
+                                    // 内置默认项不可删。
                                     let is_default = crate::scan::Exclusions::default()
                                         .names()
                                         .iter()
                                         .any(|d| d.eq_ignore_ascii_case(name));
                                     if is_default {
-                                        ui.small("(原版默认)");
+                                        ui.small("(默认)");
                                     } else if ui.button("移除").clicked() {
                                         to_remove = Some(name.clone());
                                     }

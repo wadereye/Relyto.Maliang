@@ -1,4 +1,4 @@
-//! 设备热插拔检测(`WM_DEVICECHANGE` 链路,与 Picasa 3 的行为一致)。
+//! 设备热插拔检测(`WM_DEVICECHANGE` 链路)。
 //!
 //! # 行为要点
 //!
@@ -64,14 +64,14 @@ pub const DBT_DEVICEREMOVECOMPLETE: u32 = 0x8004;
 /// `DBT_DEVTYP_DEVICEINTERFACE` —— 设备接口类(`dbcc_devicetype == 2`)。
 pub const DBT_DEVTYP_DEVICEINTERFACE: u32 = 2;
 
-/// 设备变化事件(对应原版置刷新标志 + 触发刷新的动作)。
+/// 设备变化事件:置刷新标志并触发刷新。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DeviceEvent {
     /// 设备到达(`DBT_DEVICEARRIVAL` + `DBT_DEVTYP_DEVICEINTERFACE`)。
     Arrived,
     /// 设备移除完成(`DBT_DEVICEREMOVECOMPLETE` + `DBT_DEVTYP_DEVICEINTERFACE`)。
     Removed,
-    /// 设备节点树变化(`DBT_DEVNODES_CHANGED`)—— 原版的"总闸"。
+    /// 设备节点树变化(`DBT_DEVNODES_CHANGED`):总闸。
     NodesChanged,
 }
 
@@ -88,7 +88,7 @@ impl DeviceEvent {
 
 /// 把 `WM_DEVICECHANGE` 的 (wParam, lParam) 翻译成设备事件。
 ///
-/// 翻译规则(与 Picasa 3 行为一致):
+/// 翻译规则:
 ///
 /// ```text
 /// if ((wParam == 0x8000 || wParam == 0x8004) && dbcc_devicetype == 2)  → 到达/移除
@@ -96,7 +96,7 @@ impl DeviceEvent {
 /// ```
 ///
 /// `dbcc_devicetype` 取自 `lParam + 0x04`(设备热插拔处理)。
-/// `lParam` 为 0 时(原版 `DBT_DEVNODES_CHANGED` 就是这样传的)按 0 处理。
+/// `lParam` 为 0 时按 0 处理。
 pub fn translate_device_change(wparam: u32, lparam: usize) -> Option<DeviceEvent> {
     if wparam == DBT_DEVNODES_CHANGED {
         return Some(DeviceEvent::NodesChanged);
@@ -108,7 +108,7 @@ pub fn translate_device_change(wparam: u32, lparam: usize) -> Option<DeviceEvent
     if lparam == 0 {
         return None;
     }
-    // ⚠️ 原版读的是 **dword**(设备热插拔处理:`*(int *)(lParam + 4) == 2`),
+    // ⚠️ 读的是 **dword**(`*(int *)(lParam + 4) == 2`),
     // 不是 1 字节 —— 早期实现只读 u8,当 devicetype 是 0x102 之类时会误判成 2。
     // 用 `read_unaligned`:lParam 指向的结构体只保证 4 字节对齐,dword 字段可能不对齐。
     let devicetype = unsafe { std::ptr::read_unaligned((lparam + 0x04) as *const i32) };
@@ -122,10 +122,9 @@ pub fn translate_device_change(wparam: u32, lparam: usize) -> Option<DeviceEvent
     })
 }
 
-/// 枚举当前系统上的**可移动卷**(对应原版卷类型分流的可移动磁盘列表)。
+/// 枚举当前系统上的**可移动卷**(返回可移动磁盘的根路径)。
 ///
-/// 原版用 `Removable Drive(%s)` 命名这类设备;本实现用 `GetLogicalDrives`
-/// + `GetDriveTypeW` 得到盘符列表,返回形如 `E:\` 的根路径。
+/// 用 `GetLogicalDrives` + `GetDriveTypeW` 得到盘符列表,返回形如 `E:\` 的根路径。
 #[cfg(windows)]
 pub fn removable_volumes() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -306,7 +305,7 @@ impl Drop for DeviceWatcher {
 
 /// 便捷函数:比较两次可移动卷列表,返回新增的卷根路径。
 ///
-/// 对应原版设备列表重建重建列表后与旧列表合并的动作 —— 本项目只关心
+/// 设备列表重建后与旧列表合并,本项目只关心
 /// "新出现的卷"(新插入的相机/手机的挂载点),因为那才是需要扫描的。
 pub fn new_volumes(old: &[PathBuf], new: &[PathBuf]) -> Vec<PathBuf> {
     new.iter().filter(|v| !old.contains(v)).cloned().collect()
@@ -337,7 +336,7 @@ pub fn spawn_device_watcher() -> DeviceWatcher {
 mod tests {
     use super::*;
 
-    /// `DBT_DEVNODES_CHANGED` 恒成立(原版的"总闸")。
+    /// `DBT_DEVNODES_CHANGED` 恒成立(总闸事件)。
     #[test]
     fn nodes_changed_always_translates() {
         assert_eq!(
@@ -368,9 +367,9 @@ mod tests {
         assert_eq!(translate_device_change(DBT_DEVICEARRIVAL, buf2.as_ptr() as usize), None);
     }
 
-    /// 回归测试:原版读的是 **dword**(`*(int *)(lParam+4)`),
+    /// 回归测试:devicetype 读的是 **dword**(`*(int *)(lParam+4)`),
     /// 所以 devicetype = 0x102 时**不能**被误判成 2
-    /// (早期实现只读 1 字节,低字节恰好是 0x02 → 会误判为"设备接口")。
+    /// (只读 1 字节的话,低字节恰好是 0x02 → 会误判为"设备接口")。
     #[test]
     fn devicetype_is_read_as_dword_not_byte() {
         let mut buf = [0u8; 32];
@@ -397,7 +396,7 @@ mod tests {
         assert_eq!(translate_device_change(0x0007 - 1, 0), None);
     }
 
-    /// lParam == 0 时(原版 `DBT_DEVNODES_CHANGED` 就是这样传的)不崩溃。
+    /// lParam == 0 时不崩溃。
     #[test]
     fn zero_lparam_is_safe() {
         assert_eq!(translate_device_change(DBT_DEVICEARRIVAL, 0), None);

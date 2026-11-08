@@ -751,7 +751,7 @@ mod imp {
     use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, USN_JOURNAL_DATA_V0};
 
-    /// 单次 ioctl 输出缓冲 1MB:比参考实现的 10KB 少两个数量级的系统调用,
+    /// 单次 ioctl 输出缓冲 1MB:大幅减少系统调用次数,
     /// 又不会在内存紧张的机器上碰 ERROR_INVALID_USER_BUFFER。
     pub(super) const USN_BUF_SIZE: usize = 1 << 20;
     pub(super) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;

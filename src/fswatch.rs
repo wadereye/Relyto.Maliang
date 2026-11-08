@@ -28,11 +28,11 @@ use windows::Win32::Storage::FileSystem as fs;
 use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
 
-/// 事件缓冲 64KB:与参考实现同量级;一次读不完内核会分批给,
+/// 事件缓冲 64KB:一次读不完内核会分批给,
 /// 每批都会触发一次完成事件,不会漏。
 const BUF_SIZE: usize = 64 * 1024;
 
-/// 去抖窗口:与原版秒级节奏一致。
+/// 去抖窗口:秒级节奏。
 const DEBOUNCE: Duration = Duration::from_millis(800);
 
 /// FILE_NOTIFY_INFORMATION 的固定头(3 × u32 = 12 字节),

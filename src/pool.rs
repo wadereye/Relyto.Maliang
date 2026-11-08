@@ -2,8 +2,8 @@
 //!
 //! # 设计背景
 //!
-//! Picasa 3 用的是自研列式存储,字符串列的**去重字符串本体**与
-//! **行记录里存的 32 位整数 id** 分离。本项目沿用同样的**可观测契约**,
+//! 项目采用列式存储,字符串列的**去重字符串本体**与
+//! **行记录里存的 32 位整数 id** 分离,本模块实现**可观测契约**,
 //! 但物理存储仍用 SQLite(见 `db.rs`)。
 //!
 //! | 语义 | 说明 |
@@ -22,10 +22,10 @@
 //! 实现**可观测契约**(而不是磁盘布局):
 //! - 相同字符串重复 intern → **恒返回同一 id**(去重);
 //! - id **只增不复用**,append-only;
-//! - **无引用计数**,回收靠 `vacuum()` 显式重建(对齐原版"写时重建");
+//! - **无引用计数**,回收靠 `vacuum()` 显式重建;
 //! - 池按**列**(pool 名)隔离 —— 每列一个池,不是全局一池。
 //!
-//! # 与 Picasa 3 存储方式的差异(实现口径)
+//! # 与自研列式存储的差异(实现口径)
 //!
 //! 1. **桶布局简化**:本实现用单组开放定址,查重哈希与探测起点公式保持一致,
 //!    故"同串→同 id"的契约一致,但桶内元素排列不同(不可观测)。
@@ -49,7 +49,7 @@ use std::collections::HashMap;
 /// ```
 ///
 /// **注意 `(int)(char)` 是有符号扩展** —— 非 ASCII 字节(UTF-8 续字节
-/// ≥0x80)会算成负数。这是原版行为,保持一致。
+/// ≥0x80)会算成负数。这里保持与字符串查重哈希一致的语义。
 ///
 /// `*0x20 == <<5`,`h >> 2` 是算术右移(`h` 为 `int`)。
 #[must_use]
@@ -64,12 +64,12 @@ pub fn pool_hash(s: &str) -> u32 {
 /// 单列的驻留池。
 #[derive(Debug, Default)]
 pub struct ColumnPool {
-    /// id → 值。id 就是下标(与原版一致的下标寻址)。
+    /// id → 值。id 就是下标。
     values: Vec<String>,
-    /// 值 → id(去重索引)。原版是开放定址桶,这里用 HashMap;
+    /// 值 → id(去重索引)。查重采用哈希表;
     /// 契约等价,性能更好。
     index: HashMap<String, i64>,
-    /// 桶掩码缓存(原版 `(n-1) & hash` 的 `n-1`)。
+    /// 桶掩码缓存(`(n-1) & hash` 的 `n-1`)。
     _bucket_hint: usize,
 }
 
@@ -82,7 +82,7 @@ impl ColumnPool {
     /// 驻留一个字符串,返回其池 id。
     ///
     /// 语义:同串恒返回同 id;新串 **append 追加**,id = 原长度。
-    /// 对应原版字符串查重哈希(链上精确比较)
+    /// 对应字符串查重哈希(链上精确比较)
     /// 与 `:145-175`(未命中则 append)。
     pub fn intern(&mut self, s: &str) -> i64 {
         if let Some(&id) = self.index.get(s) {
@@ -94,9 +94,9 @@ impl ColumnPool {
         id
     }
 
-    /// 按 id 取回字符串。原版池内按 id 取串。
+    /// 按 id 取回字符串。池内按 id 取串。
     ///
-    /// 越界返回 `None`(原版越界会落到空指针分支,这里显式化)。
+    /// 越界返回 `None`(越界显式化,而非落到空指针分支)。
     #[must_use]
     pub fn get(&self, id: i64) -> Option<&str> {
         if id < 0 {
@@ -123,8 +123,8 @@ impl ColumnPool {
 
     /// 写时重建:只保留 `live` 中仍被引用的 id,**其余全部丢弃并重新编号**。
     ///
-    /// 这是原版"无引用计数 + 每轮保存重算整个池"的等价实现
-    /// (池序列化整池序列化 + 字符串入池只对现存行入池)。
+    /// 这是"无引用计数 + 每轮保存重算整个池"的等价实现
+    /// (整池序列化 + 字符串入池只对现存行入池)。
     ///
     /// `live` 给出**旧 id 集合**;返回 `旧id → 新id` 的重映射表
     /// (调用方据此 UPDATE 业务表的池列)。未在 `live` 中的旧 id 不出现在映射里。
@@ -154,13 +154,13 @@ impl ColumnPool {
         remap
     }
 
-    /// 整池清空(对齐池的释放的池析构:
+    /// 整池清空(对应池析构:
     /// 遍历全部桶逐条释放字符串,无引用计数)。
     ///
     /// `vacuum_pool` 走的是 `vacuum()`(保留存活项);
-    /// 本方法对应原版**整池销毁**那条路径。生产代码不需要显式调用
+    /// 本方法对应**整池销毁**路径。生产代码不需要显式调用
     /// (池是短生命周期对象,随宿主一起释放),保留是为了让内存池与
-    /// 原版 API 一一对应,且可独立验证。
+    /// 析构一一对应,且可独立验证。
     #[cfg(test)]
     pub fn clear(&mut self) {
         self.values.clear();
@@ -168,7 +168,7 @@ impl ColumnPool {
     }
 }
 
-/// 原版用开放定址桶,这里显式别名以便测试与 vacuum 参数类型一致。
+/// 用开放定址桶,这里显式别名以便测试与 vacuum 参数类型一致。
 pub type HashSet = std::collections::HashSet<i64>;
 
 /// 多列池集合 —— key = 池名(`<表>_<列>`)。
@@ -242,7 +242,7 @@ impl PoolSet {
 ///
 /// 纯函数,不改任何状态 —— 给 UI 在真正重建**之前**展示"能省多少"。
 /// 用存活 id 集合查询当前池,复用 `ColumnPool::get` 做孤儿判定
-/// (对齐原版池序列化遍历全部 id 决定去留的逻辑)。
+/// (遍历池内全部 id 决定去留)。
 #[must_use]
 pub fn vacuum_plan(set: &PoolSet, live_by_pool: &HashMap<String, HashSet>) -> Vec<(String, usize, usize)> {
     let empty = HashSet::new();
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn hash_is_deterministic_and_order_sensitive() {
-        // 原版是滚动 xor,顺序敏感(不是可交换的乘加哈希)
+        // 字符串查重哈希是滚动 xor,顺序敏感(不是可交换的乘加哈希)
         assert_eq!(pool_hash("abc"), pool_hash("abc"));
         assert_ne!(pool_hash("abc"), pool_hash("acb"));
     }
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn hash_sign_extends_non_ascii_bytes() {
-        // UTF-8 的 ≥0x80 续字节按 (int)(char) 变负数 —— 原版行为
+        // UTF-8 的 ≥0x80 续字节按 (int)(char) 变负数 —— 即有符号扩展语义
         let mut a: i32 = 0x1234_5678u32 as i32;
         for &b in "é".as_bytes() {
             a = a ^ (a.wrapping_mul(0x20).wrapping_add(a >> 2).wrapping_add(b as i8 as i32));
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn ids_are_append_only_and_equal_to_index() {
-        // 原版 id = 字符串指针数组下标(字符串查重哈希)
+        // id = 字符串指针数组下标(字符串查重哈希)
         let mut p = ColumnPool::new();
         assert_eq!(p.intern("a"), 0);
         assert_eq!(p.intern("b"), 1);
@@ -392,7 +392,7 @@ let mut p = ColumnPool::new();
 
     #[test]
     fn pools_are_isolated_per_column() {
-        // 原版每列一个池,id 空间互相独立
+        // 每列一个池,id 空间互相独立
         let mut ps = PoolSet::new();
         assert_eq!(ps.intern("cam", "X"), 0);
         assert_eq!(ps.intern("parent", "Y"), 0);
