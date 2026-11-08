@@ -199,7 +199,7 @@ pub const REFERENCE_IDS: &[&str] = &[
     "Vignette", "moviestart", "movieend",
 ];
 
-/// 我方明确不做的效果名(测试已锁定分类)。
+/// 明确不做的效果名(测试已锁定分类)。
 pub const REFERENCE_ONLY: &[&str] = &[
     // 需要**笔刷 / 选区**交互才能有意义,UI 成本远高于算法本身
     "redeye",
@@ -208,10 +208,10 @@ pub const REFERENCE_ONLY: &[&str] = &[
     // 依赖已于早前关停的外部在线服务
     "picnik",
     // 属于「编辑历史」的条目类型,且没有独立的像素语义:
-    // save 是写盘动作;crop64 是 crop 的 64 位坐标变体(我方 crop 用 u32 已够)。
+    // save 是写盘动作;crop64 是 crop 的 64 位坐标变体(crop 用 u32 已够)。
     "save",
     "crop64",
-    // 视频的起止端点在我方不是独立效果,而是 `movie` 效果的两个参数
+    // 视频的起止端点不是独立效果,而是 `movie` 效果的两个参数
     // (`start` / `end`,见 `crate::video::MovieTrim`)。
     "moviestart",
     "movieend",
@@ -219,7 +219,7 @@ pub const REFERENCE_ONLY: &[&str] = &[
     "debug",
 ];
 
-/// 外部滤镜名 → 我方**配方名**的对应表。
+/// 外部滤镜名 → 配方名的对应表。
 pub const RECIPE_ALIASES: &[(&str, &str)] = &[
     ("boost", "punch"),
     ("border", "frame"),
@@ -244,10 +244,10 @@ pub const RECIPE_ALIASES: &[(&str, &str)] = &[
     ("soften", "bloom"),
     ("comicize", "comic"),
     ("crossprocess", "cross_process"),
-    // 注:`vignette` 保留给我方自主设计的平滑暗角(效果表里的独立一项)。
+    // 注:`vignette` 保留给自主设计的平滑暗角(效果表里的独立一项)。
 ];
 
-/// 把外部滤镜名映射到我方配方名(大小写不敏感);无对应则返回 `None`。
+/// 把外部滤镜名映射到配方名(大小写不敏感);无对应则返回 `None`。
 pub fn recipe_for(name: &str) -> Option<&'static str> {
     let low = name.to_ascii_lowercase();
     RECIPE_ALIASES
@@ -256,18 +256,18 @@ pub fn recipe_for(name: &str) -> Option<&'static str> {
         .map(|(_, v)| *v)
 }
 
-/// 一个效果名在我方的落地状态。
+/// 效果名的支持状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
 /// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
     Pixel,
-/// 我方明确不做的效果名;理由见 [`REFERENCE_ONLY`]。
+/// 明确不做的效果名;理由见 [`REFERENCE_ONLY`]。
     ReferenceOnly,
-/// 不在已知清单里、我方也不认得的名字(通常拼错或来路不明)。
+/// 不在已知清单里、无法识别的名字(通常拼错或来路不明)。
     Unknown,
 }
 
-/// 判断一个效果名的落地状态,供 UI 标注与自检使用。
+/// 判断一个效果名的支持状态,供 UI 标注与自检使用。
 pub fn support_of(name: &str) -> Support {
     let low = name.to_ascii_lowercase();
     if PIXEL_EFFECTS.contains(&low.as_str())
@@ -1747,7 +1747,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 第 2 项-a:`tilt`(Straighten)不能再是静默空操作。
+    /// `tilt`(Straighten)不能是静默空操作。
     #[test]
     fn tilt_straightens_the_image() {
         let mut img = image::RgbaImage::from_pixel(16, 16, image::Rgba([0, 0, 0, 255]));
@@ -1787,7 +1787,7 @@ mod tests {
         );
     }
 
-    /// 第 2 项-b:`shadow`(Shadow & Highlight)必须真正提亮暗部 / 压回亮部。
+    /// `shadow`(Shadow & Highlight)必须真正提亮暗部 / 压回亮部。
     #[test]
     fn shadow_highlight_lifts_darks_and_recovers_highlights() {
         // 暗底 + 中央一块亮方,使局部均值与像素值产生落差。
@@ -1831,7 +1831,7 @@ mod tests {
         assert!(pressed < 240, "亮部应被压回,实得 {pressed}");
     }
 
-    /// 第 2 项-c:回归锁 —— `PIXEL_EFFECTS` 里除显式登记的名字外,
+    /// 回归锁 —— `PIXEL_EFFECTS` 里除显式登记的名字外,
     /// 每一个都必须真的影响像素。
     #[test]
     fn every_known_effect_touches_pixels() {
@@ -1911,7 +1911,7 @@ mod tests {
         );
     }
 
-    /// 第 4 项-a:`Invert` —— 使用 Master 曲线 `[(0,255), (255,0)]` 反相。
+    /// `Invert` —— 使用 Master 曲线 `[(0,255), (255,0)]` 反相。
     #[test]
     fn invert_effect_negates_the_image() {
         let run = |pix: image::Rgba<u8>| {
@@ -1941,7 +1941,7 @@ mod tests {
         );
     }
 
-    /// 第 9 项-b:`contrast` 是双向对比度滑杆,已接到色彩矩阵的对比度。
+    /// `contrast` 是双向对比度滑杆,已接到色彩矩阵的对比度。
     #[test]
     fn reference_contrast_is_wired_to_the_matrix_contrast() {
         let base = || {
@@ -2021,7 +2021,7 @@ mod tests {
             // 同强度两条路径应逐像素一致
             let ran_a = crate::recipes::apply(&mut a, from, 100.0);
             let ran_b = crate::recipes::apply(&mut b, to, 100.0);
-            // 外部名不进 recipes 的分派(那边只认我方配方名),走 effects 的别名解析
+            // 外部名不进 recipes 的分派(那边只认配方名),走 effects 的别名解析
             assert!(!ran_a, "{from} 应由 effects 侧别名解析,不该在 recipes 里被直接认下");
             assert!(ran_b, "{to} 应是可执行配方");
             let mut c = sample();
@@ -2099,7 +2099,7 @@ mod tests {
         }
     }
 
-    /// 第 9 项-a:效果名清单的落地状态必须**可机读**而不是靠记性。
+    /// 效果名清单的支持状态必须**可机读**。
     #[test]
     fn reference_filter_ids_are_all_classified() {
         for id in crate::effects::REFERENCE_IDS {
@@ -2159,7 +2159,7 @@ mod tests {
         );
     }
 
-    /// 第 2 项-b:着色器族的台账必须自洽 —— 已落地的 6 项在效果表里,
+    /// 着色器族的台账必须自洽 —— 已落地的 6 项在效果表里,
     /// 未闭环的 4 项在效果表外,两边合起来共 10 项。
     #[test]
     fn shaders_ledger_stays_consistent() {
@@ -2190,7 +2190,7 @@ mod tests {
         );
     }
 
-    /// 第 2 项-c:分派接线 —— 缺省参数要看得出生效,位置参数 `p0..p5`
+    /// 分派接线 —— 缺省参数要看得出生效,位置参数 `p0..p5`
     /// 必须真被读进去(能落到各算子自己的「越界即恒等」分支)。
     #[test]
     fn shader_arms_read_their_positional_params() {

@@ -1,9 +1,9 @@
 //! 人脸模型就位:启动检查 + 服务端后台下载。
 //!
-//! 模型文件不进仓库,程序也不内置下载地址:下载地址由 maliang.ini 的
-//! `ModelURL`(服务端模型目录)展开;出厂不填,界面走「手动放置指引」。
-//! 识别模型上百 MB,首启不自动开下 —— 只提示,用户点「下载模型」才联网;
-//! 下载走后台线程分段续传,界面显示当前文件与进度。
+//! 模型文件不进仓库:官方直链(Apache-2.0 可再分发件)内置,maliang.ini 的
+//! `ModelURL` 作镜像;用户可在界面里测速并选定走哪个源。识别模型上百 MB,
+//! 首启不自动开下 —— 只提示,用户点「下载」才联网;下载走后台线程分段续传,
+//! 界面显示当前文件与进度(进度只在下载区显示一份,避免各方案行都转圈)。
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -22,11 +22,46 @@ const MAX_MODEL: u64 = 1024 * 1024 * 1024;
 
 /// 哪些方案的模型可以由服务端分发。
 ///
-/// SFace(YuNet / SFace 均 OpenCV Zoo,Apache-2.0 含权重)可代下;
-/// AdaFace 代码 MIT,权重训练数据(MS1MV2 等)非商用,代下责任由配了
-/// ModelURL 的服务端运营方自担;antelopev2 权重非商用,程序从不代下。
+/// SFace(YuNet / SFace 均 OpenCV Zoo,Apache-2.0 含权重)走内置官方直链
+/// 可代下;AdaFace 识别件用内置的社区 ONNX 导出件(权重训练数据条款未
+/// 闭合,是否使用由使用者自决);antelopev2 权重非商用,程序从不代下。
 pub fn downloadable(algo: FaceAlgo) -> bool {
     matches!(algo, FaceAlgo::SFace | FaceAlgo::AdaFace)
+}
+
+/// 内置下载源(按文件名)。出厂即可下载,ModelURL 配了则可作镜像。
+///
+/// - YuNet / SFace:OpenCV Zoo 官方直链,Apache-2.0 含权重,可再分发;
+/// - AdaFace 识别件:社区按官方权重导出的 ONNX(仓库 MIT;预处理为
+///   BGR (x-127.5)/127.5,与本程序 AdaFace 路径一致),权重训练数据
+///   (MS1MV2 等)条款未闭合,由使用者自行评估;
+/// - antelopev2:权重许可不可再分发,无内置源,只能手动放置。
+const YUNET_URL: &str = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx";
+const SFACE_URL: &str = "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx";
+const ADAFACE_IR50_URL: &str =
+    "https://github.com/yakhyo/adaface-onnx/releases/download/weights/adaface_ir_50.onnx";
+
+pub fn builtin_url_for(name: &str) -> Option<&'static str> {
+    // 测试里的本地 mock 服务器要独占下载源,设此环境变量让内置源让路。
+    if std::env::var_os("MALIANG_NO_BUILTIN_MODELS").is_some() {
+        return None;
+    }
+    match name {
+        "face_det.onnx" => Some(YUNET_URL),
+        "face_rec_sface.onnx" => Some(SFACE_URL),
+        "face_rec.onnx" => Some(ADAFACE_IR50_URL),
+        _ => None,
+    }
+}
+
+/// 不可代下方案的手动获取说明(官方地址)。
+pub fn manual_hint(algo: FaceAlgo) -> Option<&'static str> {
+    match algo {
+        FaceAlgo::AntelopeV2 => Some(
+            "https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip",
+        ),
+        _ => None,
+    }
 }
 
 /// 该方案在模型目录里还缺哪些文件名(都在位则返回空)。
@@ -37,6 +72,126 @@ pub fn missing_files(algo: FaceAlgo, dir: &Path) -> Vec<String> {
         .filter(|f| !dir.join(f).is_file())
         .map(|f| f.to_string())
         .collect()
+}
+
+/// 下载源选择:「自动」= 官方直链优先、镜像兜底;选定某源则只走该源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePref {
+    Auto,
+    Official,
+    Mirror,
+}
+
+impl SourcePref {
+    pub const SETTING: &'static str = "model_source_pref";
+
+    pub fn from_setting(v: &str) -> SourcePref {
+        match v {
+            "official" => SourcePref::Official,
+            "mirror" => SourcePref::Mirror,
+            _ => SourcePref::Auto,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            SourcePref::Auto => "auto",
+            SourcePref::Official => "official",
+            SourcePref::Mirror => "mirror",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SourcePref::Auto => "自动(官方优先,镜像兜底)",
+            SourcePref::Official => "仅官方直链",
+            SourcePref::Mirror => "仅镜像",
+        }
+    }
+}
+
+/// 可选下载源清单(官方直链一项;配了 ModelURL 再加镜像一项)。
+pub struct SourceInfo {
+    /// 对应 `SourcePref::key()`(镜像/官方;「自动」不参与测速行)。
+    pub key: &'static str,
+    pub label: String,
+    pub probe_url: String,
+}
+
+pub fn candidate_sources(cfg: &Config) -> Vec<SourceInfo> {
+    let mut v = vec![SourceInfo {
+        key: "official",
+        label: "官方直链(GitHub:OpenCV Zoo / AdaFace 社区导出)".into(),
+        probe_url: YUNET_URL.to_string(),
+    }];
+    let base = cfg.model_url.trim();
+    if !base.is_empty() {
+        if let Ok(u) = file_url(base, "face_det.onnx") {
+            v.push(SourceInfo {
+                key: "mirror",
+                label: format!("镜像({base})"),
+                probe_url: u,
+            });
+        }
+    }
+    v
+}
+
+/// 单个源的一次测速结论。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeResult {
+    pub key: &'static str,
+    pub label: String,
+    pub ok: bool,
+    pub ms: u64,
+    /// 测得的吞吐(KB/s);拿不到内容长度时为 None。
+    pub kbps: Option<f64>,
+    pub err: Option<String>,
+}
+
+/// 测速:对源的代表文件发一个 256 KB 的 Range 请求,计时并算吞吐。
+fn probe_one(cfg: &Config, s: &SourceInfo) -> ProbeResult {
+    let mut r = ProbeResult {
+        key: s.key,
+        label: s.label.clone(),
+        ok: false,
+        ms: 0,
+        kbps: None,
+        err: None,
+    };
+    let agent = crate::update::http_agent(cfg, 30, Some(30));
+    let t0 = Instant::now();
+    let out = agent
+        .get(&s.probe_url)
+        .header("Range", "bytes=0-262143")
+        // 只测传输,不让压缩干扰计时。
+        .header("Accept-Encoding", "identity")
+        .call();
+    r.ms = t0.elapsed().as_millis() as u64;
+    match out {
+        Err(e) => r.err = Some(format!("{e}")),
+        Ok(mut resp) => {
+            let status = resp.status().as_u16();
+            if status >= 400 {
+                r.err = Some(format!("HTTP {status}"));
+            } else {
+                match resp
+                    .body_mut()
+                    .with_config()
+                    .limit(262_144 + 1)
+                    .read_to_vec()
+                {
+                    Err(e) => r.err = Some(format!("读取失败: {e}")),
+                    Ok(bytes) => {
+                        r.ok = true;
+                        let secs = r.ms.max(1) as f64 / 1000.0;
+                        r.kbps = Some(bytes.len() as f64 / 1024.0 / secs);
+                    }
+                }
+            }
+        }
+    }
+    r
 }
 
 /// 把 `ModelURL`(服务端模型目录)与固定文件名展开成下载地址。
@@ -92,9 +247,10 @@ fn verify_onnx(path: &Path) -> Result<(), String> {
 
 #[derive(Debug)]
 enum Cmd {
-    /// 命令自带配置快照:用户改过 maliang.ini 里的 ModelURL 时不必重启程序。
+    /// 命令自带配置快照与源偏好:用户改过 maliang.ini / 换过源都不必重启程序。
     Download {
-        algo: FaceAlgo,
+        files: Vec<String>,
+        pref: SourcePref,
         cfg: Box<Config>,
     },
     Stop,
@@ -172,6 +328,14 @@ impl Phase {
     }
 }
 
+/// 下载源测速的状态(UI 只读快照)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeState {
+    Idle,
+    Running,
+    Done(Vec<ProbeResult>),
+}
+
 pub struct ModelDownloader {
     cmd: Sender<Cmd>,
     events: Receiver<Event>,
@@ -180,6 +344,9 @@ pub struct ModelDownloader {
     pub phase: Phase,
     /// 首启提示窗:缺模型且配了下载源时置位,用户表过态即关。
     pub prompt_open: bool,
+    /// 测速状态与后台结果通道。
+    pub probe: ProbeState,
+    probe_rx: Option<Receiver<Vec<ProbeResult>>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -199,6 +366,8 @@ impl ModelDownloader {
             cfg,
             phase: Phase::Idle,
             prompt_open: false,
+            probe: ProbeState::Idle,
+            probe_rx: None,
             stop,
         }
     }
@@ -210,7 +379,7 @@ impl ModelDownloader {
             None => return false,
         };
         let missing = !missing_files(algo, &dir).is_empty();
-        self.prompt_open = missing && downloadable(algo) && !self.model_base().is_empty();
+        self.prompt_open = missing && downloadable(algo);
         missing
     }
 
@@ -219,30 +388,30 @@ impl ModelDownloader {
         self.cfg.model_url.trim()
     }
 
-    /// 手动/提示窗触发下载:先重读配置,好让用户改完 ModelURL 就能直接点。
-    pub fn start(&mut self, algo: FaceAlgo) {
+    /// 手动/提示窗触发下载:按用户勾选的文件列表下,先重读配置,
+    /// 好让用户改完 ModelURL 就能直接点。已在位的文件自动跳过。
+    pub fn start_files(&mut self, files: Vec<String>, pref: SourcePref) {
         self.cfg = crate::update::load_config();
         if self.phase.working() {
             return;
         }
-        if self.model_base().is_empty() {
-            self.phase = Phase::Failed("没有可用的下载地址".into());
-            return;
-        }
-        if !downloadable(algo) {
-            self.phase = Phase::Failed("该方案的模型许可不允许程序代下载".into());
-            return;
-        }
-        // 先把界面切到「在跑」并报出第一个文件名,否则点了按钮到后台第一帧
-        // 进度事件之间界面是空的,看着像没反应。
         let dir = crate::ai::models_dir();
-        let missing = dir
+        let todo: Vec<String> = dir
             .as_ref()
-            .map(|d| missing_files(algo, d))
+            .map(|d| {
+                files
+                    .into_iter()
+                    .filter(|f| !d.join(f).is_file())
+                    .collect()
+            })
             .unwrap_or_default();
-        let count = missing.len().max(1);
+        if todo.is_empty() {
+            self.phase = Phase::Failed("所选模型文件都已就位,无需下载".into());
+            return;
+        }
+        let count = todo.len();
         self.phase = Phase::Downloading {
-            file: missing.into_iter().next().unwrap_or_default(),
+            file: todo[0].clone(),
             idx: 1,
             count,
             pct: 0,
@@ -250,9 +419,32 @@ impl ModelDownloader {
             total: 0,
         };
         let _ = self.cmd.send(Cmd::Download {
-            algo,
+            files: todo,
+            pref,
             cfg: Box::new(self.cfg.clone()),
         });
+    }
+
+    /// 对候选源各发一个小请求测速,结果经后台线程送回 `probe`。
+    pub fn start_probe(&mut self) {
+        if matches!(self.probe, ProbeState::Running) {
+            return;
+        }
+        self.cfg = crate::update::load_config();
+        let sources = candidate_sources(&self.cfg);
+        if sources.is_empty() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<Vec<ProbeResult>>();
+        self.probe_rx = Some(rx);
+        self.probe = ProbeState::Running;
+        let cfg = self.cfg.clone();
+        let _ = std::thread::Builder::new()
+            .name("maliang-model-probe".into())
+            .spawn(move || {
+                let res = sources.iter().map(|s| probe_one(&cfg, s)).collect::<Vec<_>>();
+                let _ = tx.send(res);
+            });
     }
 
     pub fn stop(&self) {
@@ -260,12 +452,18 @@ impl ModelDownloader {
         let _ = self.cmd.send(Cmd::Stop);
     }
 
-    /// 每帧一泵:收后台事件,在下载期间继续要重绘帧。
+    /// 每帧一泵:收后台事件(下载 + 测速),在忙时继续要重绘帧。
     pub fn tick(&mut self, ctx: &egui::Context) {
         while let Ok(ev) = self.events.try_recv() {
             self.on_event(ev);
         }
-        if self.phase.working() {
+        if let Some(rx) = &self.probe_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.probe = ProbeState::Done(res);
+                self.probe_rx = None;
+            }
+        }
+        if self.phase.working() || matches!(self.probe, ProbeState::Running) {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
@@ -308,10 +506,10 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         }
         match rx.recv() {
             Ok(Cmd::Stop) => break,
-            Ok(Cmd::Download { algo, cfg }) => {
+            Ok(Cmd::Download { files, pref, cfg }) => {
                 let dir = crate::ai::models_dir();
                 let out = match dir {
-                    Some(d) => fetch_all(&d, &cfg, algo, &tx, &stop, verify_onnx),
+                    Some(d) => fetch_files(&d, &cfg, &files, pref, &tx, &stop, verify_onnx),
                     None => Err("没有数据目录,模型没地方放".to_string()),
                 };
                 match out {
@@ -330,8 +528,60 @@ fn worker(rx: Receiver<Cmd>, tx: Sender<Event>, stop: Arc<AtomicBool>) {
     }
 }
 
-/// 下齐该方案缺的模型文件。`dir` 与 `verify` 可替换,便于在本地 HTTP 服务上
-/// 完整跑通「分段 / 续传 / 定名」而不碰真模型目录。
+/// 逐个下齐 `files` 列出的模型文件。`dir` 与 `verify` 可替换,便于在本地
+/// HTTP 服务上完整跑通「分段 / 续传 / 定名」而不碰真模型目录。
+fn fetch_files(
+    dir: &Path,
+    cfg: &Config,
+    files: &[String],
+    pref: SourcePref,
+    tx: &Sender<Event>,
+    stop: &AtomicBool,
+    verify: fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("建模型目录失败: {e}"))?;
+    let count = files.len();
+    for (i, name) in files.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return Err("已取消下载".into());
+        }
+        // 候选源按用户偏好来:「自动」= 内置官方直链在前、ModelURL(镜像)兜底;
+        // 选定单源则只用该源。404 才换源(自动档),其余错误(断网/取消)当场
+        // 终止,续传字节留给下一次。
+        let mut urls: Vec<String> = Vec::new();
+        if pref != SourcePref::Mirror {
+            if let Some(u) = builtin_url_for(name) {
+                urls.push(u.to_string());
+            }
+        }
+        if pref != SourcePref::Official && !cfg.model_url.trim().is_empty() {
+            if let Ok(u) = file_url(&cfg.model_url, name) {
+                if !urls.iter().any(|x| x == &u) {
+                    urls.push(u);
+                }
+            }
+        }
+        if urls.is_empty() {
+            return Err(format!("模型 {name} 在所选下载源上不可用,请换源或手动放置"));
+        }
+        for (si, url) in urls.iter().enumerate() {
+            match download_one(dir, cfg, url, name, i + 1, count, tx, stop, verify) {
+                Ok(()) => break,
+                Err(e) => {
+                    let try_next = e.contains("HTTP 404") && si + 1 < urls.len();
+                    if !try_next {
+                        return Err(e);
+                    }
+                    let _ = std::fs::remove_file(dir.join(format!("{name}.part")));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 按方案下齐缺的模型文件(仅单测用;生产路径走 `fetch_files`)。
+#[cfg(test)]
 fn fetch_all(
     dir: &Path,
     cfg: &Config,
@@ -343,17 +593,8 @@ fn fetch_all(
     if !downloadable(algo) {
         return Err("该方案的模型许可不允许程序代下载,请自行放置文件".into());
     }
-    std::fs::create_dir_all(dir).map_err(|e| format!("建模型目录失败: {e}"))?;
     let names = missing_files(algo, dir);
-    let count = names.len();
-    for (i, name) in names.iter().enumerate() {
-        if stop.load(Ordering::Relaxed) {
-            return Err("已取消下载".into());
-        }
-        let url = file_url(&cfg.model_url, name)?;
-        download_one(dir, cfg, &url, name, i + 1, count, tx, stop, verify)?;
-    }
-    Ok(())
+    fetch_files(dir, cfg, &names, SourcePref::Auto, tx, stop, verify)
 }
 
 /// 单个模型文件:按 Range 分段取到 `名字.part`,校验通过后改名定名。
@@ -665,6 +906,7 @@ mod tests {
     }
 
     fn serve(handler: Handler) -> TestServer {
+        std::env::set_var("MALIANG_NO_BUILTIN_MODELS", "1");
         use std::io::BufRead;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();

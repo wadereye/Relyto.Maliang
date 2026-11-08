@@ -13,10 +13,9 @@
 //!   - `0x17` = 视频,但缩略图走疑似网络加载器(视频缩略图加载)——语义未完全确认
 //! - **缩略图**:走外部进程(DirectShow 渲染 + IPC 回传 + JPEG 编码,
 //!   最多等 60 秒)。
-//!   **我方等效**:Windows Shell 视频缩略提供程序(`win::shell_thumbnail`,
+//!   **本项目实现**:Windows Shell 视频缩略提供程序(`win::shell_thumbnail`,
 //!   底层同为系统 DirectShow 系编解码),无需外部进程。
-//! - **播放**:走库内 DirectShow filter graph 渲染到播放子窗口的设计,
-//!   我方等效实现为 Shell 关联程序打开(`win::shell_open`)—— 库内视频渲染管线
+//! - **播放**:Shell 关联程序打开(`win::shell_open`)—— 库内视频渲染管线
 //!   体量过大,当前未实现。
 //! - **moviestart/movieend** = 编辑串里的 hex64 值(按 64 位十六进制解析),
 //!   播放时作时间过滤裁剪,**不修改原视频像素**。
@@ -31,7 +30,7 @@
 //!   序列化形态:`moviestart=%I64x` / `movieend=%I64x`(16 进制,读回用 `sscanf("%I64x")`,
 //!   读写都不做缩放)。视频导出路径另有一个 `值 / 1000`(100 ns → µs)用于时间码运算。
 //!
-//!   我方 trim UI 用**秒**为单位(内部仍按 100 ns 计数存取)。
+//!   本项目 trim UI 用**秒**为单位(内部仍按 100 ns 计数存取)。
 
 use std::path::Path;
 

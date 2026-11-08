@@ -35,6 +35,20 @@ All user-visible changes are documented here, newest first.
   against **all templates** of the named cluster (previously centroid vs
   centroid) — notably more robust for pose-skewed clusters.
 
+**Model downloads work out of the box: built-in official URLs + mirror fallback**
+
+- The program now ships with built-in official direct URLs per scheme (the two
+  default-scheme SFace files point at OpenCV Zoo; the AdaFace recognition file
+  is a community ONNX export of the official weights, preprocessed identically
+  to the built-in path) — pressing "Download models" is enough when models are
+  missing, no server configuration required.
+- `ModelURL` now means **mirror fallback**: it ships pointing at a mirror
+  directory and engages automatically when a built-in source answers 404;
+  leave it empty to disable the fallback. Downloads still require an explicit
+  user click before any traffic.
+- antelopev2 weights are non-redistributable and are never fetched by the
+  program; the UI now shows the official Release URL with rename instructions.
+
 **Three anti-snowball rules for face clustering**
 
 - Young-cluster gating: clusters with fewer than 3 members have weak centroid

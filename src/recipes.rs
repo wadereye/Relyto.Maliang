@@ -418,7 +418,7 @@ pub fn hsv_gradient_map(img: &mut RgbaImage, stops: &[(f32, (f32, f32, f32))], h
         *slot = hsv_to_rgb(c.0, c.1 / 100.0, c.2 / 100.0);
     }
 
-    // 观感上 G/B 两张查找表等同,只有 R 通道参与 —— 我方从
+    // 观感上 G/B 两张查找表等同,只有 R 通道参与 —— 从
     // 单张 LUT 写回 RGB,视觉上等价于「以 R 索引的整色映射」。
     for p in img.pixels_mut() {
         let y = p[0] as usize;
@@ -877,8 +877,7 @@ fn apply_noise_layer(
         }
     } else {
         // 非 mono:三通道**独立抽样**。各通道的随机流派生方式未见公开资料,
-        // 这里用种子异或不同常数近似「三条独立流」;早期版本用同一数组
-        // 循环移位,通道间呈固定相关,已废弃。
+        // 这里用种子异或不同常数近似「三条独立流」。
         let ng = noise_layer(img, seed ^ 0x9E37_79B9, low, high);
         let nb = noise_layer(img, seed ^ 0x85EB_CA6B, low, high);
         for (i, p) in layer.pixels_mut().enumerate() {
@@ -1523,7 +1522,7 @@ pub fn apply_with(img: &mut RgbaImage, name: &str, amount: f32, mode: Blend) -> 
         // `innerglow=true`、strength 缺省 1.4(量程 1~2)、
         // 羽化半径 = Blur·0.02·长边/4,Blur 缺省 35 → **0.175·长边**。
         //
-        // 与我方自主设计的 smoothstep 暗角(`oneclick::apply_vignette`)是两种
+        // 与自主设计的 smoothstep 暗角(`oneclick::apply_vignette`)是两种
         // 算法并存,不要混淆。
         "vignette_glow" => {
             glow_edge(img, [0, 0, 0], long * 0.175, 1.4, 1.0);
@@ -2279,7 +2278,7 @@ mod sampler_tests {
         assert!(shadowed > 0, "照片外圈没有画出任何阴影,测试证明不了东西");
     }
 
-/// 第 4 项-b:`Orton` 与 `Soften` 必须拆成两条链路。
+/// `Orton` 与 `Soften` 必须拆成两条链路。
     #[test]
     fn orton_and_soften_are_distinct_recipes() {
         // 用渐变图做基准:平坦图模糊后仍是平坦图,`Soften`(普通不透明度回混)
@@ -2339,7 +2338,7 @@ mod sampler_tests {
         assert_eq!(zero.as_raw(), &flat().into_raw(), "强度 0 应恒等");
     }
 
-    // ===== 第 5 项:3.4 批量清理(六条失败断言,实现后转绿)=====
+    // ===== 3.4 批量清理(六条失败断言,实现后转绿)=====
 
 /// 5-a:AutoFix 的 `+1.0` 与 `low==high → 全白`。
     #[test]

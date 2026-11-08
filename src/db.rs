@@ -56,7 +56,7 @@ const LEGACY_UPDATE_FILE: &str = "update.ini";
 /// 这样清掉本机配置或全新安装也能直接检查更新。
 pub const DEFAULT_UPDATE_URL: &str = "http://47.109.200.26/maliang/update/latest.ini";
 /// 模型目录出厂默认为空:权重许可由用户自行审查,需要代下载时自配 ModelURL。
-pub const DEFAULT_MODEL_URL: &str = "";
+pub const DEFAULT_MODEL_URL: &str = "http://47.109.200.26/maliang/models/";
 
 /// 统一配置文件模板(首启无配置时写入;[location] 归本模块,[update] 节
 /// 供升级/模型下载用,解析端只认键不认节,节头仅作视觉分组)。
@@ -75,7 +75,7 @@ data_dir=
 
 [update]
 # UpdateURL 指向一份版本清单(纯文本 key=value)。
-# 不写这一行 = 用程序内置的官方清单地址;改成自己的地址 = 换源;
+# 不写这一行 = 用程序内置的默认清单地址;改成自己的地址 = 换源;
 # 写成 UpdateURL=(空值) = 停用自动更新。
 UpdateURL=http://47.109.200.26/maliang/update/latest.ini
 
@@ -102,12 +102,12 @@ RestartService=1
 # 下载分段大小(MB)。慢网可调小到 1,让每段的时间预算更容易满足。
 ChunkMB=2
 
-# 模型下载目录:服务端放模型文件的目录,结尾带「/」。
-# 程序按所选方案的固定文件名(face_det.onnx + face_rec_sface.onnx 等)
-# 在这个目录下取文件,存进数据目录的 models\\。出厂默认不填 = 不代下模型,界面只给手动放置指引;
-# 自建服务端并自行确认模型分发许可后,可填自己的地址(建议 https);
-# 写成 ModelURL=(空值) 同样是不提供下载。
-ModelURL=
+# 模型镜像目录:服务端放模型文件的目录,结尾带「/」。
+# 下载优先走内置官方地址;某文件在官方源缺失时按所选方案的固定文件名
+# (face_det.onnx + face_rec_sface.onnx 等)到这个镜像目录兜底,
+# 存进数据目录的 models\\。填自己的地址前请自行确认模型分发许可(建议 https);
+# 写成 ModelURL=(空值) = 不启用镜像兜底。
+ModelURL=http://47.109.200.26/maliang/models/
 ";
 
 /// 默认数据目录(marker 文件所在;env/marker 都不生效时它就是数据目录)。
@@ -817,7 +817,7 @@ CREATE TABLE IF NOT EXISTS photos (
     -- cam 保留作兼容回退,cam_id 有效时以池为准。详见 `pool.rs` 模块文档。
     cam_id INTEGER,
     -- P2-17 媒体类型:0=图片,1=视频(按"是否视频"二分;
-    -- 子类型对应不同解码路径,我方只有 Shell 一条,无须细分)。
+    -- 子类型对应不同解码路径,只有 Shell 一条,无须细分)。
     kind INTEGER NOT NULL DEFAULT 0,
     -- 派生状态:0=未纳入作用域,1=待派生,2=已派生,3=坏文件。
     -- 结构列(path/size/mtime/kind)全盘都有,派生列(宽高/时间/缩略图)
@@ -4935,7 +4935,7 @@ mod tests {
     }
 
     /// 监听线程的精确对账:只删给定且确实不存在的路径,仍存在的跳过。
-    /// 关联行(含 mark_missing 原先漏掉的缩略图档 / 相册 / 中文 CLIP)一并清,
+    /// 关联行(缩略图档 / 相册 / 中文 CLIP)一并清,
     /// 并写入 `removed` 变更日志。
     #[test]
     fn drop_missing_paths_only_removes_vanished_ones() {

@@ -109,7 +109,7 @@ pub fn translate_device_change(wparam: u32, lparam: usize) -> Option<DeviceEvent
         return None;
     }
     // ⚠️ 读的是 **dword**(`*(int *)(lParam + 4) == 2`),
-    // 不是 1 字节 —— 早期实现只读 u8,当 devicetype 是 0x102 之类时会误判成 2。
+    // 不是 1 字节:按 u8 读时 devicetype 是 0x102 之类会误判成 2。
     // 用 `read_unaligned`:lParam 指向的结构体只保证 4 字节对齐,dword 字段可能不对齐。
     let devicetype = unsafe { std::ptr::read_unaligned((lparam + 0x04) as *const i32) };
     if devicetype != DBT_DEVTYP_DEVICEINTERFACE as i32 {

@@ -26,11 +26,11 @@
 //!   把 pid=9 的 SECURITY_QOS 改 0x80000000 后重试。
 //! - **文件传输走 WIA 通道**:QI `IWiaDataTransfer` + 临时目录。
 //!
-//! # 我方实现范围(实现口径)
+//! # 实现范围(实现口径)
 //!
 //! 1. **设备枚举**(本文件):`IPortableDeviceManager::GetDevices` + 每设备的
 //!    FriendlyName/Description/Manufacturer(WPD 管理器/WPD 设备信息接口)。
-//! 2. **客户端信息**:沿用 fmtid/pid 结构,name 换成 `Maliang`,版本号用我方 0.1。
+//! 2. **客户端信息**:沿用 fmtid/pid 结构,name 换成 `Maliang`,版本号用 0.1。
 //! 3. **统一列表**:WPD 设备 + 可移动盘符卷合成一个列表。
 //! 4. **不做文件传输**:本项目无 WIA;真要拷文件时走
 //!    `IPortableDeviceResources::GetStream`——
@@ -97,7 +97,7 @@ mod imp {
     /// 枚举全部便携设备。
     ///
     /// 走 WPD 管理器(创建 Manager)+ WPD 设备信息(迭代设备,
-    /// 设备 ID/名称经 `WideCharToMultiByte(CP_UTF8)` 转多字节 —— 我方直接
+    /// 设备 ID/名称经 `WideCharToMultiByte(CP_UTF8)` 转多字节 —— 直接
     /// 转 UTF-8 String,等价)。coclass GUID:
     /// `PortableDeviceManager` = `{0AF10CEC-2ECD-4B92-9581-34F6AE0637F3}`
     /// (crate 常量 `0x0af10cec_2ecd_4b92_9581_34f6ae0637f3` 吻合)。

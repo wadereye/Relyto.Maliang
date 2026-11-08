@@ -1,4 +1,4 @@
-//! M4b CLIP 语义搜索:ViT-B-32 双编码器(Qdrant ONNX 导出)+ 官方 BPE 分词器。
+//! M4b CLIP 语义搜索:ViT-B-32 双编码器(Qdrant ONNX 导出)+ BPE 分词器。
 //!
 //! # 第三方代码归属
 //!
@@ -35,7 +35,7 @@
 //! - 模型(`%APPDATA%\Relyto\Maliang\models\`):`clip_vision.onnx`(输入 `pixel_values`
 //!   f32[b,3,224,224] → 输出 `image_embeds` f32[b,512])、`clip_text.onnx`
 //!   (输入 `input_ids`/`attention_mask` i64[b,77] → 输出 `text_embeds` f32[b,512])、
-//!   `clip_merges.txt`(官方 merges,vocab 由 merges 按官方算法重建,无需 vocab.json)。
+//!   `clip_merges.txt`(vocab 由 merges 重建,无需 vocab.json)。
 //! - 分词器参考 openai/CLIP `simple_tokenizer.py` 实现(见上方第三方声明):正则
 //!   `'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+`(注意本版无 ` ?`
 //!   前缀、`[\p{N}]` 单字符),BPE 按 merges rank 逐级合并,`</w>` 只加在词尾。
@@ -56,8 +56,8 @@ pub const CTX: usize = 77;
 // ---------- 分词器 ----------
 
 /// bytes_to_unicode():返回 (按 bs 插入顺序的字符表, 字节→字符映射)。
-/// 官方 `dict(zip(bs, cs))` 的插入序即 bs 顺序:33..=126、161..=172、174..=255,
-/// 再补剩余字节;vocab 前 256 项按此顺序编号(否则 'a' 会错位成 353 而非 320)。
+/// 字符表插入序:33..=126、161..=172、174..=255,再补剩余字节;
+/// vocab 前 256 项按此顺序编号。
 fn bytes_to_unicode() -> (Vec<char>, [char; 256]) {
     let mut bs: Vec<u32> = (33..=126).chain(161..=172).chain(174..=255).collect();
     let mut cs: Vec<u32> = bs.clone();
@@ -90,9 +90,7 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    /// 从 merges.txt 加载;encoder 按官方算法从 merges 重建
-    /// (256 单字符 + 256 带 `</w>` + 48894 个 merge 拼接 + 2 个特殊 token = 49408,
-    /// 与 HF vocab.json 全量一致,已用 Python 对拍验证)。
+    /// 从 merges.txt 加载;encoder 按 merges 重建。
     pub fn load(merges_path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(merges_path)
             .map_err(|e| format!("读 merges: {e}"))?;
@@ -111,7 +109,6 @@ impl Tokenizer {
         let mut lines = text.lines();
         let _version = lines.next(); // "#version: 0.2 ..."
         let mut rank = 0u32;
-        // 官方:merges[1:49152-256-2+1] = 48894 条
         for line in lines.take(49152 - 256 - 2) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty() {
@@ -151,9 +148,9 @@ impl Tokenizer {
         ids
     }
 
-    /// 官方正则近似(大小写不敏感;输入已 lower):
+    /// 分词正则近似(大小写不敏感;输入已 lower):
     /// `<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+`
-    /// 注:官方正则无 ` ?` 前缀 → 空白不进 token,此处直接跳过;
+    /// 注:正则无 ` ?` 前缀 → 空白不进 token,此处直接跳过;
     /// `\p{L}` 用 `is_alphabetic() && !is_numeric()` 近似,`\p{N}` 用 `is_numeric()`。
     fn split_tokens(&self, text: &str) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect();
@@ -175,7 +172,7 @@ impl Tokenizer {
                     continue;
                 }
             }
-            // 2) 英文缩写(优先于字母串,官方交替顺序)
+            // 2) 英文缩写(优先于字母串)
             if c == '\'' && i + 1 < chars.len() {
                 let rest: String = chars[i + 1..].iter().collect();
                 let mut hit = None;
@@ -201,7 +198,7 @@ impl Tokenizer {
                 i = j;
                 continue;
             }
-            // 4) [\p{N}] 单数字字符(注意:无 +,官方逐字符)
+            // 4) [\p{N}] 单数字字符(注意:无 +,逐字符)
             if c.is_numeric() {
                 out.push(c.to_string());
                 i += 1;
@@ -227,7 +224,7 @@ impl Tokenizer {
         out
     }
 
-    /// 官方 bpe():词尾字符加 `</w>`,反复合并 rank 最小的相邻 pair。
+    /// bpe():词尾字符加 `</w>`,反复合并 rank 最小的相邻 pair。
     fn bpe(&self, token: &str) -> Vec<String> {
         let syms: Vec<char> = token.chars().collect();
         let mut word: Vec<String> = Vec::with_capacity(syms.len());
@@ -298,7 +295,7 @@ fn l2_normalize(v: &[f32]) -> Result<Vec<f32>, String> {
 
 // ---------- 中文 CLIP(Chinese-CLIP ViT-B-16)----------
 
-/// Chinese-CLIP 上下文长度(官方 config context_length=52)。
+/// Chinese-CLIP 上下文长度(context_length=52)。
 pub const CN_CTX: usize = 52;
 
 /// CJK 统一表意文字范围( Bert basic_tokenizer 的 _is_chinese_char 同集)。
@@ -342,7 +339,7 @@ fn clean_text(s: &str) -> String {
 }
 
 /// Bert BasicTokenizer + WordPiece(vocab.txt)。仅 encode。
-/// 与 transformers 的差异:不做 NFD strip accents(中文无影响,英文 accent 罕见)。
+/// 不做 NFD strip accents(中文无影响,英文 accent 罕见)。
 pub struct BertTokenizer {
     vocab: HashMap<String, u32>,
     cls: u32,
@@ -537,7 +534,7 @@ impl ClipText {
     }
 
     /// 文本 → 512 维 L2 归一化嵌入。截断到 77(SOT+≤75 词+EOT),
-    /// 不足用 EOT(49407)填充、attention_mask 对应置 0(同 HF CLIPTokenizer)。
+    /// 不足用 EOT(49407)填充、attention_mask 对应置 0。
     pub fn embed_text(&mut self, s: &str) -> Result<Vec<f32>, String> {
         let mut ids = self.tok.encode(s);
         ids.truncate(CTX);
@@ -627,7 +624,7 @@ impl CnClipText {
     }
 
     /// 文本 → 512 维 L2 归一化嵌入。截断到 CN_CTX(52),PAD 填充 + mask 0。
-    /// 注意:Chinese-CLIP 官方训练用模板"一张{}的照片",模板由调用方决定。
+    /// 注意:Chinese-CLIP 训练用模板"一张{}的照片",模板由调用方决定。
     pub fn embed_text(&mut self, s: &str) -> Result<Vec<f32>, String> {
         let mut ids = self.tok.encode(s);
         ids.truncate(CN_CTX);
@@ -814,7 +811,7 @@ pub fn scan_batch_lang(store: &Store, lang: Lang, cap: usize) -> Result<(usize, 
     Ok((todo.len(), ok))
 }
 
-/// 语义搜索:按语言选文本模型;中文查询自动套 Chinese-CLIP 官方模板
+/// 语义搜索:按语言选文本模型;中文查询自动套 Chinese-CLIP 模板
 /// "一张{}的照片"(输入已含"照片"则不重复套)。
 pub fn search_lang(
     store: &Store,
@@ -883,7 +880,7 @@ mod tests {
         models_dir().map(|d| d.is_dir()).unwrap_or(false)
     }
 
-    /// BertTokenizer 黄金序列(与 Python 复刻 transformers 对拍)。
+    /// BertTokenizer 黄金序列。
     #[test]
     fn bert_tokenizer_golden() {
         let Some(dir) = models_dir() else { return };
@@ -934,7 +931,7 @@ mod tests {
     }
 
     /// 中文模型质量 — face-test.jpg(人像)对"人像"类查询余弦
-    /// 应显著高于"猫/狗"类(社区 ONNX 转换验证)。
+    /// 应显著高于"猫/狗"类。
     #[test]
     fn cn_clip_search_ranks() {
         let Some(dir) = models_dir() else { return };
@@ -968,7 +965,7 @@ mod tests {
         let tok = Tokenizer::load(&mp).unwrap();
         assert_eq!(tok.sot, 49406);
         assert_eq!(tok.eot, 49407);
-        // 黄金序列(与 Python 复刻官方算法对拍):
+        // 黄金序列:
         // 'a photo of a cat' -> [49406, 320, 1125, 539, 320, 2368, 49407]
         assert_eq!(
             tok.encode("a photo of a cat"),

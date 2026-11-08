@@ -1053,7 +1053,7 @@ enum DownloadOutcome {
 }
 
 /// 下载期间在每段边界看一眼命令队列:用户点「立即检查 / 跳过 / 退出」时
-/// 不必等这一整包下完(慢网下原来可能排十几分钟)。
+/// 不必等这一整包下完(慢网下可能排十几分钟)。
 fn poll_ctl(rx: &mpsc::Receiver<Cmd>, stop: &AtomicBool) -> Option<Option<Cmd>> {
     if stop.load(AtomicOrdering::Relaxed) {
         return Some(None);

@@ -363,10 +363,9 @@ pub struct App {
     scroll_throttle: crate::scroll::ScrollSmoother,
     /// 本帧允许同步解码的缩略图**像素体积**(RGBA8 字节数)。
     ///
-    /// 原来是「每帧 64 张」的张数上限,在中档(256px,256KB/张)
-    /// 下约 16MB —— 没问题;但预览档(1024px,4MB/张)同样 64 张就是 256MB 的
-    /// 解码 + 纹理上传,一帧几百毫秒,「UI 永不阻塞」在大档上等于没做。
-    /// 改成字节口径后各档的每帧耗时才拉平(见 [`crate::scroll::decode_budget_for`])。
+    /// 按字节而非张数设上限:预览档(1024px,4MB/张)张数口径一帧可达
+    /// 256MB 的解码 + 纹理上传,一帧几百毫秒;字节口径后各档的每帧耗时拉平
+    /// (见 [`crate::scroll::decode_budget_for`])。
     thumb_decode_budget: usize,
     /// 本帧已用的解码配额(字节;每帧开头清零)。
     thumb_decode_count: usize,
@@ -605,6 +604,12 @@ pub struct App {
     face_show_ignored: bool,
     #[cfg(feature = "ai")]
     face_version_warn: bool,
+    /// 选项页点了别的方案,等确认窗表态后真正切换。
+    #[cfg(feature = "ai")]
+    face_algo_pending: Option<crate::ai::face::FaceAlgo>,
+    /// 模型下载复选框的勾选状态(已就位的文件每帧强制清掉)。
+    #[cfg(feature = "ai")]
+    model_pick: [bool; 3],
     #[cfg(feature = "ai")]
     input_rename: String,
     /// 右栏「人物」页正在改名的脸(face_id, 草稿名);失焦/回车即写回所属人物。
@@ -989,7 +994,7 @@ fn link_connect() -> Result<crate::ipc::Client, String> {
     // 用户明确选了「不用全盘快查」:连握手都不做,不向常驻服务索取全盘数据。
     // 所有入口(心跳、Retry、重建、落盘)都经过这里,一道门就能收口。
     if !SVC_LINK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("已按你的选择关闭全盘快查(在 选项 > 常规 可重新启用)".into());
+        return Err("已按你的选择关闭全盘快查(在 选项 > 全盘快查 可重新启用)".into());
     }
     let mut c = crate::ipc::Client::connect(500)?;
     match c.call(&crate::ipc::Req::Hello {
@@ -1259,9 +1264,8 @@ fn spawn_thumb_worker() -> (
 
 /// 用户对口全盘索引服务的意向(设置项 `svc_wanted`)。
 ///
-/// 进程模型换成常驻提权服务后,原来那三档授权
-/// (计划任务 / 每次提权 / 不做)塌成两档:装 or 不装。装服务只过一次 UAC,
-/// 之后由 SCM 自动拉起,所以"每次单独提权"这一档没有存在意义了。
+/// 授权分两档:装 or 不装。装服务只过一次 UAC,
+/// 之后由 SCM 自动拉起,无需每次单独提权。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SvcWant {
     /// 没问过(首次启动先说明再动手)。
@@ -1998,9 +2002,8 @@ fn show_in_explorer(path: &str) {
 
 /// 缩略图纹理缓存(带 LRU 上限 + 占位追踪)。
 ///
-/// 用块文件 + 纹理缓存,不会随浏览量无限增长。
-/// 我方原先用裸 `HashMap<i64, TextureHandle>`,每张看过的照片常驻一张 256×256
-/// 纹理(约 256KB),几千张就把显存撑爆;这里加 LRU 上限,超出时淘汰最久未用的。
+/// 用块文件 + 纹理缓存,不会随浏览量无限增长;
+/// LRU 超出上限时淘汰最久未用的条目。
 struct TexCache {
     map: HashMap<i64, egui::TextureHandle>,
     /// 访问顺序(队首最久未用)。
@@ -2362,6 +2365,11 @@ impl App {
             #[cfg(feature = "ai")]
             face_version_warn: false,
             #[cfg(feature = "ai")]
+            face_algo_pending: None,
+            // 默认全勾:勾选框每帧会按「文件是否已在位」收敛。
+            #[cfg(feature = "ai")]
+            model_pick: [true; 3],
+            #[cfg(feature = "ai")]
             input_rename: String::new(),
             #[cfg(feature = "ai")]
             face_name_draft: None,
@@ -2561,7 +2569,7 @@ impl App {
                 // 立刻做的事(见 svc_apply_want),每次开机都提权反而骚扰。
                 // 若服务还在(上次卸载被取消 / 用户后来手动装回),如实提示。
                 if crate::win::service_installed() {
-                    self.status = "已按你的选择关闭全盘快查;检测到索引服务仍在,可在 选项 > 常规 卸载。"
+                    self.status = "已按你的选择关闭全盘快查;检测到索引服务仍在,可在 选项 > 全盘快查 卸载。"
                         .into();
                 }
             }
@@ -2595,7 +2603,7 @@ impl App {
             ui.label("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;");
             ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
             ui.label("· 界面本身不提权:它通过本地命名管道向服务问结果;");
-            ui.label("· 不联网、不上传,随时可以在 选项 > 常规 卸载。");
+            ui.label("· 不联网、不上传,随时可以在 选项 > 全盘快查 卸载。");
         });
         ui.add_space(14.0);
         // 两档:按钮定宽对齐,说明文字跟在右侧,行距拉开。
@@ -2632,7 +2640,7 @@ impl App {
             {
                 *decided = Some(SvcWant::No);
             }
-            ui.small("跳过:若已装过服务会一并移除(需一次 UAC);查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 常规 改。");
+            ui.small("跳过:若已装过服务会一并移除(需一次 UAC);查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 全盘快查 改。");
         });
         ui.add_space(14.0);
         ui.checkbox(&mut self.svc_never_ask, "不再提示");
@@ -2669,7 +2677,7 @@ impl App {
             {
                 *decided = Some(self.scope_choice);
             }
-            ui.small("以后可在 选项 > 常规 改。");
+            ui.small("以后可在 选项 > 全盘快查 改。");
         });
     }
 
@@ -2796,7 +2804,7 @@ impl App {
         }
         if want == SvcWant::No {
             // 明确选了不用的人,切页面时不反复拉弹窗,只给一句指路。
-            self.status = "全盘快查已关闭(在 选项 > 常规 可改)".into();
+            self.status = "全盘快查已关闭(在 选项 > 全盘快查 可改)".into();
             return;
         }
         match self.link.svc {
@@ -2910,7 +2918,7 @@ impl App {
                             }
                             (None, _) => "索引服务已启动,正在重连…".into(),
                             (Some(e), _) => {
-                                format!("{op}索引服务未完成:{e}(可在 选项 > 常规 重试)")
+                                format!("{op}索引服务未完成:{e}(可在 选项 > 全盘快查 重试)")
                             }
                         };
                     } else if op == "卸载" {
@@ -2922,7 +2930,7 @@ impl App {
                                 "已移除索引服务:全盘快查关闭,发现与保鲜走逐目录扫描。".into()
                             }
                             Some(e) => format!(
-                                "移除索引服务未完成:{e}(可在 选项 > 常规 点「卸载索引服务」重试)"
+                                "移除索引服务未完成:{e}(可在 选项 > 全盘快查 点「卸载索引服务」重试)"
                             ),
                         };
                     } else {
@@ -2936,7 +2944,7 @@ impl App {
                                 let _ = self.store.set_setting("svc_wanted", "");
                                 self.link_declined = true;
                                 let _ = self.store.set_setting("svc_declined", "1");
-                                self.status = format!("索引服务未完成:{e}(可在 选项 > 常规 重试)");
+                                self.status = format!("索引服务未完成:{e}(可在 选项 > 全盘快查 重试)");
                             }
                         }
                     }
@@ -4798,22 +4806,19 @@ impl App {
         });
     }
 
-    /// 启动检查:人脸模型缺不缺件。缺件且配了服务端下载源 → 弹一次提示窗,
-    /// 由用户点「开始下载」才联网(识别模型上百 MB,不替用户花流量);
-    /// 没配 ModelURL 时只留一行状态,界面仍是原来的手动放置指引。
+    /// 启动检查:人脸模型缺不缺件。缺件 → 弹一次提示窗(内置官方直链或
+    /// ModelURL 皆可下载),由用户点「开始下载」才联网(识别模型上百 MB,
+    /// 不替用户花流量)。
     #[cfg(feature = "ai")]
     fn check_face_models(&mut self) {
         let algo = crate::faces::current_algo(&self.store);
         if !self.models.check_on_startup(algo) {
             return;
         }
-        // 「不再提示」只压掉开机弹窗,下载入口仍留在 选项 > 常规 与人脸视图。
+        // 「不再提示」只压掉开机弹窗,下载入口仍留在 选项 > 人脸识别 与人脸视图。
         if self.model_never_ask() {
             self.models.prompt_open = false;
-            return;
-        }
-        if self.models.model_base().is_empty() {
-            self.status = "人脸模型未就位:放置方法见 选项 > 常规".into();
+            self.status = "人脸模型未就位:可在 选项 > 人脸识别 或人脸视图里下载".into();
         }
     }
 
@@ -4823,10 +4828,37 @@ impl App {
         self.store.get_setting("model_never_ask").as_deref() == Some("1")
     }
 
-    /// 后台开始下载指定方案的模型(提示窗与手动按钮都走这里)。
+    /// 后台开始下载指定方案的缺件(提示窗与人脸视图按钮走这里)。
     #[cfg(feature = "ai")]
     fn start_model_download(&mut self, algo: crate::ai::face::FaceAlgo) {
-        self.models.start(algo);
+        if !crate::models::downloadable(algo) {
+            let (det_f, rec_f) = algo.files();
+            self.status = format!(
+                "「{det_f} / {rec_f}」的权重许可不可再分发,程序不代下:请按 选项 > 人脸识别 页给出的官方地址手动获取"
+            );
+            return;
+        }
+        let dir = crate::ai::models_dir();
+        let files = dir
+            .map(|d| crate::models::missing_files(algo, &d))
+            .unwrap_or_default();
+        if files.is_empty() {
+            self.status = "人脸模型已就位".into();
+            return;
+        }
+        self.start_model_files(files);
+    }
+
+    /// 后台开始下载用户勾选的模型文件(源偏好随设置项走)。
+    #[cfg(feature = "ai")]
+    fn start_model_files(&mut self, files: Vec<String>) {
+        let pref = crate::models::SourcePref::from_setting(
+            &self
+                .store
+                .get_setting(crate::models::SourcePref::SETTING)
+                .unwrap_or_default(),
+        );
+        self.models.start_files(files, pref);
         if self.models.phase.working() {
             self.status = "正在后台下载人脸模型…".into();
         } else if let crate::models::Phase::Failed(e) = &self.models.phase {
@@ -4834,12 +4866,11 @@ impl App {
         }
     }
 
-    /// 人脸模型的下载入口与状态(只在缺模型时画):状态一行 + 按钮一行。
-    /// 选项 > 常规、人脸视图共用;下载源是 maliang.ini 的 ModelURL。
+    /// 下载进度只画一份(下载区/状态行),不再按方案各画一份,
+    /// 免得别的方案行也跟着转圈让人误读。
     #[cfg(feature = "ai")]
-    fn face_model_ui(&mut self, ui: &mut egui::Ui, algo: crate::ai::face::FaceAlgo) {
+    fn face_download_progress_ui(&mut self, ui: &mut egui::Ui) {
         use crate::models::Phase;
-        let dir = crate::ai::models_dir();
         let phase = self.models.phase.clone();
         match &phase {
             Phase::Downloading { file, .. } => {
@@ -4847,56 +4878,106 @@ impl App {
                     ui.spinner();
                     ui.label(phase.label());
                 });
-                if let Some(d) = &dir {
+                if let Some(d) = crate::ai::models_dir() {
                     ui.small(format!(
-                        "断点留在 {}/{}.part,再点一次「下载模型」接着下",
+                        "断点留在 {}/{}.part,重开程序后再点下载可接着下",
                         d.display(),
                         file
                     ));
                 }
             }
             Phase::Failed(e) => {
-                ui.label(egui::RichText::new(format!("下载失败:{e}")).color(crate::theme::p().accent));
+                ui.label(
+                    egui::RichText::new(format!("下载失败:{e}")).color(crate::theme::p().accent),
+                );
             }
-            _ => {
-                let (det_f, rec_f) = algo.files();
-                if !crate::models::downloadable(algo) {
-                    ui.small(format!("缺少 {det_f} / {rec_f}:该方案的权重许可不可再分发,只能自备"));
-                } else if self.models.model_base().is_empty() {
-                    ui.small(format!(
-                        "缺少 {det_f} / {rec_f}:自行放入模型目录,或把 maliang.ini 里的 ModelURL 填回地址后由程序下载"
-                    ));
-                } else {
-                    ui.small(format!("可从服务端下载:{}", self.models.model_base()));
+            Phase::Ready => {
+                ui.small(phase.label());
+            }
+            Phase::Idle => {}
+        }
+    }
+
+    /// 选项 > 人脸识别:方案单选(切换需确认重建)、模型复选下载、
+    /// 下载源选择与测速。
+    #[cfg(feature = "ai")]
+    fn face_options_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::models::Phase;
+        // —— 识别方案(单选) ——
+        ui.heading(egui::RichText::new("识别方案").size(14.0));
+        let cur = crate::faces::current_algo(&self.store);
+        for (algo, note) in [
+            (
+                crate::ai::face::FaceAlgo::SFace,
+                "YuNet + SFace,均 OpenCV Zoo,Apache-2.0 含权重,可商用(默认)",
+            ),
+            (
+                crate::ai::face::FaceAlgo::AdaFace,
+                "YuNet + AdaFace;权重训练数据非商用,选择即自担原厂许可",
+            ),
+            (
+                crate::ai::face::FaceAlgo::AntelopeV2,
+                "YuNet + antelopev2;权重非商用 research-only,不代下,需手动放置",
+            ),
+        ] {
+            ui.horizontal(|ui| {
+                if ui.radio(cur == algo, algo.label()).clicked() && cur != algo {
+                    self.face_algo_pending = Some(algo);
                 }
+                ui.small(note);
+            });
+        }
+        ui.small("三个方案的模型文件可以都下好备着,但方案之间特征向量不通用:切换后需要重建(清除现有人脸数据并按新方案重扫,或暂留旧数据)。");
+        ui.separator();
+
+        // —— 下载进度(全局一份) ——
+        let working = self.models.phase.working();
+        self.face_download_progress_ui(ui);
+        if matches!(self.models.phase, Phase::Failed(_)) || working {
+            ui.separator();
+        }
+
+        // —— 模型文件(复选下载) ——
+        ui.heading(egui::RichText::new("模型文件").size(14.0));
+        const CATALOG: [(&str, &str); 3] = [
+            ("face_det.onnx", "YuNet 人脸检测 · Apache-2.0(所有方案共用)"),
+            ("face_rec_sface.onnx", "SFace 人脸识别 · Apache-2.0"),
+            ("face_rec.onnx", "AdaFace 人脸识别 · 社区 ONNX 导出(条款自决)"),
+        ];
+        let mut any_pick = false;
+        for (i, (name, desc)) in CATALOG.iter().enumerate() {
+            let present = crate::ai::models_dir()
+                .map(|d| d.join(name).is_file())
+                .unwrap_or(false);
+            if present {
+                self.model_pick[i] = false;
+                ui.small(format!("✓ {name} 已就位 —— {desc}"));
+            } else {
+                ui.checkbox(&mut self.model_pick[i], format!("{name} —— {desc}"));
+                any_pick |= self.model_pick[i];
             }
         }
-        let downloadable = crate::models::downloadable(algo) && !self.models.model_base().is_empty();
-        let working = phase.working();
-        // 提示窗勾过「不再提示」后,这里给回勾的入口:开机弹不弹只看这一项。
-        if downloadable {
-            let mut ask = !self.model_never_ask();
-            if ui.checkbox(&mut ask, "开机提醒下载模型").changed() {
-                let _ = self
-                    .store
-                    .set_setting("model_never_ask", if ask { "0" } else { "1" });
-                self.status = if ask {
-                    "已恢复开机提醒:缺人脸模型时会弹窗问一次".into()
-                } else {
-                    "已设为不再提示:开机不再弹人脸模型窗,下载入口留在这里".into()
-                };
-            }
+        if let Some(url) = crate::models::manual_hint(crate::ai::face::FaceAlgo::AntelopeV2) {
+            ui.small(format!(
+                "antelopev2(glint360k/antelopev2 两个 onnx,非商用)不代下:自行从 {} 下载,解包后按 README 改名放入模型目录。",
+                url
+            ));
         }
         ui.horizontal_wrapped(|ui| {
-            if downloadable
-                && ui
-                    .add_enabled(!working, egui::Button::new("下载模型"))
-                    .clicked()
+            if ui
+                .add_enabled(any_pick && !working, egui::Button::new("下载选中的模型"))
+                .clicked()
             {
-                self.start_model_download(algo);
+                let files: Vec<String> = CATALOG
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| self.model_pick[*i])
+                    .map(|(_, (name, _))| name.to_string())
+                    .collect();
+                self.start_model_files(files);
             }
             if ui.button("打开模型目录").clicked() {
-                if let Some(d) = &dir {
+                if let Some(d) = crate::ai::models_dir() {
                     show_in_explorer(&d.display().to_string());
                 }
             }
@@ -4904,10 +4985,99 @@ impl App {
                 crate::update::open_config_file();
             }
         });
+        ui.separator();
+
+        // —— 下载源(单选 + 测速) ——
+        ui.heading(egui::RichText::new("下载源").size(14.0));
+        let pref = crate::models::SourcePref::from_setting(
+            &self
+                .store
+                .get_setting(crate::models::SourcePref::SETTING)
+                .unwrap_or_default(),
+        );
+        for p in [
+            crate::models::SourcePref::Auto,
+            crate::models::SourcePref::Official,
+            crate::models::SourcePref::Mirror,
+        ] {
+            if ui.radio(pref == p, p.label()).clicked() && pref != p {
+                let _ = self
+                    .store
+                    .set_setting(crate::models::SourcePref::SETTING, p.key());
+                self.status = format!("模型下载源已切换为「{}」", p.label());
+            }
+        }
+        ui.small("「仅镜像」需要 maliang.ini 里配好 ModelURL;源上的文件缺失会直接报错,不做回退。");
+        ui.horizontal(|ui| {
+            let probing = matches!(self.models.probe, crate::models::ProbeState::Running);
+            if ui
+                .add_enabled(!probing, egui::Button::new("测速"))
+                .clicked()
+            {
+                self.models.start_probe();
+                self.status = "正在对各下载源测速(各取 256 KB)…".into();
+            }
+            if probing {
+                ui.spinner();
+                ui.small("测速中…");
+            }
+        });
+        if let crate::models::ProbeState::Done(res) = &self.models.probe {
+            for r in res {
+                if r.ok {
+                    let speed = r
+                        .kbps
+                        .map(|k| format!(" · {:.0} KB/s", k))
+                        .unwrap_or_default();
+                    ui.small(format!("{}:{} ms{}", r.label, r.ms, speed));
+                } else {
+                    ui.small(format!(
+                        "{}:不可用({})",
+                        r.label,
+                        r.err.as_deref().unwrap_or("未知错误")
+                    ));
+                }
+            }
+        }
+        ui.separator();
+
+        // 开机提醒(勾过「不再提示」后的回勾入口)。
+        let mut ask = !self.model_never_ask();
+        if ui.checkbox(&mut ask, "开机提醒下载模型").changed() {
+            let _ = self
+                .store
+                .set_setting("model_never_ask", if ask { "0" } else { "1" });
+            self.status = if ask {
+                "已恢复开机提醒:缺人脸模型时会弹窗问一次".into()
+            } else {
+                "已设为不再提示:开机不再弹人脸模型窗,下载入口留在 选项 > 人脸识别".into()
+            };
+        }
+    }
+
+    /// 人脸视图里的精简下载入口:按钮 + 指路(完整选项在 选项 > 人脸识别)。
+    #[cfg(feature = "ai")]
+    fn face_model_compact_ui(&mut self, ui: &mut egui::Ui, algo: crate::ai::face::FaceAlgo) {
+        let working = self.models.phase.working();
+        if working {
+            self.face_download_progress_ui(ui);
+        } else if crate::models::downloadable(algo) {
+            if ui.button("下载缺失模型").clicked() {
+                self.start_model_download(algo);
+            }
+        } else if let Some(url) = crate::models::manual_hint(algo) {
+            ui.small(format!("权重许可不可再分发,请自行从 {url} 获取后放入模型目录。"));
+        }
+        if ui.button("打开模型目录").clicked() {
+            if let Some(d) = crate::ai::models_dir() {
+                show_in_explorer(&d.display().to_string());
+            }
+        }
+        ui.small("更多选项(复选文件、选源、测速)在 选项 > 人脸识别。");
     }
 
     /// 首启提示窗:缺人脸模型时问一次「现在下载吗」。
-    /// 关掉后不再生扰,下载入口仍留在 选项 > 常规 与人脸视图里。
+    /// 关掉后不再生扰,下载入口仍留在 选项 > 人脸识别 与人脸视图里。
     #[cfg(feature = "ai")]
     fn model_prompt_window(&mut self, ctx: &egui::Context) {
         if !self.models.prompt_open {
@@ -4916,7 +5086,9 @@ impl App {
         let mut open = self.models.prompt_open;
         let mut dismissed = false;
         let mut start = false;
-        let mut never = false;
+        // 勾选态以库里的设置为初值,否则每帧重置,复选框永远显示未勾。
+        let stored_never = self.model_never_ask();
+        let mut never = stored_never;
         let dir_text = crate::ai::models_dir()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
@@ -4929,10 +5101,12 @@ impl App {
             .show(ctx, |ui| {
                 ui.label("「人物」视图要靠人脸模型工作,本机模型目录里还没有模型文件。");
                 ui.small(format!("模型目录:{dir_text}"));
-                ui.small(format!(
-                    "下载地址:{}(改这一行就换源,见 maliang.ini 的 ModelURL)",
-                    self.models.model_base()
-                ));
+                let base = self.models.model_base();
+                if base.is_empty() {
+                    ui.small("下载源:程序内置官方地址(可在 maliang.ini 配 ModelURL 作镜像兜底)");
+                } else {
+                    ui.small(format!("下载源:内置官方地址,镜像兜底 {base}(ModelURL)"));
+                }
                 ui.label("识别模型体积较大,确认后会在后台分段下载,可随时关掉本窗口继续用其它功能。");
                 ui.add_space(6.0);
                 ui.checkbox(&mut never, "不再提示(以后开机不再弹这个窗)");
@@ -4960,10 +5134,14 @@ impl App {
         } else if !open {
             self.models.prompt_open = false;
         }
-        // 拒绝、关窗、点下载时勾了都要落库,否则下次开机照旧弹窗。
-        if never {
-            let _ = self.store.set_setting("model_never_ask", "1");
-            self.status = "已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > 常规".into();
+        // 勾选状态一变就落库,不依赖点按钮那一帧;取消勾选也能正确写回。
+        if never != stored_never {
+            let _ = self
+                .store
+                .set_setting("model_never_ask", if never { "1" } else { "0" });
+            if never {
+                self.status = "已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > 人脸识别".into();
+            }
         }
     }
 
@@ -4974,11 +5152,11 @@ impl App {
             self.status = "人脸扫描进行中…".into();
             return;
         }
-        // 模型缺失时先问要不要下载(没配下载源就直说怎么手动放),不进后台线程撞裸错误。
+        // 模型缺失时先问要不要下载(不可代下方案直说怎么手动放),不进后台线程撞裸错误。
         let algo = crate::faces::current_algo(&self.store);
         if !crate::ai::face::Faces::models_present(algo) {
             let (det_f, rec_f) = algo.files();
-            if crate::models::downloadable(algo) && !self.models.model_base().is_empty() {
+            if crate::models::downloadable(algo) {
                 self.status = format!("缺少人脸模型 {det_f} / {rec_f}:确认后可在后台下载");
                 self.models.prompt_open = true;
             } else {
@@ -5403,7 +5581,7 @@ impl App {
 
     /// 预览实际渲染用的效果栈 = 已存效果 + 当前草稿(草稿覆盖同名项)。
     ///
-    /// "参数 + op 树实时渲染":滑块一动 op 树立刻重建 → 我方等价实现:
+    /// "参数 + op 树实时渲染":滑块一动 op 树立刻重建 → 等价实现:
     /// 预览纹理签名随草稿变化而重算。
     fn fx_preview_stack(&self, id: i64) -> crate::effects::FilterStack {
         // 只读速看格式不套效果:动画帧与合成图都不参与编辑链。
@@ -5580,7 +5758,7 @@ impl App {
 
     /// 粘贴所有效果:把暂存的效果栈写给选中的多张照片。
     ///
-    /// 效果批量应用对电影类型跳过(我方库内只有照片,天然满足)。
+    /// 效果批量应用对电影类型跳过(库内只有照片,天然满足)。
     fn fx_paste_all(&mut self, targets: &[i64]) {
         let Some(st) = self.fx_clipboard.clone() else {
             self.fx_msg = "剪贴板里没有效果".into();
@@ -6911,15 +7089,154 @@ impl App {
         }
     }
 
-    /// 选项窗口(常规 / 电子邮件 / 幻灯片 三页签)。
+    /// 选项 > 全盘快查:索引服务状态一览 + 启用意向 + 手动重建/卸载入口。
+    fn options_svc_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading(egui::RichText::new("全盘快查(索引服务)").size(14.0));
+        let link = self.link.clone();
+        let svc_text = match link.svc {
+            crate::win::ServiceState::NotInstalled => "未安装".to_string(),
+            crate::win::ServiceState::Stopped => "已停止".to_string(),
+            // 过渡态的原始码只给排障看,别当成确定结论。
+            crate::win::ServiceState::Transition(c) => format!("过渡态(码 {c})"),
+            crate::win::ServiceState::Running => "运行中".to_string(),
+        };
+        let status = if link.online {
+            let mut s = format!("服务{svc_text} · {} 卷 {} 条", link.vols, link.entries);
+            if link.building > 0 {
+                s.push_str(&format!(" · {} 卷正在建库", link.building));
+            }
+            if link.dirty {
+                s.push_str(" · 有未落盘的变更");
+            }
+            s.push_str(&format!(" · 已运行 {}", fmt_uptime(link.uptime)));
+            if let Some(t) = link.seen {
+                s.push_str(&format!(" · {} 秒前刷新", t.elapsed().as_secs()));
+            }
+            s
+        } else if link.svc == crate::win::ServiceState::Running {
+            format!("服务{svc_text},但连不上它的管道(全盘快查暂不可用)")
+        } else {
+            format!("服务{svc_text}:全盘快查不可用,发现与保鲜走逐目录扫描兜底")
+        };
+        ui.horizontal(|ui| {
+            ui.label("状态:");
+            ui.label(&status);
+        });
+        if link.building > 0 {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.small(format!(
+                    "{} 卷正在全量建库,期间快查结果可能不全",
+                    link.building
+                ));
+            });
+        }
+        for (letter, why) in &link.compat {
+            ui.small(format!(
+                "{letter}: 盘走兼容扫描(walkdir + 目录监听),无实时快查 —— {why}"
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let cur = self.svc_want();
+            ui.horizontal(|ui| {
+                ui.label("全盘快查:");
+                if ui.radio(cur != SvcWant::No, "启用(推荐)").clicked() {
+                    self.svc_apply_want(SvcWant::Yes);
+                }
+                if ui.radio(cur == SvcWant::No, "不用").clicked() {
+                    self.svc_apply_want(SvcWant::No);
+                }
+            });
+            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默;选「不用」会断开连接并移除已装的服务。");
+            if self.store.get_setting("svc_never_ask").as_deref() == Some("1") {
+                ui.small("已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。");
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(link.online, egui::Button::new("立即重建全盘索引"))
+                    .clicked()
+                {
+                    self.svc_rebuild();
+                }
+                if ui
+                    .add_enabled(link.online, egui::Button::new("立刻保存索引"))
+                    .clicked()
+                {
+                    if let Some(tx) = &self.link_tx {
+                        let _ = tx.send(LinkCmd::Flush);
+                    }
+                    self.status = "已请求索引服务把内存索引落盘".into();
+                }
+                if ui
+                    .add_enabled(!self.svc_busy, egui::Button::new("重试连接"))
+                    .clicked()
+                {
+                    if let Some(tx) = &self.link_tx {
+                        let _ = tx.send(LinkCmd::Retry);
+                    }
+                }
+            });
+            // 停与起必须成对出现:只给「停止」等于把人关在门外 ——
+            // 停完之后只剩「卸载再重装」这一条回头路。
+            let stoppable = link.svc == crate::win::ServiceState::Running;
+            let startable = link.svc == crate::win::ServiceState::Stopped;
+            if stoppable || startable {
+                ui.horizontal(|ui| {
+                    if stoppable
+                        && ui
+                            .add_enabled(!self.svc_busy, egui::Button::new("停止索引服务…"))
+                            .clicked()
+                    {
+                        self.svc_stop();
+                    }
+                    if startable
+                        && ui
+                            .add_enabled(!self.svc_busy, egui::Button::new("启动索引服务…"))
+                            .clicked()
+                    {
+                        self.svc_start();
+                    }
+                });
+                ui.small(if stoppable {
+                    "停一下服务能让程序自己腾出手来:升级、搬家或想把硬盘歇口气的时候用,索引记录都保留,在同一页点「启动」就接着跑。"
+                } else {
+                    "服务停着时全盘快查不可用,发现与保鲜退回逐目录扫描;索引文件都留在数据目录,启动后接着用。"
+                });
+            }
+            if link.svc != crate::win::ServiceState::NotInstalled
+                && ui
+                    .add_enabled(!self.svc_busy, egui::Button::new("卸载索引服务…"))
+                    .clicked()
+            {
+                self.svc_uninstall();
+            }
+            if link.svc != crate::win::ServiceState::NotInstalled {
+                ui.small("卸载会停掉服务并删除注册项(需要一次 UAC);索引文件本身留在数据目录。");
+            }
+            if self.svc_busy {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.small("等待你在 UAC 授权窗口点「是」…");
+                });
+            }
+        }
+        #[cfg(not(windows))]
+        ui.small("全盘快查仅支持 Windows(NTFS USN journal)。");
+        ui.small("服务装卸失败后不再自动打扰;可在此或快速查找页重新发起。");
+    }
+
+    /// 选项窗口(常规 / 人脸识别 / 全盘快查 / 电子邮件 / 幻灯片 五页签)。
     fn options_ui(&mut self, ctx: &egui::Context) {
         let mut opts_open = self.show_options;
         egui::Window::new("选项")
             .open(&mut opts_open)
-            .default_width(420.0)
+            .default_width(520.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, name) in ["常规", "电子邮件", "幻灯片"].iter().enumerate() {
+                    for (i, name) in
+                        ["常规", "人脸识别", "全盘快查", "电子邮件", "幻灯片"].iter().enumerate()
+                    {
                         if ui.selectable_label(self.options_tab == i, *name).clicked() {
                             self.options_tab = i;
                         }
@@ -6968,185 +7285,6 @@ impl App {
                                 }
                             }
                         });
-                        ui.separator();
-                        // 人脸识别方案:默认 YuNet + SFace(两模型均 OpenCV Zoo,
-                        // Apache-2.0 含权重,可商用,可由 ModelURL 代下)。
-                        // AdaFace / antelopev2 权重的训练数据为非商用 research-only,
-                        // 不默认、不代下(AdaFace 可由运营方自担责任配置 ModelURL),
-                        // 用户自备权重即视为接受原厂许可条款(见 README / THIRD_PARTY_NOTICES)。
-                        // 切换即存;各方案向量不通用,会触发重扫提示。
-                        #[cfg(feature = "ai")]
-                        {
-                            ui.heading(egui::RichText::new("人脸识别方案").size(14.0));
-                            let cur = crate::faces::current_algo(&self.store);
-                            for algo in [
-                                crate::ai::face::FaceAlgo::SFace,
-                                crate::ai::face::FaceAlgo::AdaFace,
-                                crate::ai::face::FaceAlgo::AntelopeV2,
-                            ] {
-                                ui.horizontal(|ui| {
-                                    if ui.radio(cur == algo, algo.label()).clicked() && cur != algo
-                                    {
-                                        let _ = self.store.set_setting("face_algo", algo.key());
-                                        self.refresh_people();
-                                    }
-                                });
-                                let (det_f, rec_f) = algo.files();
-                                if crate::ai::face::Faces::models_present(algo) {
-                                    ui.small(format!("　模型已就位:{det_f} / {rec_f}"));
-                                } else {
-                                    ui.small(format!("　缺少 {det_f} / {rec_f}"));
-                                    ui.indent(("face_models_", algo.key()), |ui| {
-                                        self.face_model_ui(ui, algo);
-                                    });
-                                }
-                            }
-                            ui.separator();
-                        }
-                        // 全盘快查的数据源是常驻索引服务(Windows 专属):
-                        // 状态一览 + 启用意向 + 手动重建/卸载入口。
-                        ui.heading(egui::RichText::new("全盘快查(索引服务)").size(14.0));
-                        let link = self.link.clone();
-                        let svc_text = match link.svc {
-                            crate::win::ServiceState::NotInstalled => "未安装".to_string(),
-                            crate::win::ServiceState::Stopped => "已停止".to_string(),
-                            // 过渡态的原始码只给排障看,别当成确定结论。
-                            crate::win::ServiceState::Transition(c) => format!("过渡态(码 {c})"),
-                            crate::win::ServiceState::Running => "运行中".to_string(),
-                        };
-                        let status = if link.online {
-                            let mut s = format!("服务{svc_text} · {} 卷 {} 条", link.vols, link.entries);
-                            if link.building > 0 {
-                                s.push_str(&format!(" · {} 卷正在建库", link.building));
-                            }
-                            if link.dirty {
-                                s.push_str(" · 有未落盘的变更");
-                            }
-                            s.push_str(&format!(" · 已运行 {}", fmt_uptime(link.uptime)));
-                            if let Some(t) = link.seen {
-                                s.push_str(&format!(" · {} 秒前刷新", t.elapsed().as_secs()));
-                            }
-                            s
-                        } else if link.svc == crate::win::ServiceState::Running {
-                            format!("服务{svc_text},但连不上它的管道(全盘快查暂不可用)")
-                        } else {
-                            format!("服务{svc_text}:全盘快查不可用,发现与保鲜走逐目录扫描兜底")
-                        };
-                        ui.horizontal(|ui| {
-                            ui.label("状态:");
-                            ui.label(&status);
-                        });
-                        if link.building > 0 {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.small(format!(
-                                    "{} 卷正在全量建库,期间快查结果可能不全",
-                                    link.building
-                                ));
-                            });
-                        }
-                        for (letter, why) in &link.compat {
-                            ui.small(format!(
-                                "{letter}: 盘走兼容扫描(walkdir + 目录监听),无实时快查 —— {why}"
-                            ));
-                        }
-                        #[cfg(windows)]
-                        {
-                            let cur = self.svc_want();
-                            ui.horizontal(|ui| {
-                                ui.label("全盘快查:");
-                                if ui
-                                    .radio(cur != SvcWant::No, "启用(推荐)")
-                                    .clicked()
-                                {
-                                    self.svc_apply_want(SvcWant::Yes);
-                                }
-                                if ui.radio(cur == SvcWant::No, "不用").clicked() {
-                                    self.svc_apply_want(SvcWant::No);
-                                }
-                            });
-                            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默;选「不用」会断开连接并移除已装的服务。");
-                            if self.store.get_setting("svc_never_ask").as_deref() == Some("1") {
-                                ui.small("已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。");
-                            }
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .add_enabled(link.online, egui::Button::new("立即重建全盘索引"))
-                                    .clicked()
-                                {
-                                    self.svc_rebuild();
-                                }
-                                if ui
-                                    .add_enabled(link.online, egui::Button::new("立刻保存索引"))
-                                    .clicked()
-                                {
-                                    if let Some(tx) = &self.link_tx {
-                                        let _ = tx.send(LinkCmd::Flush);
-                                    }
-                                    self.status = "已请求索引服务把内存索引落盘".into();
-                                }
-                                if ui
-                                    .add_enabled(!self.svc_busy, egui::Button::new("重试连接"))
-                                    .clicked()
-                                {
-                                    if let Some(tx) = &self.link_tx {
-                                        let _ = tx.send(LinkCmd::Retry);
-                                    }
-                                }
-                            });
-                            // 停与起必须成对出现:只给「停止」等于把人关在门外 ——
-                            // 停完之后只剩「卸载再重装」这一条回头路。
-                            let stoppable = link.svc == crate::win::ServiceState::Running;
-                            let startable = link.svc == crate::win::ServiceState::Stopped;
-                            if stoppable || startable {
-                                ui.horizontal(|ui| {
-                                    if stoppable
-                                        && ui
-                                            .add_enabled(
-                                                !self.svc_busy,
-                                                egui::Button::new("停止索引服务…"),
-                                            )
-                                            .clicked()
-                                    {
-                                        self.svc_stop();
-                                    }
-                                    if startable
-                                        && ui
-                                            .add_enabled(
-                                                !self.svc_busy,
-                                                egui::Button::new("启动索引服务…"),
-                                            )
-                                            .clicked()
-                                    {
-                                        self.svc_start();
-                                    }
-                                });
-                                ui.small(if stoppable {
-                                    "停一下服务能让程序自己腾出手来:升级、搬家或想把硬盘歇口气的时候用,索引记录都保留,在同一页点「启动」就接着跑。"
-                                } else {
-                                    "服务停着时全盘快查不可用,发现与保鲜退回逐目录扫描;索引文件都留在数据目录,启动后接着用。"
-                                });
-                            }
-                            if link.svc != crate::win::ServiceState::NotInstalled
-                                && ui
-                                    .add_enabled(!self.svc_busy, egui::Button::new("卸载索引服务…"))
-                                    .clicked()
-                            {
-                                self.svc_uninstall();
-                            }
-                            if link.svc != crate::win::ServiceState::NotInstalled {
-                                ui.small("卸载会停掉服务并删除注册项(需要一次 UAC);索引文件本身留在数据目录。");
-                            }
-                            if self.svc_busy {
-                                ui.horizontal(|ui| {
-                                    ui.spinner();
-                                    ui.small("等待你在 UAC 授权窗口点「是」…");
-                                });
-                            }
-                        }
-                        #[cfg(not(windows))]
-                        ui.small("全盘快查仅支持 Windows(NTFS USN journal)。");
-                        ui.small("服务装卸失败后不再自动打扰;可在此或快速查找页重新发起。");
                         ui.separator();
                         // 数据目录:防 C 盘写满 —— 库/索引/模型整体迁走。
                         ui.heading(egui::RichText::new("数据目录").size(14.0));
@@ -7266,7 +7404,15 @@ impl App {
                         ui.small("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。");
                         ui.small("索引备份 / 压缩在「工具 > 图库维护」里。");
                     }
+                    // 人脸识别(方案/下载/源测速)与全盘快查各自独立成页。
+                    #[cfg(feature = "ai")]
+                    1 => self.face_options_ui(ui),
+                    #[cfg(not(feature = "ai"))]
                     1 => {
+                        ui.label("本版本未启用人脸识别(编译时未带 ai 特性)。");
+                    }
+                    2 => self.options_svc_ui(ui),
+                    3 => {
                         // 电子邮件(8 档尺寸列表,默认 1024)。
                         ui.label("邮件附件默认尺寸(发送窗口仍可临时改):");
                         let cur_px = self.email_size.px();
@@ -8504,11 +8650,35 @@ impl App {
                 let name_rect =
                     egui::Rect::from_min_size(rect.left_top(), egui::vec2(name_w, row_h))
                         .translate(egui::vec2(8.0, 0.0));
-                ui.put(
+                // 名称手排 galley:ui.put 套的是 centered_and_justified 布局,
+                // 短名字会在列内居中,Label::halign 管不到那一层。
+                let galley = ui.fonts_mut(|f| {
+                    f.layout_job(egui::text::LayoutJob {
+                        wrap: egui::text::TextWrapping {
+                            max_width: name_w,
+                            max_rows: 1,
+                            break_anywhere: true,
+                            ..Default::default()
+                        },
+                        ..egui::text::LayoutJob::single_section(
+                            name_text.clone(),
+                            egui::TextFormat {
+                                font_id: egui::FontId::proportional(12.5),
+                                color: text,
+                                ..Default::default()
+                            },
+                        )
+                    })
+                });
+                ui.painter().galley(
+                    egui::pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    text,
+                );
+                ui.interact(
                     name_rect,
-                    egui::Label::new(egui::RichText::new(&name_text).size(12.5).color(text))
-                        .halign(egui::Align::Min)
-                        .wrap_mode(egui::TextWrapMode::Truncate),
+                    egui::Id::new(("detail-name", it.id)),
+                    egui::Sense::hover(),
                 )
                 .on_hover_text(&it.dir);
                 let date_c = egui::pos2(
@@ -9237,7 +9407,6 @@ impl App {
             // 1) 先查落盘缓存;
             // 2) 没有 → 发请求给后台 worker(后台解码 + 落盘),本帧先不显示;
             // 3) worker 完成后回报,UI 再加载纹理。
-            // 原来这里同步 `image::open` 4K 原图,会卡住界面几百毫秒。
             let path = self.rows[idx].path.clone();
             // 预览底图(未加效果)缓存 —— 滑块连续拖动时复用,避免每帧重解码 jpeg。
             if self.preview_base.as_ref().map(|(k, _)| *k) != Some(id) {
@@ -11369,7 +11538,7 @@ impl eframe::App for App {
                                             .map(|d| d.display().to_string())
                                             .unwrap_or_default(),
                                     );
-                                    self.face_model_ui(ui, algo);
+                                    self.face_model_compact_ui(ui, algo);
                                 } else {
                                     ui.label(
                                         "左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。",
@@ -12278,6 +12447,72 @@ impl eframe::App for App {
             }
         }
 
+        // 选项页点了别的识别方案:确认后切换;向量不通用,提示要重建。
+        #[cfg(feature = "ai")]
+        if let Some(pend) = self.face_algo_pending {
+            let mut open = true;
+            let mut decision: u8 = 0; // 1=切换并重建 2=切换暂留 3=取消
+            egui::Window::new("切换人脸识别方案")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(480.0)
+                .show(ctx, |ui| {
+                    ui.label(format!(
+                        "切换到「{}」后,现有的人脸特征向量与簇不通用,需要重建。",
+                        pend.label()
+                    ));
+                    ui.small("重建 = 清除全部人脸数据(含人物命名)并按新方案重新扫描;暂留 = 旧簇照旧显示,待下次扫描再慢慢换血。");
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("切换并重建").clicked() {
+                            decision = 1;
+                        }
+                        if ui.button("切换,暂留旧数据").clicked() {
+                            decision = 2;
+                        }
+                        if ui.button("取消").clicked() {
+                            decision = 3;
+                        }
+                    });
+                });
+            if decision > 0 || !open {
+                self.face_algo_pending = None;
+            }
+            match decision {
+                1 => {
+                    let _ = crate::faces::wipe_faces(&self.store);
+                    let _ = self.store.set_setting("face_algo", pend.key());
+                    let tag = crate::faces::algo_tag(&self.store);
+                    let _ = self.store.set_setting("face_algo_version", &tag);
+                    self.refresh_people_and_suggestions();
+                    if crate::ai::face::Faces::models_present(pend) {
+                        self.start_face_scan();
+                        self.status = format!(
+                            "已切换到 {},现有人脸数据已清除,正在按新方案重新扫描",
+                            pend.label()
+                        );
+                    } else {
+                        self.status = format!(
+                            "已切换到 {},人脸数据已清除;模型未就位,请到 选项 > 人脸识别 下载后再扫描",
+                            pend.label()
+                        );
+                    }
+                }
+                2 => {
+                    let _ = self.store.set_setting("face_algo", pend.key());
+                    let tag = crate::faces::algo_tag(&self.store);
+                    let _ = self.store.set_setting("face_algo_version", &tag);
+                    self.refresh_people_and_suggestions();
+                    self.status = format!(
+                        "已切换到 {},旧的人脸数据保留;重新扫描后新旧结果可能混排,建议用「切换并重建」",
+                        pend.label()
+                    );
+                }
+                _ => {}
+            }
+        }
+
         // 人脸算法版本不一致:旧向量无法与新算法结果比较
         #[cfg(feature = "ai")]
         if self.face_version_warn {
@@ -12309,7 +12544,7 @@ impl eframe::App for App {
         }
 
         // 初次设置向导:服务授权说明与首启范围两问合在一窗、分步呈现,
-        // 不再两个框叠在屏幕中央。只欠其一问时仍是原来的单窗样式;
+        // 不再两个框叠在屏幕中央。只欠其一问时仍是单窗样式;
         // 页序固定:先服务说明(可关可拒),后照片范围(必答一次,无取消)。
         #[cfg(windows)]
         let svc_page_open = self.svc_ask_grant;

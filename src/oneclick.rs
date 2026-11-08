@@ -885,7 +885,7 @@ mod tests {
     fn mt19937_output_is_xorshift32_mixed() {
         // 手算验证:取 state 首个输出,s 取 twist 后 index 0 的值
         let mut rng = Mt19937::new(5489);
-        // 手动复刻 state
+        // 手动按初始化算法重建 state
         let mut state = [0u32; 624];
         state[0] = 5489;
         for i in 1..624 {

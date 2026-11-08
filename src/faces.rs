@@ -1024,14 +1024,11 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                     b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
                 });
                 let probes: Vec<&Vec<f32>> = ranked.iter().take(2).map(|(v, _)| v).collect();
-                let centroid = mean_vec_weighted(vs);
                 let mut best: Option<(String, f32)> = None;
                 for (name, tpl) in named.values() {
+                    // probe × 对方簇全部模板取最优;簇内自身信息不参与(防自比满分)。
                     let mut s = 0.0f32;
                     for p in &probes {
-                        if let Some(c) = &centroid {
-                            s = s.max(cos(p, c));
-                        }
                         for (v, _) in tpl {
                             s = s.max(cos(p, v));
                         }
@@ -1071,9 +1068,14 @@ mod tests {
     }
 
     /// 直接插入一张带簇/质量的人脸(绕过模型,测聚类逻辑)。
+    /// 测试向量不足方案维度时零填充到位 —— 零填充不改余弦值,查询端的
+    /// t.dim 过滤才能命中。
     fn insert_face(store: &Store, photo_id: i64, vec: &[f32], quality: f32, cluster: Option<i64>) {
+        let dim = emb_dim(store) as usize;
+        let mut full = vec.to_vec();
+        full.resize(dim.max(vec.len()), 0.0);
         let mut blob = Vec::new();
-        for v in vec {
+        for v in &full {
             blob.extend_from_slice(&v.to_le_bytes());
         }
         let c = store.test_conn();
@@ -1086,9 +1088,17 @@ mod tests {
         let fid = c.last_insert_rowid();
         c.execute(
             "INSERT INTO face_templates(face_id,dim,vec) VALUES(?1,?2,?3)",
-            params![fid, vec.len() as i64, blob],
+            params![fid, full.len() as i64, blob],
         )
         .unwrap();
+    }
+
+    /// 测试用 save_face 包装:向量零填充到方案维度(不改余弦,过 t.dim 过滤)。
+    fn save_face_t(store: &Store, photo_id: i64, vec: &[f32], quality: f32) -> anyhow::Result<i64> {
+        let dim = emb_dim(store) as usize;
+        let mut full = vec.to_vec();
+        full.resize(dim.max(vec.len()), 0.0);
+        save_face(store, photo_id, 0.0, 0.0, 1.0, 1.0, 0.9, quality, &full)
     }
 
     #[test]
@@ -1104,9 +1114,9 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.9, 0.1, 0.0];
         let c = vec![0.0, 1.0, 0.0];
-        save_face(&store, 90, 0.0, 0.0, 1.0, 1.0, 0.9, 0.8, &a).unwrap();
-        save_face(&store, 90, 0.0, 0.0, 1.0, 1.0, 0.9, 0.8, &b).unwrap();
-        save_face(&store, 90, 0.0, 0.0, 1.0, 1.0, 0.9, 0.8, &c).unwrap();
+        save_face_t(&store, 90, &a, 0.8).unwrap();
+        save_face_t(&store, 90, &b, 0.8).unwrap();
+        save_face_t(&store, 90, &c, 0.8).unwrap();
         let n = assign_clusters(&store, 0.5).unwrap();
         let rows = people_overview(&store);
         assert_eq!(n, 2);

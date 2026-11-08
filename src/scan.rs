@@ -105,7 +105,7 @@ pub fn is_media_ext(ext: &str) -> bool {
 /// (walkdir)才可能共用同一份判定而不各自抄一遍。
 pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picasaoriginals"];
 
-/// 我方扩充的**硬**排除:按定义里面不会有用户的照片,任何入口都不放行,
+/// 本项目扩充的**硬**排除:按定义里面不会有用户的照片,任何入口都不放行,
 /// 而且**根本不进库**(见 `db::Store::purge_hard_excluded_once`)。
 ///
 /// `RECYCLER` 的现代对应物 `$RECYCLE.BIN` 继承同一档硬度:回收站里的东西是
@@ -130,7 +130,7 @@ pub const HARD_EXCLUDES_OURS: [&str; 11] = [
     "rk-scratch",
 ];
 
-/// 我方扩充的**软**排除:默认不派生,但用户亲手指向(导入页选中它、对着占位格
+/// 本项目扩充的**软**排除:默认不派生,但用户亲手指向(导入页选中它、对着占位格
 /// 右键「纳入此目录」)时放行。
 ///
 /// `AppData` 不能一刀切 —— 微信 / QQ / 网盘客户端的接收目录
@@ -158,7 +158,7 @@ pub enum ExcludeLayer {
 /// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
 /// 而非靠排除规则拦截。
 ///
-/// 我方默认表是**刻意超集**,并分两档(见 [`ExcludeLayer`]):
+/// 默认表是**刻意超集**,并分两档(见 [`ExcludeLayer`]):
 /// [`HARD_EXCLUDES_OURS`] 里的目录(回收站现代名 $RECYCLE.BIN、系统与程序
 /// 目录、依赖目录)按定义不会有用户的照片 —— 连库都不进;
 /// [`SOFT_EXCLUDES`] 里的(`AppData` 一类)默认不派生,但用户亲手指向时放行。
@@ -180,7 +180,7 @@ pub struct Exclusions {
 impl Default for Exclusions {
     fn default() -> Self {
         let mut names: Vec<String> = HARD_EXCLUDES.iter().map(|s| s.to_string()).collect();
-        // —— 我方扩充:硬层(不进库)与软层(不主动派生,但用户表态可放行) ——
+        // —— 扩充层:硬层(不进库)与软层(不主动派生,但用户表态可放行) ——
         names.extend(
             HARD_EXCLUDES_OURS
                 .iter()
@@ -361,7 +361,7 @@ pub struct Record {
     pub size: i64,
     /// 媒体类型:`video::kind::PHOTO`(0)=图片,`video::kind::MOVIE`(1)=视频。
     /// 记录类型的"是否视频"二分(7 种子类型对应不同解码路径,
-    /// 我方只有一条 Shell 路径,无须细分)。
+    /// 只有一条 Shell 路径,无须细分)。
     pub kind: i32,
 }
 

@@ -541,7 +541,7 @@ impl App {
     }
 
     /// 两条常驻草稿(调整 / 曲线)按当前照片的已存效果栈载入。
-    /// 曲线草稿以前只在曲线页重载,换图后会一直叠在新照片上,这里统一收口。
+    /// 曲线草稿也在换图时统一重载。
     fn editor_ensure_drafts(&mut self, id: i64) {
         if self.fx_draft_id != Some(id) {
             self.fx_draft_id = Some(id);

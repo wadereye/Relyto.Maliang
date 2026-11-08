@@ -1742,9 +1742,7 @@ fn write_col_u16(w: &mut impl Write, scratch: &mut Vec<u8>, col: &[u16]) -> Resu
 /// `maliang --mft-scan [C,D]`:全量枚举 NTFS 卷并落盘名字索引。
 ///
 /// 这是**手动/诊断**入口(需要提权才有 $MFT 读权限);常驻路径是 `--service`
-/// 里的索引服务。原先的 `--mft-report <文件>` 报告协议整体废除:
-/// 报告是给"提权子进程 → 非提权 GUI"单向回报用的,现在 GUI 直接连管道问
-/// `Status`,不需要靠轮询一个文本文件来猜进度。统计仍打到 stdout
+/// 里的索引服务。GUI 直接连管道问 `Status`,统计打到 stdout
 /// (命令行子命令由 `win::attach_parent_console` 挂回调用方终端)。
 pub fn cli_mft_scan(spec: Option<&str>) -> Result<()> {
     cli_mft_scan_run(spec)
@@ -2289,7 +2287,7 @@ fn cli_mft_scan_run(spec: Option<&str>) -> Result<()> {
             next = j.next_usn
         ));
         let built = build_volume(&p, Some(&ctrl), |n| {
-            // 逐秒条数写进报告:原来只有黑控制台里的 \r 计数能看到,现在进界面。
+            // 逐秒条数写进报告,界面可见进度。
             say(format!("PROGRESS {frac:.2} [{letter}:] 全量读取中…已 {n} 条"));
         })?;
         if let Some(d) = &built.degraded {

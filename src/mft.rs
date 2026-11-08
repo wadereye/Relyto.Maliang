@@ -108,8 +108,7 @@ pub fn volume_geometry(letter: char) -> Result<VolumeGeometry> {
 /// `BytesPerFileRecordSegment=1024` + `ClustersPerFileRecordSegment=0` +
 /// `BytesPerCluster=4096`。三种编码都要能落地:记录尺寸一错,整卷 MFT 全错位。
 ///
-/// `pub(crate)`:rec.rs 的只读诊断程序也用同一套折算,免得两处口径漂移
-/// (诊断程序原先直接 `BytesPerFileRecordSegment as usize`,遇到负数编码会算出天文数字)。
+/// `pub(crate)`:rec.rs 的只读诊断程序也用同一套折算,免得两处口径漂移。
 pub(crate) fn record_size_bytes(bps_raw: u32, cpr_raw: u32, bytes_per_cluster: u32) -> u32 {
     // u32 字段按 i32 解释是否为负。
     let neg = |v: u32| v >= 0x8000_0000;
@@ -168,7 +167,7 @@ pub struct ScanStats {
 
 /// 一条 USN 记录解析出的全部字段(名字保持 UTF-16 借用,不分配、不转换)。
 ///
-/// `usn` 与 `timestamp` 是原先被丢掉的两个字段:`usn`(+0x18)是增量续读的游标,
+/// `usn`(+0x18)是增量续读的游标,
 /// `timestamp`(+0x20)是**这条变更事件发生的时刻**,与 MFT `$STANDARD_INFORMATION`
 /// 里的内容修改时间语义不同 —— 两者都要存,不能互相顶替。
 #[derive(Debug, Clone)]
@@ -215,7 +214,7 @@ fn classify_open(code: Option<u32>) -> Support {
     }
 }
 
-/// 查询 journal 失败的分类(原先一律吞成 NoJournal)。
+/// 查询 journal 失败的分类。
 fn classify_journal(code: Option<u32>) -> Support {
     match code {
         Some(ERR_ACCESS_DENIED) => Support::NeedsAdmin,

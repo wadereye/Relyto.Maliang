@@ -2,8 +2,6 @@
 ///
 /// 效率取向:`FindNextFileW` 一次拿全属性,
 /// EXIF 也只解析一次再分发出多个字段。
-/// 我方原先 `read_taken`/`read_orientation`/`read_gps`/`read_cam` 各自开一次文件
-/// 解析一次 EXIF(每文件 4 次 IO),这里合并为 1 次。
 #[derive(Debug, Clone, Default)]
 pub struct Meta {
     pub taken: Option<String>,

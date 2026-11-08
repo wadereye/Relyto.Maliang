@@ -344,7 +344,7 @@ pub fn known_dirs() -> Vec<std::path::PathBuf> {
 /// 工具栏「查看选项」的壳目录快捷键(View 菜单里的
 /// Desktop / My Documents / My Pictures / My Computer 四项)。
 ///
-/// 「我的电脑」在经典图库里是浏览树根(可下探任意盘);我方左栏是图库树,
+/// 「我的电脑」在经典图库里是浏览树根(可下探任意盘);本项目左栏是图库树,
 /// 覆盖不到全盘,故路径给 `None`,由调用方给出明确说明而不是假装能跳。
 pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     vec![
@@ -549,8 +549,8 @@ fn shell_execute_elevated(
         lpFile: PCWSTR(file_w.as_ptr()),
         lpParameters: PCWSTR(params_w.as_ptr()),
         lpDirectory: PCWSTR::null(),
-        // 原来是 SW_SHOWNORMAL:debug 构建是控制台子系统,提权子进程因此会弹一个
-        // 黑色控制台框。SW_HIDE 对 release(GUI 子系统)无副作用,对 debug 就把框藏了。
+        // SW_HIDE:debug 构建是控制台子系统,提权子进程若用 SW_SHOWNORMAL
+        // 会弹一个黑色控制台框。SW_HIDE 对 release(GUI 子系统)无副作用。
         nShow: SW_HIDE.0,
         ..Default::default()
     };
@@ -634,7 +634,7 @@ pub fn launch_update_helper(params: &str) -> Result<Option<u32>, String> {
     }
 }
 
-// 全盘索引服务的安装/查询/卸载(替掉原先「计划任务 + 每次一次性拉起子进程」)。
+// 全盘索引服务的安装/查询/卸载。
 //
 // 索引引擎必须常驻:USN 保鲜是挂在内核里阻塞读 journal 的活进程,不是跑完就退的
 // 批处理。所以进程模型换成拆进程 —— 一个自动启动的提权服务 + 非提权 UI

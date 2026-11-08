@@ -300,7 +300,7 @@ fn downscale(img: image::DynamicImage, size: u32) -> image::DynamicImage {
 /// 「缩到 S 再转」与「转完再缩到 S」结果逐像素一致(dHash 也不变),
 /// 而在 4000×3000 的原图上先转一次要多花十几倍的时间与内存。
 ///
-/// 方案里说的「orientation 6/8 时交换请求宽高」在我方是恒等变换:
+/// 「orientation 6/8 时交换请求宽高」在这里是恒等变换:
 /// `image` crate 不支持缩放解码,而各档的目标框都是正方形,交换宽高不变 ——
 /// 能省的只有**顺序**这一项。
 fn fit_oriented(
@@ -909,7 +909,7 @@ pub struct PreviewWorker {
 /// 没有就发请求给这个 worker,worker 在后台解码 + 落盘,
 /// 完成后通过通道回报,UI 再加载纹理。
 ///
-/// 这样 UI 线程**不做解码**(原来同步 `image::open` 4K 原图会卡住界面几百毫秒),
+/// 这样 UI 线程**不做解码**(同步 `image::open` 4K 原图会卡住界面几百毫秒),
 /// 预览解码在后台线程完成(不阻塞 UI)。
 pub fn spawn_preview_worker(store: Arc<crate::db::Store>) -> PreviewWorker {
     let (req_tx, req_rx) = mpsc::channel::<(i64, String)>();
