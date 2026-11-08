@@ -1,8 +1,7 @@
 //! 人脸模型就位:启动检查 + 服务端后台下载。
 //!
-//! 模型文件不进仓库,程序也不内置第三方直链:下载地址由 maliang.ini 的
-//! `ModelURL`(服务端模型目录)展开,不写这个键时取程序内置的官方目录,
-//! 显式留空时界面回到「手动放置指引」的原行为。
+//! 模型文件不进仓库,程序也不内置下载地址:下载地址由 maliang.ini 的
+//! `ModelURL`(服务端模型目录)展开;出厂不填,界面走「手动放置指引」。
 //! 识别模型上百 MB,首启不自动开下 —— 只提示,用户点「下载模型」才联网;
 //! 下载走后台线程分段续传,界面显示当前文件与进度。
 
@@ -23,10 +22,11 @@ const MAX_MODEL: u64 = 1024 * 1024 * 1024;
 
 /// 哪些方案的模型可以由服务端分发。
 ///
-/// YuNet(Apache-2.0)与 AdaFace(MIT)允许再分发;insightface antelopev2 的
-/// 权重许可为非商用且不可再分发,只能用户自备,程序不代其下载。
+/// SFace(YuNet / SFace 均 OpenCV Zoo,Apache-2.0 含权重)可代下;
+/// AdaFace 代码 MIT,权重训练数据(MS1MV2 等)非商用,代下责任由配了
+/// ModelURL 的服务端运营方自担;antelopev2 权重非商用,程序从不代下。
 pub fn downloadable(algo: FaceAlgo) -> bool {
-    matches!(algo, FaceAlgo::AdaFace)
+    matches!(algo, FaceAlgo::SFace | FaceAlgo::AdaFace)
 }
 
 /// 该方案在模型目录里还缺哪些文件名(都在位则返回空)。

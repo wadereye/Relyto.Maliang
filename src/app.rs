@@ -5016,11 +5016,12 @@ impl App {
         self.check_face_algo_version();
     }
 
-    /// 刷新簇列表 + 命名建议(建议阈值 0.55)。
+    /// 刷新簇列表 + 命名建议(建议阈值随所选方案)。
     #[cfg(feature = "ai")]
     fn refresh_people_and_suggestions(&mut self) {
         self.refresh_people();
-        self.face_sugs = crate::faces::face_suggestions(&self.store, 0.55);
+        let thr = crate::faces::suggestion_thr(&self.store);
+        self.face_sugs = crate::faces::face_suggestions(&self.store, thr);
     }
 
     /// 人脸算法版本检查(算法版本迁移):库中记录的版本+方案标识与当前
@@ -6968,14 +6969,18 @@ impl App {
                             }
                         });
                         ui.separator();
-                        // 人脸识别方案:两套模型都支持,默认推荐 YuNet + AdaFace
-                        // (商业友好许可);antelopev2 权重不可商用,自备自用。
-                        // 切换即存;两方案的向量不通用,会触发重扫提示。
+                        // 人脸识别方案:默认 YuNet + SFace(两模型均 OpenCV Zoo,
+                        // Apache-2.0 含权重,可商用,可由 ModelURL 代下)。
+                        // AdaFace / antelopev2 权重的训练数据为非商用 research-only,
+                        // 不默认、不代下(AdaFace 可由运营方自担责任配置 ModelURL),
+                        // 用户自备权重即视为接受原厂许可条款(见 README / THIRD_PARTY_NOTICES)。
+                        // 切换即存;各方案向量不通用,会触发重扫提示。
                         #[cfg(feature = "ai")]
                         {
                             ui.heading(egui::RichText::new("人脸识别方案").size(14.0));
                             let cur = crate::faces::current_algo(&self.store);
                             for algo in [
+                                crate::ai::face::FaceAlgo::SFace,
                                 crate::ai::face::FaceAlgo::AdaFace,
                                 crate::ai::face::FaceAlgo::AntelopeV2,
                             ] {
@@ -11049,7 +11054,10 @@ impl eframe::App for App {
                         // 全量重聚类:增量聚类只增不改,分错的簇不会自己长好;
                         // 把全部向量按质量降序重分一遍(已命名按质心最近迁移)。
                         if ui.button("重新聚类").clicked() {
-                            match crate::faces::recluster_all(&self.store, crate::faces::CLUSTER_THR)
+                            match crate::faces::recluster_all(
+                                &self.store,
+                                crate::faces::cluster_thr(&self.store),
+                            )
                             {
                                 Ok(n) => {
                                     self.status = format!("重新聚类完成:共 {n} 簇");

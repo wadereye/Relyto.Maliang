@@ -45,7 +45,8 @@ SOFTWARE.
 | 文件 | 说明 | 来源与许可 |
 |---|---|---|
 | `face_det.onnx` | 人脸检测(YuNet,2023mar 版) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo),Apache-2.0 |
-| `face_rec.onnx` | 人脸识别(AdaFace IR-50 导出的 ONNX,512 维) | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace),MIT |
+| `face_rec_sface.onnx` | 人脸识别(SFace,**默认方案**,128 维) | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo),Apache-2.0(**许可覆盖权重文件**) |
+| `face_rec.onnx` | 可选方案:人脸识别(AdaFace IR-50 导出的 ONNX,512 维) | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace),代码 MIT;**权重训练数据(MS1MV2 等)为非商用,商用前自行审查** |
 | `face_det_v2.onnx` / `face_rec_v2.onnx` | 可选方案:insightface antelopev2(SCRFD + ArcFace,**权重许可非商用**,自备自用) | [deepinsight/insightface](https://github.com/deepinsight/insightface),权重许可以官方发布为准 |
 | `clip_vision.onnx` | 图像编码器(ONNX 导出) | [openai/CLIP](https://github.com/openai/CLIP),MIT |
 | `clip_text.onnx` | 文本编码器(ONNX 导出) | [openai/CLIP](https://github.com/openai/CLIP),MIT |
@@ -63,12 +64,27 @@ SOFTWARE.
   [`LICENSE`](https://github.com/opencv/opencv_zoo/blob/master/LICENSE))
 * **涉及范围**:仅运行时由用户自行下载使用,不在本仓库分发。
 
-### AdaFace(人脸识别模型)
+### SFace(人脸识别模型,默认方案)
+
+* **作品**:SFace 人脸识别器(`face_recognition_sface_2021dec.onnx`,128 维嵌入)
+* **来源**:https://github.com/opencv/opencv_zoo/tree/main/models/face_recognition_sface
+* **许可**:Apache License 2.0,Copyright (C) 2021, Shenzhen Institute of
+  Artificial Intelligence and Robotics for Society(SAIRI),许可覆盖**权重文件
+  本身**,允许商用与再分发(保留许可与归属声明即可)
+* **涉及范围**:默认方案;可由用户配置 ModelURL 后由程序代下,不在本仓库分发。
+
+### AdaFace(可选人脸识别模型)
 
 * **作品**:AdaFace IR-50 预训练权重(MS1MV2 / Glint360K 训练)
 * **来源**:https://github.com/mk-minchul/AdaFace
-* **许可**:MIT License
-* **涉及范围**:用户自行下载权重并转换为 ONNX 后运行时使用,不在本仓库分发。
+* **许可**:MIT License(代码)
+* **原厂授权声明**:官方模型卡(HuggingFace `minchul/cvlface_adaface_ir101_ms1mv2`)
+  原文要求 *Please cite the original paper and follow the license of the
+  training dataset*;训练集 MS1MV2(MS-Celeb-1M 清洗版)与 CASIA-WebFace 的
+  自身条款均为**非商用、仅限研究用途**。代码的 MIT 许可不覆盖训练数据,
+  转成 ONNX 也不产生新的授权,商业使用前请自行审查上游条款并做尽职调查。
+* **涉及范围**:可选方案,用户自行下载权重并转换为 ONNX 后运行时使用,
+  不在本仓库分发。
 
 ```text
 MIT License
@@ -99,8 +115,12 @@ SOFTWARE.
 * **作品**:insightface antelopev2 模型包(SCRFD 检测 + ArcFace 识别)
 * **来源**:https://github.com/deepinsight/insightface
 * **许可**:代码为 MIT,但**模型权重许可为非商用且不可再分发**
+* **原厂授权声明**:insightface 官方模型页原文 *The pretrained models we
+  provided with this library are available for non-commercial research
+  purposes only, including both auto-downloading models and
+  manual-downloading models*(仅限非商用研究用途,涵盖其发布的全部模型包)。
 * **涉及范围**:保留为可选方案(选项 > 常规 可切换),权重由用户自行获取、
-  自担许可义务,不在本仓库分发,本项目也从不分发其权重。
+  自担许可义务,不在本仓库分发,本项目也从不分发其权重、从不代其下载。
 
 ---
 

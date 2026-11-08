@@ -4,6 +4,66 @@ All user-visible changes are documented here, newest first.
 中文版见 [CHANGELOG.md](./CHANGELOG.md)；the full feature list is in
 [README.md](./README.md).
 
+## Unreleased
+
+### Changed
+
+**Default face scheme switched to YuNet + SFace (licensing adjustment)**
+
+- The default scheme is now **YuNet + SFace** (OpenCV Zoo): both models'
+  weights are released under Apache-2.0 **with the license covering the
+  weights themselves** — commercial use is OK, and the program may fetch them
+  once ModelURL is configured.
+- AdaFace and insightface antelopev2 become optional, non-default schemes:
+  their training data (MS1MV2 / CASIA-WebFace / glint360k) is non-commercial
+  research-only, and the code's MIT license does not cover it — converting to
+  ONNX grants no new rights. Users bring their own weights and place them
+  manually (AdaFace may be staged by a server operator at their own
+  responsibility; antelopev2 is never auto-downloaded). The vendor license
+  statements are labeled on the options page, in the README, and in
+  THIRD_PARTY_NOTICES.md.
+- The recognition pipeline adapts per scheme: SFace uses the OpenCV
+  FaceRecognizerSF alignment template and raw-RGB preprocessing, outputting
+  128-d vectors; clustering/suggestion thresholds switch automatically
+  (SFace 0.45/0.40, AdaFace-family keeps 0.6/0.55), and template loading
+  filters by dimension to prevent cross-scheme comparisons after a switch.
+- Switching schemes still prompts a rescan (vectors are incompatible); the
+  default change means existing AdaFace users get one rescan prompt on
+  first launch.
+- Suggestion matching upgraded: unnamed clusters are now matched against
+  named clusters using the two highest-quality faces as probes compared
+  against **all templates** of the named cluster (previously centroid vs
+  centroid) — notably more robust for pose-skewed clusters.
+
+**Three anti-snowball rules for face clustering**
+
+- Young-cluster gating: clusters with fewer than 3 members have weak centroid
+  evidence and now demand a higher cosine (threshold +0.1) to absorb a face,
+  so junk singleton clusters stop snowballing during incremental imports.
+- Assignment margin: a face whose best and second-best cluster scores differ
+  by less than 0.05 is treated as ambiguous — it is not assigned on the spot
+  and waits for the next batch or a full recluster instead of polluting a
+  centroid.
+- Centroid-level merging: at the end of every scan batch and every full
+  recluster, clusters whose centroids are close enough are merged back
+  together, repairing the splits greedy clustering tends to produce
+  ("splits but never merges"). User-named clusters are never auto-merged.
+  Vector compatibility is unchanged — no rescan needed; recluster applies it.
+
+**Models default to manual placement; the program no longer downloads them on its own**
+
+- The face-recognition weights (AdaFace IR-50) were trained on MS1MV2, whose
+  terms are research-only — the code's MIT license does not cover the training
+  data. To leave the licensing responsibility with the user, the factory
+  configuration no longer ships a built-in model directory: missing models
+  show manual-placement guidance, and the first-run download prompt is gone.
+- Self-hosting users can still set `ModelURL` in the `[update]` section of
+  `maliang.ini` to restore downloads; confirming the redistribution license is
+  the server operator's responsibility. `antelopev2` remains manual-only.
+- README gained an "AdaFace weight licensing notice"; THIRD_PARTY_NOTICES.md
+  documents the training-data caveat; the face-scheme option now reads
+  "recommended" instead of "commercially usable".
+
 ## 0.3.0 (2026-11-07)
 
 A major update since v0.2: **disk-wide quick find now runs as a resident

@@ -157,26 +157,33 @@ cargo build --release --no-default-features
 子目录（默认 `%APPDATA%\Relyto\Maliang\models\`，数据目录可在 选项 > 常规 迁移）。
 缺模型时对应功能会显示放置指引，不影响其他功能。
 
-程序内置了官方的版本清单地址与模型目录，**全新安装或清掉本机配置也不会丢**。
-要换成自己的服务端，在统一配置 `maliang.ini` 的 `[update]` 段里改
-`UpdateURL`（清单地址）或 `ModelURL=https://你的域名/maliang/models/`
-（服务端模型目录，结尾带 `/`）；写成空值即停用对应能力。
-配置文件以 exe 同目录那份优先 = 便携部署，否则用 `%APPDATA%\Relyto\Maliang\maliang.ini`，
-「帮助 > 检查更新」与 选项 > 常规 人脸方案区都有「打开配置文件」按钮可直达。
-配好后，程序就能代取默认方案的两个人脸模型：启动时检查模型目录，缺件则提示，
-由用户在提示窗或 **选项 > 常规 > 人脸识别方案** 点「下载模型」才联网（识别模型体积较大，
+版本清单地址内置在程序里（**全新安装或清掉本机配置也不会丢**）；模型目录则
+**出厂默认不填**——配好 `ModelURL` 后，默认方案（SFace）的两个模型可以代下，
+其权重为 Apache-2.0（含权重，可商用）；AdaFace / antelopev2 权重的许可链
+需要用户自行审查（见下方「非默认方案的权重许可声明」），程序不默认替用户下载
+任何模型，界面只给手动放置指引。
+统一配置 `maliang.ini` 的 `[update]` 段里：`UpdateURL`（清单地址）不写就用
+内置地址，改成自己的地址即换源，写成空值停用自动更新；`ModelURL=https://你的域名/maliang/models/`
+（自建服务端模型目录，结尾带 `/`）配好后，程序才能代取默认方案的两个人脸模型：
+启动时检查模型目录，缺件则提示，由用户在提示窗或
+**选项 > 常规 > 人脸识别方案** 点「下载模型」才联网（识别模型体积较大，
 不默认替用户花流量）；下载在后台分段进行，状态栏与设置页显示进度，中断会保留断点，
 再点一次续传。落盘前用 ONNX Runtime 实际加载校验，加载不了的内容直接丢弃。
-`antelopev2` 的权重许可不可再分发，界面只提供手动放置。把 `ModelURL` 写成空值时回到原来的手动放置指引。
+`ModelURL` 留空或写成空值都回到手动放置指引；`antelopev2` 的权重许可不可再分发，
+任何情况下都只提供手动放置。自建服务端分发模型前，请自行确认分发行为符合相应许可。
+配置文件以 exe 同目录那份优先 = 便携部署，否则用 `%APPDATA%\Relyto\Maliang\maliang.ini`，
+「帮助 > 检查更新」与 选项 > 常规 人脸方案区都有「打开配置文件」按钮可直达。
 
-程序只按固定文件名取件（`<ModelURL>face_det.onnx`、`<ModelURL>face_rec.onnx`）；
+程序只按所选方案的固定文件名取件（默认方案 `<ModelURL>face_det.onnx` +
+`<ModelURL>face_rec_sface.onnx`，其余见下表）；
 下面列的官方模型地址是给你上架时对照、以及手动放置时用的，
 优先用官方链接，官方地址不通再退到国内加速镜像。
 
 | 文件 | 用途 | 来源与许可 |
 |---|---|---|
 | `face_det.onnx` | 人脸检测（YuNet，2023mar 版） | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/blob/main/models/face_detection_yunet/)，Apache-2.0 |
-| `face_rec.onnx` | 人脸识别，512 维（AdaFace IR-50 导出 ONNX） | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)，MIT |
+| `face_rec_sface.onnx` | 人脸识别，128 维（**默认方案** SFace） | [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo/blob/main/models/face_recognition_sface/)，Apache-2.0（**含权重**，可商用） |
+| `face_rec.onnx` | 可选方案：人脸识别，512 维（AdaFace IR-50 导出 ONNX） | [mk-minchul/AdaFace](https://github.com/mk-minchul/AdaFace)，代码 MIT；权重训练数据（MS1MV2）非商用，见下方声明 |
 | `face_det_v2.onnx` / `face_rec_v2.onnx` | 可选方案：insightface antelopev2（SCRFD + ArcFace，**权重不可商用**，自备自用） | [deepinsight/insightface](https://github.com/deepinsight/insightface)，权重许可以官方发布为准 |
 | `ch_PP-OCRv4_det_infer.onnx` / `ch_PP-OCRv4_rec_infer.onnx` / `ppocr_keys_v1.txt` | 中文 OCR | PP-OCRv4（PaddleOCR，Apache-2.0） |
 | `clip_vision.onnx` / `clip_text.onnx` / `clip_merges.txt` | 语义搜索 | OpenAI CLIP（MIT）导出的 ONNX |
@@ -186,20 +193,52 @@ cargo build --release --no-default-features
 | 程序内文件名 | 官方地址 | 国内可达的加速镜像 | 核对结果 |
 |---|---|---|---|
 | `face_det.onnx` | <https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx> | OpenCV 官方 HuggingFace 仓库 <https://huggingface.co/opencv/face_detection_yunet>，其镜像 <https://hf-mirror.com/opencv/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx> | 官方地址 200 / 232,589 字节；`hf-mirror.com` 同样 200 / 232,589 字节（`huggingface.co` 本身要看网络，本机测试时它无响应）。⚠️ `raw.githubusercontent.com` 的同一路径只返回 131 字节的 Git-LFS 指针，必须走 `media.githubusercontent.com`；opencv_zoo 的 GitHub Release 里没有模型资产。GitCode 上的 opencv_zoo 镜像**不能当直连源**：`.../raw/main/...onnx` 回 200 但给的是 6 KB 网页壳，`file.gitcode.com` 回 401，`raw.gitcode.com` 该路径 404 |
-| `face_rec.onnx` | AdaFace 官方只发布 PyTorch 权重，放在 Google Drive（IR-50 / MS1MV2：<https://drive.google.com/file/d/1eUaSHG4pGlIZK7hBkqjyp2fc2epKoBvI>） | 没有官方镜像 | 官方仓库没有任何 ONNX 资产（GitHub Releases 为空），作者后续的 CVLFace 仓库在 HuggingFace 上也只有 `model.safetensors`。所以这一件**要么按下面的脚本自己转 ONNX，要么由你的服务端代收转换好的 ONNX**；网上流传的 AdaFace ONNX 都不是官方发布的 |
+| `face_rec_sface.onnx` | <https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx> | OpenCV 官方 HuggingFace 仓库 <https://huggingface.co/opencv/face_recognition_sface>，其镜像 <https://hf-mirror.com/opencv/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx> | 与 YuNet 同仓同规则：走 `media.githubusercontent.com` 或 HuggingFace，`raw.githubusercontent.com` 只给 LFS 指针。官方文件 200 / 38,696,353 字节（约 36.9 MiB）；Apache-2.0 **含权重**，程序可在配置 ModelURL 后代下 |
+| `face_rec.onnx` | AdaFace 官方只发布 PyTorch 权重，放在 Google Drive（IR-50 / MS1MV2：<https://drive.google.com/file/d/1eUaSHG4pGlIZK7hBkqjyp2fc2epKoBvI>） | 没有官方镜像 | 官方仓库没有任何 ONNX 资产（GitHub Releases 为空），作者后续的 CVLFace 仓库在 HuggingFace 上也只有 `model.safetensors`。所以这一件**要么按下面的脚本自己转 ONNX，要么由你的服务端代收转换好的 ONNX**；网上流传的 AdaFace ONNX 都不是官方发布的。⚠️ 该权重以 MS1MV2（研究用途数据集）训练，见「非默认方案的权重许可声明」 |
 | `face_det_v2.onnx`、`face_rec_v2.onnx` | <https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip>（Release tag `v0.7` 的资产，`buffalo_l.zip` 是同页的另一个包） | ModelScope 的 `deepghs/insightface` 是社区自动镜像，非官方 | 官方包 360,662,982 字节（约 344 MiB，体积以 GitHub API 返回的 size 为准）。解包后把检测件（SCRFD 10G，包内名 `scrfd_10g_bnkps.onnx`）改名成 `face_det_v2.onnx`、识别件（ArcFace R100，包内名 `glintr100.onnx`，512 维来自它）改名成 `face_rec_v2.onnx`，具体以包内实际文件名为准；`buffalo_l.zip` 里的 `det_10g.onnx` / `w600k_r50.onnx` 是另一套方案的件，不要拿来改名。**许可不可再分发，程序不提供代下载** |
 
-两套人脸方案都支持，在 **选项 > 常规 > 人脸识别方案** 里选择，默认推荐
-YuNet + AdaFace（商业友好许可）；切换后向量不通用，会提示重新扫描。
+三套人脸方案都支持，在 **选项 > 常规 > 人脸识别方案** 里选择，**默认
+YuNet + SFace**（两个模型都是 Apache-2.0 含权重，可商用，配 ModelURL 后可代下）；
+切换后向量不通用，会提示重新扫描。各方案的聚类/建议阈值随方案自动切换，
 程序会按输出张量数自动识别检测模型类型，文件按对应方案命名放置即可。
+
+#### 非默认方案的权重许可声明（选用前请先读）
+
+- **YuNet / SFace（默认方案，供对照）**：两个模型均出自 OpenCV Zoo，
+  以 Apache-2.0 发布且**许可覆盖权重文件本身**，允许商用与再分发
+  （保留许可与归属声明即可，见 THIRD_PARTY_NOTICES.md）。
+- **AdaFace（可选，自备）**：代码 MIT（© 2022 Minchul Kim），但官方模型卡
+  明确要求 *follow the license of the training dataset*；其预训练权重的训练集
+  MS1MV2（MS-Celeb-1M 清洗版）与 CASIA-WebFace 条款均为**非商用、仅限研究
+  用途**。代码的 MIT 许可**不覆盖**训练数据，把权重转成 ONNX（或任何其他
+  格式）也不产生新的授权。选用即表示你自备权重并自行承担许可审查责任。
+- **antelopev2（可选，自备）**：insightface 官方对其发布的预训练模型的
+  声明原文为 *The pretrained models we provided with this library are
+  available for non-commercial research purposes only*（仅限非商用研究用途，
+  含自动下载与手动下载的所有模型包）。该权重**不可再分发**，程序任何情况下
+  都不代下，只提供手动放置。
+
+本项目对非默认方案的处理：
+
+- **手动下载是推荐路径**：按下方地址自行取得权重并（对 AdaFace）转 ONNX
+  放入模型目录，许可责任由使用者自担。
+- 若你运营自己的服务端并愿意分发 AdaFace 权重，可在 `ModelURL` 填自己的地址——
+  分发行为及其许可后果由服务端运营方承担，与本程序无关；antelopev2 无论如何
+  都不进代下通道。
+- 对许可要求更高的场景，可关注上游以更清晰条款重新发布的权重，或使用
+  自行训练的模型（AdaFace 的网络结构与转换脚本同样是 MIT）。
 
 人脸模型放置方法：
 
-- **检测（YuNet）**：直接下载上表的 `face_detection_yunet_2023mar.onnx`，
+- **检测（YuNet，默认方案与 AdaFace 方案共用）**：直接下载上表的
+  `face_detection_yunet_2023mar.onnx`，
   重命名为 `face_det.onnx` 放入模型目录即可。取件走
   `media.githubusercontent.com` 或 HuggingFace；用 `raw.githubusercontent.com`
   拿到的是 131 字节的 Git-LFS 指针文本，程序会在加载校验那一步拒掉。
-- **识别（AdaFace）**：官方仓库发布的是 PyTorch 权重，需先转成 ONNX。按其
+- **识别（SFace，默认方案）**：下载上表的 `face_recognition_sface_2021dec.onnx`
+  （Apache-2.0 含权重），重命名为 `face_rec_sface.onnx` 放入模型目录即可
+  （输出 128 维）。配置 `ModelURL` 后也可由程序代下这两个文件。
+- **识别（AdaFace，可选）**：官方仓库发布的是 PyTorch 权重，需先转成 ONNX。按其
   README 下载 IR-50 权重（如 `adaface_ir50_ms1mv2.ckpt`），在 AdaFace 仓库
   根目录执行：
 
@@ -224,7 +263,8 @@ YuNet + AdaFace（商业友好许可）；切换后向量不通用，会提示�
   `scrfd_10g_bnkps.onnx` 改名成 `face_det_v2.onnx`、`glintr100.onnx` 改名成
   `face_rec_v2.onnx`（512 维来自后者）后放入模型目录。同名 zip 之外的
   `det_10g.onnx` / `w600k_r50.onnx` 属于 buffalo_l 方案，不是本方案的件，
-  别按上面的名字改。该方案权重许可不可再分发，程序只给手动放置，不提供代下载。
+  别按上面的名字改。该方案权重许可不可再分发（声明见上节），程序只给手动放置，
+  不提供代下载。
 
 模型文件的许可归各自权利人所有，归属声明与许可原文见
 [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md)。

@@ -274,44 +274,108 @@ pub mod face {
     use ort::session::Session;
     use ort::value::Tensor;
 
-    /// 人脸方案:检测 + 识别模型配对(成套使用,向量不通用)。
+    /// 人脸方案:检测 + 识别模型配对(成套使用,向量与阈值均不通用)。
+    /// 默认 SFace:YuNet 与 SFace 均出自 OpenCV Zoo,Apache-2.0(含权重),可商用。
+    /// AdaFace / antelopev2 权重的训练集(MS1MV2 / CASIA-WebFace / glint360k)
+    /// 为非商用 research-only,许可链未闭合 —— 不默认,由用户自备并自担许可责任。
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FaceAlgo {
-        /// YuNet 检测 + AdaFace IR-50 识别(默认推荐,商业友好许可)。
+        /// YuNet 检测 + SFace 识别(OpenCV Zoo;默认,Apache-2.0 含权重)。
+        SFace,
+        /// YuNet 检测 + AdaFace IR-50 识别(权重非商用,自备)。
         AdaFace,
-        /// insightface antelopev2(SCRFD + ArcFace;权重许可非商用,自备自用)。
+        /// insightface antelopev2(SCRFD + ArcFace;权重非商用,自备自用)。
         AntelopeV2,
     }
 
     impl FaceAlgo {
         pub fn key(self) -> &'static str {
             match self {
+                Self::SFace => "sface",
                 Self::AdaFace => "adaface",
                 Self::AntelopeV2 => "antelopev2",
             }
         }
 
         pub fn from_key(k: &str) -> Self {
-            if k == Self::AntelopeV2.key() {
+            if k == Self::AdaFace.key() {
+                Self::AdaFace
+            } else if k == Self::AntelopeV2.key() {
                 Self::AntelopeV2
             } else {
-                Self::AdaFace
+                Self::SFace
             }
         }
 
         pub fn label(self) -> &'static str {
             match self {
-                Self::AdaFace => "YuNet + AdaFace(可商用,推荐)",
-                Self::AntelopeV2 => "insightface antelopev2(不可商用)",
+                Self::SFace => "YuNet + SFace(推荐,Apache-2.0 含权重)",
+                Self::AdaFace => "YuNet + AdaFace(权重许可非商用,自备)",
+                Self::AntelopeV2 => "insightface antelopev2(权重非商用,自备)",
             }
         }
 
         /// 该方案要求的模型文件名(检测, 识别),放数据目录 models\ 下。
         pub fn files(self) -> (&'static str, &'static str) {
             match self {
+                Self::SFace => ("face_det.onnx", "face_rec_sface.onnx"),
                 Self::AdaFace => ("face_det.onnx", "face_rec.onnx"),
                 Self::AntelopeV2 => ("face_det_v2.onnx", "face_rec_v2.onnx"),
             }
+        }
+
+        /// 嵌入维度(模板 dim 过滤与输出校验用)。
+        pub fn emb_dim(self) -> usize {
+            match self {
+                Self::SFace => 128,
+                Self::AdaFace | Self::AntelopeV2 => 512,
+            }
+        }
+
+        /// 聚类/建议阈值(余弦):各模型嵌入分布不同,不可跨方案照搬。
+        /// SFace 按 OpenCV 1:1 判同参考阈值 0.363 上调取严(聚类)/放宽(建议);
+        /// AdaFace 系 512 维同人 >0.6 异人 <0.3,沿用既有值。
+        pub fn cluster_thr(self) -> f32 {
+            match self {
+                Self::SFace => 0.45,
+                Self::AdaFace | Self::AntelopeV2 => 0.6,
+            }
+        }
+
+        pub fn suggestion_thr(self) -> f32 {
+            match self {
+                Self::SFace => 0.4,
+                Self::AdaFace | Self::AntelopeV2 => 0.55,
+            }
+        }
+
+        /// 识别对齐目标 5 点:ArcFace 系用标准模板;SFace 用 OpenCV
+        /// FaceRecognizerSF 的模板(= 标准模板 + (8,0),与其参考实现一致)。
+        pub fn canon(self) -> [(f32, f32); 5] {
+            const ARCFACE: [(f32, f32); 5] = [
+                (30.294_6, 51.696_3),
+                (65.531_8, 51.501_4),
+                (48.025_2, 71.736_6),
+                (33.549_3, 92.365_5),
+                (62.729_9, 92.204_1),
+            ];
+            const OPENCV_SFACE: [(f32, f32); 5] = [
+                (38.2946, 51.6963),
+                (73.5318, 51.5014),
+                (56.0252, 71.7366),
+                (41.5493, 92.3655),
+                (70.7299, 92.2041),
+            ];
+            match self {
+                Self::SFace => OPENCV_SFACE,
+                Self::AdaFace | Self::AntelopeV2 => ARCFACE,
+            }
+        }
+
+        /// 识别输入预处理:SFace 喂 raw 0~255 RGB(OpenCV 参考口径,
+        /// 不做均值归一化);ArcFace 系喂 BGR (x-127.5)/127.5。
+        pub fn rec_raw_rgb(self) -> bool {
+            matches!(self, Self::SFace)
         }
     }
 
@@ -332,6 +396,8 @@ pub mod face {
     }
 
     pub struct Faces {
+        /// 当前方案(决定对齐模板/预处理/维度校验)。
+        algo: FaceAlgo,
         det: Session,
         det_out: String,
         /// true = 检测模型是 YuNet(单输出);false = SCRFD(多输出,antelopev2)。
@@ -347,14 +413,6 @@ pub mod face {
             .map_err(|e| e.to_string())
     }
 
-    const CANON: [(f32, f32); 5] = [
-        (30.294_6, 51.696_3),
-        (65.531_8, 51.501_4),
-        (48.025_2, 71.736_6),
-        (33.549_3, 92.365_5),
-        (62.729_9, 92.204_1),
-    ];
-
     impl Faces {
         pub fn load(algo: FaceAlgo) -> Result<Self, String> {
             let dir = models_dir().ok_or("无数据目录")?;
@@ -365,7 +423,7 @@ pub mod face {
             let det_yunet = det.outputs().len() == 1;
             let rec = open_session(&dir.join(rec_f))?;
             let rec_out = rec.outputs()[0].name().to_string();
-            Ok(Self { det, det_out, det_yunet, rec, rec_out })
+            Ok(Self { algo, det, det_out, det_yunet, rec, rec_out })
         }
 
         /// 指定方案的模型文件(检测+识别)是否已就位。
@@ -551,15 +609,16 @@ pub mod face {
             Ok(dets)
         }
 
-        /// 检测 + 5 点对齐 + 512 维嵌入(ArcFace 标准 5 点模板对齐,
-        /// 两方案的识别模型都输出 512 维)。
+        /// 检测 + 5 点对齐 + 嵌入(ArcFace 标准模板或 SFace 模板对齐,
+        /// 维度随方案:512 / 128)。
         pub fn analyze(&mut self, img: &image::DynamicImage) -> Result<Vec<Face>, String> {
+            let canon = self.algo.canon();
             let dets = self.detect(img)?;
             let mut out = Vec::new();
             for d in dets {
                 // 相似变换:src→canon。θ = atan2(Σ s_x d_y - s_y d_x, Σ d_x s_x + d_y s_y)
                 let (mut dx, mut dy, mut cx, mut cy) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-                for (s, dd) in d.kps.iter().zip(CANON.iter()) {
+                for (s, dd) in d.kps.iter().zip(canon.iter()) {
                     cx += s.0;
                     cy += s.1;
                     dx += dd.0;
@@ -567,7 +626,7 @@ pub mod face {
                 }
                 let (mx, my, nx, ny) = (cx / 5.0, cy / 5.0, dx / 5.0, dy / 5.0);
                 let (mut r11, mut r21) = (0.0f32, 0.0f32);
-                for (s, dd) in d.kps.iter().zip(CANON.iter()) {
+                for (s, dd) in d.kps.iter().zip(canon.iter()) {
                     let sx0 = s.0 - mx;
                     let sy0 = s.1 - my;
                     let dx0 = dd.0 - nx;
@@ -578,7 +637,7 @@ pub mod face {
                 let th = r21.atan2(r11);
                 let (ct, st) = (th.cos(), th.sin());
                 let (mut num, mut den) = (0.0f32, 0.0f32);
-                for (s, dd) in d.kps.iter().zip(CANON.iter()) {
+                for (s, dd) in d.kps.iter().zip(canon.iter()) {
                     let sx0 = s.0 - mx;
                     let sy0 = s.1 - my;
                     num += sx0 * (ct * dd.0 - st * dd.1) + sy0 * (st * dd.0 + ct * dd.1);
@@ -621,9 +680,19 @@ pub mod face {
                                 + p01[c] * (1.0 - fx) * fy
                                 + p11[c] * fx * fy;
                         }
-                        crop.push((px[2] - 127.5) / 127.5);
-                        crop.push((px[1] - 127.5) / 127.5);
-                        crop.push((px[0] - 127.5) / 127.5);
+                        if self.algo.rec_raw_rgb() {
+                            // SFace:raw RGB 0~255(OpenCV 参考口径,勿归一化)。
+                            crop.push(px[0]);
+                            crop.push(px[1]);
+                            crop.push(px[2]);
+                        } else {
+                            // ArcFace / AdaFace 训练归一化:(x/255-0.5)/0.5,
+                            // 通道序 BGR。必须用 u8 图再转 f32(0~255),
+                            // to_rgb32f 的 0~1 值误入会把嵌入压成常数。
+                            crop.push((px[2] - 127.5) / 127.5);
+                            crop.push((px[1] - 127.5) / 127.5);
+                            crop.push((px[0] - 127.5) / 127.5);
+                        }
                     }
                 }
                 let input = Tensor::from_array(([1usize, 3, 112usize, 112usize], crop))
@@ -636,8 +705,9 @@ pub mod face {
                     .try_extract_tensor::<f32>()
                     .map_err(|e| format!("rec 输出: {e}"))?;
                 let dim = vals.len();
-                if dim != 512 {
-                    return Err(format!("rec 维度异常: {dim}"));
+                let expect = self.algo.emb_dim();
+                if dim != expect {
+                    return Err(format!("rec 维度异常: {dim}(预期 {expect})"));
                 }
                 let mut emb = vals.to_vec();
                 let norm = emb.iter().map(|v| v * v).sum::<f32>().sqrt();
@@ -677,7 +747,7 @@ pub mod face {
                 out.first().map(|x| (x.det.x0, x.det.y0, x.det.x1, x.det.y1, x.det.score, x.det.kps))
             );
             assert!(!out.is_empty(), "未检测到人脸");
-            assert!(out[0].emb.len() == 512, "嵌入维度错误");
+            assert!(out[0].emb.len() == FaceAlgo::AdaFace.emb_dim(), "嵌入维度错误");
             assert!(out[0].det.score > 0.5);
         }
     }

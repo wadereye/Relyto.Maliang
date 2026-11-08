@@ -55,8 +55,8 @@ const LEGACY_UPDATE_FILE: &str = "update.ini";
 /// 显式写成 `UpdateURL=`(空值)则停用自动更新,填别的地址可换源。
 /// 这样清掉本机配置或全新安装也能直接检查更新。
 pub const DEFAULT_UPDATE_URL: &str = "http://47.109.200.26/maliang/update/latest.ini";
-/// 出厂默认的服务端模型目录,规则同上:显式留空即回到手动放置。
-pub const DEFAULT_MODEL_URL: &str = "http://47.109.200.26/maliang/models/";
+/// 模型目录出厂默认为空:权重许可由用户自行审查,需要代下载时自配 ModelURL。
+pub const DEFAULT_MODEL_URL: &str = "";
 
 /// 统一配置文件模板(首启无配置时写入;[location] 归本模块,[update] 节
 /// 供升级/模型下载用,解析端只认键不认节,节头仅作视觉分组)。
@@ -103,11 +103,11 @@ RestartService=1
 ChunkMB=2
 
 # 模型下载目录:服务端放模型文件的目录,结尾带「/」。
-# 程序按固定文件名(face_det.onnx / face_rec.onnx)在这个目录下取文件,
-# 存进数据目录的 models\\。不写这一行 = 用程序内置的官方目录;
-# 写成 ModelURL=(空值) = 不提供下载,界面只给手动放置指引。
-# 建议用 https;模型由服务端自行选择与授权,程序只校验它能否被加载。
-ModelURL=http://47.109.200.26/maliang/models/
+# 程序按所选方案的固定文件名(face_det.onnx + face_rec_sface.onnx 等)
+# 在这个目录下取文件,存进数据目录的 models\\。出厂默认不填 = 不代下模型,界面只给手动放置指引;
+# 自建服务端并自行确认模型分发许可后,可填自己的地址(建议 https);
+# 写成 ModelURL=(空值) 同样是不提供下载。
+ModelURL=
 ";
 
 /// 默认数据目录(marker 文件所在;env/marker 都不生效时它就是数据目录)。
