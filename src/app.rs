@@ -4877,6 +4877,11 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(phase.label());
+                    if ui.button("停止下载").clicked() {
+                        self.models.cancel();
+                        self.status =
+                            "已停止下载:断点留在 .part,稍后点「下载选中的模型」接着下".into();
+                    }
                 });
                 if let Some(d) = crate::ai::models_dir() {
                     ui.small(format!(
@@ -5000,12 +5005,47 @@ impl App {
             crate::models::SourcePref::Official,
             crate::models::SourcePref::Mirror,
         ] {
-            if ui.radio(pref == p, p.label()).clicked() && pref != p {
+            // 镜像源没配 ModelURL 时禁选,免得选完下不动。
+            let enabled =
+                p != crate::models::SourcePref::Mirror || !self.models.model_base().is_empty();
+            if ui
+                .add_enabled(
+                    enabled,
+                    egui::RadioButton::new(pref == p, p.label()),
+                )
+                .clicked()
+                && pref != p
+            {
                 let _ = self
                     .store
                     .set_setting(crate::models::SourcePref::SETTING, p.key());
-                self.status = format!("模型下载源已切换为「{}」", p.label());
+                // 下载进行中切源:立刻打断当前任务并用新源重启剩余缺件,
+                // 断点(.part)保留,同内容文件可续传,不浪费已下字节。
+                if self.models.phase.working() {
+                    self.models.cancel();
+                    let files: Vec<String> = CATALOG
+                        .iter()
+                        .map(|(name, _)| name.to_string())
+                        .filter(|name| {
+                            crate::ai::models_dir()
+                                .map(|d| !d.join(name).is_file())
+                                .unwrap_or(false)
+                        })
+                        .collect();
+                    if files.is_empty() {
+                        self.status = "下载源已切换;当前任务已停,所需文件其实都已就位".into();
+                    } else {
+                        self.start_model_files(files);
+                        self.status =
+                            format!("已切换为「{}」并用新源重启下载,断点保留接着下", p.label());
+                    }
+                } else {
+                    self.status = format!("模型下载源已切换为「{}」,下次下载生效", p.label());
+                }
             }
+        }
+        if self.models.model_base().is_empty() {
+            ui.small("想用镜像下载:在 maliang.ini 里配好 ModelURL(「打开配置文件」可直达),这里才会放开「仅镜像」。");
         }
         ui.small("「仅镜像」需要 maliang.ini 里配好 ModelURL;源上的文件缺失会直接报错,不做回退。");
         ui.horizontal(|ui| {

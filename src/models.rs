@@ -253,6 +253,7 @@ enum Cmd {
         pref: SourcePref,
         cfg: Box<Config>,
     },
+    /// 兼容收摊路径;运行中的任务由共享的取消位打断。
     Stop,
 }
 
@@ -347,7 +348,10 @@ pub struct ModelDownloader {
     /// 测速状态与后台结果通道。
     pub probe: ProbeState,
     probe_rx: Option<Receiver<Vec<ProbeResult>>>,
+    /// 程序退出(Drop)用的总闸;worker 收到后彻底收摊。
     stop: Arc<AtomicBool>,
+    /// 只取消当前下载任务(切源重启/手动停止);worker 不退出,还能接新任务。
+    cancel: Arc<AtomicBool>,
 }
 
 impl ModelDownloader {
@@ -356,10 +360,12 @@ impl ModelDownloader {
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
         let (ev_tx, ev_rx) = mpsc::channel::<Event>();
         let stop = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
+        let worker_cancel = cancel.clone();
         let _ = std::thread::Builder::new()
             .name("maliang-models".into())
-            .spawn(move || worker(cmd_rx, ev_tx, worker_stop));
+            .spawn(move || worker(cmd_rx, ev_tx, worker_stop, worker_cancel));
         ModelDownloader {
             cmd: cmd_tx,
             events: ev_rx,
@@ -369,6 +375,7 @@ impl ModelDownloader {
             probe: ProbeState::Idle,
             probe_rx: None,
             stop,
+            cancel,
         }
     }
 
@@ -449,7 +456,14 @@ impl ModelDownloader {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
         let _ = self.cmd.send(Cmd::Stop);
+    }
+
+    /// 停掉当前下载任务但保留 worker:断点(.part)留在原地,接着就能续传。
+    pub fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.phase = Phase::Idle;
     }
 
     /// 每帧一泵:收后台事件(下载 + 测速),在忙时继续要重绘帧。
@@ -499,25 +513,35 @@ impl Drop for ModelDownloader {
     }
 }
 
-fn worker(rx: Receiver<Cmd>, tx: Sender<Event>, stop: Arc<AtomicBool>) {
+fn worker(
+    rx: Receiver<Cmd>,
+    tx: Sender<Event>,
+    stop: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         match rx.recv() {
-            Ok(Cmd::Stop) => break,
+            // 空闲期收到取消:当前没有任务在跑,直接忽略(标志位由下个任务开工时清零)。
+            Ok(Cmd::Stop) => continue,
             Ok(Cmd::Download { files, pref, cfg }) => {
+                // 新任务开工前先清取消位:让「取消旧任务 → 立刻重启」的连招能落地。
+                cancel.store(false, Ordering::Relaxed);
                 let dir = crate::ai::models_dir();
                 let out = match dir {
-                    Some(d) => fetch_files(&d, &cfg, &files, pref, &tx, &stop, verify_onnx),
+                    Some(d) => fetch_files(&d, &cfg, &files, pref, &tx, &cancel, verify_onnx),
                     None => Err("没有数据目录,模型没地方放".to_string()),
                 };
                 match out {
                     Ok(()) => {
-                        let _ = tx.send(Event::Ready);
+                        if !cancel.load(Ordering::Relaxed) {
+                            let _ = tx.send(Event::Ready);
+                        }
                     }
                     Err(e) => {
-                        if !stop.load(Ordering::Relaxed) {
+                        if !stop.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
                             let _ = tx.send(Event::Failed(e));
                         }
                     }
