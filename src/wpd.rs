@@ -42,8 +42,7 @@ mod imp {
     use anyhow::{anyhow, Result};
     use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Devices::PortableDevices::{
-        IPortableDeviceManager, IPortableDeviceValues, PortableDeviceManager,
-        PortableDeviceValues,
+        IPortableDeviceManager, IPortableDeviceValues, PortableDeviceManager, PortableDeviceValues,
     };
     use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
     use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
@@ -131,8 +130,7 @@ mod imp {
             for id in ids {
                 // 友好名:设备 ID 与名称都转 UTF-8;
                 // 名称取不到时回落设备 ID(名称为空仍列出)。
-                let friendly =
-                    query_string(&manager, &id, 0).unwrap_or_else(|| id.clone());
+                let friendly = query_string(&manager, &id, 0).unwrap_or_else(|| id.clone());
                 let description = query_string(&manager, &id, 1).unwrap_or_default();
                 let manufacturer = query_string(&manager, &id, 2).unwrap_or_default();
                 out.push(WpdDevice {
@@ -197,7 +195,8 @@ mod imp {
     /// 供测试:GUID 常量正确性(防手抖写错 fmtid)。
     #[cfg(test)]
     pub(crate) fn client_fmtid_matches_original() -> bool {
-        WPD_CLIENT_FMTID == windows::core::GUID::from_u128(0x204d_9f0c_2292_4080_9f42_4066_4e70_f859)
+        WPD_CLIENT_FMTID
+            == windows::core::GUID::from_u128(0x204d_9f0c_2292_4080_9f42_4066_4e70_f859)
     }
 }
 

@@ -30,7 +30,8 @@ pub const SERVICE_NAME: &str = "RelytoMaliangIndex";
 /// 服务列表里显示的名字。
 pub const SERVICE_DISPLAY: &str = "Relyto.Maliang 全盘文件名索引";
 /// 服务描述(控制面板里那段话,要能让用户判断该不该留着它)。
-pub const SERVICE_DESC: &str = "维护全盘文件名索引与照片结构元数据:直读 NTFS $MFT 建库、订阅 USN 日志保鲜,\
+pub const SERVICE_DESC: &str =
+    "维护全盘文件名索引与照片结构元数据:直读 NTFS $MFT 建库、订阅 USN 日志保鲜,\
 通过本地命名管道向 Relyto.Maliang 界面提供快速查找。停用后界面降级为逐目录扫描,没有全盘快查。";
 
 /// 服务日志文件名(落在数据目录)。
@@ -95,7 +96,10 @@ struct Log {
 fn open_log_file() -> Option<std::fs::File> {
     let p = crate::db::data_dir().join(LOG_NAME);
     // 超上限就截断:宁可丢旧账,不可吃掉数据盘。
-    if std::fs::metadata(&p).map(|m| m.len() > LOG_MAX_BYTES).unwrap_or(false) {
+    if std::fs::metadata(&p)
+        .map(|m| m.len() > LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&p);
     }
     std::fs::OpenOptions::new()
@@ -466,7 +470,8 @@ impl Engine {
         let t0 = Instant::now();
         let last = std::cell::Cell::new(Instant::now());
         let log = &self.log;
-        self.log.line(&format!("[{letter}:] 开始全量建库(直读 $MFT)…"));
+        self.log
+            .line(&format!("[{letter}:] 开始全量建库(直读 $MFT)…"));
         let built = nameidx::build_volume(&p, Some(&self.ctrl), |n| {
             if last.get().elapsed() >= BUILD_LOG_EVERY {
                 last.set(Instant::now());
@@ -691,8 +696,16 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
     // (只在空闲轮次打;有增量的轮次本来就有 增量 行。)
     let mut rounds = 0u64;
     let mut last_diag = Instant::now();
-    struct RoundDiag { records: u64, ops: usize, next: i64 }
-    let mut last_round = RoundDiag { records: 0, ops: 0, next: 0 };
+    struct RoundDiag {
+        records: u64,
+        ops: usize,
+        next: i64,
+    }
+    let mut last_round = RoundDiag {
+        records: 0,
+        ops: 0,
+        next: 0,
+    };
     while !e.stop.load(Ordering::SeqCst) {
         // 每轮重新问一次 journal:日志可能被重建(id 变了),也可能被关掉。
         let probe = mft::probe().into_iter().find(|p| p.letter == letter);
@@ -715,7 +728,10 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
         backoff = BACKOFF_MIN;
         let start = {
             let st = e.lock();
-            st.journals.get(&letter).map(|s| s.next_usn).unwrap_or(j.next_usn)
+            st.journals
+                .get(&letter)
+                .map(|s| s.next_usn)
+                .unwrap_or(j.next_usn)
         };
         rounds += 1;
         if last_diag.elapsed() >= Duration::from_secs(10) {
@@ -733,7 +749,11 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
                 records,
                 raw,
             } => {
-                last_round = RoundDiag { records, ops: ops.len(), next: next_usn };
+                last_round = RoundDiag {
+                    records,
+                    ops: ops.len(),
+                    next: next_usn,
+                };
                 // 诊断(临时):把有记录的轮次摊开,验证内核到底回了什么、
                 // collect_close_op 收了什么。收口前整段摘除。
                 if records > 0 {
@@ -769,7 +789,8 @@ fn fresh_loop(e: Arc<Engine>, letter: char) {
             }
             nameidx::JournalStep::Unavailable(why) => {
                 e.set_meta(letter, |m| m.why = why.clone());
-                e.log.line(&format!("[{letter}:] 保鲜失败:{why}({backoff:?} 后重试)"));
+                e.log
+                    .line(&format!("[{letter}:] 保鲜失败:{why}({backoff:?} 后重试)"));
                 std::thread::sleep(backoff);
                 backoff = (backoff * 2).min(BACKOFF_MAX);
             }
@@ -988,11 +1009,7 @@ impl Query for Engine {
                 journal_id: j.journal_id,
                 first_usn: j.first_usn,
                 next_usn: j.next_usn,
-                l2_usn: self
-                    .store
-                    .as_ref()
-                    .map(|s| s.l2_cursor(*l))
-                    .unwrap_or(0),
+                l2_usn: self.store.as_ref().map(|s| s.l2_cursor(*l)).unwrap_or(0),
             })
             .collect();
         out.sort_by_key(|c| c.letter);
@@ -1086,8 +1103,7 @@ fn ipc_loop(e: Arc<Engine>) {
         let raw = h.0 as usize;
         std::thread::spawn(move || {
             // SAFETY: 句柄已由上面的 ConnectNamedPipe 移交,交给 File 负责关闭。
-            let mut wf =
-                unsafe { std::fs::File::from_raw_handle(raw as *mut std::ffi::c_void) };
+            let mut wf = unsafe { std::fs::File::from_raw_handle(raw as *mut std::ffi::c_void) };
             // 读写各要一个 &mut,复制一份句柄(DuplicateHandle)最省事。
             let Ok(rf) = wf.try_clone() else { return };
             let mut rf = std::io::BufReader::new(rf);
@@ -1185,7 +1201,11 @@ fn service_body() -> Result<()> {
         process_id: None,
     };
     status
-        .set_service_status(mk(ServiceState::StartPending, ServiceControlAccept::empty(), 1))
+        .set_service_status(mk(
+            ServiceState::StartPending,
+            ServiceControlAccept::empty(),
+            1,
+        ))
         .map_err(|e| anyhow::anyhow!("上报 StartPending 失败:{e}"))?;
     let e = Engine::start(false);
     status
@@ -1198,7 +1218,11 @@ fn service_body() -> Result<()> {
     // 阻塞到 SCM 发停止/关机。
     let _ = rx.recv();
     status
-        .set_service_status(mk(ServiceState::StopPending, ServiceControlAccept::empty(), 1))
+        .set_service_status(mk(
+            ServiceState::StopPending,
+            ServiceControlAccept::empty(),
+            1,
+        ))
         .ok();
     e.shutdown();
     status
@@ -1309,7 +1333,13 @@ mod tests {
 
     fn sample_vol(letter: char) -> VolumeIndex {
         let mut b = VolumeIndexBuilder::new(letter);
-        push(&mut b, 10, mft::ROOT_FRN_INDEX, nameidx::ATTR_DIRECTORY, "Users");
+        push(
+            &mut b,
+            10,
+            mft::ROOT_FRN_INDEX,
+            nameidx::ATTR_DIRECTORY,
+            "Users",
+        );
         push(&mut b, 100, 10, 0, "photo.jpg");
         push(&mut b, 101, 10, 0, "notes.txt");
         b.finish()
@@ -1409,14 +1439,22 @@ mod tests {
     #[test]
     fn search_applies_class_and_limit() {
         let e = engine_with_vols(vec![sample_vol('C')]);
-        match e.search("o", 10, ipc::class_to_wire(crate::nameidx::FileClass::Image)) {
+        match e.search(
+            "o",
+            10,
+            ipc::class_to_wire(crate::nameidx::FileClass::Image),
+        ) {
             Resp::Hits(h) => {
                 assert_eq!(h.len(), 1);
                 assert_eq!(h[0].name, "photo.jpg");
             }
             other => panic!("期望 Hits,得到 {other:?}"),
         }
-        match e.search("o", 10, ipc::class_to_wire(crate::nameidx::FileClass::Document)) {
+        match e.search(
+            "o",
+            10,
+            ipc::class_to_wire(crate::nameidx::FileClass::Document),
+        ) {
             Resp::Hits(h) => assert_eq!(h.len(), 1),
             other => panic!("期望 Hits,得到 {other:?}"),
         }

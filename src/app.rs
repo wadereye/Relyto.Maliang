@@ -1,4 +1,5 @@
 use crate::db::Store;
+use crate::i18n::{t, t_with};
 use crate::timeline::{self, PhotoRow};
 use eframe::egui;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -33,15 +34,15 @@ impl ViewKind {
     /// 状态栏/历史提示用的一词名(左栏导航项的文案另有取舍,见导航列表)。
     fn label(self) -> &'static str {
         match self {
-            ViewKind::Recent => "最近更新",
-            ViewKind::Timeline => "时间线",
-            ViewKind::Folder => "文件夹",
-            ViewKind::Duplicates => "重复照片",
-            ViewKind::Albums => "相簿",
-            ViewKind::Faces => "人物",
-            ViewKind::Tags => "标签",
-            ViewKind::Semantic => "语义搜索",
-            ViewKind::Search => "快速查找",
+            ViewKind::Recent => t("最近更新"),
+            ViewKind::Timeline => t("时间线"),
+            ViewKind::Folder => t("文件夹"),
+            ViewKind::Duplicates => t("重复照片"),
+            ViewKind::Albums => t("相簿"),
+            ViewKind::Faces => t("人物"),
+            ViewKind::Tags => t("标签"),
+            ViewKind::Semantic => t("语义搜索"),
+            ViewKind::Search => t("快速查找"),
         }
     }
 }
@@ -59,8 +60,8 @@ enum PageKind {
 impl PageKind {
     fn label(self) -> &'static str {
         match self {
-            PageKind::Library => "图库",
-            PageKind::Import => "导入",
+            PageKind::Library => t("图库"),
+            PageKind::Import => t("导入"),
         }
     }
 }
@@ -108,9 +109,9 @@ impl PeopleSort {
 
     fn label(self) -> &'static str {
         match self {
-            PeopleSort::Name => "按姓名给人物排序",
-            PeopleSort::Amount => "按数量给人物排序",
-            PeopleSort::Top10 => "给人物排序并只看前 10",
+            PeopleSort::Name => t("按姓名给人物排序"),
+            PeopleSort::Amount => t("按数量给人物排序"),
+            PeopleSort::Top10 => t("给人物排序并只看前 10"),
         }
     }
 
@@ -151,10 +152,10 @@ impl DrawerTab {
 
     fn label(self) -> &'static str {
         match self {
-            DrawerTab::Props => "属性",
-            DrawerTab::Tags => "标签",
-            DrawerTab::People => "人物",
-            DrawerTab::Places => "地点",
+            DrawerTab::Props => t("属性"),
+            DrawerTab::Tags => t("标签"),
+            DrawerTab::People => t("人物"),
+            DrawerTab::Places => t("地点"),
         }
     }
 
@@ -192,7 +193,7 @@ type Dup = (i64, Vec<i64>);
 /// 「检查更新」窗口里的时间戳文案。0 = 从没检查过。
 fn update_time_text(secs: i64) -> String {
     if secs <= 0 {
-        return "从未".into();
+        return t("从未").into();
     }
     chrono::DateTime::from_timestamp(secs, 0)
         .map(|dt| {
@@ -200,16 +201,16 @@ fn update_time_text(secs: i64) -> String {
                 .format("%Y-%m-%d %H:%M")
                 .to_string()
         })
-        .unwrap_or_else(|| "从未".into())
+        .unwrap_or_else(|| t("从未").into())
 }
 
 /// 「检查更新」窗口里的索引服务状态。安装前必须让用户看见它在不在跑。
 fn update_service_text() -> &'static str {
     match crate::win::service_state() {
-        crate::win::ServiceState::Running => "运行中(安装时会先停止,完成后恢复)",
-        crate::win::ServiceState::Stopped => "已停止",
-        crate::win::ServiceState::NotInstalled => "未安装",
-        crate::win::ServiceState::Transition(_) => "状态切换中",
+        crate::win::ServiceState::Running => t("运行中(安装时会先停止,完成后恢复)"),
+        crate::win::ServiceState::Stopped => t("已停止"),
+        crate::win::ServiceState::NotInstalled => t("未安装"),
+        crate::win::ServiceState::Transition(_) => t("状态切换中"),
     }
 }
 
@@ -267,6 +268,26 @@ pub struct App {
     texs: TexCache,
     /// 常驻缩略图后台 worker:启动时补存量,扫描后自动补新增。
     thumb_bg: Option<crate::thumbs::ThumbWorker>,
+    /// AI 队列调度骨架:三阶段 worker 与暂停闸门。
+    #[cfg(feature = "ai")]
+    ai_sched: Option<crate::ai_sched::AiSched>,
+    /// 预览提级去重:同一张只入队一次。
+    #[cfg(feature = "ai")]
+    ai_preview_for: Option<i64>,
+    /// AI 统计快照(选项页 2 秒内不重复查询)。
+    #[cfg(feature = "ai")]
+    ai_stats_cache: Option<(std::time::Instant, Vec<crate::ai_sched::StageStats>)>,
+    /// 模型下载器(单任务)与最近一次导入/替换的提示。
+    #[cfg(feature = "ai")]
+    ai_dl: Option<crate::ai_models::SlotDownloader>,
+    /// 多文件槽位的待下载队列(前一个文件完成后串行启动)。
+    #[cfg(feature = "ai")]
+    ai_dl_queue: Vec<crate::ai_models::DownloadPlan>,
+    #[cfg(feature = "ai")]
+    ai_models_msg: String,
+    /// 槽位状态与磁盘占用快照(2 秒缓存)。
+    #[cfg(feature = "ai")]
+    ai_models_cache: Option<(std::time::Instant, Vec<crate::ai_models::SlotStatus>, u64)>,
     scan_busy: Arc<AtomicBool>,
     scan_rx: Option<mpsc::Receiver<ScanResult>>,
     /// 扫描进度/取消控制(进度回调 + 退出检查)。
@@ -319,6 +340,19 @@ pub struct App {
     thumb_tier: crate::thumbs::Tier,
     tags: Vec<timeline::TagInfo>,
     sel_tag: Option<String>,
+    /// AI 后台索引是否启用(设置页/工具栏开关同步)。
+    #[cfg(feature = "ai")]
+    ai_enabled: bool,
+    /// 标签视图:AI 分类筛选与分类计数缓存。
+    #[cfg(feature = "ai")]
+    sel_category: Option<String>,
+    #[cfg(feature = "ai")]
+    ai_category_cache: Option<(std::time::Instant, Vec<(&'static str, &'static str, usize)>)>,
+    /// 标签视图:库内标签/图中文字检索词与命中照片。
+    #[cfg(feature = "ai")]
+    ai_query: String,
+    #[cfg(feature = "ai")]
+    ai_query_hits: Vec<i64>,
     show_about: bool,
     /// 「关于」窗口里 Markdown 更新日志的渲染缓存(egui_commonmark)。
     about_cache: egui_commonmark::CommonMarkCache,
@@ -598,6 +632,9 @@ pub struct App {
     face_hits: Vec<crate::faces::FaceHit>,
     #[cfg(feature = "ai")]
     face_sugs: Vec<crate::faces::Suggestion>,
+    /// 合并/拆分约束的目标簇(当前簇之外)。
+    #[cfg(feature = "ai")]
+    face_merge_target: Option<i64>,
     #[cfg(feature = "ai")]
     face_hide_low: bool,
     #[cfg(feature = "ai")]
@@ -824,9 +861,7 @@ pub(crate) static SVC_LINK_ENABLED: std::sync::atomic::AtomicBool =
 
 /// 启动索引服务链路线程:维持一根管道连接、周期问 `Status`、掉线退避重连,
 /// 并代办装卸服务(要等 UAC)与全量重建。UI 只读回报,自己不碰管道。
-fn spawn_link_worker(
-    ctx: egui::Context,
-) -> (mpsc::Sender<LinkCmd>, mpsc::Receiver<LinkMsg>) {
+fn spawn_link_worker(ctx: egui::Context) -> (mpsc::Sender<LinkCmd>, mpsc::Receiver<LinkMsg>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<LinkCmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<LinkMsg>();
     std::thread::Builder::new()
@@ -880,7 +915,7 @@ fn spawn_link_worker(
                 }
                 // 连上了就清掉旧原因:下一句失败要如实报出来。
                 last_down.clear();
-                let c = client.as_mut().expect("上面刚确保连接在位");
+                let c = client.as_mut().expect(t("上面刚确保连接在位"));
                 match c.call_ok(&crate::ipc::Req::Status) {
                     Ok(crate::ipc::Resp::Status(s)) => {
                         let _ = msg_tx.send(LinkMsg::Up(s, crate::win::service_state()));
@@ -889,7 +924,10 @@ fn spawn_link_worker(
                     Ok(other) => {
                         client = None;
                         let _ = msg_tx.send(LinkMsg::Down(
-                            format!("服务对 Status 回了意外答复:{other:?}"),
+                            t_with(
+                                "服务对 Status 回了意外答复:{other:?}",
+                                &[("other", format!("{other:?}"))],
+                            ),
                             crate::win::service_state(),
                         ));
                         ctx.request_repaint();
@@ -905,7 +943,7 @@ fn spawn_link_worker(
                 // 别把 3 秒一次的 Status 打成忙等。
             }
         })
-        .expect("启动索引服务链路线程失败");
+        .expect(t("启动索引服务链路线程失败"));
     (cmd_tx, msg_rx)
 }
 
@@ -978,7 +1016,7 @@ fn link_call(
     if client.is_none() {
         *client = Some(link_connect()?);
     }
-    let c = client.as_mut().expect("上面刚连上");
+    let c = client.as_mut().expect(t("上面刚连上"));
     match c.call_ok(req) {
         Ok(r) => Ok(r),
         Err(e) => {
@@ -994,14 +1032,17 @@ fn link_connect() -> Result<crate::ipc::Client, String> {
     // 用户明确选了「不用全盘快查」:连握手都不做,不向常驻服务索取全盘数据。
     // 所有入口(心跳、Retry、重建、落盘)都经过这里,一道门就能收口。
     if !SVC_LINK_ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
-        return Err("已按你的选择关闭全盘快查(在 选项 > 全盘快查 可重新启用)".into());
+        return Err(t("已按你的选择关闭全盘快查(在 选项 > 全盘快查 可重新启用)").into());
     }
     let mut c = crate::ipc::Client::connect(500)?;
     match c.call(&crate::ipc::Req::Hello {
         proto: crate::ipc::PROTO_VERSION,
     }) {
         Ok(crate::ipc::Resp::Hello { .. }) => Ok(c),
-        Ok(other) => Err(format!("握手答复异常:{other:?}")),
+        Ok(other) => Err(t_with(
+            "握手答复异常:{other:?}",
+            &[("other", format!("{other:?}"))],
+        )),
         Err(e) => Err(e),
     }
 }
@@ -1067,11 +1108,11 @@ impl NameRow {
         }
         // 常量不能带 `as` 当模式用,所以把被匹配的值转成 i32(db 侧的原类型)。
         match i32::from(self.rich_state) {
-            crate::db::RICH_OUT => "待生成缩略图",
-            crate::db::RICH_PENDING => "排队中",
-            crate::db::RICH_DONE => "已就绪",
-            crate::db::RICH_BAD => "读取失败",
-            _ => "非图库文件",
+            crate::db::RICH_OUT => t("待生成缩略图"),
+            crate::db::RICH_PENDING => t("排队中"),
+            crate::db::RICH_DONE => t("已就绪"),
+            crate::db::RICH_BAD => t("读取失败"),
+            _ => t("非图库文件"),
         }
     }
 }
@@ -1092,10 +1133,7 @@ enum SearchResp {
         ms: f64,
     },
     /// 服务连不上:这一轮出不来结果。UI 据此显示降级,而不是"没有命中"。
-    Down {
-        gen: u64,
-        why: String,
-    },
+    Down { gen: u64, why: String },
 }
 
 /// 启动常驻检索线程:收请求(合并到最新)→ 走管道问服务 → 回报命中。
@@ -1122,13 +1160,19 @@ fn spawn_search_worker() -> (
                 }
                 if client.is_none() {
                     if let Err(e) = link_connect().map(|c| client = Some(c)) {
-                        if res_tx.send(SearchResp::Down { gen: req.gen, why: e }).is_err() {
+                        if res_tx
+                            .send(SearchResp::Down {
+                                gen: req.gen,
+                                why: e,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                         continue;
                     }
                 }
-                let c = client.as_mut().expect("上面刚连上");
+                let c = client.as_mut().expect(t("上面刚连上"));
                 let t0 = std::time::Instant::now();
                 let resp = c.call_ok(&crate::ipc::Req::Search {
                     text: req.q.clone(),
@@ -1140,7 +1184,10 @@ fn spawn_search_worker() -> (
                     Ok(crate::ipc::Resp::Hits(h)) => h,
                     Ok(other) => {
                         client = None;
-                        let why = format!("服务对 Search 回了意外答复:{other:?}");
+                        let why = t_with(
+                            "服务对 Search 回了意外答复:{other:?}",
+                            &[("other", format!("{other:?}"))],
+                        );
                         if res_tx.send(SearchResp::Down { gen: req.gen, why }).is_err() {
                             return;
                         }
@@ -1148,7 +1195,13 @@ fn spawn_search_worker() -> (
                     }
                     Err(e) => {
                         client = None;
-                        if res_tx.send(SearchResp::Down { gen: req.gen, why: e }).is_err() {
+                        if res_tx
+                            .send(SearchResp::Down {
+                                gen: req.gen,
+                                why: e,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                         continue;
@@ -1167,7 +1220,7 @@ fn spawn_search_worker() -> (
                 }
             }
         })
-        .expect("启动检索线程失败");
+        .expect(t("启动检索线程失败"));
     (req_tx, res_rx, h)
 }
 
@@ -1228,13 +1281,19 @@ fn fmt_mtime(secs: u64) -> String {
 fn fmt_uptime(secs: u64) -> String {
     let (d, h, m) = (secs / 86400, (secs % 86400) / 3600, (secs % 3600) / 60);
     if d > 0 {
-        format!("{d} 天 {h} 小时")
+        t_with(
+            "{d} 天 {h} 小时",
+            &[("d", d.to_string()), ("h", h.to_string())],
+        )
     } else if h > 0 {
-        format!("{h} 小时 {m} 分")
+        t_with(
+            "{h} 小时 {m} 分",
+            &[("h", h.to_string()), ("m", m.to_string())],
+        )
     } else if m > 0 {
-        format!("{m} 分")
+        t_with("{m} 分", &[("m", m.to_string())])
     } else {
-        format!("{secs} 秒")
+        t_with("{secs} 秒", &[("secs", secs.to_string())])
     }
 }
 
@@ -1243,7 +1302,7 @@ fn fmt_uptime(secs: u64) -> String {
 fn spawn_thumb_worker() -> (
     mpsc::Sender<String>,
     mpsc::Receiver<(String, Option<image::DynamicImage>)>,
-    ) {
+) {
     let (tx, rx) = mpsc::channel::<String>();
     let (out_tx, out_rx) = mpsc::channel::<(String, Option<image::DynamicImage>)>();
     std::thread::Builder::new()
@@ -1251,14 +1310,13 @@ fn spawn_thumb_worker() -> (
         .spawn(move || {
             crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
             while let Ok(p) = rx.recv() {
-                let img = crate::thumbs::load_for_preview(Path::new(&p), 128)
-                    .map(|(img, _)| img);
+                let img = crate::thumbs::load_for_preview(Path::new(&p), 128).map(|(img, _)| img);
                 if out_tx.send((p, img)).is_err() {
                     return;
                 }
             }
         })
-        .expect("启动搜索缩略图线程失败");
+        .expect(t("启动搜索缩略图线程失败"));
     (tx, out_rx)
 }
 
@@ -1331,6 +1389,23 @@ const TAG_COLORS: [(&str, egui::Color32); 10] = [
     ("white", egui::Color32::from_rgb(228, 228, 228)),
     ("gray", egui::Color32::from_rgb(140, 140, 140)),
 ];
+
+/// 颜色键对应的显示名(存储仍用英文键)。
+fn tag_color_name(key: &str) -> &'static str {
+    match key {
+        "red" => "红色",
+        "orange" => "橙色",
+        "yellow" => "黄色",
+        "green" => "绿色",
+        "blue" => "蓝色",
+        "purple" => "紫色",
+        "pink" => "粉色",
+        "black" => "黑色",
+        "white" => "白色",
+        "gray" => "灰色",
+        _ => "",
+    }
+}
 
 /// 颜色名 -> Color32(未知/None -> None)。
 fn tag_color(name: Option<&str>) -> Option<egui::Color32> {
@@ -1595,7 +1670,14 @@ fn cn_date(s: &str) -> String {
         let m = p[1].parse::<u32>().unwrap_or(0);
         let d = p[2].parse::<u32>().unwrap_or(0);
         if m > 0 && d > 0 {
-            return format!("{}年{}月{}日", p[0], m, d);
+            return t_with(
+                "{p1}年{p2}月{p3}日",
+                &[
+                    ("p1", (p[0]).to_string()),
+                    ("p2", (m).to_string()),
+                    ("p3", (d).to_string()),
+                ],
+            );
         }
     }
     s.to_string()
@@ -1699,7 +1781,11 @@ fn thumb_star(
     if resp.clicked() {
         *clicked = true;
     }
-    resp.on_hover_text(if on { "取消星标" } else { "加星标" });
+    resp.on_hover_text(if on {
+        crate::i18n::t("取消星标")
+    } else {
+        crate::i18n::t("加星标")
+    });
 }
 
 /// 主题化图标源表(Lucide,ISC 许可,见 assets/icons/LICENSE-lucide.txt):
@@ -1773,7 +1859,10 @@ const ICON_LIGHT: &[(&str, &[u8])] = &[
     ),
     ("search", include_bytes!("../assets/icons/light/search.svg")),
     ("x", include_bytes!("../assets/icons/light/x.svg")),
-    ("refresh", include_bytes!("../assets/icons/light/refresh.svg")),
+    (
+        "refresh",
+        include_bytes!("../assets/icons/light/refresh.svg"),
+    ),
 ];
 const ICON_DARK: &[(&str, &[u8])] = &[
     (
@@ -1844,7 +1933,10 @@ const ICON_DARK: &[(&str, &[u8])] = &[
     ),
     ("search", include_bytes!("../assets/icons/dark/search.svg")),
     ("x", include_bytes!("../assets/icons/dark/x.svg")),
-    ("refresh", include_bytes!("../assets/icons/dark/refresh.svg")),
+    (
+        "refresh",
+        include_bytes!("../assets/icons/dark/refresh.svg"),
+    ),
 ];
 
 /// 内置更新日志全文,「帮助 > 关于」里以 Markdown 渲染。
@@ -2120,6 +2212,12 @@ impl App {
             .unwrap_or(crate::theme::Kind::Gray);
         crate::theme::set_kind(ui_theme);
         crate::theme::apply(&cc.egui_ctx);
+        // 界面语言:默认中文,可切英文(设置项 ui_lang,入口在 选项 > 常规)。
+        let ui_lang = store
+            .get_setting("ui_lang")
+            .and_then(|v| crate::i18n::Lang::from_key(&v))
+            .unwrap_or(crate::i18n::Lang::Zh);
+        crate::i18n::set_lang(ui_lang);
         // SVG 图标加载器(工具栏图标等),必须在首帧前装好。
         egui_extras::install_image_loaders(&cc.egui_ctx);
         load_cjk_font(&cc.egui_ctx);
@@ -2183,6 +2281,20 @@ impl App {
             recent_date: String::new(),
             texs: TexCache::new(TEX_CACHE_CAP),
             thumb_bg: None,
+            #[cfg(feature = "ai")]
+            ai_sched: None,
+            #[cfg(feature = "ai")]
+            ai_preview_for: None,
+            #[cfg(feature = "ai")]
+            ai_stats_cache: None,
+            #[cfg(feature = "ai")]
+            ai_dl: None,
+            #[cfg(feature = "ai")]
+            ai_dl_queue: Vec::new(),
+            #[cfg(feature = "ai")]
+            ai_models_msg: String::new(),
+            #[cfg(feature = "ai")]
+            ai_models_cache: None,
             scan_busy: Arc::new(AtomicBool::new(false)),
             scan_rx: None,
             scan_ctrl: None,
@@ -2233,7 +2345,7 @@ impl App {
             show_import_devices: false,
             import_devices: Vec::new(),
             import_devices_err: String::new(),
-            status: "就绪".into(),
+            status: t("就绪").into(),
             dups: Vec::new(),
             dup_near: false,
             id_row: HashMap::new(),
@@ -2259,6 +2371,16 @@ impl App {
             thumb_tier: crate::thumbs::Tier::Normal,
             tags: Vec::new(),
             sel_tag: None,
+            #[cfg(feature = "ai")]
+            ai_enabled: false,
+            #[cfg(feature = "ai")]
+            sel_category: None,
+            #[cfg(feature = "ai")]
+            ai_category_cache: None,
+            #[cfg(feature = "ai")]
+            ai_query: String::new(),
+            #[cfg(feature = "ai")]
+            ai_query_hits: Vec::new(),
             show_about: false,
             about_cache: Default::default(),
             show_shortcuts: false,
@@ -2337,7 +2459,7 @@ impl App {
             import_entries: Vec::new(),
             import_sel: BTreeSet::new(),
             last_import_src: String::new(),
-            scan_verb: "扫描",
+            scan_verb: t("扫描"),
             people_sort,
             album_new_win: false,
             pending_thumbs: 0,
@@ -2358,6 +2480,8 @@ impl App {
             face_hits: Vec::new(),
             #[cfg(feature = "ai")]
             face_sugs: Vec::new(),
+            #[cfg(feature = "ai")]
+            face_merge_target: None,
             #[cfg(feature = "ai")]
             face_hide_low: false,
             #[cfg(feature = "ai")]
@@ -2453,6 +2577,17 @@ impl App {
             self.store.clone(),
             crate::thumbs::visible_dirs(),
         ));
+        // AI 调度器:默认暂停,由「工具 > 继续 AI 索引」或选项页开启。
+        #[cfg(feature = "ai")]
+        {
+            let enabled = self
+                .store
+                .get_setting("ai_enabled")
+                .map(|v| v != "0")
+                .unwrap_or(false);
+            self.ai_enabled = enabled;
+            self.ai_sched = Some(crate::ai_sched::AiSched::spawn(self.store.clone(), enabled));
+        }
         // 首启补图顺序:先把常用目录(我的文档/我的图片/桌面)铺出来,
         // 排空后才按「最新照片优先」兜底其余全库 —— 即使向导答的是
         // 「全盘」,眼前的常用目录也是第一批出图,洪峰在后台慢慢补。
@@ -2488,9 +2623,12 @@ impl App {
         if !pending.is_empty() {
             let roots: Vec<PathBuf> = pending.iter().map(|(r, _)| PathBuf::from(r)).collect();
             let scope = if pending.len() == 1 {
-                format!("续扫 {}", pending[0].0)
+                t_with("续扫 {p1}", &[("p1", (pending[0].0).to_string())])
             } else {
-                format!("续扫 {} 个上次中断的目录", pending.len())
+                t_with(
+                    "续扫 {p1} 个上次中断的目录",
+                    &[("p1", (pending.len()).to_string())],
+                )
             };
             self.start_scan_roots(roots, &scope);
         } else if self.store.scope_initialized() {
@@ -2500,7 +2638,7 @@ impl App {
             // 摘行后同线程清掉对应缩略图缓存。首扫 / 续扫已占用扫描线程时不重复发。
             let roots = self.store.list_watched();
             if !roots.is_empty() {
-                self.start_scan_roots_ext(roots, "启动对账", true);
+                self.start_scan_roots_ext(roots, t("启动对账"), true);
             }
         }
         // 缩略图缓存:数据目录迁走后,旧系统缓存要在后台搬到新落点;
@@ -2569,8 +2707,10 @@ impl App {
                 // 立刻做的事(见 svc_apply_want),每次开机都提权反而骚扰。
                 // 若服务还在(上次卸载被取消 / 用户后来手动装回),如实提示。
                 if crate::win::service_installed() {
-                    self.status = "已按你的选择关闭全盘快查;检测到索引服务仍在,可在 选项 > 全盘快查 卸载。"
-                        .into();
+                    self.status = t(
+                        "已按你的选择关闭全盘快查;检测到索引服务仍在,可在 选项 > 全盘快查 卸载。",
+                    )
+                    .into();
                 }
             }
         }
@@ -2578,7 +2718,12 @@ impl App {
 
     /// 用户对口索引服务的意向(没存过就是「未问过」)。
     fn svc_want(&self) -> SvcWant {
-        SvcWant::from_setting(self.store.get_setting("svc_wanted").as_deref().unwrap_or(""))
+        SvcWant::from_setting(
+            self.store
+                .get_setting("svc_wanted")
+                .as_deref()
+                .unwrap_or(""),
+        )
     }
 
     /// 打开授权说明窗(「不再提示」勾选每次打开时复位)。
@@ -2596,14 +2741,20 @@ impl App {
     /// 两档决定写进 `decided`;勾选态留在 `svc_never_ask` 供窗口层落库。
     #[cfg(windows)]
     fn svc_grant_body(&mut self, ui: &mut egui::Ui, decided: &mut Option<SvcWant>) {
-        ui.label("「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。");
-        ui.label("读卷日志属于管理员级操作,所以要装一个后台服务来干这件事 —— 这需要你点一次 UAC。");
+        ui.label(t(
+            "「快速查找」要列出全盘所有文件名,数据来自 NTFS 卷的 USN/MFT 日志。",
+        ));
+        ui.label(t(
+            "读卷日志属于管理员级操作,所以要装一个后台服务来干这件事 —— 这需要你点一次 UAC。",
+        ));
         ui.indent("svc_grant_what", |ui| {
-            ui.label("· 服务名 RelytoMaliangIndex,开机自动启动,只在本机跑;");
-            ui.label("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;");
-            ui.label("· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);");
-            ui.label("· 界面本身不提权:它通过本地命名管道向服务问结果;");
-            ui.label("· 不联网、不上传,随时可以在 选项 > 全盘快查 卸载。");
+            ui.label(t("· 服务名 RelytoMaliangIndex,开机自动启动,只在本机跑;"));
+            ui.label(t("· 只读文件名、大小与时间戳,不读文件内容、不改任何文件;"));
+            ui.label(t(
+                "· 产物只有一个本地索引文件 nameindex.bin(存在数据目录里);",
+            ));
+            ui.label(t("· 界面本身不提权:它通过本地命名管道向服务问结果;"));
+            ui.label(t("· 不联网、不上传,随时可以在 选项 > 全盘快查 卸载。"));
         });
         ui.add_space(14.0);
         // 两档:按钮定宽对齐,说明文字跟在右侧,行距拉开。
@@ -2611,7 +2762,7 @@ impl App {
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("安装并启动服务(推荐)")
+                        egui::RichText::new(t("安装并启动服务(推荐)"))
                             .color(egui::Color32::WHITE)
                             .strong(),
                     )
@@ -2623,14 +2774,16 @@ impl App {
             {
                 *decided = Some(SvcWant::Yes);
             }
-            ui.small("只有这次弹 UAC。装好后开机自启、持续保鲜索引,以后不再问。");
+            ui.small(t(
+                "只有这次弹 UAC。装好后开机自启、持续保鲜索引,以后不再问。",
+            ));
         });
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("不用全盘快查").color(egui::Color32::WHITE),
+                        egui::RichText::new(t("不用全盘快查")).color(egui::Color32::WHITE),
                     )
                     .fill(Self::GRANT_BLUE_DARK)
                     .min_size(egui::vec2(200.0, 30.0))
@@ -2640,34 +2793,46 @@ impl App {
             {
                 *decided = Some(SvcWant::No);
             }
-            ui.small("跳过:若已装过服务会一并移除(需一次 UAC);查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 全盘快查 改。");
+            ui.small(t("跳过:若已装过服务会一并移除(需一次 UAC);查找只覆盖图库里的照片,发现与保鲜退回逐目录扫描,以后可在 选项 > 全盘快查 改。"));
         });
         ui.add_space(14.0);
-        ui.checkbox(&mut self.svc_never_ask, "不再提示");
-        ui.small("嫌每次启动都问就勾上:选「不用全盘快查」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。");
+        ui.checkbox(&mut self.svc_never_ask, t("不再提示"));
+        ui.small(t("嫌每次启动都问就勾上:选「不用全盘快查」或直接关窗,以后启动不再询问,老老实实走传统扫描;菜单和页面入口仍可随时启用。"));
     }
 
     /// 首启范围窗正文(向导第 2 页):两档单选,**无取消** —— 必须答一次;
     /// 空账本下派生门谁都不放行,网格全是占位,所以这一页没有跳过。
     fn scope_ask_body(&mut self, ui: &mut egui::Ui, decided: &mut Option<InitialScope>) {
-        ui.label("整台电脑的文件名都会收进索引 —— 那一步不读文件内容,很快。");
-        ui.label("下面这一档只决定**哪些目录要出缩略图、读拍摄信息**,不影响能不能搜到。");
+        ui.label(t(
+            "整台电脑的文件名都会收进索引 —— 那一步不读文件内容,很快。",
+        ));
+        ui.label(t(
+            "下面这一档只决定**哪些目录要出缩略图、读拍摄信息**,不影响能不能搜到。",
+        ));
         ui.add_space(12.0);
-        ui.radio_value(&mut self.scope_choice, InitialScope::Complete, "全盘");
+        ui.radio_value(&mut self.scope_choice, InitialScope::Complete, t("全盘"));
         ui.indent("scope_complete_why", |ui| {
-            ui.small("所有磁盘上的图都出缩略图。补齐在后台慢慢跑,眼前的目录优先。");
+            ui.small(t(
+                "所有磁盘上的图都出缩略图。补齐在后台慢慢跑,眼前的目录优先。",
+            ));
         });
         ui.add_space(6.0);
-        ui.radio_value(&mut self.scope_choice, InitialScope::Limited, "只常用目录");
+        ui.radio_value(
+            &mut self.scope_choice,
+            InitialScope::Limited,
+            t("只常用目录"),
+        );
         ui.indent("scope_limited_why", |ui| {
-            ui.small("只给「我的文档 / 我的图片 / 桌面」出缩略图。别处的图照样在库里、照样搜得到,点进那个目录时再补。");
+            ui.small(t("只给「我的文档 / 我的图片 / 桌面」出缩略图。别处的图照样在库里、照样搜得到,点进那个目录时再补。"));
         });
         ui.add_space(14.0);
         ui.horizontal(|ui| {
             if ui
                 .add(
                     egui::Button::new(
-                        egui::RichText::new("确定").color(egui::Color32::WHITE).strong(),
+                        egui::RichText::new(t("确定"))
+                            .color(egui::Color32::WHITE)
+                            .strong(),
                     )
                     .fill(Self::GRANT_GREEN)
                     .min_size(egui::vec2(120.0, 30.0))
@@ -2677,12 +2842,14 @@ impl App {
             {
                 *decided = Some(self.scope_choice);
             }
-            ui.small("以后可在 选项 > 全盘快查 改。");
+            ui.small(t("以后可在 选项 > 全盘快查 改。"));
         });
     }
 
     fn apply_initial_scope(&mut self, choice: InitialScope, scan: bool) {
-        let roots = self.store.apply_initial_scope(choice == InitialScope::Complete);
+        let roots = self
+            .store
+            .apply_initial_scope(choice == InitialScope::Complete);
         self.scope_ask = false;
         self.scope_choice = choice;
         if roots.is_empty() {
@@ -2692,12 +2859,12 @@ impl App {
         let gate = crate::db::ScopeGate::load(&self.store);
         let _ = self.store.reconcile_rich_state(&gate);
         if !scan {
-            self.status = "已按偏好跳过首扫;派生作用域已落账,可在文件夹管理器里手动扫。".into();
+            self.status = t("已按偏好跳过首扫;派生作用域已落账,可在文件夹管理器里手动扫。").into();
             return;
         }
         let label = match choice {
-            InitialScope::Complete => "全盘",
-            InitialScope::Limited => "常用目录",
+            InitialScope::Complete => t("全盘"),
+            InitialScope::Limited => t("常用目录"),
         };
         self.start_scan_roots(roots, label);
     }
@@ -2779,10 +2946,10 @@ impl App {
                 // 自动启动的,留着它就等于继续常驻提权、继续建全盘索引。
                 // 所以已经装上的要一并卸载(一次 UAC),并立刻断开现有连接。
                 if crate::win::service_installed() {
-                    self.status = "正在移除索引服务…(需要一次 UAC)".into();
+                    self.status = t("正在移除索引服务…(需要一次 UAC)").into();
                     self.svc_uninstall();
                 } else {
-                    self.status = "已关闭全盘快查;发现与保鲜走逐目录扫描。".into();
+                    self.status = t("已关闭全盘快查;发现与保鲜走逐目录扫描。").into();
                 }
                 if let Some(tx) = &self.link_tx {
                     let _ = tx.send(LinkCmd::Retry);
@@ -2804,7 +2971,7 @@ impl App {
         }
         if want == SvcWant::No {
             // 明确选了不用的人,切页面时不反复拉弹窗,只给一句指路。
-            self.status = "全盘快查已关闭(在 选项 > 全盘快查 可改)".into();
+            self.status = t("全盘快查已关闭(在 选项 > 全盘快查 可改)").into();
             return;
         }
         match self.link.svc {
@@ -2817,7 +2984,7 @@ impl App {
                 if let Some(tx) = &self.link_tx {
                     let _ = tx.send(LinkCmd::Retry);
                 }
-                self.status = "索引服务在运行,正在重连…".into();
+                self.status = t("索引服务在运行,正在重连…").into();
             }
         }
     }
@@ -2825,7 +2992,7 @@ impl App {
     /// 非 Windows:没有索引服务这回事,入口只负责说明。
     #[cfg(not(windows))]
     fn svc_try_start(&mut self) {
-        self.status = "全盘快查仅 Windows 可用(NTFS USN/MFT 索引服务)".into();
+        self.status = t("全盘快查仅 Windows 可用(NTFS USN/MFT 索引服务)").into();
     }
 
     /// 进入快速查找页时的引导判定。
@@ -2856,7 +3023,7 @@ impl App {
             return;
         };
         let _ = tx.send(LinkCmd::Rebuild(Vec::new()));
-        self.status = "已请求索引服务全量重建(进度见下方状态)".into();
+        self.status = t("已请求索引服务全量重建(进度见下方状态)").into();
     }
 
     /// 泵索引服务链路事件(概况 / 掉线 / 重建与装卸回执)。
@@ -2879,8 +3046,10 @@ impl App {
                         // 这句只在「刚接上」那一刻写一次,所以不能带条数:
                         // 条数会随建库一直涨,写死在这儿就成了过期读数
                         // (「2 卷 0 条」就是这么来的)。
-                        self.status =
-                            format!("全盘快查已接上索引服务:{} 卷(条数见快查页)", self.link.vols);
+                        self.status = t_with(
+                            "全盘快查已接上索引服务:{p1} 卷(条数见快查页)",
+                            &[("p1", (self.link.vols).to_string())],
+                        );
                         if !self.name_query.trim().is_empty() {
                             self.dispatch_name_search();
                         }
@@ -2897,13 +3066,16 @@ impl App {
                     self.link.compat.clear();
                     if was_up {
                         self.name_search_cache.clear();
-                        self.status = format!("索引服务断开,已降级为逐目录扫描:{why}");
+                        self.status = t_with(
+                            "索引服务断开,已降级为逐目录扫描:{why}",
+                            &[("why", why.to_string())],
+                        );
                     }
                 }
                 Ok(LinkMsg::Rebuild(err)) => {
                     self.status = match err {
-                        None => "索引服务已受理全量重建".into(),
-                        Some(e) => format!("请求重建失败:{e}"),
+                        None => t("索引服务已受理全量重建").into(),
+                        Some(e) => t_with("请求重建失败:{e}", &[("e", e.to_string())]),
                     };
                 }
                 Ok(LinkMsg::Service(op, err)) => {
@@ -2914,12 +3086,13 @@ impl App {
                     if state_only {
                         self.status = match (&err, op) {
                             (None, "停止") => {
-                                "索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动".into()
+                                t("索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动").into()
                             }
-                            (None, _) => "索引服务已启动,正在重连…".into(),
-                            (Some(e), _) => {
-                                format!("{op}索引服务未完成:{e}(可在 选项 > 全盘快查 重试)")
-                            }
+                            (None, _) => t("索引服务已启动,正在重连…").into(),
+                            (Some(e), _) => t_with(
+                                "{op}索引服务未完成:{e}(可在 选项 > 全盘快查 重试)",
+                                &[("op", t(op).to_string()), ("e", e.to_string())],
+                            ),
                         };
                     } else if op == "卸载" {
                         // 卸载是「不同意」的落地动作。失败只是移除没完成,
@@ -2927,11 +3100,9 @@ impl App {
                         // 那会让下次启动又弹授权窗、甚至把服务装回来。
                         self.status = match err {
                             None => {
-                                "已移除索引服务:全盘快查关闭,发现与保鲜走逐目录扫描。".into()
+                                t("已移除索引服务:全盘快查关闭,发现与保鲜走逐目录扫描。").into()
                             }
-                            Some(e) => format!(
-                                "移除索引服务未完成:{e}(可在 选项 > 全盘快查 点「卸载索引服务」重试)"
-                            ),
+                            Some(e) => t_with("移除索引服务未完成:{e}(可在 选项 > 全盘快查 点「卸载索引服务」重试)", &[("e", e.to_string())]),
                         };
                     } else {
                         match err {
@@ -2944,7 +3115,10 @@ impl App {
                                 let _ = self.store.set_setting("svc_wanted", "");
                                 self.link_declined = true;
                                 let _ = self.store.set_setting("svc_declined", "1");
-                                self.status = format!("索引服务未完成:{e}(可在 选项 > 全盘快查 重试)");
+                                self.status = t_with(
+                                    "索引服务未完成:{e}(可在 选项 > 全盘快查 重试)",
+                                    &[("e", e.to_string())],
+                                );
                             }
                         }
                     }
@@ -3013,12 +3187,14 @@ impl App {
                     }
                     self.name_results = h;
                     self.name_search_ms = ms;
-                    self.status = format!(
-                        "快速查找 \"{}\"({}):{} 条命中,耗时 {:.1} ms",
-                        self.name_query.trim(),
-                        self.name_class.label(),
-                        self.name_results.len(),
-                        ms
+                    self.status = t_with(
+                        "快速查找 \"{p1}\"({p2}):{p3} 条命中,耗时 {p4} ms",
+                        &[
+                            ("p1", (self.name_query.trim()).to_string()),
+                            ("p2", t(self.name_class.label()).to_string()),
+                            ("p3", (self.name_results.len()).to_string()),
+                            ("p4", format!("{p4:.1}", p4 = (ms))),
+                        ],
                     );
                     ctx.request_repaint();
                 }
@@ -3077,34 +3253,38 @@ impl App {
         let busy = self.svc_busy;
         let want_no = self.svc_want() == SvcWant::No;
         let head = if want_no {
-            "全盘快查已按你的选择关闭"
+            t("全盘快查已按你的选择关闭")
         } else {
             match svc {
-                S::NotInstalled => "全盘快查未启用(索引服务未安装)",
-                S::Stopped => "索引服务已停止",
-                S::Transition(_) => "索引服务正在启动…",
-                S::Running => "索引服务在运行,但连不上它的管道",
+                S::NotInstalled => t("全盘快查未启用(索引服务未安装)"),
+                S::Stopped => t("索引服务已停止"),
+                S::Transition(_) => t("索引服务正在启动…"),
+                S::Running => t("索引服务在运行,但连不上它的管道"),
             }
         };
         ui.horizontal(|ui| {
             // ⚠ 字形默认字体里没有,用橙色加粗文字代替图标(项目里同口径)。
-            ui.label(egui::RichText::new(head).color(egui::Color32::from_rgb(230, 145, 56)).strong());
+            ui.label(
+                egui::RichText::new(head)
+                    .color(egui::Color32::from_rgb(230, 145, 56))
+                    .strong(),
+            );
         });
-        ui.small("现在只有图库里的照片能按文件名查;全盘文件与文件夹的查找、以及未导入目录的实时发现都不可用。");
+        ui.small(t("索引服务不可用时,全盘文件与文件夹的查找、以及未导入目录的实时发现都不可用;标签和图中文字请到「标签」页检索。"));
         if !why.is_empty() {
-            ui.small(egui::RichText::new(format!("原因:{why}")).weak());
+            ui.small(egui::RichText::new(t_with("原因:{why}", &[("why", why.to_string())])).weak());
         }
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             #[cfg(windows)]
             {
                 let label = if want_no {
-                    "重新启用全盘快查…"
+                    t("重新启用全盘快查…")
                 } else {
                     match svc {
-                        S::NotInstalled => "安装索引服务…",
-                        S::Stopped | S::Transition(_) => "重新安装并启动服务…",
-                        S::Running => "重试连接",
+                        S::NotInstalled => t("安装索引服务…"),
+                        S::Stopped | S::Transition(_) => t("重新安装并启动服务…"),
+                        S::Running => t("重试连接"),
                     }
                 };
                 if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
@@ -3125,14 +3305,16 @@ impl App {
                 }
                 if busy {
                     ui.spinner();
-                    ui.small("等待你在 UAC 授权窗口点「是」…");
+                    ui.small(t("等待你在 UAC 授权窗口点「是」…"));
                 }
             }
             #[cfg(not(windows))]
-            ui.small("全盘快查仅支持 Windows(NTFS USN/MFT)。");
+            ui.small(t("全盘快查仅支持 Windows(NTFS USN/MFT)。"));
         });
         if matches!(svc, S::Stopped | S::Transition(_)) {
-            ui.small("服务是「自动启动」的:停在这里通常是被手动停过或上次启动失败,重装一次即可恢复。");
+            ui.small(t(
+                "服务是「自动启动」的:停在这里通常是被手动停过或上次启动失败,重装一次即可恢复。",
+            ));
         }
     }
 
@@ -3140,7 +3322,7 @@ impl App {
     fn search_ui(&mut self, ctx: &egui::Context) {
         // 索引服务链路事件已在 update 顶层统一泵(见 pump_link_events),这里只画。
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("快速查找");
+            ui.heading(t("快速查找"));
             // 三层数据必须标来源(仅源码注释,不进 UI)。名字/路径/大小/日期这一路走
             // L1(服务内存里的文件名索引,不经 SQLite);图库条件查询走 L2;派生列只可能
             // 来自 L3。只有「图库」这一列是 L2 的投影,由服务批量查库后随命中一起回。
@@ -3155,34 +3337,31 @@ impl App {
             if self.link.building > 0 {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(format!(
-                        "索引服务正在建库({} 卷进行中),已建好 {} 条 —— 可以先搜,结果会越查越全",
-                        self.link.building, self.link.entries
-                    ));
+                    ui.label(t_with("索引服务正在建库({p1} 卷进行中),已建好 {p2} 条 —— 可以先搜,结果会越查越全", &[("p1", (self.link.building).to_string()), ("p2", (self.link.entries).to_string())]));
                 });
             }
             for (letter, why) in self.link.compat.clone() {
-                ui.small(format!("{letter}: 盘走兼容扫描,无实时快查({why})"));
+                ui.small(t_with("{letter}: 盘走兼容扫描,无实时快查({why})", &[("letter", letter.to_string()), ("why", why.to_string())]));
             }
             if self.link.entries == 0 {
-                ui.label("索引还是空的:服务正在扫第一轮全盘,建好后这里自动可用。");
+                ui.label(t("索引还是空的:服务正在扫第一轮全盘,建好后这里自动可用。"));
                 return;
             }
 
             // 输入框在顶部整条快速查找栏(gsearch),这里只出结果面板;
             // 即输即搜由 gsearch 的 changed() 触发,本页被动刷新。
             if self.name_query.trim().is_empty() {
-                ui.label("在上方搜索栏输入关键字开始查找(文件与文件夹都搜,大小写不敏感)");
+                ui.label(t("在上方搜索栏输入关键字开始查找(文件与文件夹都搜,大小写不敏感)"));
                 return;
             }
             if self.name_results.is_empty() {
                 if self.search_inflight {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("正在检索…");
+                        ui.label(t("正在检索…"));
                     });
                 } else {
-                    ui.label("没有命中的文件");
+                    ui.label(t("没有命中的文件"));
                 }
                 return;
             }
@@ -3207,7 +3386,7 @@ impl App {
                 .column(egui_extras::Column::auto())
                 .column(egui_extras::Column::auto())
                 .header(26.0, |mut h| {
-                    for title in ["文件名称", "路径", "大小", "修改时间", "图库", "预览"] {
+                    for title in [t("文件名称"), t("路径"), t("大小"), t("修改时间"), t("图库"), t("预览")] {
                         h.col(|ui| {
                             ui.strong(title);
                         });
@@ -3241,18 +3420,15 @@ impl App {
                                 let label = r.rich_label();
                                 let why = match i32::from(r.rich_state) {
                                     crate::db::RICH_OUT => {
-                                        "图库里有这张照片,缩略图还没轮到生成。\
-                                         打开它所在的文件夹就会开始补,不影响查看原图。\
-                                         想让这个文件夹以后优先生成,可以在\
-                                         「工具 → 文件夹管理器」里导入它。"
+                                        t("图库里有这张照片,缩略图还没轮到生成。打开它所在的文件夹就会开始补,不影响查看原图。想让这个文件夹以后优先生成,可以在「工具 → 文件夹管理器」里导入它。")
                                     }
-                                    crate::db::RICH_PENDING => "缩略图正在排队生成。",
-                                    crate::db::RICH_DONE => "缩略图已就绪,网格里能看到。",
+                                    crate::db::RICH_PENDING => t("缩略图正在排队生成。"),
+                                    crate::db::RICH_DONE => t("缩略图已就绪,网格里能看到。"),
                                     crate::db::RICH_BAD => {
-                                        "文件读取失败(损坏或无权限),已隔离,不再重试。"
+                                        t("文件读取失败(损坏或无权限),已隔离,不再重试。")
                                     }
-                                    _ if r.hit.is_dir => "文件夹不进图库。",
-                                    _ => "不是图库收录的媒体类型,或还没被扫描入库。",
+                                    _ if r.hit.is_dir => t("文件夹不进图库。"),
+                                    _ => t("不是图库收录的媒体类型,或还没被扫描入库。"),
                                 };
                                 ui.label(label).on_hover_text(why);
                             });
@@ -3318,36 +3494,36 @@ impl App {
                                     );
                                     ctx_id = Some(pid);
                                     ui.separator();
-                                    if ui.button("复制完整路径").clicked() {
+                                    if ui.button(crate::i18n::t("复制完整路径")).clicked() {
                                         ui.ctx().copy_text(h.path.clone());
                                         ui.close();
                                     }
-                                    if ui.button("系统右键菜单…").clicked() {
+                                    if ui.button(crate::i18n::t("系统右键菜单…")).clicked() {
                                         menu_for = Some(h.path.clone());
                                         ui.close();
                                     }
                                 } else {
-                                    if ui.button("打开").clicked() {
+                                    if ui.button(t("打开")).clicked() {
                                         open_clicked = true;
                                         ui.close();
                                     }
                                     if ui
                                         .button(if h.is_dir {
-                                            "打开文件夹"
+                                            t("打开文件夹")
                                         } else {
-                                            "打开所在文件夹"
+                                            t("打开所在文件夹")
                                         })
                                         .clicked()
                                     {
                                         revealed = Some(h.path.clone());
                                         ui.close();
                                     }
-                                    if ui.button("复制完整路径").clicked() {
+                                    if ui.button(t("复制完整路径")).clicked() {
                                         ui.ctx().copy_text(h.path.clone());
                                         ui.close();
                                     }
                                     ui.separator();
-                                    if ui.button("系统右键菜单…").clicked() {
+                                    if ui.button(t("系统右键菜单…")).clicked() {
                                         menu_for = Some(h.path.clone());
                                         ui.close();
                                     }
@@ -3410,12 +3586,9 @@ impl App {
                     }
                     None => {
                         if !crate::win::shell_open(Path::new(&path)) {
-                            self.status = format!("无法打开:{path}(无关联程序)");
+                            self.status = t_with("无法打开:{path}(无关联程序)", &[("path", path.to_string())]);
                         } else {
-                            self.status = format!(
-                                "{p} 还没入库,已用系统关联程序打开;\
-                                 要在本系统里预览编辑,请先把所在目录纳入图库。"
-                            );
+                            self.status = t_with("{p} 还没入库,已用系统关联程序打开;要在本系统里预览编辑,请先把所在目录纳入图库。", &[("p", p.to_string())]);
                         }
                     }
                 }
@@ -3516,17 +3689,17 @@ impl App {
         let mut skip_ver: Option<String> = None;
         let mut open = true;
 
-        egui::Window::new("检查更新")
+        egui::Window::new(t("检查更新"))
             .open(&mut open)
             .default_width(560.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("检查更新");
+                    ui.heading(t("检查更新"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(if pending_restart {
-                            format!("当前版本 v{cur_ver}(重启后生效)")
+                            t_with("当前版本 v{cur_ver}(重启后生效)", &[("cur_ver", cur_ver.to_string())])
                         } else {
-                            format!("当前版本 v{cur_ver}")
+                            t_with("当前版本 v{cur_ver}", &[("cur_ver", cur_ver.to_string())])
                         });
                     });
                 });
@@ -3535,7 +3708,7 @@ impl App {
                     .num_columns(2)
                     .spacing([10.0, 5.0])
                     .show(ui, |ui| {
-                        ui.label("状态");
+                        ui.label(t("状态"));
                         ui.horizontal(|ui| {
                             if working {
                                 ui.spinner();
@@ -3543,20 +3716,20 @@ impl App {
                             ui.label(phase.label());
                         });
                         ui.end_row();
-                        ui.label("更新地址");
+                        ui.label(t("更新地址"));
                         ui.label(if cfg.url.is_empty() {
-                            "已停用(配置里留空)".to_string()
+                            t("已停用(配置里留空)").to_string()
                         } else {
                             cfg.url.clone()
                         });
                         ui.end_row();
-                        ui.label("配置文件");
+                        ui.label(t("配置文件"));
                         ui.monospace(cfg.path.display().to_string());
                         ui.end_row();
-                        ui.label("上次检查");
+                        ui.label(t("上次检查"));
                         ui.label(update_time_text(last_check));
                         ui.end_row();
-                        ui.label("索引服务");
+                        ui.label(t("索引服务"));
                         ui.label(update_service_text());
                         ui.end_row();
                     });
@@ -3565,7 +3738,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.label(egui::RichText::new(n).color(crate::theme::p().accent));
-                        if ui.small_button("知道了").clicked() {
+                        if ui.small_button(t("知道了")).clicked() {
                             clear_notice = true;
                         }
                     });
@@ -3577,7 +3750,7 @@ impl App {
                 };
                 if !notes.is_empty() {
                     ui.add_space(4.0);
-                    ui.label("更新说明:");
+                    ui.label(t("更新说明:"));
                     egui::ScrollArea::vertical()
                         .id_salt("update_notes")
                         .max_height(110.0)
@@ -3587,7 +3760,7 @@ impl App {
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
                     if ui
-                        .add_enabled(!working, egui::Button::new("立即检查"))
+                        .add_enabled(!working, egui::Button::new(t("立即检查")))
                         .clicked()
                     {
                         check = true;
@@ -3595,14 +3768,14 @@ impl App {
                     // 自动下载开着时已经在跑了,别让用户又排一次相同的下载。
                     let can_download = matches!(phase, Phase::Found(_)) && !cfg.auto_download;
                     if ui
-                        .add_enabled(can_download && !working, egui::Button::new("下载更新"))
+                        .add_enabled(can_download && !working, egui::Button::new(t("下载更新")))
                         .clicked()
                     {
                         download = true;
                     }
                     let can_install = matches!(phase, Phase::Ready(_)) && !working;
                     if ui
-                        .add_enabled(can_install, egui::Button::new("安装更新…"))
+                        .add_enabled(can_install, egui::Button::new(t("安装更新…")))
                         .clicked()
                     {
                         install = true;
@@ -3612,23 +3785,23 @@ impl App {
                         Phase::Ready(p) => Some(p.version.clone()),
                         _ => None,
                     } {
-                        if ui.button("跳过此版本").clicked() {
+                        if ui.button(t("跳过此版本")).clicked() {
                             skip_ver = Some(v);
                         }
                     }
-                    if ui.button("打开配置文件").clicked() {
+                    if ui.button(t("打开配置文件")).clicked() {
                         open_cfg = true;
                     }
                 });
                 ui.add_space(6.0);
-                ui.small("启动后在空闲时才检查(没有输入,且扫描 / 导入 / 服务装卸都不在跑)。");
-                ui.small("发现新版本先提示一次;后台分段下载,断线会保留进度,下载完成再提示一次。");
-                ui.small("安装会等索引服务状态落定后停它(它锁着程序文件),替换完按原状态恢复;需要一次管理员授权。");
-                ui.small("若安装进程意外中断,下次启动会自动把索引服务拉回来。");
-                ui.small("当前窗口继续运行,请尽快重新启动程序以使用新版本(服务与界面版本一致更稳)。");
+                ui.small(t("启动后在空闲时才检查(没有输入,且扫描 / 导入 / 服务装卸都不在跑)。"));
+                ui.small(t("发现新版本先提示一次;后台分段下载,断线会保留进度,下载完成再提示一次。"));
+                ui.small(t("安装会等索引服务状态落定后停它(它锁着程序文件),替换完按原状态恢复;需要一次管理员授权。"));
+                ui.small(t("若安装进程意外中断,下次启动会自动把索引服务拉回来。"));
+                ui.small(t("当前窗口继续运行,请尽快重新启动程序以使用新版本(服务与界面版本一致更稳)。"));
                 if cfg.url.is_empty() {
                     ui.add_space(4.0);
-                    ui.small("配置里把 UpdateURL 留空,自动更新已停用;填回地址即可启用。");
+                    ui.small(t("配置里把 UpdateURL 留空,自动更新已停用;填回地址即可启用。"));
                 }
             });
 
@@ -3664,24 +3837,30 @@ impl App {
         let (mut yes, mut no) = (false, false);
         let ver = match &self.updater.phase {
             crate::update::Phase::Ready(p) => p.version.clone(),
-            _ => "新版本".into(),
+            _ => t("新版本").into(),
         };
-        egui::Window::new("确认安装更新")
+        egui::Window::new(t("确认安装更新"))
             .open(&mut open)
             .default_width(440.0)
             .show(ctx, |ui| {
-                ui.label(format!("即将安装 v{ver}。"));
+                ui.label(t_with("即将安装 v{ver}。", &[("ver", ver.to_string())]));
                 ui.add_space(4.0);
-                ui.label("· 索引服务正锁着程序文件,安装时会先等它状态稳定再停止,替换完成后自动恢复。");
-                ui.label("· 停止 / 启动服务需要管理员权限,系统会弹出一次授权确认。");
-                ui.label("· 若安装进程被中断,下次启动程序会自动把索引服务起回来。");
-                ui.label("· 本次会话不会中断;请尽快重新启动程序,让界面和服务都跑在新版本上。");
+                ui.label(t(
+                    "· 索引服务正锁着程序文件,安装时会先等它状态稳定再停止,替换完成后自动恢复。",
+                ));
+                ui.label(t(
+                    "· 停止 / 启动服务需要管理员权限,系统会弹出一次授权确认。",
+                ));
+                ui.label(t("· 若安装进程被中断,下次启动程序会自动把索引服务起回来。"));
+                ui.label(t(
+                    "· 本次会话不会中断;请尽快重新启动程序,让界面和服务都跑在新版本上。",
+                ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("开始安装").clicked() {
+                    if ui.button(t("开始安装")).clicked() {
                         yes = true;
                     }
-                    if ui.button("取消").clicked() {
+                    if ui.button(t("取消")).clicked() {
                         no = true;
                     }
                 });
@@ -3753,7 +3932,10 @@ impl App {
 
     /// 消化按张放行队列:一批 id 一次批量抬进后台派生队列,不写目录账本。
     fn drain_adopts(&mut self, max: usize) {
-        let ids: Vec<i64> = self.adopt_queue.drain(..max.min(self.adopt_queue.len())).collect();
+        let ids: Vec<i64> = self
+            .adopt_queue
+            .drain(..max.min(self.adopt_queue.len()))
+            .collect();
         if ids.is_empty() {
             return;
         }
@@ -3805,7 +3987,10 @@ impl App {
 
     fn goto_known_dir(&mut self, dir: Option<std::path::PathBuf>, label: &str) {
         let Some(p) = dir else {
-            self.status = format!("{label}:图库树只覆盖已导入的目录");
+            self.status = t_with(
+                "{label}:图库树只覆盖已导入的目录",
+                &[("label", label.to_string())],
+            );
             return;
         };
         let want = p
@@ -3833,9 +4018,14 @@ impl App {
                 let p = self.folders[i].clone();
                 self.enter_dir(&p);
                 self.tree_reveal(&p);
-                self.status = format!("已定位到 {label}");
+                self.status = t_with("已定位到 {label}", &[("label", label.to_string())]);
             }
-            None => self.status = format!("{label} 未导入图库:文件夹管理器 > 添加文件夹"),
+            None => {
+                self.status = t_with(
+                    "{label} 未导入图库:文件夹管理器 > 添加文件夹",
+                    &[("label", label.to_string())],
+                )
+            }
         }
     }
 
@@ -3847,7 +4037,7 @@ impl App {
             // 前后导航(浏览器式历史;Alt+←/→ 同一条路)。
             if ui
                 .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
-                .on_hover_text("后退(Alt+←)")
+                .on_hover_text(t("后退(Alt+←)"))
                 .clicked()
             {
                 self.nav_back();
@@ -3857,7 +4047,7 @@ impl App {
                     self.nav_at + 1 < self.nav_hist.len(),
                     tool_button("arrow-right", false),
                 )
-                .on_hover_text("前进(Alt+→)")
+                .on_hover_text(t("前进(Alt+→)"))
                 .clicked()
             {
                 self.nav_forward();
@@ -3868,21 +4058,21 @@ impl App {
             let on_import = self.page == PageKind::Import;
             if ui
                 .add(tool_button("folder-plus", on_import))
-                .on_hover_text("导入(打开导入页:选源 → 看清单 → 入库)")
+                .on_hover_text(t("导入(打开导入页:选源 → 看清单 → 入库)"))
                 .clicked()
             {
                 self.go_page(PageKind::Import);
             }
             if ui
                 .add(tool_button("smartphone", false))
-                .on_hover_text("从设备导入…")
+                .on_hover_text(t("从设备导入…"))
                 .clicked()
             {
                 self.open_import_devices();
             }
             if ui
                 .add(tool_button("image-plus", false))
-                .on_hover_text("新建相簿(有选中照片则一并放入)")
+                .on_hover_text(t("新建相簿(有选中照片则一并放入)"))
                 .clicked()
             {
                 self.album_input.clear();
@@ -3891,7 +4081,7 @@ impl App {
             ui.separator();
             if ui
                 .add(tool_button("images", false))
-                .on_hover_text("幻灯片放映(选中照片;未选中则放映当前视图)")
+                .on_hover_text(t("幻灯片放映(选中照片;未选中则放映当前视图)"))
                 .clicked()
             {
                 self.start_slideshow();
@@ -3899,23 +4089,23 @@ impl App {
             ui.separator();
             if ui
                 .add(tool_button("layout-grid", !self.folder_tree))
-                .on_hover_text("平铺文件夹视图")
+                .on_hover_text(t("平铺文件夹视图"))
                 .clicked()
             {
                 self.set_folder_tree(false);
             }
             if ui
                 .add(tool_button("list-tree", self.folder_tree))
-                .on_hover_text("树形视图(只显示有照片的目录)")
+                .on_hover_text(t("树形视图(只显示有照片的目录)"))
                 .clicked()
             {
                 self.set_folder_tree(true);
             }
-            ui.menu_button("查看选项", |ui| self.view_options_menu(ui));
+            ui.menu_button(t("查看选项"), |ui| self.view_options_menu(ui));
             ui.separator();
             if ui
                 .add(tool_button("wand-sparkles", self.fx_panel))
-                .on_hover_text("效果面板")
+                .on_hover_text(t("效果面板"))
                 .clicked()
             {
                 self.fx_panel = !self.fx_panel;
@@ -3925,9 +4115,9 @@ impl App {
                 // 二选一的配色开关:浅色显月亮(点了变暗),暗色显太阳(点了变亮)。
                 let dark = !crate::theme::p().is_light;
                 let tip = if dark {
-                    "切回灰色配色"
+                    t("切回灰色配色")
                 } else {
-                    "切到蓝黑配色"
+                    t("切到蓝黑配色")
                 };
                 if ui
                     .add(tool_button(if dark { "sun" } else { "moon" }, false))
@@ -3945,7 +4135,7 @@ impl App {
                 // 右栏抽屉开关(工具栏的属性面板按钮;抽屉内四页签见右栏)。
                 if ui
                     .add(tool_button("panel-right", self.drawer_open))
-                    .on_hover_text("属性面板")
+                    .on_hover_text(t("属性面板"))
                     .clicked()
                 {
                     self.drawer_open = !self.drawer_open;
@@ -3956,7 +4146,7 @@ impl App {
                 ui.separator();
                 if self.busy() {
                     ui.add(egui::Spinner::new().size(17.0))
-                        .on_hover_text("后台正在扫描 / 生成缩略图 / 建立索引 / 检查或下载更新");
+                        .on_hover_text(t("后台正在扫描 / 生成缩略图 / 建立索引 / 检查或下载更新"));
                 } else {
                     // 不忙也占住同样的宽度,免得指示灯出现时整行左右抖。
                     ui.add_space(23.0);
@@ -3967,13 +4157,13 @@ impl App {
                 let mut idx = self.thumb_tier as i32;
                 let slider = egui::Slider::new(&mut idx, 0..=3)
                     .show_value(false)
-                    .text("图");
+                    .text(t("图"));
                 // egui 的滑块宽度取自 spacing.slider_width,工具栏里要收窄。
                 let old_w = ui.spacing().slider_width;
                 ui.spacing_mut().slider_width = 96.0;
                 let moved = ui
                     .add(slider)
-                    .on_hover_text("缩略图大小:小 · 普通 · 大 · 预览")
+                    .on_hover_text(t("缩略图大小:小 · 普通 · 大 · 预览"))
                     .changed();
                 ui.spacing_mut().slider_width = old_w;
                 if moved {
@@ -3984,8 +4174,8 @@ impl App {
                 ui.separator();
                 // 四个可叠加的过滤开关(星标 / 人脸 / 视频 / 地理标记)。
                 // 右到左布局里后加的在左边,所以倒序添加,视觉顺序才是 星标·人物·视频·地理标记。
-                for i in (0..timeline::FILTER_BTNS.len()).rev() {
-                    let (name, tip) = timeline::FILTER_BTNS[i];
+                for i in (0..timeline::filter_btns().len()).rev() {
+                    let (name, tip) = timeline::filter_btns()[i];
                     if ui
                         .add(tool_button(name, self.filters.flag(i)))
                         .on_hover_text(tip)
@@ -4003,25 +4193,31 @@ impl App {
     /// (View 组 → 排序 → Sort People 组 → 壳目录快捷键 → 缩略图/树形选项)。
     fn view_options_menu(&mut self, ui: &mut egui::Ui) {
         if ui
-            .selectable_label(!self.folder_tree, "平铺文件夹视图")
+            .selectable_label(!self.folder_tree, t("平铺文件夹视图"))
             .clicked()
         {
             self.set_folder_tree(false);
             ui.close();
         }
-        if ui.selectable_label(self.folder_tree, "树形视图").clicked() {
+        if ui
+            .selectable_label(self.folder_tree, t("树形视图"))
+            .clicked()
+        {
             self.set_folder_tree(true);
             ui.close();
         }
         ui.separator();
         for s in timeline::SortBy::ALL {
-            if ui.selectable_label(self.sort_by == s, s.label()).clicked() {
+            if ui
+                .selectable_label(self.sort_by == s, t(s.label()))
+                .clicked()
+            {
                 self.sort_by = s;
                 self.apply_view_state();
                 ui.close();
             }
         }
-        if ui.selectable_label(self.sort_rev, "反向排序").clicked() {
+        if ui.selectable_label(self.sort_rev, t("反向排序")).clicked() {
             self.sort_rev = !self.sort_rev;
             self.apply_view_state();
             ui.close();
@@ -4041,9 +4237,9 @@ impl App {
         ui.separator();
         for (label, dir) in crate::win::shell_shortcuts() {
             let tip = if dir.is_some() {
-                "跳到该目录(需已导入图库)"
+                t("跳到该目录(需已导入图库)")
             } else {
-                "图库树只覆盖已导入的目录"
+                t("图库树只覆盖已导入的目录")
             };
             if ui
                 .add_enabled(dir.is_some(), egui::Button::new(label))
@@ -4056,7 +4252,7 @@ impl App {
         }
         ui.separator();
         if ui
-            .selectable_label(self.tree_thumbs, "在图库中显示缩略图")
+            .selectable_label(self.tree_thumbs, t("在图库中显示缩略图"))
             .clicked()
         {
             self.tree_thumbs = !self.tree_thumbs;
@@ -4066,7 +4262,7 @@ impl App {
             ui.close();
         }
         if ui
-            .selectable_label(self.thumb_captions, "缩略图说明")
+            .selectable_label(self.thumb_captions, t("缩略图说明"))
             .clicked()
         {
             self.thumb_captions = !self.thumb_captions;
@@ -4149,7 +4345,9 @@ impl App {
         let excl = crate::scan::Exclusions::from_store(&self.store);
         let mut recent = Vec::with_capacity(RECENT_LIMIT);
         for id in ids {
-            let Some(&i) = self.id_row.get(&id) else { continue };
+            let Some(&i) = self.id_row.get(&id) else {
+                continue;
+            };
             let dir = self.rows[i].parent.as_str();
             if dir.is_empty()
                 || matches!(
@@ -4193,7 +4391,7 @@ impl App {
             .into_iter()
             .map(|(p, _)| PathBuf::from(p))
             .collect();
-        self.start_scan_roots(roots, "全部监听目录");
+        self.start_scan_roots(roots, t("全部监听目录"));
     }
 
     /// 启动扫描后台线程;scope 仅用于状态文案。
@@ -4223,8 +4421,14 @@ impl App {
         let ctrl = Arc::new(crate::scan::ScanControl::new());
         self.scan_ctrl = Some(ctrl.clone());
         self.scan_scope = scope_owned.clone();
-        self.scan_verb = "扫描";
-        self.status = format!("正在{}{scope}…", self.scan_verb);
+        self.scan_verb = t("扫描");
+        self.status = t_with(
+            "正在{p1}{scope}…",
+            &[
+                ("p1", (self.scan_verb).to_string()),
+                ("scope", scope.to_string()),
+            ],
+        );
         std::thread::spawn(move || {
             // L1 索引住在服务进程里,UI 侧不再持有 `IndexFile`,
             // 所以监听根的发现走 walkdir —— 这正是的口径:全盘发现与
@@ -4320,7 +4524,7 @@ impl App {
             }
         }
         self.push_nav();
-        self.status = format!("切到{}页", page.label());
+        self.status = t_with("切到{p1}页", &[("p1", (page.label()).to_string())]);
     }
 
     /// 选视图:分类只在图库页有,所以顺带把页面切回去并记站。
@@ -4372,7 +4576,13 @@ impl App {
         if s.page == PageKind::Import && self.import_src.is_none() {
             self.set_import_source(PathBuf::from(&self.last_import_src));
         }
-        self.status = format!("回到 {} · {}", s.page.label(), s.view.label());
+        self.status = t_with(
+            "回到 {p1} · {p2}",
+            &[
+                ("p1", (s.page.label()).to_string()),
+                ("p2", (s.view.label()).to_string()),
+            ],
+        );
     }
 
     // ===== 导入页 =====
@@ -4385,7 +4595,7 @@ impl App {
         self.last_import_src = dir.to_string_lossy().into_owned();
         self.import_src = Some(dir);
         self.import_sel.clear();
-        self.status = format!("导入源:{n} 个可入库文件");
+        self.status = t_with("导入源:{n} 个可入库文件", &[("n", n.to_string())]);
     }
 
     /// 重读当前源目录(清单按钮「刷新」;新增/删除文件后不必重开页面)。
@@ -4402,13 +4612,13 @@ impl App {
     /// 占掉图库页那栏的位置 —— 导入面板把左侧换成源选择,
     /// 菜单、工具栏与状态栏保持原位。
     fn import_sources_ui(&mut self, ui: &mut egui::Ui) {
-        crate::theme::section_title(ui, "选择源");
+        crate::theme::section_title(ui, t("选择源"));
         let cur = self.import_src.clone();
         let mut pick: Option<PathBuf> = None;
 
         let shell = crate::win::known_dirs();
         if !shell.is_empty() {
-            muted_title(ui, "我的文件夹");
+            muted_title(ui, t("我的文件夹"));
             for p in shell {
                 let name = p
                     .file_name()
@@ -4422,11 +4632,13 @@ impl App {
         // 设备:可移动卷(U 盘 / 相机卡)。
         let devs = crate::device::removable_volumes();
         if !devs.is_empty() {
-            muted_title(ui, "设备");
+            muted_title(ui, t("设备"));
             for v in devs {
                 let label = crate::win::volume_label(&v)
                     .map(|l| format!("{l} ({})", v.display()))
-                    .unwrap_or_else(|| format!("可移动磁盘 {}", v.display()));
+                    .unwrap_or_else(|| {
+                        t_with("可移动磁盘 {p1}", &[("p1", (v.display()).to_string())])
+                    });
                 if source_row(ui, "smartphone", &label, &v, &cur) {
                     pick = Some(v);
                 }
@@ -4443,11 +4655,13 @@ impl App {
             })
             .collect();
         if !roots.is_empty() {
-            muted_title(ui, "我的电脑");
+            muted_title(ui, t("我的电脑"));
             for r in roots {
                 let label = crate::win::volume_label(&r)
                     .map(|l| format!("{l} ({})", r.display()))
-                    .unwrap_or_else(|| format!("本地磁盘 {}", r.display()));
+                    .unwrap_or_else(|| {
+                        t_with("本地磁盘 {p1}", &[("p1", (r.display()).to_string())])
+                    });
                 if source_row(ui, "hard-drive", &label, &r, &cur) {
                     pick = Some(r);
                 }
@@ -4455,15 +4669,15 @@ impl App {
         }
 
         ui.separator();
-        if ui.button("浏览其他文件夹…").clicked() {
+        if ui.button(t("浏览其他文件夹…")).clicked() {
             if let Some(dir) = rfd::FileDialog::new()
-                .set_title("选择导入源文件夹")
+                .set_title(t("选择导入源文件夹"))
                 .pick_folder()
             {
                 pick = Some(dir);
             }
         }
-        if ui.button("刷新清单").clicked() {
+        if ui.button(t("刷新清单")).clicked() {
             self.refresh_import_entries();
         }
         if let Some(d) = pick {
@@ -4475,13 +4689,13 @@ impl App {
     fn import_page_ui(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("导入照片");
+                ui.heading(t("导入照片"));
                 if let Some(src) = &self.import_src {
                     ui.small(src.display().to_string())
-                        .on_hover_text("当前导入源目录");
+                        .on_hover_text(t("当前导入源目录"));
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("返回图库").clicked() {
+                    if ui.button(t("返回图库")).clicked() {
                         self.go_page(PageKind::Library);
                     }
                 });
@@ -4489,7 +4703,9 @@ impl App {
             ui.separator();
 
             if self.import_src.is_none() {
-                ui.small("左侧还没有可浏览的源:选一个文件夹,或点「浏览其他文件夹…」。");
+                ui.small(t(
+                    "左侧还没有可浏览的源:选一个文件夹,或点「浏览其他文件夹…」。",
+                ));
                 return;
             }
 
@@ -4501,17 +4717,21 @@ impl App {
                 .filter(|e| !e.is_dir && !e.in_library)
                 .count();
             ui.horizontal(|ui| {
-                if ui.button("全选照片").clicked() {
+                if ui.button(t("全选照片")).clicked() {
                     self.import_sel = (0..self.import_entries.len())
                         .filter(|&i| !self.import_entries[i].is_dir)
                         .collect();
                 }
-                if ui.button("全不选").clicked() {
+                if ui.button(t("全不选")).clicked() {
                     self.import_sel.clear();
                 }
-                ui.small(format!(
-                    "{pics} 个可入库文件(未入库 {fresh} 个),已勾选 {} 个",
-                    self.import_sel.len()
+                ui.small(t_with(
+                    "{pics} 个可入库文件(未入库 {fresh} 个),已勾选 {p1} 个",
+                    &[
+                        ("pics", pics.to_string()),
+                        ("fresh", fresh.to_string()),
+                        ("p1", (self.import_sel.len()).to_string()),
+                    ],
                 ));
             });
 
@@ -4528,7 +4748,7 @@ impl App {
                                 let text = format!("{} \\", e.name);
                                 if ui
                                     .selectable_label(false, &text)
-                                    .on_hover_text("进入该子目录")
+                                    .on_hover_text(t("进入该子目录"))
                                     .clicked()
                                 {
                                     descend = Some(e.path.clone());
@@ -4537,15 +4757,15 @@ impl App {
                                 ui.add(toolbar_icon("images"));
                                 let mut on = self.import_sel.contains(&i);
                                 let name = if e.in_library {
-                                    format!("{}  (已入库)", e.name)
+                                    t_with("{p1}  (已入库)", &[("p1", (e.name).to_string())])
                                 } else {
                                     e.name.clone()
                                 };
                                 let chk =
                                     ui.checkbox(&mut on, &name).on_hover_text(if e.in_library {
-                                        "已在图库里,导入时会跳过"
+                                        t("已在图库里,导入时会跳过")
                                     } else {
-                                        "勾选后「导入所选」只入这几张"
+                                        t("勾选后「导入所选」只入这几张")
                                     });
                                 if chk.changed() {
                                     if on {
@@ -4565,7 +4785,7 @@ impl App {
                         });
                     }
                     if entries.is_empty() {
-                        ui.small("这个目录里没有可入库的图片(或子目录)。");
+                        ui.small(t("这个目录里没有可入库的图片(或子目录)。"));
                     }
                 });
             let sel: Vec<PathBuf> = self
@@ -4583,21 +4803,24 @@ impl App {
             // 动作行。
             ui.separator();
             ui.horizontal(|ui| {
-                ui.small("导入 = 登记该目录进图库并建索引,不移动、不改写原文件。");
+                ui.small(t("导入 = 登记该目录进图库并建索引,不移动、不改写原文件。"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             !sel.is_empty(),
-                            egui::Button::new(format!("导入所选({})", sel.len())),
+                            egui::Button::new(t_with(
+                                "导入所选({p1})",
+                                &[("p1", (sel.len()).to_string())],
+                            )),
                         )
-                        .on_hover_text("只把勾选的文件逐张入库(有进度,可取消)")
+                        .on_hover_text(t("只把勾选的文件逐张入库(有进度,可取消)"))
                         .clicked()
                     {
                         self.import_selected(sel.clone());
                     }
                     if ui
-                        .button("导入整个文件夹")
-                        .on_hover_text("登记该目录并扫描(含子目录)")
+                        .button(t("导入整个文件夹"))
+                        .on_hover_text(t("登记该目录并扫描(含子目录)"))
                         .clicked()
                     {
                         self.import_whole_folder();
@@ -4613,7 +4836,7 @@ impl App {
             return;
         };
         if let Err(e) = self.store.upsert_watched(&dir) {
-            self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
+            self.status = t_with("记录文件夹失败(本次仍会扫描): {e}", &[("e", e.to_string())]);
         }
         let scope = dir.display().to_string();
         // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账。
@@ -4626,11 +4849,11 @@ impl App {
     /// 否则左栏看不到刚落库的图)。
     fn import_selected(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
-            self.status = "没有待导入的勾选(已入库的会跳过)".into();
+            self.status = t("没有待导入的勾选(已入库的会跳过)").into();
             return;
         }
         if self.scan_busy.swap(true, Ordering::SeqCst) {
-            self.status = "已有扫描在跑,请等它结束后再导入所选".into();
+            self.status = t("已有扫描在跑,请等它结束后再导入所选").into();
             return;
         }
         let Some(dir) = self.import_src.clone() else {
@@ -4646,16 +4869,16 @@ impl App {
         );
         let store = self.store.clone();
         let busy = self.scan_busy.clone();
-        let scope = format!("所选 {} 张", paths.len());
+        let scope = t_with("所选 {p1} 张", &[("p1", (paths.len()).to_string())]);
         self.scan_scope = scope.clone();
-        self.scan_verb = "导入";
+        self.scan_verb = t("导入");
         let scope_owned = scope.clone();
         let (tx, rx) = mpsc::channel();
         self.scan_rx = Some(rx);
         let ctrl = Arc::new(crate::scan::ScanControl::new());
         ctrl.set_total(paths.len());
         self.scan_ctrl = Some(ctrl.clone());
-        self.status = format!("正在{scope}…");
+        self.status = t_with("正在{scope}…", &[("scope", scope.to_string())]);
         std::thread::spawn(move || {
             let mut scanned = 0usize;
             let mut indexed = 0usize;
@@ -4691,13 +4914,13 @@ impl App {
     /// 文件 > 添加文件夹到图库:选目录 → 记入 watched → 只扫该目录。
     fn add_folder_to_library(&mut self) {
         let Some(dir) = rfd::FileDialog::new()
-            .set_title("添加文件夹到图库")
+            .set_title(t("添加文件夹到图库"))
             .pick_folder()
         else {
             return;
         };
         if let Err(e) = self.store.upsert_watched(&dir) {
-            self.status = format!("记录文件夹失败(本次仍会扫描): {e}");
+            self.status = t_with("记录文件夹失败(本次仍会扫描): {e}", &[("e", e.to_string())]);
         }
         let scope = dir.display().to_string();
         // 用户明确要这个目录 = 它该出缩略图:落 `imported` 账。
@@ -4757,8 +4980,13 @@ impl App {
         }
         let n = ids.len();
         match timeline::remove_photos(&self.store, &ids) {
-            Ok(()) => self.status = format!("已从图库移除 {n} 张(未删除磁盘文件)"),
-            Err(e) => self.status = format!("移除失败: {e}"),
+            Ok(()) => {
+                self.status = t_with(
+                    "已从图库移除 {n} 张(未删除磁盘文件)",
+                    &[("n", n.to_string())],
+                )
+            }
+            Err(e) => self.status = t_with("移除失败: {e}", &[("e", e.to_string())]),
         }
         self.sel.clear();
         self.preview = None;
@@ -4769,18 +4997,18 @@ impl App {
     /// 启动保存烘培后台线程(备份+重编码+重缩略图)。
     fn start_bake(&mut self, id: i64) {
         if self.bake_rx.is_some() {
-            self.status = "保存进行中,请稍候…".into();
+            self.status = t("保存进行中,请稍候…").into();
             return;
         }
         // 只读速看格式:即便 UI 上误触保存,也不启动会覆盖原文件的后台任务。
         if self.readonly_media(id) {
-            self.status = "只读速看预览格式不参与保存烘培,原文件保持不变".into();
+            self.status = t("只读速看预览格式不参与保存烘培,原文件保持不变").into();
             return;
         }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.bake_rx = Some(rx);
-        self.status = "正在保存(备份并重写原图)…".into();
+        self.status = t("正在保存(备份并重写原图)…").into();
         std::thread::spawn(move || {
             let res = crate::save::bake(&store, id)
                 .and_then(|_| crate::thumbs::regen(&store, id))
@@ -4795,11 +5023,12 @@ impl App {
     fn start_ocr(&mut self, id: i64, path: PathBuf) {
         let (tx, rx) = mpsc::channel::<Result<(i64, Vec<crate::ai::ocr::Txt>), String>>();
         self.ocr_rx = Some(rx);
-        self.status = "正在 OCR 识别(首次需加载模型)…".into();
+        self.status = t("正在 OCR 识别(首次需加载模型)…").into();
+        let store = self.store.clone();
         std::thread::spawn(move || {
             let out = (|| -> Result<(i64, Vec<crate::ai::ocr::Txt>), String> {
                 let img = image::open(&path).map_err(|e| e.to_string())?;
-                let mut o = crate::ai::ocr::Ocr::load()?;
+                let mut o = crate::ai::ocr::Ocr::load(&store)?;
                 Ok((id, o.extract(&img)?))
             })();
             let _ = tx.send(out);
@@ -4815,10 +5044,10 @@ impl App {
         if !self.models.check_on_startup(algo) {
             return;
         }
-        // 「不再提示」只压掉开机弹窗,下载入口仍留在 选项 > 人脸识别 与人脸视图。
+        // 「不再提示」只压掉开机弹窗,下载入口仍留在 选项 > AI 模型 与人脸视图。
         if self.model_never_ask() {
             self.models.prompt_open = false;
-            self.status = "人脸模型未就位:可在 选项 > 人脸识别 或人脸视图里下载".into();
+            self.status = t("人脸模型未就位:可在 选项 > AI 模型 或人脸视图里下载").into();
         }
     }
 
@@ -4833,9 +5062,7 @@ impl App {
     fn start_model_download(&mut self, algo: crate::ai::face::FaceAlgo) {
         if !crate::models::downloadable(algo) {
             let (det_f, rec_f) = algo.files();
-            self.status = format!(
-                "「{det_f} / {rec_f}」的权重许可不可再分发,程序不代下:请按 选项 > 人脸识别 页给出的官方地址手动获取"
-            );
+            self.status = t_with("「{det_f} / {rec_f}」的权重许可不可再分发,程序不代下:请按 选项 > AI 模型 页给出的官方地址手动获取", &[("det_f", det_f.to_string()), ("rec_f", rec_f.to_string())]);
             return;
         }
         let dir = crate::ai::models_dir();
@@ -4843,7 +5070,7 @@ impl App {
             .map(|d| crate::models::missing_files(algo, &d))
             .unwrap_or_default();
         if files.is_empty() {
-            self.status = "人脸模型已就位".into();
+            self.status = t("人脸模型已就位").into();
             return;
         }
         self.start_model_files(files);
@@ -4860,9 +5087,9 @@ impl App {
         );
         self.models.start_files(files, pref);
         if self.models.phase.working() {
-            self.status = "正在后台下载人脸模型…".into();
+            self.status = t("正在后台下载人脸模型…").into();
         } else if let crate::models::Phase::Failed(e) = &self.models.phase {
-            self.status = format!("人脸模型下载失败:{e}");
+            self.status = t_with("人脸模型下载失败:{e}", &[("e", e.to_string())]);
         }
     }
 
@@ -4877,23 +5104,26 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(phase.label());
-                    if ui.button("停止下载").clicked() {
+                    if ui.button(t("停止下载")).clicked() {
                         self.models.cancel();
                         self.status =
-                            "已停止下载:断点留在 .part,稍后点「下载选中的模型」接着下".into();
+                            t("已停止下载:断点留在 .part,稍后点「下载选中的模型」接着下").into();
                     }
                 });
                 if let Some(d) = crate::ai::models_dir() {
-                    ui.small(format!(
-                        "断点留在 {}/{}.part,重开程序后再点下载可接着下",
-                        d.display(),
-                        file
+                    ui.small(t_with(
+                        "断点留在 {p1}/{p2}.part,重开程序后再点下载可接着下",
+                        &[
+                            ("p1", (d.display()).to_string()),
+                            ("p2", (file).to_string()),
+                        ],
                     ));
                 }
             }
             Phase::Failed(e) => {
                 ui.label(
-                    egui::RichText::new(format!("下载失败:{e}")).color(crate::theme::p().accent),
+                    egui::RichText::new(t_with("下载失败:{e}", &[("e", e.to_string())]))
+                        .color(crate::theme::p().accent),
                 );
             }
             Phase::Ready => {
@@ -4903,26 +5133,25 @@ impl App {
         }
     }
 
-    /// 选项 > 人脸识别:方案单选(切换需确认重建)、模型复选下载、
+    /// 选项 > AI 模型:方案单选(切换需确认重建)、模型复选下载、
     /// 下载源选择与测速。
     #[cfg(feature = "ai")]
     fn face_options_ui(&mut self, ui: &mut egui::Ui) {
-        use crate::models::Phase;
         // —— 识别方案(单选) ——
-        ui.heading(egui::RichText::new("识别方案").size(14.0));
+        ui.heading(egui::RichText::new(t("识别方案")).size(14.0));
         let cur = crate::faces::current_algo(&self.store);
         for (algo, note) in [
             (
                 crate::ai::face::FaceAlgo::SFace,
-                "YuNet + SFace,均 OpenCV Zoo,Apache-2.0 含权重,可商用(默认)",
+                t("YuNet + SFace,均 OpenCV Zoo,Apache-2.0 含权重,可商用(默认)"),
             ),
             (
                 crate::ai::face::FaceAlgo::AdaFace,
-                "YuNet + AdaFace;权重训练数据非商用,选择即自担原厂许可",
+                t("YuNet + AdaFace;权重训练数据非商用,选择即自担原厂许可"),
             ),
             (
                 crate::ai::face::FaceAlgo::AntelopeV2,
-                "YuNet + antelopev2;权重非商用 research-only,不代下,需手动放置",
+                t("YuNet + antelopev2;权重非商用 research-only,不代下,需手动放置"),
             ),
         ] {
             ui.horizontal(|ui| {
@@ -4932,48 +5161,49 @@ impl App {
                 ui.small(note);
             });
         }
-        ui.small("三个方案的模型文件可以都下好备着,但方案之间特征向量不通用:切换后需要重建(清除现有人脸数据并按新方案重扫,或暂留旧数据)。");
+        ui.small(t("三个方案的模型文件可以都下好备着,但方案之间特征向量不通用:切换后需要重建(清除现有人脸数据并按新方案重扫,或暂留旧数据)。"));
         ui.separator();
 
-        // —— 下载进度(全局一份) ——
-        let working = self.models.phase.working();
-        self.face_download_progress_ui(ui);
-        if matches!(self.models.phase, Phase::Failed(_)) || working {
-            ui.separator();
-        }
-
         // —— 模型文件(复选下载) ——
-        ui.heading(egui::RichText::new("模型文件").size(14.0));
-        const CATALOG: [(&str, &str); 3] = [
-            ("face_det.onnx", "YuNet 人脸检测 · Apache-2.0(所有方案共用)"),
-            ("face_rec_sface.onnx", "SFace 人脸识别 · Apache-2.0"),
-            ("face_rec.onnx", "AdaFace 人脸识别 · 社区 ONNX 导出(条款自决)"),
+        let working =
+            self.models.phase.working() || self.ai_dl.as_ref().is_some_and(|d| d.phase.working());
+        ui.heading(egui::RichText::new(t("模型文件")).size(14.0));
+        let catalog: [(&str, &str); 3] = [
+            (
+                "face_det.onnx",
+                t("YuNet 人脸检测 · Apache-2.0(所有方案共用)"),
+            ),
+            ("face_rec_sface.onnx", t("SFace 人脸识别 · Apache-2.0")),
+            (
+                "face_rec.onnx",
+                t("AdaFace 人脸识别 · 社区 ONNX 导出(条款自决)"),
+            ),
         ];
         let mut any_pick = false;
-        for (i, (name, desc)) in CATALOG.iter().enumerate() {
+        for (i, (name, desc)) in catalog.iter().enumerate() {
             let present = crate::ai::models_dir()
                 .map(|d| d.join(name).is_file())
                 .unwrap_or(false);
             if present {
                 self.model_pick[i] = false;
-                ui.small(format!("✓ {name} 已就位 —— {desc}"));
+                ui.small(t_with(
+                    "✓ {name} 已就位 —— {desc}",
+                    &[("name", name.to_string()), ("desc", desc.to_string())],
+                ));
             } else {
                 ui.checkbox(&mut self.model_pick[i], format!("{name} —— {desc}"));
                 any_pick |= self.model_pick[i];
             }
         }
         if let Some(url) = crate::models::manual_hint(crate::ai::face::FaceAlgo::AntelopeV2) {
-            ui.small(format!(
-                "antelopev2(glint360k/antelopev2 两个 onnx,非商用)不代下:自行从 {} 下载,解包后按 README 改名放入模型目录。",
-                url
-            ));
+            ui.small(t_with("antelopev2(glint360k/antelopev2 两个 onnx,非商用)不代下:自行从 {p1} 下载,解包后按 README 改名放入模型目录。", &[("p1", (url).to_string())]));
         }
         ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(any_pick && !working, egui::Button::new("下载选中的模型"))
+                .add_enabled(any_pick && !working, egui::Button::new(t("下载选中的模型")))
                 .clicked()
             {
-                let files: Vec<String> = CATALOG
+                let files: Vec<String> = catalog
                     .iter()
                     .enumerate()
                     .filter(|(i, _)| self.model_pick[*i])
@@ -4981,87 +5211,102 @@ impl App {
                     .collect();
                 self.start_model_files(files);
             }
-            if ui.button("打开模型目录").clicked() {
+            if ui.button(t("打开模型目录")).clicked() {
                 if let Some(d) = crate::ai::models_dir() {
                     show_in_explorer(&d.display().to_string());
                 }
             }
-            if ui.button("打开配置文件").clicked() {
+            if ui.button(t("打开配置文件")).clicked() {
                 crate::update::open_config_file();
             }
         });
         ui.separator();
 
-        // —— 下载源(单选 + 测速) ——
-        ui.heading(egui::RichText::new("下载源").size(14.0));
+        // —— 下载源(全局单选 + 测速) ——
+        ui.heading(egui::RichText::new(t("下载源")).size(14.0));
         let pref = crate::models::SourcePref::from_setting(
             &self
                 .store
                 .get_setting(crate::models::SourcePref::SETTING)
                 .unwrap_or_default(),
         );
-        for p in [
-            crate::models::SourcePref::Auto,
-            crate::models::SourcePref::Official,
-            crate::models::SourcePref::Mirror,
-        ] {
-            // 镜像源没配 ModelURL 时禁选,免得选完下不动。
-            let enabled =
-                p != crate::models::SourcePref::Mirror || !self.models.model_base().is_empty();
-            if ui
-                .add_enabled(
-                    enabled,
-                    egui::RadioButton::new(pref == p, p.label()),
-                )
-                .clicked()
-                && pref != p
-            {
-                let _ = self
-                    .store
-                    .set_setting(crate::models::SourcePref::SETTING, p.key());
-                // 下载进行中切源:立刻打断当前任务并用新源重启剩余缺件,
-                // 断点(.part)保留,同内容文件可续传,不浪费已下字节。
-                if self.models.phase.working() {
-                    self.models.cancel();
-                    let files: Vec<String> = CATALOG
-                        .iter()
-                        .map(|(name, _)| name.to_string())
-                        .filter(|name| {
-                            crate::ai::models_dir()
-                                .map(|d| !d.join(name).is_file())
-                                .unwrap_or(false)
-                        })
-                        .collect();
-                    if files.is_empty() {
-                        self.status = "下载源已切换;当前任务已停,所需文件其实都已就位".into();
-                    } else {
-                        self.start_model_files(files);
-                        self.status =
-                            format!("已切换为「{}」并用新源重启下载,断点保留接着下", p.label());
-                    }
-                } else {
-                    self.status = format!("模型下载源已切换为「{}」,下次下载生效", p.label());
-                }
-            }
-        }
-        if self.models.model_base().is_empty() {
-            ui.small("想用镜像下载:在 maliang.ini 里配好 ModelURL(「打开配置文件」可直达),这里才会放开「仅镜像」。");
-        }
-        ui.small("「仅镜像」需要 maliang.ini 里配好 ModelURL;源上的文件缺失会直接报错,不做回退。");
         ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("model_src_pref")
+                .selected_text(pref.label())
+                .show_ui(ui, |ui| {
+                    for p in [
+                        crate::models::SourcePref::Auto,
+                        crate::models::SourcePref::Official,
+                        crate::models::SourcePref::Mirror,
+                    ] {
+                        // 镜像源没配 ModelURL 时禁选,免得选完下不动。
+                        let enabled = p != crate::models::SourcePref::Mirror
+                            || !self.models.model_base().is_empty();
+                        if ui
+                            .add_enabled(enabled, egui::Button::new(p.label()).selected(pref == p))
+                            .clicked()
+                            && pref != p
+                        {
+                            let _ = self
+                                .store
+                                .set_setting(crate::models::SourcePref::SETTING, p.key());
+                            // 下载进行中切源:立刻打断当前任务并用新源重启人脸剩余缺件,
+                            // 断点(.part)保留;AI 槽位保留断点,下次点「下载」续传。
+                            if self.models.phase.working() {
+                                self.models.cancel();
+                                let files: Vec<String> = catalog
+                                    .iter()
+                                    .map(|(name, _)| name.to_string())
+                                    .filter(|name| {
+                                        crate::ai::models_dir()
+                                            .map(|d| !d.join(name).is_file())
+                                            .unwrap_or(false)
+                                    })
+                                    .collect();
+                                if files.is_empty() {
+                                    self.status =
+                                        t("下载源已切换;当前任务已停,所需文件其实都已就位").into();
+                                } else {
+                                    self.start_model_files(files);
+                                    self.status = t_with(
+                                        "已切换为「{p1}」并用新源重启下载,断点保留接着下",
+                                        &[("p1", (p.label()).to_string())],
+                                    );
+                                }
+                            } else {
+                                self.status = t_with(
+                                    "模型下载源已切换为「{p1}」,下次下载生效",
+                                    &[("p1", (p.label()).to_string())],
+                                );
+                            }
+                            if self.ai_dl.as_ref().is_some_and(|d| d.phase.working()) {
+                                if let Some(d) = self.ai_dl.as_mut() {
+                                    d.cancel();
+                                }
+                                self.ai_dl_queue.clear();
+                                self.ai_models_msg =
+                                    t("已停止当前模型下载:断点保留,点「下载」即用新源接着下")
+                                        .into();
+                            }
+                        }
+                    }
+                });
             let probing = matches!(self.models.probe, crate::models::ProbeState::Running);
             if ui
-                .add_enabled(!probing, egui::Button::new("测速"))
+                .add_enabled(!probing, egui::Button::new(t("测速")))
                 .clicked()
             {
                 self.models.start_probe();
-                self.status = "正在对各下载源测速(各取 256 KB)…".into();
+                self.status = t("正在对各下载源测速(各取 256 KB)…").into();
             }
             if probing {
                 ui.spinner();
-                ui.small("测速中…");
+                ui.small(t("测速中…"));
             }
         });
+        if self.models.model_base().is_empty() {
+            ui.small(t("想用镜像下载:在 maliang.ini 里配好 ModelURL(「打开配置文件」可直达),这里才会放开「仅镜像」。"));
+        }
         if let crate::models::ProbeState::Done(res) = &self.models.probe {
             for r in res {
                 if r.ok {
@@ -5071,10 +5316,15 @@ impl App {
                         .unwrap_or_default();
                     ui.small(format!("{}:{} ms{}", r.label, r.ms, speed));
                 } else {
-                    ui.small(format!(
-                        "{}:不可用({})",
-                        r.label,
-                        r.err.as_deref().unwrap_or("未知错误")
+                    ui.small(t_with(
+                        "{p1}:不可用({p2})",
+                        &[
+                            ("p1", (r.label).to_string()),
+                            (
+                                "p2",
+                                (r.err.as_deref().unwrap_or(t("未知错误"))).to_string(),
+                            ),
+                        ],
                     ));
                 }
             }
@@ -5083,41 +5333,44 @@ impl App {
 
         // 开机提醒(勾过「不再提示」后的回勾入口)。
         let mut ask = !self.model_never_ask();
-        if ui.checkbox(&mut ask, "开机提醒下载模型").changed() {
+        if ui.checkbox(&mut ask, t("开机提醒下载模型")).changed() {
             let _ = self
                 .store
                 .set_setting("model_never_ask", if ask { "0" } else { "1" });
             self.status = if ask {
-                "已恢复开机提醒:缺人脸模型时会弹窗问一次".into()
+                t("已恢复开机提醒:缺人脸模型时会弹窗问一次").into()
             } else {
-                "已设为不再提示:开机不再弹人脸模型窗,下载入口留在 选项 > 人脸识别".into()
+                t("已设为不再提示:开机不再弹人脸模型窗,下载入口留在 选项 > AI 模型").into()
             };
         }
     }
 
-    /// 人脸视图里的精简下载入口:按钮 + 指路(完整选项在 选项 > 人脸识别)。
+    /// 人脸视图里的精简下载入口:按钮 + 指路(完整选项在 选项 > AI 模型)。
     #[cfg(feature = "ai")]
     fn face_model_compact_ui(&mut self, ui: &mut egui::Ui, algo: crate::ai::face::FaceAlgo) {
         let working = self.models.phase.working();
         if working {
             self.face_download_progress_ui(ui);
         } else if crate::models::downloadable(algo) {
-            if ui.button("下载缺失模型").clicked() {
+            if ui.button(t("下载缺失模型")).clicked() {
                 self.start_model_download(algo);
             }
         } else if let Some(url) = crate::models::manual_hint(algo) {
-            ui.small(format!("权重许可不可再分发,请自行从 {url} 获取后放入模型目录。"));
+            ui.small(t_with(
+                "权重许可不可再分发,请自行从 {url} 获取后放入模型目录。",
+                &[("url", url.to_string())],
+            ));
         }
-        if ui.button("打开模型目录").clicked() {
+        if ui.button(t("打开模型目录")).clicked() {
             if let Some(d) = crate::ai::models_dir() {
                 show_in_explorer(&d.display().to_string());
             }
         }
-        ui.small("更多选项(复选文件、选源、测速)在 选项 > 人脸识别。");
+        ui.small(t("更多选项(复选文件、选源、测速)在 选项 > AI 模型。"));
     }
 
     /// 首启提示窗:缺人脸模型时问一次「现在下载吗」。
-    /// 关掉后不再生扰,下载入口仍留在 选项 > 人脸识别 与人脸视图里。
+    /// 关掉后不再生扰,下载入口仍留在 选项 > AI 模型 与人脸视图里。
     #[cfg(feature = "ai")]
     fn model_prompt_window(&mut self, ctx: &egui::Context) {
         if !self.models.prompt_open {
@@ -5132,31 +5385,43 @@ impl App {
         let dir_text = crate::ai::models_dir()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
-        egui::Window::new("缺少人脸模型")
+        egui::Window::new(t("缺少人脸模型"))
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .default_width(520.0)
             .show(ctx, |ui| {
-                ui.label("「人物」视图要靠人脸模型工作,本机模型目录里还没有模型文件。");
-                ui.small(format!("模型目录:{dir_text}"));
+                ui.label(t(
+                    "「人物」视图要靠人脸模型工作,本机模型目录里还没有模型文件。",
+                ));
+                ui.small(t_with(
+                    "模型目录:{dir_text}",
+                    &[("dir_text", dir_text.to_string())],
+                ));
                 let base = self.models.model_base();
                 if base.is_empty() {
-                    ui.small("下载源:程序内置官方地址(可在 maliang.ini 配 ModelURL 作镜像兜底)");
+                    ui.small(t(
+                        "下载源:程序内置官方地址(可在 maliang.ini 配 ModelURL 作镜像兜底)",
+                    ));
                 } else {
-                    ui.small(format!("下载源:内置官方地址,镜像兜底 {base}(ModelURL)"));
+                    ui.small(t_with(
+                        "下载源:内置官方地址,镜像兜底 {base}(ModelURL)",
+                        &[("base", base.to_string())],
+                    ));
                 }
-                ui.label("识别模型体积较大,确认后会在后台分段下载,可随时关掉本窗口继续用其它功能。");
+                ui.label(t(
+                    "识别模型体积较大,确认后会在后台分段下载,可随时关掉本窗口继续用其它功能。",
+                ));
                 ui.add_space(6.0);
-                ui.checkbox(&mut never, "不再提示(以后开机不再弹这个窗)");
+                ui.checkbox(&mut never, t("不再提示(以后开机不再弹这个窗)"));
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("开始下载").clicked() {
+                    if ui.button(t("开始下载")).clicked() {
                         start = true;
                         dismissed = true;
                     }
-                    if ui.button("以后再说").clicked() {
+                    if ui.button(t("以后再说")).clicked() {
                         dismissed = true;
                     }
                 });
@@ -5180,7 +5445,8 @@ impl App {
                 .store
                 .set_setting("model_never_ask", if never { "1" } else { "0" });
             if never {
-                self.status = "已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > 人脸识别".into();
+                self.status =
+                    t("已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > AI 模型").into();
             }
         }
     }
@@ -5189,7 +5455,7 @@ impl App {
     #[cfg(feature = "ai")]
     fn start_face_scan(&mut self) {
         if self.face_rx.is_some() {
-            self.status = "人脸扫描进行中…".into();
+            self.status = t("人脸扫描进行中…").into();
             return;
         }
         // 模型缺失时先问要不要下载(不可代下方案直说怎么手动放),不进后台线程撞裸错误。
@@ -5197,14 +5463,23 @@ impl App {
         if !crate::ai::face::Faces::models_present(algo) {
             let (det_f, rec_f) = algo.files();
             if crate::models::downloadable(algo) {
-                self.status = format!("缺少人脸模型 {det_f} / {rec_f}:确认后可在后台下载");
+                self.status = t_with(
+                    "缺少人脸模型 {det_f} / {rec_f}:确认后可在后台下载",
+                    &[("det_f", det_f.to_string()), ("rec_f", rec_f.to_string())],
+                );
                 self.models.prompt_open = true;
             } else {
                 let dir = crate::ai::models_dir()
                     .map(|d| d.display().to_string())
                     .unwrap_or_default();
-                self.status =
-                    format!("缺少人脸模型:请将 {det_f} 与 {rec_f} 放入模型目录 {dir},获取方式见 README");
+                self.status = t_with(
+                    "缺少人脸模型:请将 {det_f} 与 {rec_f} 放入模型目录 {dir},获取方式见 README",
+                    &[
+                        ("det_f", det_f.to_string()),
+                        ("rec_f", rec_f.to_string()),
+                        ("dir", dir.to_string()),
+                    ],
+                );
             }
             return;
         }
@@ -5215,7 +5490,10 @@ impl App {
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.face_cancel = Some(cancel.clone());
         let remaining = crate::faces::remaining_count(&store);
-        self.status = format!("正在人脸识别(全库连续扫描,剩余 {remaining} 张)…");
+        self.status = t_with(
+            "正在人脸识别(全库连续扫描,剩余 {remaining} 张)…",
+            &[("remaining", remaining.to_string())],
+        );
         std::thread::spawn(move || {
             // 连续扫描直到队列空:此前单批 200 张,无人脸照片永远卡住队列,
             // 覆盖整个库要点几百次;face_done 标记修复后一次即可扫完,可取消。
@@ -5263,14 +5541,24 @@ impl App {
     #[cfg(feature = "ai")]
     fn start_clip_index(&mut self) {
         if self.clip_index_rx.is_some() {
-            self.status = "语义索引进行中…".into();
+            self.status = t("语义索引进行中…").into();
             return;
         }
         let store = self.store.clone();
+        if crate::ai_models::stage_ready(&store, crate::ai_queue::Stage::Clip) {
+            self.status = t("已把全库排入语义索引队列(后台分批完成)").into();
+            std::thread::spawn(move || {
+                let _ = crate::ai_queue::enqueue_all_for(&store, crate::ai_queue::Stage::Clip);
+            });
+            return;
+        }
         let lang = self.clip_lang;
         let (tx, rx) = mpsc::channel();
         self.clip_index_rx = Some(rx);
-        self.status = format!("正在建立语义索引({}模型,较慢)…", lang.label());
+        self.status = t_with(
+            "正在建立语义索引({p1}模型,较慢)…",
+            &[("p1", (lang.label()).to_string())],
+        );
         std::thread::spawn(move || {
             let res = crate::clip::scan_batch_lang(&store, lang, 200).map_err(|e| e.to_string());
             let _ = tx.send(res.map_err(|e| e.to_string()));
@@ -5282,24 +5570,65 @@ impl App {
     #[cfg(feature = "ai")]
     fn start_clip_search(&mut self, query: String) {
         if self.clip_search_rx.is_some() {
-            self.status = "语义搜索进行中…".into();
-            return;
-        }
-        let lang = crate::clip::Lang::detect(&query);
-        if crate::clip::clip_count_lang(&self.store, lang) == 0 {
-            self.status = format!(
-                "{}模型还没有语义索引 — 请先在下方选择「{}」模型并点「语义索引」",
-                lang.label(),
-                lang.label()
-            );
+            self.status = t("语义搜索进行中…").into();
             return;
         }
         let store = self.store.clone();
+        let clip_ver = crate::ai_queue::stage_version(&store, crate::ai_queue::Stage::Clip);
+        let natural = crate::ai_models::stage_ready(&store, crate::ai_queue::Stage::Clip)
+            && crate::ai_search::count(&store, &clip_ver) > 0;
+        let lang = crate::clip::Lang::detect(&query);
+        if !natural && crate::clip::clip_count_lang(&self.store, lang) == 0 {
+            self.status = t_with(
+                "{p1}模型还没有语义索引 — 请先在下方选择「{p2}」模型并点「语义索引」",
+                &[
+                    ("p1", (lang.label()).to_string()),
+                    ("p2", (lang.label()).to_string()),
+                ],
+            );
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         self.clip_search_rx = Some(rx);
-        self.status = format!("正在语义搜索({}模型):{query}", lang.label());
+        self.status = if natural {
+            t_with("正在综合检索:{p1}", &[("p1", (query).to_string())])
+        } else {
+            t_with(
+                "正在语义搜索({p1}模型):{query}",
+                &[
+                    ("p1", (lang.label()).to_string()),
+                    ("query", query.to_string()),
+                ],
+            )
+        };
         std::thread::spawn(move || {
-            let res = crate::clip::search_lang(&store, lang, &query, 200);
+            let res = if natural {
+                let parsed = crate::ai_parse::heuristic(&query);
+                let text = if parsed.text.is_empty() {
+                    query.clone()
+                } else {
+                    parsed.text.clone()
+                };
+                match crate::clip::search_natural(&store, &text, 200) {
+                    Ok(mut hits) => {
+                        if let Some(cat) = parsed.category {
+                            let tag_ver = crate::ai_queue::stage_version(
+                                &store,
+                                crate::ai_queue::Stage::Tags,
+                            );
+                            let allowed: std::collections::HashSet<i64> =
+                                crate::ai_tags::category_ids(&store, &cat, &tag_ver, usize::MAX)
+                                    .into_iter()
+                                    .collect();
+                            hits.retain(|(id, _)| allowed.contains(id));
+                        }
+                        Ok(hits)
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                crate::clip::search_lang(&store, lang, &query, 200)
+            };
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
     }
@@ -5406,24 +5735,30 @@ impl App {
     /// 后台线程暂存邮件附件并调 Simple MAPI(附件暂存目录链路)。
     fn start_email(&mut self) {
         if self.share_rx.is_some() {
-            self.status = "已有分享任务进行中…".into();
+            self.status = t("已有分享任务进行中…").into();
             return;
         }
         let items = self.share_items();
         if items.is_empty() {
-            self.status = "当前视图没有可发送的照片".into();
+            self.status = t("当前视图没有可发送的照片").into();
             return;
         }
         let size = self.email_size;
         let dir = std::env::temp_dir().join("maliang_email");
         let (tx, rx) = mpsc::channel();
         self.share_rx = Some(rx);
-        self.status = format!("正在准备 {} 张照片的邮件附件…", items.len());
+        self.status = t_with(
+            "正在准备 {p1} 张照片的邮件附件…",
+            &[("p1", (items.len()).to_string())],
+        );
         std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<String> {
                 let files = crate::share::stage_jpegs(&items, size.px(), &dir)?;
-                crate::share::send_email("Maliang 照片分享", &files)?;
-                Ok(format!("邮件已交给系统邮件客户端(附件 {} 张)", files.len()))
+                crate::share::send_email(t("Maliang 照片分享"), &files)?;
+                Ok(t_with(
+                    "邮件已交给系统邮件客户端(附件 {p1} 张)",
+                    &[("p1", (files.len()).to_string())],
+                ))
             })();
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
@@ -5432,24 +5767,30 @@ impl App {
     /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
     fn start_gift_cd(&mut self) {
         if self.share_rx.is_some() {
-            self.status = "已有分享任务进行中…".into();
+            self.status = t("已有分享任务进行中…").into();
             return;
         }
         let items = self.share_items();
         if items.is_empty() {
-            self.status = "当前视图没有可刻录的照片".into();
+            self.status = t("当前视图没有可刻录的照片").into();
             return;
         }
         let size = self.cd_size;
         let dir = std::env::temp_dir().join("maliang_giftcd");
         let (tx, rx) = mpsc::channel();
         self.share_rx = Some(rx);
-        self.status = format!("正在准备礼品光盘内容({} 张)…", items.len());
+        self.status = t_with(
+            "正在准备礼品光盘内容({p1} 张)…",
+            &[("p1", (items.len()).to_string())],
+        );
         std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<String> {
                 let files = crate::share::stage_gift_cd(&items, size.px(), &dir)?;
                 crate::share::burn_folder(&dir, "Maliang CD", "Maliang")?;
-                Ok(format!("刻录完成(共 {} 张)", files.len()))
+                Ok(t_with(
+                    "刻录完成(共 {p1} 张)",
+                    &[("p1", (files.len()).to_string())],
+                ))
             })();
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
@@ -5458,16 +5799,16 @@ impl App {
     /// 弹出目录选择,后台线程把当前视图的原图复制过去。
     fn start_export(&mut self) {
         if self.export_rx.is_some() {
-            self.status = "导出进行中…".into();
+            self.status = t("导出进行中…").into();
             return;
         }
         let paths = self.view_paths();
         if paths.is_empty() {
-            self.status = "当前视图没有可导出的照片".into();
+            self.status = t("当前视图没有可导出的照片").into();
             return;
         }
         let Some(dir) = rfd::FileDialog::new()
-            .set_title("选择导出目录")
+            .set_title(t("选择导出目录"))
             .pick_folder()
         else {
             return;
@@ -5495,7 +5836,7 @@ impl App {
         };
         let (tx, rx) = mpsc::channel();
         self.export_rx = Some(rx);
-        self.status = format!("正在导出 {} 张…", items.len());
+        self.status = t_with("正在导出 {p1} 张…", &[("p1", (items.len()).to_string())]);
         std::thread::spawn(move || {
             let (ok, errs) = if with_fx {
                 crate::export::copy_all_with_effects(&items, &dir)
@@ -5512,18 +5853,18 @@ impl App {
     fn toggle_wifi(&mut self) {
         if let Some(h) = self.wifi.take() {
             h.stop();
-            self.status = "WiFi 导入已停止".into();
+            self.status = t("WiFi 导入已停止").into();
         } else {
             match crate::net::start(self.store.clone()) {
                 Ok(h) => {
-                    self.status = format!("WiFi 导入已启动:{}/", h.addr);
+                    self.status = t_with("WiFi 导入已启动:{p1}/", &[("p1", (h.addr).to_string())]);
                     let _ = self.store.upsert_watched(&crate::net::incoming_dir());
                     self.wifi = Some(h);
                     self.wifi_panel = true;
                     self.watched = self.store.watched_stats();
                 }
                 Err(e) => {
-                    self.status = format!("WiFi 导入启动失败: {e}");
+                    self.status = t_with("WiFi 导入启动失败: {e}", &[("e", e.to_string())]);
                 }
             }
         }
@@ -5560,20 +5901,21 @@ impl App {
     fn lookup_uid(&mut self) -> Result<String, String> {
         let t = self.uid_input.trim();
         if t.is_empty() {
-            return Err("请输入 uid64".into());
+            return Err(crate::i18n::t("请输入 uid64").into());
         }
         let raw = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X"));
         let uid = match raw {
-            Some(hex) => {
-                u64::from_str_radix(hex, 16).map_err(|e| format!("十六进制解析失败: {e}"))?
-            }
-            None => t.parse::<u64>().map_err(|e| format!("数字解析失败: {e}"))?,
+            Some(hex) => u64::from_str_radix(hex, 16)
+                .map_err(|e| t_with("十六进制解析失败: {e}", &[("e", e.to_string())]))?,
+            None => t
+                .parse::<u64>()
+                .map_err(|e| t_with("数字解析失败: {e}", &[("e", e.to_string())]))?,
         };
         // uid64 存的是 i64(高位为 1 时是负数)→ 还原成 u64。
         let id = self
             .store
             .photo_by_uid64(uid)
-            .ok_or_else(|| format!("未找到 uid64 = {uid} 的照片"))?;
+            .ok_or_else(|| t_with("未找到 uid64 = {uid} 的照片", &[("uid", uid.to_string())]))?;
         let path: String = self
             .store
             .read(|conn| conn.query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0)))
@@ -5606,7 +5948,7 @@ impl App {
             w.tier.store(tier as u8, Ordering::Relaxed);
         }
         self.refresh_tier_count();
-        self.status = format!("已切换到{}", tier.label());
+        self.status = t_with("已切换到{p1}", &[("p1", (tier.label()).to_string())]);
     }
 
     // ===== 效果系统 =====
@@ -5686,7 +6028,10 @@ impl App {
                 );
                 p.insert(
                     "highlight".into(),
-                    format!("{:02x}{:02x}{:02x}", highlight[0], highlight[1], highlight[2]),
+                    format!(
+                        "{:02x}{:02x}{:02x}",
+                        highlight[0], highlight[1], highlight[2]
+                    ),
                 );
             }
             "unsharp" => {
@@ -5705,7 +6050,7 @@ impl App {
     /// 提交一个命名编辑项 → 入撤销栈。
     fn fx_apply_draft(&mut self, targets: &[i64]) {
         if targets.is_empty() {
-            self.fx_msg = "没有可应用的照片".into();
+            self.fx_msg = t("没有可应用的照片").into();
             return;
         }
         // 批量应用时把只读格式摘掉:效果写进库记录也只会让预览语义含混。
@@ -5715,13 +6060,13 @@ impl App {
             .filter(|id| !self.readonly_media(*id))
             .collect();
         if targets.is_empty() {
-            self.fx_msg = "选中的都是只读速看预览格式,未应用".into();
+            self.fx_msg = t("选中的都是只读速看预览格式,未应用").into();
             return;
         }
         let adj = self.fx_draft.clamped();
         // 恒等调整不入栈(空效果不建编辑项)。
         if crate::effects::Effect::enhance(&adj).is_identity() {
-            self.fx_msg = "当前调整全为默认值,未应用".into();
+            self.fx_msg = t("当前调整全为默认值,未应用").into();
             return;
         }
         // 先记下提交前的栈(撤销用),再统一写入。
@@ -5732,7 +6077,7 @@ impl App {
         let n = match crate::effects::commit_adjust(&self.store, &targets, &adj) {
             Ok(n) => n,
             Err(e) => {
-                self.fx_msg = format!("写入失败: {e}");
+                self.fx_msg = t_with("写入失败: {e}", &[("e", e.to_string())]);
                 return;
             }
         };
@@ -5742,19 +6087,19 @@ impl App {
                 .fx_undo
                 .entry(id)
                 .or_insert_with(crate::effects::EditStack::new);
-            stack.commit("增强", before, after);
+            stack.commit(t("增强"), before, after);
         }
         // 预览纹理需要重算(签名变化即触发)。
         self.fx_applied_sig = None;
         self.fx_draft_id = None;
         self.fx_curve_draft_id = None;
-        self.fx_msg = format!("已应用到 {n} 张照片");
+        self.fx_msg = t_with("已应用到 {n} 张照片", &[("n", n.to_string())]);
     }
 
     /// 撤销一步。
     fn fx_undo_step(&mut self, id: i64) {
         let Some(stack) = self.fx_undo.get_mut(&id) else {
-            self.fx_msg = "无可撤销的操作".into();
+            self.fx_msg = t("无可撤销的操作").into();
             return;
         };
         match crate::effects::undo_commit(&self.store, stack, id) {
@@ -5763,16 +6108,16 @@ impl App {
                 // 栈被换回旧状态,两条草稿必须按新栈重新载入,否则预览会叠旧值。
                 self.fx_draft_id = None;
                 self.fx_curve_draft_id = None;
-                self.fx_msg = format!("已撤销: {label}");
+                self.fx_msg = t_with("已撤销: {label}", &[("label", label.to_string())]);
             }
-            None => self.fx_msg = "无可撤销的操作".into(),
+            None => self.fx_msg = t("无可撤销的操作").into(),
         }
     }
 
     /// 重做一步。
     fn fx_redo_step(&mut self, id: i64) {
         let Some(stack) = self.fx_undo.get_mut(&id) else {
-            self.fx_msg = "无可重做的操作".into();
+            self.fx_msg = t("无可重做的操作").into();
             return;
         };
         match crate::effects::redo_commit(&self.store, stack, id) {
@@ -5780,9 +6125,9 @@ impl App {
                 self.fx_applied_sig = None;
                 self.fx_draft_id = None;
                 self.fx_curve_draft_id = None;
-                self.fx_msg = format!("已重做: {label}");
+                self.fx_msg = t_with("已重做: {label}", &[("label", label.to_string())]);
             }
-            None => self.fx_msg = "无可重做的操作".into(),
+            None => self.fx_msg = t("无可重做的操作").into(),
         }
     }
 
@@ -5793,7 +6138,10 @@ impl App {
     fn fx_copy_all(&mut self, source: i64) {
         let st = crate::effects::copy_from(&self.store, source);
         self.fx_clipboard = Some(st.clone());
-        self.fx_msg = format!("已复制效果({} 项)", st.items.len());
+        self.fx_msg = t_with(
+            "已复制效果({p1} 项)",
+            &[("p1", (st.items.len()).to_string())],
+        );
     }
 
     /// 粘贴所有效果:把暂存的效果栈写给选中的多张照片。
@@ -5801,11 +6149,11 @@ impl App {
     /// 效果批量应用对电影类型跳过(库内只有照片,天然满足)。
     fn fx_paste_all(&mut self, targets: &[i64]) {
         let Some(st) = self.fx_clipboard.clone() else {
-            self.fx_msg = "剪贴板里没有效果".into();
+            self.fx_msg = t("剪贴板里没有效果").into();
             return;
         };
         if targets.is_empty() {
-            self.fx_msg = "没有选中的照片".into();
+            self.fx_msg = t("没有选中的照片").into();
             return;
         }
         match crate::effects::paste_to(&self.store, targets, &st) {
@@ -5813,9 +6161,9 @@ impl App {
                 self.fx_applied_sig = None;
                 self.fx_draft_id = None;
                 self.fx_curve_draft_id = None;
-                self.fx_msg = format!("已粘贴效果到 {n} 张照片");
+                self.fx_msg = t_with("已粘贴效果到 {n} 张照片", &[("n", n.to_string())]);
             }
-            Err(e) => self.fx_msg = format!("粘贴失败: {e}"),
+            Err(e) => self.fx_msg = t_with("粘贴失败: {e}", &[("e", e.to_string())]),
         }
     }
 
@@ -5823,7 +6171,7 @@ impl App {
     fn fx_panel_ui(&mut self, ui: &mut egui::Ui) {
         let cur = self.preview;
         let Some(id) = cur else {
-            ui.label("先打开一张照片");
+            ui.label(t("先打开一张照片"));
             return;
         };
         // 打开新照片时,把已存的效果载入草稿(打开照片即显示其效果)。
@@ -5833,10 +6181,13 @@ impl App {
             let stored = self.fx_stack_for(id);
             self.fx_draft = stored.merged_adjust();
         }
-        ui.heading("效果");
+        ui.heading(t("效果"));
         // 标签页(编辑面板按功能分页,不堆长列表)。
         ui.horizontal(|ui| {
-            for (i, name) in ["调整", "曲线", "一键", "裁剪", "维护"].iter().enumerate() {
+            for (i, name) in [t("调整"), t("曲线"), t("一键"), t("裁剪"), t("维护")]
+                .iter()
+                .enumerate()
+            {
                 if ui.selectable_label(self.fx_tab == i, *name).clicked() {
                     self.fx_tab = i;
                 }
@@ -5845,29 +6196,29 @@ impl App {
         ui.separator();
         match self.fx_tab {
             0 => {
-                ui.small("亮度 / 对比度 / 饱和度 / 曝光 / 暗部 / 锐化 / 模糊");
+                ui.small(t("亮度 / 对比度 / 饱和度 / 曝光 / 暗部 / 锐化 / 模糊"));
                 let mut d = self.fx_draft;
                 let mut changed = false;
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.brightness, -100.0..=100.0).text("亮度"))
+                    .add(egui::Slider::new(&mut d.brightness, -100.0..=100.0).text(t("亮度")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.contrast, -100.0..=100.0).text("对比度"))
+                    .add(egui::Slider::new(&mut d.contrast, -100.0..=100.0).text(t("对比度")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.saturation, -100.0..=100.0).text("饱和度"))
+                    .add(egui::Slider::new(&mut d.saturation, -100.0..=100.0).text(t("饱和度")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.exposure, -3.0..=3.0).text("曝光(档)"))
+                    .add(egui::Slider::new(&mut d.exposure, -3.0..=3.0).text(t("曝光(档)")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.blacks, -100.0..=100.0).text("暗部"))
+                    .add(egui::Slider::new(&mut d.blacks, -100.0..=100.0).text(t("暗部")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.sharpen, 0.0..=100.0).text("锐化"))
+                    .add(egui::Slider::new(&mut d.sharpen, 0.0..=100.0).text(t("锐化")))
                     .changed();
                 changed |= ui
-                    .add(egui::Slider::new(&mut d.blur, 0.0..=20.0).text("模糊"))
+                    .add(egui::Slider::new(&mut d.blur, 0.0..=20.0).text(t("模糊")))
                     .changed();
                 if changed {
                     self.fx_draft = d;
@@ -5875,7 +6226,7 @@ impl App {
                     self.fx_applied_sig = None;
                 }
                 ui.horizontal(|ui| {
-                    if ui.button("应用到选中").clicked() {
+                    if ui.button(t("应用到选中")).clicked() {
                         let targets: Vec<i64> = if self.sel.is_empty() {
                             vec![id]
                         } else {
@@ -5883,10 +6234,10 @@ impl App {
                         };
                         self.fx_apply_draft(&targets);
                     }
-                    if ui.button("应用到这张").clicked() {
+                    if ui.button(t("应用到这张")).clicked() {
                         self.fx_apply_draft(&[id]);
                     }
-                    if ui.button("重置").clicked() {
+                    if ui.button(t("重置")).clicked() {
                         self.fx_draft = crate::effects::Adjust::default();
                         self.fx_applied_sig = None;
                     }
@@ -5902,18 +6253,18 @@ impl App {
             let can_undo = self.fx_undo.get(&id).map(|s| s.can_undo()).unwrap_or(false);
             let can_redo = self.fx_undo.get(&id).map(|s| s.can_redo()).unwrap_or(false);
             if ui
-                .add_enabled(can_undo, egui::Button::new("撤销"))
+                .add_enabled(can_undo, egui::Button::new(t("撤销")))
                 .clicked()
             {
                 self.fx_undo_step(id);
             }
             if ui
-                .add_enabled(can_redo, egui::Button::new("重做"))
+                .add_enabled(can_redo, egui::Button::new(t("重做")))
                 .clicked()
             {
                 self.fx_redo_step(id);
             }
-            if ui.button("复制所有效果").clicked() {
+            if ui.button(t("复制所有效果")).clicked() {
                 self.fx_copy_all(id);
             }
             let paste_targets: Vec<i64> = if self.sel.is_empty() {
@@ -5921,15 +6272,15 @@ impl App {
             } else {
                 self.sel.iter().copied().collect()
             };
-            if ui.button("粘贴所有效果").clicked() {
+            if ui.button(t("粘贴所有效果")).clicked() {
                 self.fx_paste_all(&paste_targets);
             }
         });
         // 清除效果(移除栈中所有命名项 —— 逐项撤销到空栈)。
-        if ui.button("清除这张的所有效果").clicked() {
+        if ui.button(t("清除这张的所有效果")).clicked() {
             let before = self.fx_stack_for(id);
             if before.is_empty() {
-                self.fx_msg = "这张照片没有效果".into();
+                self.fx_msg = t("这张照片没有效果").into();
             } else {
                 let mut after = before.clone();
                 while after.remove("enhance").is_some() {}
@@ -5938,30 +6289,33 @@ impl App {
                     .fx_undo
                     .entry(id)
                     .or_insert_with(crate::effects::EditStack::new);
-                stack.commit("清除效果", before, after);
+                stack.commit(t("清除效果"), before, after);
                 self.fx_applied_sig = None;
                 self.fx_draft = crate::effects::Adjust::default();
-                self.fx_msg = "已清除效果".into();
+                self.fx_msg = t("已清除效果").into();
             }
         }
         // 统计:整个视图里有多少张带效果(效果是记录级属性)。
         let view = self.view_ids();
         let with_fx = self.store.get_filters_many(&view).len();
-        ui.small(format!("当前视图 {with_fx} 张带效果"));
+        ui.small(t_with(
+            "当前视图 {with_fx} 张带效果",
+            &[("with_fx", with_fx.to_string())],
+        ));
         // 已应用的效果项清单(效果栈的每一项都是命名编辑项)。
         let st = self.fx_stack_for(id);
         if !st.is_empty() {
-            ui.small("本张已应用:");
+            ui.small(t("本张已应用:"));
             for it in &st.items {
                 // 未实现的项(如需笔刷交互)要显式标出,别让用户以为已生效
                 let tag = match crate::effects::support_of(&it.name) {
-                    crate::effects::Support::ReferenceOnly => "暂不支持",
-                    crate::effects::Support::Unknown => "未知名",
+                    crate::effects::Support::ReferenceOnly => t("暂不支持"),
+                    crate::effects::Support::Unknown => t("未知名"),
                     crate::effects::Support::Pixel => {
                         if it.is_oneclick() {
-                            "一键"
+                            t("一键")
                         } else {
-                            "调整"
+                            t("调整")
                         }
                     }
                 };
@@ -5982,11 +6336,13 @@ impl App {
     /// append-only、**无引用计数**,回收靠「写时重建」。
     /// 这个面板把内部状态暴露出来,并提供手动触发重建的入口。
     fn pool_maintenance_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("字符串池");
-        ui.small("每列一个去重池,行记录只存 32 位 id;池按旧 id 升序重建(写时重建,无引用计数)");
+        ui.heading(t("字符串池"));
+        ui.small(t(
+            "每列一个去重池,行记录只存 32 位 id;池按旧 id 升序重建(写时重建,无引用计数)",
+        ));
         let stats = self.store.pool_stats().unwrap_or_default();
         if stats.is_empty() {
-            ui.small("尚未池化任何列(扫描带 EXIF 相机型号的照片后会填充)");
+            ui.small(t("尚未池化任何列(扫描带 EXIF 相机型号的照片后会填充)"));
             return;
         }
         let mut total_entries = 0i64;
@@ -5994,35 +6350,60 @@ impl App {
         for (pool, n, refs) in &stats {
             total_entries += *n;
             total_refs += *refs;
-            ui.small(format!(
-                "  · {pool}:池内 {n} 条/ 引用 {refs} 行  (去重率 {:.1}%)",
-                if *refs > 0 {
-                    *n as f64 * 100.0 / *refs as f64
-                } else {
-                    0.0
-                }
+            ui.small(t_with(
+                "  · {pool}:池内 {n} 条/ 引用 {refs} 行  (去重率 {p1}%)",
+                &[
+                    ("pool", pool.to_string()),
+                    ("n", n.to_string()),
+                    ("refs", refs.to_string()),
+                    (
+                        "p1",
+                        format!(
+                            "{p1:.1}",
+                            p1 = if *refs > 0 {
+                                *n as f64 * 100.0 / *refs as f64
+                            } else {
+                                0.0
+                            }
+                        ),
+                    ),
+                ],
             ));
         }
         if total_refs > 0 {
-            ui.small(format!(
-                "合计:{} 条池条目承载 {total_refs} 行引用(平均压缩 {:.1}×)",
-                total_entries,
-                total_refs as f64 / total_entries.max(1) as f64
+            ui.small(t_with(
+                "合计:{p1} 条池条目承载 {total_refs} 行引用(平均压缩 {p2}×)",
+                &[
+                    ("p1", (total_entries).to_string()),
+                    ("total_refs", total_refs.to_string()),
+                    (
+                        "p2",
+                        format!(
+                            "{p2:.1}",
+                            p2 = (total_refs as f64 / total_entries.max(1) as f64)
+                        ),
+                    ),
+                ],
             ));
         }
         // 重建前的预估(纯函数,不改状态):能省下多少条孤儿
         if let (Ok(set), Ok(live)) = (self.store.load_pool_set(), self.store.live_pool_ids()) {
             for (pool, cur, alive) in crate::pool::vacuum_plan(&set, &live) {
                 if cur > alive {
-                    ui.small(format!(
-                        "  · {pool}:可回收 {} 条孤儿({cur} → {alive})",
-                        cur - alive
+                    ui.small(t_with(
+                        "  · {pool}:可回收 {p1} 条孤儿({cur} → {alive})",
+                        &[
+                            ("pool", pool.to_string()),
+                            ("p1", (cur - alive).to_string()),
+                            ("cur", cur.to_string()),
+                            ("alive", alive.to_string()),
+                        ],
                     ));
                 }
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("重建池(回收孤儿)").clicked() {
+            if ui.button(t("重建池(回收孤儿)")).clicked() {
                 match self.store.vacuum_all_pools() {
                     Ok(report) => {
                         let mut removed = 0usize;
@@ -6031,35 +6412,48 @@ impl App {
                             removed += o;
                             remapped += m;
                         }
-                        self.fx_msg =
-                            format!("池重建完成:回收孤儿 {removed} 条,重映射 {remapped} 行");
+                        self.fx_msg = t_with(
+                            "池重建完成:回收孤儿 {removed} 条,重映射 {remapped} 行",
+                            &[
+                                ("removed", removed.to_string()),
+                                ("remapped", remapped.to_string()),
+                            ],
+                        );
                     }
-                    Err(e) => self.fx_msg = format!("池重建失败:{e}"),
+                    Err(e) => self.fx_msg = t_with("池重建失败:{e}", &[("e", e.to_string())]),
                 }
             }
-            if ui.button("查一个池 id").clicked() {
+            if ui.button(t("查一个池 id")).clicked() {
                 // 诊断入口:按 id 查询池内字符串
                 let id = self.pool_probe_id;
                 match self.store.pooled_value(crate::timeline::CAM_POOL, id) {
                     Some(s) => self.fx_msg = format!("photos_cam[{id}] = {s}"),
-                    None => self.fx_msg = format!("photos_cam[{id}] 不存在"),
+                    None => {
+                        self.fx_msg = t_with("photos_cam[{id}] 不存在", &[("id", id.to_string())])
+                    }
                 }
             }
         });
         ui.horizontal(|ui| {
-            ui.label("池 id:");
+            ui.label(t("池 id:"));
             ui.add(egui::DragValue::new(&mut self.pool_probe_id).range(0..=9999));
         });
-        ui.small(format!(
-            "查重哈希(seed 0x12345678):hash(\"Nikon D850\") = 0x{:08x}",
-            crate::pool::pool_hash("Nikon D850")
+        ui.small(t_with(
+            "查重哈希(seed 0x12345678):hash(\"Nikon D850\") = 0x{p1}",
+            &[(
+                "p1",
+                format!("{p1:08x}", p1 = (crate::pool::pool_hash("Nikon D850"))),
+            )],
         ));
         // 内存池快照:展示池的当前内容
         if let Ok(set) = self.store.load_pool_set() {
             let total = set.total_entries();
-            ui.small(format!(
-                "内存池快照:{} 个池,共 {total} 条(去重后)",
-                set.names().len()
+            ui.small(t_with(
+                "内存池快照:{p1} 个池,共 {total} 条(去重后)",
+                &[
+                    ("p1", (set.names().len()).to_string()),
+                    ("total", total.to_string()),
+                ],
             ));
             // 池 id = 值在池内的下标(查重哈希),按序展示
             let cam_vals: Vec<String> = set
@@ -6080,7 +6474,10 @@ impl App {
         let cams = self.store.cams().unwrap_or_default();
         if !cams.is_empty() {
             ui.separator();
-            ui.small(format!("相机型号(池列解析,共 {} 种):", cams.len()));
+            ui.small(t_with(
+                "相机型号(池列解析,共 {p1} 种):",
+                &[("p1", (cams.len()).to_string())],
+            ));
             egui::ScrollArea::vertical()
                 .max_height(120.0)
                 .show(ui, |ui| {
@@ -6106,30 +6503,32 @@ impl App {
                 .map(|it| it.curve_set())
                 .unwrap_or_default();
         }
-        ui.heading("色调曲线");
-        ui.small("自然三次样条:Master 先算出公共值,RGB 三条曲线各自以同一值求值");
+        ui.heading(t("色调曲线"));
+        ui.small(t(
+            "自然三次样条:Master 先算出公共值,RGB 三条曲线各自以同一值求值",
+        ));
         // 内置滤镜预设
         let mut picked = 0usize;
         ui.horizontal_wrapped(|ui| {
-            if ui.button("电影感").clicked() {
+            if ui.button(t("电影感")).clicked() {
                 picked = 1;
             }
-            if ui.button("交叉冲洗").clicked() {
+            if ui.button(t("交叉冲洗")).clicked() {
                 picked = 2;
             }
-            if ui.button("六十年代").clicked() {
+            if ui.button(t("六十年代")).clicked() {
                 picked = 3;
             }
-            if ui.button("反相").clicked() {
+            if ui.button(t("反相")).clicked() {
                 picked = 4;
             }
-            if ui.button("奥顿").clicked() {
+            if ui.button(t("奥顿")).clicked() {
                 picked = 5;
             }
-            if ui.button("素描").clicked() {
+            if ui.button(t("素描")).clicked() {
                 picked = 6;
             }
-            if ui.button("清空曲线").clicked() {
+            if ui.button(t("清空曲线")).clicked() {
                 picked = 7;
             }
         });
@@ -6148,22 +6547,22 @@ impl App {
         // 曝光档位(走 Master 槽的曝光整形点)
         let mut exp = self.fx_curve_draft.exposure;
         if ui
-            .add(egui::Slider::new(&mut exp, -3.0..=3.0).text("曝光(档)"))
+            .add(egui::Slider::new(&mut exp, -3.0..=3.0).text(t("曝光(档)")))
             .changed()
         {
             self.fx_curve_draft.exposure = exp;
             self.fx_applied_sig = None;
         }
         ui.horizontal(|ui| {
-            if ui.button("应用曲线").clicked() {
+            if ui.button(t("应用曲线")).clicked() {
                 self.fx_commit_effect(
                     id,
-                    "曲线",
+                    t("曲线"),
                     crate::effects::Effect::curves(&self.fx_curve_draft),
                 );
             }
-            if ui.button("移除曲线").clicked() {
-                self.fx_remove_effect(id, "曲线", "curves");
+            if ui.button(t("移除曲线")).clicked() {
+                self.fx_remove_effect(id, t("曲线"), "curves");
             }
         });
     }
@@ -6174,19 +6573,19 @@ impl App {
     /// - `warm`/`cool`/`vignette`/`faded` 是本项目自主设计的调色 → 可用,
     ///   强度共用一个滑块(量程 0~100)。
     fn fx_oneclick_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        ui.heading("一键效果");
+        ui.heading(t("一键效果"));
         ui.horizontal_wrapped(|ui| {
             for (label, key) in [
-                ("黑白", "bw"),
-                ("棕褐色", "sepia"),
-                ("颗粒", "grain"),
-                ("锐化", "unsharp"),
-                ("暖调", "warm"),
-                ("冷调", "cool"),
-                ("暗角", "vignette"),
-                ("褪色", "faded"),
-                ("扶正", "tilt"),
-                ("暗部/高光", "shadow"),
+                (t("黑白"), "bw"),
+                (t("棕褐色"), "sepia"),
+                (t("颗粒"), "grain"),
+                (t("锐化"), "unsharp"),
+                (t("暖调"), "warm"),
+                (t("冷调"), "cool"),
+                (t("暗角"), "vignette"),
+                (t("褪色"), "faded"),
+                (t("扶正"), "tilt"),
+                (t("暗部/高光"), "shadow"),
             ] {
                 let on = self.fx_oneclick.as_deref() == Some(key);
                 if ui.selectable_label(on, label).clicked() {
@@ -6203,7 +6602,7 @@ impl App {
             // 直接绑定状态字段,不用每帧重建的局部变量 ——
             // 否则滑块松手后会弹回初值(值其实存进去了,只是视觉上回跳)。
             if ui
-                .add(egui::Slider::new(&mut self.fx_grain_amount, 0.0..=1.0).text("颗粒强度"))
+                .add(egui::Slider::new(&mut self.fx_grain_amount, 0.0..=1.0).text(t("颗粒强度")))
                 .changed()
             {
                 self.fx_applied_sig = None;
@@ -6211,7 +6610,9 @@ impl App {
         }
         if self.fx_oneclick.as_deref() == Some("unsharp") {
             if ui
-                .add(egui::Slider::new(&mut self.fx_sharpen_amount, 0.0..=100.0).text("锐化强度"))
+                .add(
+                    egui::Slider::new(&mut self.fx_sharpen_amount, 0.0..=100.0).text(t("锐化强度")),
+                )
                 .changed()
             {
                 self.fx_applied_sig = None;
@@ -6219,14 +6620,14 @@ impl App {
         }
         // 自主设计调色四件套共用一个强度滑块(语义都是"0 = 不动,100 = 最重")。
         if let Some(text) = match self.fx_oneclick.as_deref() {
-            Some("warm") => Some("暖调强度"),
-            Some("cool") => Some("冷调强度"),
-            Some("vignette") => Some("暗角强度"),
-            Some("faded") => Some("褪色强度"),
+            Some("warm") => Some(t("暖调强度")),
+            Some("cool") => Some(t("冷调强度")),
+            Some("vignette") => Some(t("暗角强度")),
+            Some("faded") => Some(t("褪色强度")),
             // 扶正:0~100 折算到 ±15°,50 = 不旋转。
-            Some("tilt") => Some("扶正角度"),
+            Some("tilt") => Some(t("扶正角度")),
             // 暗部/高光:一根滑杆同时驱动两端。
-            Some("shadow") => Some("修复强度"),
+            Some("shadow") => Some(t("修复强度")),
             _ => None,
         } {
             if ui
@@ -6237,24 +6638,24 @@ impl App {
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("应用一键效果").clicked() {
+            if ui.button(t("应用一键效果")).clicked() {
                 let Some(name) = self.fx_oneclick.clone() else {
-                    self.fx_msg = "先选一个一键效果".into();
+                    self.fx_msg = t("先选一个一键效果").into();
                     return;
                 };
                 let params = self.fx_oneclick_params(&name);
                 self.fx_commit_effect(
                     id,
-                    "一键效果",
+                    t("一键效果"),
                     crate::effects::Effect::oneclick(&name, params),
                 );
             }
-            if ui.button("移除一键效果").clicked() {
+            if ui.button(t("移除一键效果")).clicked() {
                 for n in [
                     "bw", "sepia", "grain", "unsharp", "warm", "cool", "vignette", "faded", "tilt",
                     "shadow",
                 ] {
-                    self.fx_remove_effect(id, "一键效果", n);
+                    self.fx_remove_effect(id, t("一键效果"), n);
                 }
                 self.fx_oneclick = None;
             }
@@ -6262,7 +6663,7 @@ impl App {
 
         // ===== 风格配方:一个名字对应一串固定顺序的操作 =====
         ui.separator();
-        ui.label("风格配方(整组效果,强度控制与原图的混合比例)");
+        ui.label(t("风格配方(整组效果,强度控制与原图的混合比例)"));
         ui.horizontal_wrapped(|ui| {
             for key in crate::recipes::RECIPES {
                 let on = self.fx_recipe.as_deref() == Some(*key);
@@ -6281,9 +6682,12 @@ impl App {
             }
         });
         if self.fx_recipe.is_some() {
-            let text = format!(
-                "{} 强度",
-                crate::recipes::label(self.fx_recipe.as_deref().unwrap_or(""))
+            let text = t_with(
+                "{p1} 强度",
+                &[(
+                    "p1",
+                    (crate::recipes::label(self.fx_recipe.as_deref().unwrap_or(""))).to_string(),
+                )],
             );
             if ui
                 .add(egui::Slider::new(&mut self.fx_recipe_amount, 0.0..=100.0).text(text))
@@ -6293,22 +6697,22 @@ impl App {
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("应用风格配方").clicked() {
+            if ui.button(t("应用风格配方")).clicked() {
                 let Some(name) = self.fx_recipe.clone() else {
-                    self.fx_msg = "先选一个风格配方".into();
+                    self.fx_msg = t("先选一个风格配方").into();
                     return;
                 };
                 let mut params = std::collections::BTreeMap::new();
                 params.insert("amount".into(), format!("{:.4}", self.fx_recipe_amount));
                 self.fx_commit_effect(
                     id,
-                    "风格配方",
+                    t("风格配方"),
                     crate::effects::Effect::oneclick(&name, params),
                 );
             }
-            if ui.button("移除风格配方").clicked() {
+            if ui.button(t("移除风格配方")).clicked() {
                 for n in crate::recipes::RECIPES {
-                    self.fx_remove_effect(id, "风格配方", n);
+                    self.fx_remove_effect(id, t("风格配方"), n);
                 }
                 self.fx_recipe = None;
             }
@@ -6346,15 +6750,15 @@ impl App {
                 }
             }
         }
-        ui.heading("视频裁剪");
-        ui.small("起点 / 终点(秒)。内部以 100 纳秒为单位,此处按秒操作。");
+        ui.heading(t("视频裁剪"));
+        ui.small(t("起点 / 终点(秒)。内部以 100 纳秒为单位,此处按秒操作。"));
         let mut changed = false;
         changed |= ui
             .add(
                 egui::DragValue::new(&mut self.fx_trim_start)
                     .range(0.0..=f64::MAX)
                     .speed(0.1)
-                    .prefix("起点 "),
+                    .prefix(t("起点 ")),
             )
             .changed();
         changed |= ui
@@ -6362,7 +6766,7 @@ impl App {
                 egui::DragValue::new(&mut self.fx_trim_end)
                     .range(0.0..=f64::MAX)
                     .speed(0.1)
-                    .prefix("终点 "),
+                    .prefix(t("终点 ")),
             )
             .changed();
         changed |= ui
@@ -6370,7 +6774,7 @@ impl App {
                 egui::DragValue::new(&mut self.fx_trim_total)
                     .range(0.0..=f64::MAX)
                     .speed(0.5)
-                    .prefix("总时长(0=不限) "),
+                    .prefix(t("总时长(0=不限) ")),
             )
             .changed();
         let _ = changed;
@@ -6381,27 +6785,32 @@ impl App {
         } else {
             raw
         };
-        ui.small(format!(
-            "区间 {} 秒({})",
-            format!("{:.1}", t.duration_secs()),
-            t.label()
+        ui.small(t_with(
+            "区间 {p1} 秒({p2})",
+            &[
+                ("p1", (format!("{:.1}", t.duration_secs())).to_string()),
+                ("p2", (t.label()).to_string()),
+            ],
         ));
-        ui.small(format!("落库片段:{}", t.serialize()));
+        ui.small(t_with(
+            "落库片段:{p1}",
+            &[("p1", (t.serialize()).to_string())],
+        ));
         ui.horizontal(|ui| {
-            if ui.button("应用裁剪").clicked() {
+            if ui.button(crate::i18n::t("应用裁剪")).clicked() {
                 if t.is_empty() {
-                    self.fx_msg = "终点需大于起点".into();
+                    self.fx_msg = crate::i18n::t("终点需大于起点").into();
                     return;
                 }
                 self.fx_commit_effect(
                     id,
-                    "视频裁剪",
+                    crate::i18n::t("视频裁剪"),
                     crate::effects::Effect::oneclick("movie", t.to_params()),
                 );
-                self.fx_msg = "已应用裁剪".into();
+                self.fx_msg = crate::i18n::t("已应用裁剪").into();
             }
-            if ui.button("清除裁剪").clicked() {
-                self.fx_remove_effect(id, "视频裁剪", "movie");
+            if ui.button(crate::i18n::t("清除裁剪")).clicked() {
+                self.fx_remove_effect(id, crate::i18n::t("视频裁剪"), "movie");
                 self.fx_trim_start = 0.0;
                 self.fx_trim_end = 0.0;
             }
@@ -6411,14 +6820,14 @@ impl App {
     /// 把一个效果项写进目标照片的效果栈并记入撤销栈。
     fn fx_commit_effect(&mut self, id: i64, label: &str, eff: crate::effects::Effect) {
         if self.readonly_media(id) {
-            self.fx_msg = "只读速看预览格式不支持编辑效果".into();
+            self.fx_msg = t("只读速看预览格式不支持编辑效果").into();
             return;
         }
         let before = self.fx_stack_for(id);
         let mut after = before.clone();
         after.push(eff);
         if let Err(e) = self.store.set_filters(id, &after.serialize()) {
-            self.fx_msg = format!("写入失败: {e}");
+            self.fx_msg = t_with("写入失败: {e}", &[("e", e.to_string())]);
             return;
         }
         let stack = self
@@ -6427,7 +6836,7 @@ impl App {
             .or_insert_with(crate::effects::EditStack::new);
         stack.commit(label, before, after);
         self.fx_applied_sig = None;
-        self.fx_msg = format!("已应用: {label}");
+        self.fx_msg = t_with("已应用: {label}", &[("label", label.to_string())]);
     }
 
     /// 从目标照片的效果栈移除指定名字的效果项(并记入撤销栈)。
@@ -6438,7 +6847,7 @@ impl App {
             return;
         }
         if let Err(e) = self.store.set_filters(id, &after.serialize()) {
-            self.fx_msg = format!("写入失败: {e}");
+            self.fx_msg = t_with("写入失败: {e}", &[("e", e.to_string())]);
             return;
         }
         let stack = self
@@ -6455,7 +6864,7 @@ impl App {
     /// 连点两次顺时针 = 180°,四次回到原位(quarter 归零时直接移除该项)。
     fn preview_rotate(&mut self, id: i64, quarter_delta: u32) {
         if self.readonly_media(id) {
-            self.fx_msg = "只读速看预览格式不支持旋转(不写原文件)".into();
+            self.fx_msg = t("只读速看预览格式不支持旋转(不写原文件)").into();
             return;
         }
         let cur = self
@@ -6467,17 +6876,17 @@ impl App {
             .unwrap_or(0);
         let q = (cur + quarter_delta) % 4;
         if q == 0 {
-            self.fx_remove_effect(id, "旋转复位", "rot");
-            self.fx_msg = "已复位旋转".into();
+            self.fx_remove_effect(id, t("旋转复位"), "rot");
+            self.fx_msg = t("已复位旋转").into();
         } else {
             let mut params = std::collections::BTreeMap::new();
             params.insert("quarter".into(), q.to_string());
             self.fx_commit_effect(
                 id,
                 if quarter_delta % 2 == 1 {
-                    "旋转90°"
+                    t("旋转90°")
                 } else {
-                    "旋转180°"
+                    t("旋转180°")
                 },
                 crate::effects::Effect {
                     name: "rot".into(),
@@ -6518,7 +6927,7 @@ impl App {
     /// 间隔 / 循环来自设置项(选项对话框可改)。
     fn start_slideshow(&mut self) {
         if self.view_ids().is_empty() {
-            self.fx_msg = "当前视图没有照片".into();
+            self.fx_msg = t("当前视图没有照片").into();
             return;
         }
         self.slide_interval = self
@@ -6547,11 +6956,14 @@ impl App {
     /// 按路径设壁纸(网格右键与快速查找右键共用;后台线程解码转 JPEG)。
     fn set_wallpaper(&mut self, path: &str) {
         if self.wallpaper_rx.is_some() {
-            self.status = "上一个壁纸设置还在进行中…".into();
+            self.status = t("上一个壁纸设置还在进行中…").into();
             return;
         }
         let path = PathBuf::from(path);
-        self.status = format!("正在设为桌面壁纸:{}…", path.display());
+        self.status = t_with(
+            "正在设为桌面壁纸:{p1}…",
+            &[("p1", (path.display()).to_string())],
+        );
         let (tx, rx) = mpsc::channel();
         self.wallpaper_rx = Some(rx);
         std::thread::spawn(move || {
@@ -6575,9 +6987,9 @@ impl App {
                 .map_err(|e| e.to_string())?;
                 std::fs::write(&dst, buf.into_inner()).map_err(|e| e.to_string())?;
                 if crate::win::set_wallpaper(&dst) {
-                    Ok("已设为桌面壁纸".into())
+                    Ok(t("已设为桌面壁纸").into())
                 } else {
-                    Err("SystemParametersInfoW 调用失败".into())
+                    Err(t("SystemParametersInfoW 调用失败").into())
                 }
             })();
             let _ = tx.send(res);
@@ -6593,7 +7005,7 @@ impl App {
     /// 浮动属性窗与右栏抽屉「属性」页共用(属性详情部分)。
     fn props_detail_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         let Some(&idx) = self.id_row.get(&id) else {
-            ui.small("该照片不在当前视图。");
+            ui.small(t("该照片不在当前视图。"));
             return;
         };
         // 先取齐数据再排版(避免闭包里借用 self.rows 冲突)。
@@ -6640,31 +7052,39 @@ impl App {
                         .into()
                 })
                 .unwrap_or_default();
-            ui.small(format!("{size_s}    修改:{mtime}"));
+            ui.small(t_with(
+                "{size_s}    修改:{mtime}",
+                &[("size_s", size_s.to_string()), ("mtime", mtime.to_string())],
+            ));
         }
         ui.separator();
         // Property / Value 两列清单。
         egui::Grid::new("props-grid").num_columns(2).show(ui, |ui| {
-            ui.label("类型");
+            ui.label(t("类型"));
             ui.label(if kind == crate::video::kind::MOVIE {
-                "视频".into()
+                t("视频").into()
             } else {
                 Path::new(&path)
                     .extension()
-                    .map(|e| format!("图片({})", e.to_string_lossy().to_uppercase()))
-                    .unwrap_or_else(|| "图片".into())
+                    .map(|e| {
+                        t_with(
+                            "图片({p1})",
+                            &[("p1", (e.to_string_lossy().to_uppercase()).to_string())],
+                        )
+                    })
+                    .unwrap_or_else(|| t("图片").into())
             });
             ui.end_row();
-            ui.label("像素");
+            ui.label(t("像素"));
             ui.label(match dims {
                 (Some(w), Some(h)) => format!("{w} × {h}"),
                 _ => "—".into(),
             });
             ui.end_row();
-            ui.label("拍摄时间");
+            ui.label(t("拍摄时间"));
             ui.label(taken.unwrap_or_default().replace('T', " "));
             ui.end_row();
-            ui.label("相机");
+            ui.label(t("相机"));
             ui.label(if cam.is_empty() { "—".into() } else { cam });
             ui.end_row();
             ui.label("GPS");
@@ -6673,22 +7093,25 @@ impl App {
                 _ => "—".into(),
             });
             ui.end_row();
-            ui.label("星标");
+            ui.label(t("星标"));
             ui.label(if star {
-                "★ 已加星"
+                t("★ 已加星")
             } else {
-                "☆ 未加星"
+                t("☆ 未加星")
             });
             ui.end_row();
-            ui.label("标题");
+            ui.label(t("标题"));
             ui.label(if caption.is_empty() {
                 "—".into()
             } else {
                 caption
             });
             ui.end_row();
-            ui.label("效果项");
-            ui.label(format!("{fx_count} 项"));
+            ui.label(t("效果项"));
+            ui.label(t_with(
+                "{fx_count} 项",
+                &[("fx_count", fx_count.to_string())],
+            ));
             ui.end_row();
         });
     }
@@ -6718,7 +7141,7 @@ impl App {
             .map(|i| i + 1)
             .unwrap_or(1);
         let mut props_open = self.show_props;
-        egui::Window::new("属性")
+        egui::Window::new(t("属性"))
             .open(&mut props_open)
             .default_width(460.0)
             .show(ctx, |ui| {
@@ -6726,20 +7149,23 @@ impl App {
                 ui.separator();
                 // 上一张 / 下一张(序号行)。
                 ui.horizontal(|ui| {
-                    if ui.button("◀ 上一张").clicked() {
+                    if ui.button(t("◀ 上一张")).clicked() {
                         self.step_preview(-1);
                     }
-                    ui.label(format!("{pos} / {total} 张"));
-                    if ui.button("下一张 ▶").clicked() {
+                    ui.label(t_with(
+                        "{pos} / {total} 张",
+                        &[("pos", pos.to_string()), ("total", total.to_string())],
+                    ));
+                    if ui.button(t("下一张 ▶")).clicked() {
                         self.step_preview(1);
                     }
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("关闭").clicked() {
+                    if ui.button(t("关闭")).clicked() {
                         self.show_props = false;
                     }
-                    if ui.button("在资源管理器中显示").clicked() {
+                    if ui.button(t("在资源管理器中显示")).clicked() {
                         if let Some(path) = self.photo_path(id) {
                             show_in_explorer(&path);
                         }
@@ -6759,7 +7185,7 @@ impl App {
         if let Some((_, cap)) = &mut self.caption_edit {
             let resp = ui
                 .horizontal(|ui| {
-                    ui.label("标题:");
+                    ui.label(t("标题:"));
                     ui.add(
                         egui::TextEdit::singleline(cap).desired_width(ui.available_width() - 60.0),
                     )
@@ -6769,7 +7195,7 @@ impl App {
             if resp.lost_focus() || enter {
                 if *cap != self.store.get_caption(id) {
                     let _ = self.store.set_caption(id, cap);
-                    self.fx_msg = "标题已保存".into();
+                    self.fx_msg = t("标题已保存").into();
                 }
             }
         }
@@ -6778,7 +7204,7 @@ impl App {
     /// 标签编辑(输入框 + 色标 + 点 ✕ 移除)。
     fn tags_editor(&mut self, ui: &mut egui::Ui, id: i64) {
         ui.horizontal(|ui| {
-            ui.label("标签:");
+            ui.label(t("标签:"));
             if ui.text_edit_singleline(&mut self.input_tag).lost_focus()
                 && ui.input(|i| i.key_pressed(egui::Key::Enter))
             {
@@ -6788,7 +7214,7 @@ impl App {
                     self.sync_sidecars(id, self.star_of(id));
                 }
             }
-            if ui.button("添加").clicked() {
+            if ui.button(t("添加")).clicked() {
                 let t = std::mem::take(&mut self.input_tag);
                 if !t.is_empty() {
                     let _ = timeline::add_tag(&self.store, id, &t);
@@ -6859,8 +7285,8 @@ impl App {
 
     /// 没选中照片时四个页签共用的提示。
     fn drawer_need_photo(ui: &mut egui::Ui) {
-        ui.small("先在图库点选一张照片(或双击打开单图)。");
-        ui.small("这里显示它的属性、标签、人物与拍摄地点。");
+        ui.small(t("先在图库点选一张照片(或双击打开单图)。"));
+        ui.small(t("这里显示它的属性、标签、人物与拍摄地点。"));
     }
 
     /// 右栏抽屉(属性 / 标签 / 人物 / 地点 四页签,
@@ -6880,12 +7306,7 @@ impl App {
                         // 没有。标注挂在页签的悬停上,不新增可见控件。
                         if ui
                             .selectable_label(cur == t, t.label())
-                            .on_hover_text(
-                                "来源 L3:派生数据(EXIF / 缩略图 / 标签 / 人物 / 地理),\
-                                 由图库逐条抽取,后台按常用目录、最近变更、\
-                                 当前可见的顺序依次补齐。\
-                                 还没轮到的照片这里暂时没有内容,打开文件夹即开始生成。",
-                            )
+                            .on_hover_text(crate::i18n::t("来源 L3:派生数据(EXIF / 缩略图 / 标签 / 人物 / 地理),由图库逐条抽取,后台按常用目录、最近变更、当前可见的顺序依次补齐。还没轮到的照片这里暂时没有内容,打开文件夹即开始生成。"))
                             .clicked()
                         {
                             self.drawer_tab = t;
@@ -6893,7 +7314,7 @@ impl App {
                         }
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("»").on_hover_text("收起属性面板").clicked() {
+                        if ui.small_button("»").on_hover_text(t("收起属性面板")).clicked() {
                             self.drawer_open = false;
                             let _ = self.store.set_setting("drawer_open", "0");
                         }
@@ -6910,7 +7331,7 @@ impl App {
                         DrawerTab::People => self.drawer_people_ui(ui),
                         #[cfg(not(feature = "ai"))]
                         DrawerTab::People => {
-                            ui.small("此构建未开启人脸功能(ai 特性)。");
+                            ui.small(t("此构建未开启人脸功能(ai 特性)。"));
                         }
                         DrawerTab::Places => self.drawer_places_ui(ui, ctx),
                     });
@@ -6931,15 +7352,15 @@ impl App {
             let starred = self.star_of(id) != 0;
             if ui
                 .small_button(if starred {
-                    "★ 取消星标"
+                    t("★ 取消星标")
                 } else {
-                    "☆ 加星"
+                    t("☆ 加星")
                 })
                 .clicked()
             {
                 self.toggle_star(id);
             }
-            if ui.small_button("在资源管理器中显示").clicked() {
+            if ui.small_button(t("在资源管理器中显示")).clicked() {
                 if let Some(path) = self.photo_path(id) {
                     show_in_explorer(&path);
                 }
@@ -6956,10 +7377,10 @@ impl App {
         self.tags_editor(ui, id);
         ui.add_space(6.0);
         ui.separator();
-        ui.small("库内标签(点一下即加到本张):");
+        ui.small(t("库内标签(点一下即加到本张):"));
         let names: Vec<String> = self.tags.iter().map(|t| t.name.clone()).collect();
         if names.is_empty() {
-            ui.small("(还没有标签)");
+            ui.small(t("(还没有标签)"));
             return;
         }
         ui.horizontal_wrapped(|ui| {
@@ -7000,16 +7421,25 @@ impl App {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         if faces.is_empty() {
-            ui.small("本张照片还没有人脸数据。");
-            ui.small("左栏「人物」里可以扫描图库并自动聚类。");
+            ui.small(t("本张照片还没有人脸数据。"));
+            ui.small(t("左栏「人物」里可以扫描图库并自动聚类。"));
             return;
         }
         for f in faces {
             let Some(cluster) = f.cluster else {
-                ui.small(format!(
-                    "未归入人物的脸  · 质量 {:.2}{}",
-                    f.quality,
-                    if f.ignored { "(已忽略)" } else { "" }
+                ui.small(t_with(
+                    "未归入人物的脸  · 质量 {p1}{p2}",
+                    &[
+                        ("p1", format!("{p1:.2}", p1 = (f.quality))),
+                        (
+                            "p2",
+                            if f.ignored {
+                                t("(已忽略)").to_string()
+                            } else {
+                                String::new()
+                            },
+                        ),
+                    ],
                 ));
                 continue;
             };
@@ -7017,20 +7447,23 @@ impl App {
             let named = f.person.clone().unwrap_or_default();
             ui.horizontal(|ui| {
                 if named.is_empty() {
-                    ui.strong(format!("簇 {cluster}"));
+                    ui.strong(t_with("簇 {cluster}", &[("cluster", cluster.to_string())]));
                 } else {
                     ui.strong(named.as_str());
                 }
-                ui.small(format!("质量 {:.2}", f.quality));
+                ui.small(t_with(
+                    "质量 {p1}",
+                    &[("p1", format!("{p1:.2}", p1 = (f.quality)))],
+                ));
                 if f.ignored {
-                    ui.small("(已忽略)");
+                    ui.small(t("(已忽略)"));
                 }
             });
             ui.horizontal(|ui| {
-                if ui.small_button("命名").clicked() {
+                if ui.small_button(t("命名")).clicked() {
                     self.face_name_draft = Some((f.face_id, named.clone()));
                 }
-                if ui.small_button("查看该人物").clicked() {
+                if ui.small_button(t("查看该人物")).clicked() {
                     if self.face_people.is_empty() {
                         self.refresh_people_and_suggestions();
                     }
@@ -7044,7 +7477,7 @@ impl App {
                     );
                 }
                 if ui
-                    .small_button(if f.ignored { "恢复" } else { "忽略" })
+                    .small_button(if f.ignored { t("恢复") } else { t("忽略") })
                     .clicked()
                 {
                     let _ = crate::faces::ignore_cluster(&self.store, cluster, !f.ignored);
@@ -7065,7 +7498,7 @@ impl App {
                     if !name.is_empty() {
                         let _ = crate::faces::rename_cluster(&self.store, cluster, &name);
                         self.refresh_people_and_suggestions();
-                        self.status = format!("已命名:{name}");
+                        self.status = t_with("已命名:{name}", &[("name", name.to_string())]);
                     }
                     self.face_name_draft = None;
                 }
@@ -7080,7 +7513,7 @@ impl App {
             return;
         };
         let Some(&idx) = self.id_row.get(&id) else {
-            ui.small("该照片不在当前视图。");
+            ui.small(t("该照片不在当前视图。"));
             return;
         };
         let (lat, lon) = (self.rows[idx].lat, self.rows[idx].lon);
@@ -7089,127 +7522,157 @@ impl App {
             (Some(a), Some(b)) => {
                 ui.label(format!("GPS:{a:.6}, {b:.6}"));
                 if let Some(t) = taken {
-                    ui.small(format!("拍摄时间:{}", t.replace('T', " ")));
+                    ui.small(t_with(
+                        "拍摄时间:{p1}",
+                        &[("p1", (t.replace('T', " ")).to_string())],
+                    ));
                 }
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.small_button("复制坐标").clicked() {
+                    if ui.small_button(t("复制坐标")).clicked() {
                         ctx.copy_text(format!("{a:.6}, {b:.6}"));
-                        self.status = "已复制 GPS 坐标".into();
+                        self.status = t("已复制 GPS 坐标").into();
                     }
-                    if ui.small_button("在地图中打开").clicked() {
+                    if ui.small_button(t("在地图中打开")).clicked() {
                         // 交给系统默认浏览器(OpenStreetMap,无需第三方密钥)。
                         let url = format!(
                             "https://www.openstreetmap.org/?mlat={a}&mlon={b}#map=17/{a}/{b}"
                         );
                         if !crate::win::shell_open(Path::new(&url)) {
-                            self.status = "无法打开地图(没有默认浏览器?)".into();
+                            self.status = t("无法打开地图(没有默认浏览器?)").into();
                         }
                     }
                 });
             }
             (Some(a), None) => {
-                ui.small("只有纬度,坐标不完整(原图 EXIF 可能损坏)。");
-                ui.small(format!("纬度:{a:.6}"));
+                ui.small(t("只有纬度,坐标不完整(原图 EXIF 可能损坏)。"));
+                ui.small(t_with("纬度:{a:.6}", &[("a", format!("{a:.6}"))]));
             }
             (None, Some(b)) => {
-                ui.small("只有经度,坐标不完整(原图 EXIF 可能损坏)。");
-                ui.small(format!("经度:{b:.6}"));
+                ui.small(t("只有经度,坐标不完整(原图 EXIF 可能损坏)。"));
+                ui.small(t_with("经度:{b:.6}", &[("b", format!("{b:.6}"))]));
             }
             (None, None) => {
-                ui.small("本张照片的 EXIF 里没有 GPS 坐标。");
-                ui.small("相机未定位或导出时丢掉了定位信息;可在原图属性里补写。");
+                ui.small(t("本张照片的 EXIF 里没有 GPS 坐标。"));
+                ui.small(t("相机未定位或导出时丢掉了定位信息;可在原图属性里补写。"));
             }
         }
         ui.add_space(6.0);
         ui.separator();
-        ui.small("整个图库的定位数据:");
-        if ui.small_button("导出地理标记(KML)…").clicked() {
+        ui.small(t("整个图库的定位数据:"));
+        if ui.small_button(t("导出地理标记(KML)…")).clicked() {
             self.export_kml();
         }
     }
 
     /// 选项 > 全盘快查:索引服务状态一览 + 启用意向 + 手动重建/卸载入口。
     fn options_svc_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(egui::RichText::new("全盘快查(索引服务)").size(14.0));
+        ui.heading(egui::RichText::new(t("全盘快查(索引服务)")).size(14.0));
         let link = self.link.clone();
         let svc_text = match link.svc {
-            crate::win::ServiceState::NotInstalled => "未安装".to_string(),
-            crate::win::ServiceState::Stopped => "已停止".to_string(),
+            crate::win::ServiceState::NotInstalled => t("未安装").to_string(),
+            crate::win::ServiceState::Stopped => t("已停止").to_string(),
             // 过渡态的原始码只给排障看,别当成确定结论。
-            crate::win::ServiceState::Transition(c) => format!("过渡态(码 {c})"),
-            crate::win::ServiceState::Running => "运行中".to_string(),
+            crate::win::ServiceState::Transition(c) => {
+                t_with("过渡态(码 {c})", &[("c", c.to_string())])
+            }
+            crate::win::ServiceState::Running => t("运行中").to_string(),
         };
         let status = if link.online {
-            let mut s = format!("服务{svc_text} · {} 卷 {} 条", link.vols, link.entries);
+            let mut s = t_with(
+                "服务{svc_text} · {p1} 卷 {p2} 条",
+                &[
+                    ("svc_text", svc_text.to_string()),
+                    ("p1", (link.vols).to_string()),
+                    ("p2", (link.entries).to_string()),
+                ],
+            );
             if link.building > 0 {
-                s.push_str(&format!(" · {} 卷正在建库", link.building));
+                s.push_str(&t_with(
+                    " · {p1} 卷正在建库",
+                    &[("p1", (link.building).to_string())],
+                ));
             }
             if link.dirty {
-                s.push_str(" · 有未落盘的变更");
+                s.push_str(t(" · 有未落盘的变更"));
             }
-            s.push_str(&format!(" · 已运行 {}", fmt_uptime(link.uptime)));
+            s.push_str(&t_with(
+                " · 已运行 {p1}",
+                &[("p1", (fmt_uptime(link.uptime)).to_string())],
+            ));
             if let Some(t) = link.seen {
-                s.push_str(&format!(" · {} 秒前刷新", t.elapsed().as_secs()));
+                s.push_str(&t_with(
+                    " · {p1} 秒前刷新",
+                    &[("p1", (t.elapsed().as_secs()).to_string())],
+                ));
             }
             s
         } else if link.svc == crate::win::ServiceState::Running {
-            format!("服务{svc_text},但连不上它的管道(全盘快查暂不可用)")
+            t_with(
+                "服务{svc_text},但连不上它的管道(全盘快查暂不可用)",
+                &[("svc_text", svc_text.to_string())],
+            )
         } else {
-            format!("服务{svc_text}:全盘快查不可用,发现与保鲜走逐目录扫描兜底")
+            t_with(
+                "服务{svc_text}:全盘快查不可用,发现与保鲜走逐目录扫描兜底",
+                &[("svc_text", svc_text.to_string())],
+            )
         };
         ui.horizontal(|ui| {
-            ui.label("状态:");
+            ui.label(t("状态:"));
             ui.label(&status);
         });
         if link.building > 0 {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.small(format!(
-                    "{} 卷正在全量建库,期间快查结果可能不全",
-                    link.building
+                ui.small(t_with(
+                    "{p1} 卷正在全量建库,期间快查结果可能不全",
+                    &[("p1", (link.building).to_string())],
                 ));
             });
         }
         for (letter, why) in &link.compat {
-            ui.small(format!(
-                "{letter}: 盘走兼容扫描(walkdir + 目录监听),无实时快查 —— {why}"
+            ui.small(t_with(
+                "{letter}: 盘走兼容扫描(walkdir + 目录监听),无实时快查 —— {why}",
+                &[("letter", letter.to_string()), ("why", why.to_string())],
             ));
         }
         #[cfg(windows)]
         {
             let cur = self.svc_want();
             ui.horizontal(|ui| {
-                ui.label("全盘快查:");
-                if ui.radio(cur != SvcWant::No, "启用(推荐)").clicked() {
+                ui.label(t("全盘快查:"));
+                if ui.radio(cur != SvcWant::No, t("启用(推荐)")).clicked() {
                     self.svc_apply_want(SvcWant::Yes);
                 }
-                if ui.radio(cur == SvcWant::No, "不用").clicked() {
+                if ui.radio(cur == SvcWant::No, t("不用")).clicked() {
                     self.svc_apply_want(SvcWant::No);
                 }
             });
-            ui.small("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默;选「不用」会断开连接并移除已装的服务。");
+            ui.small(t("启用 = 装一个自动启动的索引服务:安装与卸载各过一次 UAC,之后开机自启、全程静默;选「不用」会断开连接并移除已装的服务。"));
             if self.store.get_setting("svc_never_ask").as_deref() == Some("1") {
-                ui.small("已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。");
+                ui.small(t(
+                    "已勾「不再提示」:启动不再自动询问,点上面任一档即可恢复。",
+                ));
             }
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(link.online, egui::Button::new("立即重建全盘索引"))
+                    .add_enabled(link.online, egui::Button::new(t("立即重建全盘索引")))
                     .clicked()
                 {
                     self.svc_rebuild();
                 }
                 if ui
-                    .add_enabled(link.online, egui::Button::new("立刻保存索引"))
+                    .add_enabled(link.online, egui::Button::new(t("立刻保存索引")))
                     .clicked()
                 {
                     if let Some(tx) = &self.link_tx {
                         let _ = tx.send(LinkCmd::Flush);
                     }
-                    self.status = "已请求索引服务把内存索引落盘".into();
+                    self.status = t("已请求索引服务把内存索引落盘").into();
                 }
                 if ui
-                    .add_enabled(!self.svc_busy, egui::Button::new("重试连接"))
+                    .add_enabled(!self.svc_busy, egui::Button::new(t("重试连接")))
                     .clicked()
                 {
                     if let Some(tx) = &self.link_tx {
@@ -7225,57 +7688,572 @@ impl App {
                 ui.horizontal(|ui| {
                     if stoppable
                         && ui
-                            .add_enabled(!self.svc_busy, egui::Button::new("停止索引服务…"))
+                            .add_enabled(!self.svc_busy, egui::Button::new(t("停止索引服务…")))
                             .clicked()
                     {
                         self.svc_stop();
                     }
                     if startable
                         && ui
-                            .add_enabled(!self.svc_busy, egui::Button::new("启动索引服务…"))
+                            .add_enabled(!self.svc_busy, egui::Button::new(t("启动索引服务…")))
                             .clicked()
                     {
                         self.svc_start();
                     }
                 });
                 ui.small(if stoppable {
-                    "停一下服务能让程序自己腾出手来:升级、搬家或想把硬盘歇口气的时候用,索引记录都保留,在同一页点「启动」就接着跑。"
+                    t("停一下服务能让程序自己腾出手来:升级、搬家或想把硬盘歇口气的时候用,索引记录都保留,在同一页点「启动」就接着跑。")
                 } else {
-                    "服务停着时全盘快查不可用,发现与保鲜退回逐目录扫描;索引文件都留在数据目录,启动后接着用。"
+                    t("服务停着时全盘快查不可用,发现与保鲜退回逐目录扫描;索引文件都留在数据目录,启动后接着用。")
                 });
             }
             if link.svc != crate::win::ServiceState::NotInstalled
                 && ui
-                    .add_enabled(!self.svc_busy, egui::Button::new("卸载索引服务…"))
+                    .add_enabled(!self.svc_busy, egui::Button::new(t("卸载索引服务…")))
                     .clicked()
             {
                 self.svc_uninstall();
             }
             if link.svc != crate::win::ServiceState::NotInstalled {
-                ui.small("卸载会停掉服务并删除注册项(需要一次 UAC);索引文件本身留在数据目录。");
+                ui.small(t(
+                    "卸载会停掉服务并删除注册项(需要一次 UAC);索引文件本身留在数据目录。",
+                ));
             }
             if self.svc_busy {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.small("等待你在 UAC 授权窗口点「是」…");
+                    ui.small(t("等待你在 UAC 授权窗口点「是」…"));
                 });
             }
         }
         #[cfg(not(windows))]
-        ui.small("全盘快查仅支持 Windows(NTFS USN journal)。");
-        ui.small("服务装卸失败后不再自动打扰;可在此或快速查找页重新发起。");
+        ui.small(t("全盘快查仅支持 Windows(NTFS USN journal)。"));
+        ui.small(t("服务装卸失败后不再自动打扰;可在此或快速查找页重新发起。"));
     }
 
-    /// 选项窗口(常规 / 人脸识别 / 全盘快查 / 电子邮件 / 幻灯片 五页签)。
+    /// 后台全库入队,不阻塞界面。
+    #[cfg(feature = "ai")]
+    fn enqueue_all_ai(&mut self) {
+        let store = self.store.clone();
+        self.status = t("已在后台把全库排入 AI 队列").into();
+        std::thread::spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let _ = crate::ai_queue::enqueue_all(&store);
+        });
+    }
+
+    /// 标签视图:库内检索 / AI 分类 / 手动标签三种筛选。
+    fn tags_view(&mut self, ui: &mut egui::Ui) {
+        #[cfg(feature = "ai")]
+        {
+            let q = self.ai_query.trim().to_string();
+            if !q.is_empty() {
+                let cells: Vec<usize> = self
+                    .ai_query_hits
+                    .iter()
+                    .filter_map(|id| self.id_row.get(id).copied())
+                    .collect();
+                ui.heading(t_with(
+                    "库内检索 «{p1}» · {p2} 张",
+                    &[("p1", q), ("p2", (cells.len()).to_string())],
+                ));
+                if cells.is_empty() {
+                    ui.label(t("没有命中的照片;先启用 AI 索引可生成标签与文字索引。"));
+                }
+                self.photo_grid(ui, "tag-search-grid", &cells);
+                return;
+            }
+            if let Some(node) = self.sel_category.clone() {
+                let ver =
+                    crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+                let ids = crate::ai_tags::category_ids(&self.store, &node, &ver, 2000);
+                let cells: Vec<usize> = ids
+                    .iter()
+                    .filter_map(|id| self.id_row.get(id).copied())
+                    .collect();
+                let name = crate::ai_tags::CATEGORIES
+                    .iter()
+                    .find(|(n, _)| *n == node.as_str())
+                    .map(|(_, l)| *l)
+                    .unwrap_or("");
+                ui.heading(t_with(
+                    "分类 «{p1}» · {p2} 张",
+                    &[
+                        ("p1", t(name).to_string()),
+                        ("p2", (cells.len()).to_string()),
+                    ],
+                ));
+                if cells.is_empty() {
+                    ui.label(t("该分类下还没有照片。"));
+                }
+                self.photo_grid(ui, "category-grid", &cells);
+                return;
+            }
+        }
+        self.tags_plain_view(ui);
+    }
+
+    /// 手动标签:选中标签后展示该标签下的照片。
+    fn tags_plain_view(&mut self, ui: &mut egui::Ui) {
+        match self.sel_tag.clone() {
+            None => {
+                ui.heading(t("标签"));
+                ui.label(t("左侧选择一个标签,查看标有该标签的照片。"));
+            }
+            Some(tag) => {
+                let ids = timeline::photos_by_tag(&self.store, &tag).unwrap_or_default();
+                let cells: Vec<usize> = ids
+                    .iter()
+                    .filter_map(|id| self.id_row.get(id).copied())
+                    .collect();
+                ui.heading(t_with("标签 «{tag}» · {p1} 张", &[("tag", tag.to_string()), ("p1", (cells.len()).to_string())]));
+                self.photo_grid(ui, "tags-grid", &cells);
+            }
+        }
+    }
+
+    /// 只把某一阶段全库入队(重建).
+    #[cfg(feature = "ai")]
+    fn enqueue_stage_ai(&mut self, stage: crate::ai_queue::Stage) {
+        let store = self.store.clone();
+        self.status = t_with(
+            "已在后台把全库排入{p1}队列",
+            &[("p1", (stage.label()).to_string())],
+        );
+        std::thread::spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let _ = crate::ai_queue::enqueue_all_for(&store, stage);
+        });
+    }
+
+    /// 选项页「AI 行为」:基础开关、暂停恢复与队列统计。
+    #[cfg(feature = "ai")]
+    fn ai_options_ui(&mut self, ui: &mut egui::Ui) {
+        let mut enabled = self.ai_enabled;
+        if ui
+            .checkbox(&mut enabled, t("启用后台 AI 索引"))
+            .changed()
+        {
+            let _ = self
+                .store
+                .set_setting("ai_enabled", if enabled { "1" } else { "0" });
+            self.ai_enabled = enabled;
+            if let Some(s) = &self.ai_sched {
+                if enabled {
+                    s.resume();
+                } else {
+                    s.pause();
+                }
+            }
+            if enabled {
+                self.enqueue_all_ai();
+            }
+        }
+        let paused = self
+            .ai_sched
+            .as_ref()
+            .map(|s| s.is_paused())
+            .unwrap_or(true);
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!paused, egui::Button::new(t("暂停")))
+                .clicked()
+            {
+                let _ = self.store.set_setting("ai_enabled", "0");
+                self.ai_enabled = false;
+                if let Some(s) = &self.ai_sched {
+                    s.pause();
+                }
+            }
+            if ui
+                .add_enabled(paused, egui::Button::new(t("继续")))
+                .clicked()
+            {
+                let _ = self.store.set_setting("ai_enabled", "1");
+                self.ai_enabled = true;
+                if let Some(s) = &self.ai_sched {
+                    s.resume();
+                }
+                self.enqueue_all_ai();
+            }
+        });
+        if ui.button(t("立即入队全库")).clicked() {
+            self.enqueue_all_ai();
+        }
+        ui.separator();
+        let mut sens = crate::ai_tags::sensitivity(&self.store);
+        egui::ComboBox::from_id_salt("ai_tag_sens")
+            .selected_text([t("宽松"), t("适中"), t("严格")][sens as usize])
+            .show_ui(ui, |ui| {
+                for (i, name) in [t("宽松"), t("适中"), t("严格")].iter().enumerate() {
+                    if ui.selectable_value(&mut sens, i as i32, *name).clicked() {
+                        let _ = self.store.set_setting("ai_tag_sensitivity", &i.to_string());
+                        crate::ai_queue::enqueue_all_for(&self.store, crate::ai_queue::Stage::Tags)
+                            .ok();
+                    }
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label(t("OCR 触发"));
+            let mut mode = crate::ai_ocr::mode(&self.store);
+            egui::ComboBox::from_id_salt("ai_ocr_mode")
+                .selected_text(mode.label())
+                .show_ui(ui, |ui| {
+                    for m in [
+                        crate::ai_ocr::Mode::Off,
+                        crate::ai_ocr::Mode::Auto,
+                        crate::ai_ocr::Mode::Selected,
+                    ] {
+                        if ui.selectable_value(&mut mode, m, m.label()).clicked() {
+                            let _ = self.store.set_setting(crate::ai_ocr::Mode::KEY, m.key());
+                        }
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            if ui.button(t("重建标签")).clicked() {
+                self.enqueue_stage_ai(crate::ai_queue::Stage::Tags);
+            }
+            if ui.button(t("重建语义")).clicked() {
+                self.enqueue_stage_ai(crate::ai_queue::Stage::Clip);
+            }
+            if ui.button(t("入队 OCR")).clicked() {
+                self.enqueue_stage_ai(crate::ai_queue::Stage::Ocr);
+            }
+        });
+        ui.small(t_with(
+            "词表 {p1} 条 · 语义向量 {p2} 条 · OCR 文档 {p3} 篇 · 人脸约束 {p4} 条",
+            &[
+                ("p1", (crate::ai_tags::label_count(&self.store)).to_string()),
+                (
+                    "p2",
+                    (crate::ai_search::count(
+                        &self.store,
+                        &crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Clip),
+                    ))
+                    .to_string(),
+                ),
+                ("p3", (crate::ai_ocr::count(&self.store)).to_string()),
+                ("p4", (crate::ai_review::all(&self.store).len()).to_string()),
+            ],
+        ));
+        let tag_ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+        let counts = crate::ai_tags::category_counts(&self.store, &tag_ver);
+        ui.horizontal_wrapped(|ui| {
+            for (name, n) in counts {
+                if n > 0 {
+                    ui.small(format!("{}:{n}", t(name)));
+                }
+            }
+        });
+        ui.separator();
+        let fresh = self
+            .ai_stats_cache
+            .as_ref()
+            .map(|(t, _)| t.elapsed() < std::time::Duration::from_secs(2))
+            .unwrap_or(false);
+        if !fresh {
+            if let Some(s) = &self.ai_sched {
+                let v = s.stats(&self.store);
+                self.ai_stats_cache = Some((std::time::Instant::now(), v));
+            }
+        }
+        if let Some((_, rows)) = &self.ai_stats_cache {
+            for row in rows {
+                ui.small(t_with(
+                    "{p1}:待办 {p2} · 完成 {p3} · 失败 {p4}",
+                    &[
+                        ("p1", (row.stage.label()).to_string()),
+                        ("p2", (row.stats.pending).to_string()),
+                        ("p3", (row.stats.done).to_string()),
+                        ("p4", (row.stats.failed).to_string()),
+                    ],
+                ));
+            }
+        }
+        ui.separator();
+        ui.small(t("暂停/恢复在批边界生效;任务持久化在索引库,重启后继续。"));
+    }
+
+    /// 启用某槽位版本(带调度器的顺序化替换)。
+    #[cfg(feature = "ai")]
+    fn ai_activate_slot(&mut self, slot: &str, ver: &str) {
+        let out = match &self.ai_sched {
+            Some(s) => crate::ai_models::replace_model(&self.store, s, slot, ver),
+            None => crate::ai_models::activate(&self.store, slot, ver),
+        };
+        self.ai_models_msg = match out {
+            Ok(()) => t_with(
+                "已启用 {slot} · {ver}",
+                &[("slot", slot.to_string()), ("ver", ver.to_string())],
+            ),
+            Err(e) => t_with("启用失败:{e}", &[("e", e.to_string())]),
+        };
+        self.ai_models_cache = None;
+    }
+
+    /// 选项页「AI 模型」:槽位状态、导入、下载与版本切换。
+    #[cfg(feature = "ai")]
+    fn ai_models_ui(&mut self, ui: &mut egui::Ui) {
+        use crate::ai_models::DlPhase;
+        use crate::models::SourcePref;
+        if self.ai_dl.is_none() {
+            self.ai_dl = Some(crate::ai_models::SlotDownloader::new(self.store.clone()));
+        }
+        let phase = if let Some(d) = self.ai_dl.as_mut() {
+            d.tick();
+            d.phase.clone()
+        } else {
+            DlPhase::Idle
+        };
+        // 多文件槽位:前一个文件完成后串行启动下一个。
+        if matches!(phase, DlPhase::Done) && !self.ai_dl_queue.is_empty() {
+            let next = self.ai_dl_queue.remove(0);
+            if let Some(d) = self.ai_dl.as_mut() {
+                if let Err(e) = d.start(next) {
+                    self.ai_dl_queue.clear();
+                    self.ai_models_msg = t_with("下载未能开始:{e}", &[("e", e.to_string())]);
+                }
+            }
+        }
+        if matches!(&phase, DlPhase::Failed(_)) {
+            self.ai_dl_queue.clear();
+        }
+
+        // —— 进度:人脸与 AI 槽位都画在顶部,不散落在各自分区 ——
+        let face = self.models.phase.clone();
+        if face.working() || matches!(face, crate::models::Phase::Failed(_)) {
+            self.face_download_progress_ui(ui);
+        }
+        if phase.working() {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(phase.label());
+                if ui.button(t("停止下载")).clicked() {
+                    if let Some(d) = self.ai_dl.as_mut() {
+                        d.cancel();
+                    }
+                    self.ai_dl_queue.clear();
+                    self.ai_models_msg = t("已停止下载:断点保留,点「下载」即接着下").into();
+                }
+            });
+            if let Some(root) = crate::ai_models::root() {
+                ui.small(t_with(
+                    "断点留在 {p1},重开程序后再点「下载」可接着下",
+                    &[(
+                        "p1",
+                        (crate::ai_models::staging(&root).display()).to_string(),
+                    )],
+                ));
+            }
+        } else if let DlPhase::Failed(e) = &phase {
+            ui.colored_label(egui::Color32::LIGHT_RED, e);
+        }
+        if !self.ai_models_msg.is_empty() {
+            ui.small(self.ai_models_msg.clone());
+        }
+        ui.separator();
+
+        // 识别方案、下载源、人脸模型文件(原「人脸识别」页内容)。
+        self.face_options_ui(ui);
+
+        // —— AI 槽位(逐行折叠,默认收起,避免整页过高) ——
+        ui.separator();
+        let fresh = self
+            .ai_models_cache
+            .as_ref()
+            .map(|(t, _, _)| t.elapsed() < std::time::Duration::from_secs(2))
+            .unwrap_or(false);
+        if !fresh {
+            let rows = crate::ai_models::status(&self.store);
+            let disk = crate::ai_models::disk_usage(&self.store);
+            self.ai_models_cache = Some((std::time::Instant::now(), rows, disk));
+        }
+        let (rows, disk) = match &self.ai_models_cache {
+            Some((_, rows, disk)) => (rows.clone(), *disk),
+            None => (Vec::new(), 0),
+        };
+        ui.horizontal(|ui| {
+            ui.heading(egui::RichText::new(t("AI 模型槽位")).size(14.0));
+            ui.small(t_with(
+                "占用 {p1} MB(含旧版本与暂存)",
+                &[("p1", format!("{:.1}", disk as f64 / 1_048_576.0))],
+            ));
+        });
+        let now = crate::ai_queue::now_ms();
+        let pref = SourcePref::from_setting(
+            &self
+                .store
+                .get_setting(SourcePref::SETTING)
+                .unwrap_or_default(),
+        );
+        for row in rows {
+            let Some(spec) = crate::ai_models::spec(&row.key) else {
+                continue;
+            };
+            let head = if row.installed {
+                format!(
+                    "{} · {} · {:.1} MB{}",
+                    row.label,
+                    row.version,
+                    row.bytes as f64 / 1_048_576.0,
+                    if row.legacy {
+                        format!(" · {}", t("旧平铺路径"))
+                    } else {
+                        String::new()
+                    }
+                )
+            } else {
+                format!("{} · {}", row.label, t("未安装"))
+            };
+            egui::CollapsingHeader::new(head)
+                .id_salt(format!("ai_slot_{}", row.key))
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.small(t_with("许可:{p1}", &[("p1", (row.license).to_string())]));
+                    let links = crate::ai_models::official_weight_links(&row.key);
+                    if !links.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.small(t("官方权重(仅 .pt):"));
+                            for (name, url) in links {
+                                ui.hyperlink_to(*name, *url);
+                            }
+                        });
+                        ui.small(t("官方未发布 ONNX;这里的 ONNX 由本项目转换后经镜像分发。"));
+                    }
+                    if row.manual {
+                        ui.weak(t("需自行获取"));
+                    }
+                    // 自定义主文件直链;留空则按上面的全局下载源自动选择。
+                    let url_key = format!("ai_url:{}", row.key);
+                    let mut url = self.store.get_setting(&url_key).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.label(t("自定义直链"));
+                        if ui
+                            .add(
+                                egui::TextEdit::singleline(&mut url)
+                                    .desired_width(220.0)
+                                    .hint_text(t("留空按下载源自动选择")),
+                            )
+                            .changed()
+                        {
+                            let _ = self.store.set_setting(&url_key, &url);
+                        }
+                        if ui
+                            .add_enabled(!phase.working(), egui::Button::new(t("下载")))
+                            .clicked()
+                        {
+                            self.start_ai_slot_download(&row.key, &row.label, &url, pref);
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let ver = format!("import-{now}");
+                        if ui.button(t("导入文件")).clicked() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("ONNX", &["onnx"])
+                                .pick_file()
+                            {
+                                let out = crate::ai_models::import_file(
+                                    &self.store,
+                                    &row.key,
+                                    &p,
+                                    &ver,
+                                    None,
+                                    None,
+                                );
+                                match out {
+                                    Ok(_) => self.ai_activate_slot(&row.key, &ver),
+                                    Err(e) => {
+                                        self.ai_models_msg =
+                                            t_with("导入失败:{e}", &[("e", e.to_string())])
+                                    }
+                                }
+                            }
+                        }
+                        if spec.files.len() > 1 && ui.button(t("导入目录")).clicked() {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                                let out =
+                                    crate::ai_models::import_dir(&self.store, &row.key, &p, &ver);
+                                match out {
+                                    Ok(_) => self.ai_activate_slot(&row.key, &ver),
+                                    Err(e) => {
+                                        self.ai_models_msg =
+                                            t_with("导入失败:{e}", &[("e", e.to_string())])
+                                    }
+                                }
+                            }
+                        }
+                        if !row.versions.is_empty() {
+                            let mut pick = row.active.clone();
+                            egui::ComboBox::from_id_salt(format!("ai_ver_{}", row.key))
+                                .selected_text(if pick.is_empty() {
+                                    t("选择版本").to_string()
+                                } else {
+                                    pick.clone()
+                                })
+                                .show_ui(ui, |ui| {
+                                    for v in &row.versions {
+                                        ui.selectable_value(&mut pick, v.clone(), v);
+                                    }
+                                });
+                            if ui.button(t("启用")).clicked() && !pick.is_empty() {
+                                self.ai_activate_slot(&row.key, &pick);
+                            }
+                        }
+                    });
+                });
+        }
+        ui.separator();
+        ui.small(t("更换模型严格按 暂停 → 等当前批结束 → 释放会话 → 切版本 → 重建 → 继续 的顺序执行;旧版本目录保留可滚回。"));
+    }
+
+    /// 按全局下载源偏好启动某个槽位的下载(多文件自动串行,断点续传由下载器负责)。
+    #[cfg(feature = "ai")]
+    fn start_ai_slot_download(
+        &mut self,
+        key: &str,
+        label: &str,
+        custom_url: &str,
+        pref: crate::models::SourcePref,
+    ) {
+        let now = crate::ai_queue::now_ms();
+        let mut plans =
+            crate::ai_models::plans_for_pref(key, &format!("dl-{now}"), custom_url, pref);
+        if plans.is_empty() {
+            self.ai_models_msg =
+                t("该槽位在此下载源下没有可用地址,请换「自动」或「仅镜像」后再试").to_string();
+            return;
+        }
+        let count = plans.len();
+        let first = plans.remove(0);
+        self.ai_dl_queue = plans;
+        if let Some(d) = self.ai_dl.as_mut() {
+            if let Err(e) = d.start(first) {
+                self.ai_dl_queue.clear();
+                self.ai_models_msg = t_with("下载未能开始:{e}", &[("e", e.to_string())]);
+            } else if count > 1 {
+                self.ai_models_msg = t_with(
+                    "开始下载 {p1}(共 {p2} 个文件)",
+                    &[("p1", label.to_string()), ("p2", count.to_string())],
+                );
+            } else {
+                self.ai_models_msg = t_with("开始下载 {p1}", &[("p1", label.to_string())]);
+            }
+        }
+    }
+
+    /// 选项窗口(常规 / 全盘快查 / 电子邮件 / 幻灯片 / AI 行为 / AI 模型 六页签,
+    /// 人脸方案与各 AI 槽位的下载合并在「AI 模型」页)。
     fn options_ui(&mut self, ctx: &egui::Context) {
         let mut opts_open = self.show_options;
-        egui::Window::new("选项")
+        egui::Window::new(t("选项"))
             .open(&mut opts_open)
-            .default_width(520.0)
+            .default_width(640.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, name) in
-                        ["常规", "人脸识别", "全盘快查", "电子邮件", "幻灯片"].iter().enumerate()
+                    for (i, name) in [t("常规"), t("全盘快查"), t("电子邮件"), t("幻灯片"), t("AI 行为"), t("AI 模型")]
+                        .iter()
+                        .enumerate()
                     {
                         if ui.selectable_label(self.options_tab == i, *name).clicked() {
                             self.options_tab = i;
@@ -7287,17 +8265,17 @@ impl App {
                     0 => {
                         // 常规页(本地适用项)。
                         if ui
-                            .checkbox(&mut self.export_with_effects, "导出时套用已保存的效果")
+                            .checkbox(&mut self.export_with_effects, t("导出时套用已保存的效果"))
                             .changed()
                         {
                             self.fx_msg = if self.export_with_effects {
-                                "导出将带上已保存的效果".into()
+                                t("导出将带上已保存的效果").into()
                             } else {
-                                "导出 = 原图副本".into()
+                                t("导出 = 原图副本").into()
                             };
                         }
                         if ui
-                            .checkbox(&mut self.thumb_captions, "缩略图下方显示标题")
+                            .checkbox(&mut self.thumb_captions, t("缩略图下方显示标题"))
                             .changed()
                         {
                             let _ = self.store.set_setting(
@@ -7306,18 +8284,18 @@ impl App {
                             );
                         }
                         if ui
-                            .checkbox(&mut self.dup_near, "重复照片检测包含近似重复")
+                            .checkbox(&mut self.dup_near, t("重复照片检测包含近似重复"))
                             .changed()
                         {
                             self.rebuild();
                         }
                         ui.separator();
                         // 配色:默认灰色;暗色方案为浅蓝点缀。切换即存。
-                        ui.heading(egui::RichText::new("配色").size(14.0));
+                        ui.heading(egui::RichText::new(t("配色")).size(14.0));
                         ui.horizontal(|ui| {
                             for k in [crate::theme::Kind::Gray, crate::theme::Kind::Blue] {
                                 if ui
-                                    .selectable_label(crate::theme::kind() == k, k.label())
+                                    .selectable_label(crate::theme::kind() == k, t(k.label()))
                                     .clicked()
                                 {
                                     crate::theme::switch(ctx, k);
@@ -7326,71 +8304,82 @@ impl App {
                             }
                         });
                         ui.separator();
+                        // 界面语言:默认中文,可切英文。切换即存、立即生效。
+                        ui.heading(egui::RichText::new(t("界面语言")).size(14.0));
+                        ui.horizontal(|ui| {
+                            for l in crate::i18n::Lang::ALL {
+                                if ui
+                                    .selectable_label(crate::i18n::lang() == l, l.label())
+                                    .clicked()
+                                {
+                                    crate::i18n::set_lang(l);
+                                    let _ = self.store.set_setting("ui_lang", l.key());
+                                }
+                            }
+                        });
+                        ui.separator();
                         // 数据目录:防 C 盘写满 —— 库/索引/模型整体迁走。
-                        ui.heading(egui::RichText::new("数据目录").size(14.0));
+                        ui.heading(egui::RichText::new(t("数据目录")).size(14.0));
                         ui.small(crate::db::data_dir().to_string_lossy().to_string());
                         ui.horizontal(|ui| {
-                            if ui.button("更改数据目录…").clicked() {
+                            if ui.button(t("更改数据目录…")).clicked() {
                                 if let Some(d) = rfd::FileDialog::new().pick_folder() {
                                     if d != crate::db::data_dir() {
                                         match crate::db::set_data_dir(Some(&d)) {
                                             Ok(()) => {
-                                                self.status = format!(
-                                                    "数据目录已指向 {},下次启动时自动迁移文件",
-                                                    d.display()
-                                                );
+                                                self.status = t_with("数据目录已指向 {p1},下次启动时自动迁移文件", &[("p1", (d.display()).to_string())]);
                                             }
                                             Err(e) => {
                                                 self.status =
-                                                    format!("写入数据目录配置失败: {e}");
+                                                    t_with("写入数据目录配置失败: {e}", &[("e", e.to_string())]);
                                             }
                                         }
                                     }
                                 }
                             }
-                            if ui.button("恢复默认").clicked() {
+                            if ui.button(t("恢复默认")).clicked() {
                                 match crate::db::set_data_dir(None) {
                                     Ok(()) => {
                                         self.status =
-                                            "数据目录已恢复默认(旧目录文件保留,不自动删)"
+                                            t("数据目录已恢复默认(旧目录文件保留,不自动删)")
                                                 .into();
                                     }
                                     Err(e) => {
-                                        self.status = format!("清除数据目录配置失败: {e}");
+                                        self.status = t_with("清除数据目录配置失败: {e}", &[("e", e.to_string())]);
                                     }
                                 }
                             }
                         });
                         ui.small(
-                            "更改后,数据库/全盘索引/模型在下次启动时复制到新目录(原目录文件保留);本会话继续用原目录。",
+                            t("更改后,数据库/全盘索引/模型在下次启动时复制到新目录(原目录文件保留);本会话继续用原目录。"),
                         );
                         ui.small(
-                            "索引服务认的是安装时记下的数据目录;改过目录后要先「卸载索引服务…」再重新安装,它才会跟着搬。",
+                            t("索引服务认的是安装时记下的数据目录;改过目录后要先「卸载索引服务…」再重新安装,它才会跟着搬。"),
                         );
                         ui.separator();
                         // 缩略图缓存:库搬到大盘时缓存跟着走,不再默默写系统盘。
-                        ui.heading(egui::RichText::new("缩略图缓存").size(14.0));
+                        ui.heading(egui::RichText::new(t("缩略图缓存")).size(14.0));
                         let cdir = crate::db::cache_dir();
                         let sdir = crate::db::system_cache_dir();
                         ui.small(cdir.to_string_lossy().to_string());
                         ui.small(if cdir == sdir {
-                            "在系统缓存目录;把数据目录迁走后会跟随到新数据目录的 cache\\ 子目录(重启后生效)。"
+                            t("在系统缓存目录;把数据目录迁走后会跟随到新数据目录的 cache\\ 子目录(重启后生效)。")
                         } else {
-                            "跟随数据目录(可用 MALIANG_CACHE_DIR 单独指定);旧缓存会在启动后自动搬到此处。"
+                            t("跟随数据目录(可用 MALIANG_CACHE_DIR 单独指定);旧缓存会在启动后自动搬到此处。")
                         });
                         let (mig_state, mig_moved) = crate::db::cache_migration_status();
                         match mig_state {
                             1 => {
                                 ui.horizontal(|ui| {
                                     ui.spinner();
-                                    ui.small("正在把旧缓存搬到新目录…");
+                                    ui.small(t("正在把旧缓存搬到新目录…"));
                                 });
                             }
                             2 if mig_moved > 0 => {
-                                ui.small(format!("已从系统缓存目录搬来 {mig_moved} 个文件。"));
+                                ui.small(t_with("已从系统缓存目录搬来 {mig_moved} 个文件。", &[("mig_moved", mig_moved.to_string())]));
                             }
                             3 => {
-                                ui.small("上次自动搬运有文件被占用,旧位置留有残留,可用下方按钮重试。");
+                                ui.small(t("上次自动搬运有文件被占用,旧位置留有残留,可用下方按钮重试。"));
                             }
                             _ => {}
                         }
@@ -7405,7 +8394,7 @@ impl App {
                                 Some((files, bytes, std::time::Instant::now()));
                         }
                         if let Some((files, bytes, _)) = self.cache_usage {
-                            ui.small(format!("{files} 个文件 · {}", fmt_size(bytes)));
+                            ui.small(t_with("{files} 个文件 · {p1}", &[("files", files.to_string()), ("p1", (fmt_size(bytes)).to_string())]));
                         }
                         // 自动搬迁只处理四档缩略图;旧位置可能还剩历史备份
                         // (*.reset-*),留一个手动入口由用户决定是否一起搬。
@@ -7414,51 +8403,42 @@ impl App {
                             if ui
                                 .add_enabled(
                                     !busy,
-                                    egui::Button::new("把旧位置剩余内容搬过来"),
+                                    egui::Button::new(t("把旧位置剩余内容搬过来")),
                                 )
                                 .clicked()
                             {
                                 match crate::db::migrate_cache_from(&sdir) {
                                     Ok((0, _)) => {
                                         self.status =
-                                            "旧位置无新内容可搬(目标目录已是最新)".into();
+                                            t("旧位置无新内容可搬(目标目录已是最新)").into();
                                     }
                                     Ok((n, cleared)) => {
-                                        self.status = format!(
-                                            "已搬动 {n} 个缓存文件{}",
-                                            if cleared { "" } else { "(旧目录尚有占用中的文件)" }
-                                        );
+                                        self.status = t_with("已搬动 {n} 个缓存文件{p1}", &[("n", n.to_string()), ("p1", (if cleared { "" } else { t("(旧目录尚有占用中的文件)") }).to_string())]);
                                     }
                                     Err(e) => {
-                                        self.status = format!("缓存迁移失败: {e}");
+                                        self.status = t_with("缓存迁移失败: {e}", &[("e", e.to_string())]);
                                     }
                                 }
                                 // 搬完立刻重采,别让面板显示旧数字。
                                 self.cache_usage = None;
                             }
                             ui.small(
-                                "旧位置若有 *.reset-* 历史备份,后台不会自动搬;点此会整棵搬到新缓存目录并清掉来源。",
+                                t("旧位置若有 *.reset-* 历史备份,后台不会自动搬;点此会整棵搬到新缓存目录并清掉来源。"),
                             );
                         }
                         ui.separator();
-                        ui.small("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。");
-                        ui.small("索引备份 / 压缩在「工具 > 图库维护」里。");
+                        ui.small(t("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。"));
+                        ui.small(t("索引备份 / 压缩在「工具 > 图库维护」里。"));
                     }
-                    // 人脸识别(方案/下载/源测速)与全盘快查各自独立成页。
-                    #[cfg(feature = "ai")]
-                    1 => self.face_options_ui(ui),
-                    #[cfg(not(feature = "ai"))]
-                    1 => {
-                        ui.label("本版本未启用人脸识别(编译时未带 ai 特性)。");
-                    }
-                    2 => self.options_svc_ui(ui),
-                    3 => {
+                    // 全盘快查;人脸方案与 AI 模型已合并到「AI 模型」页。
+                    1 => self.options_svc_ui(ui),
+                    2 => {
                         // 电子邮件(8 档尺寸列表,默认 1024)。
-                        ui.label("邮件附件默认尺寸(发送窗口仍可临时改):");
+                        ui.label(t("邮件附件默认尺寸(发送窗口仍可临时改):"));
                         let cur_px = self.email_size.px();
                         for s in crate::share::ShareSize::ALL {
                             if ui
-                                .selectable_label(cur_px == s.px(), s.label())
+                                .selectable_label(cur_px == s.px(), t(s.label()))
                                 .clicked()
                             {
                                 self.email_size = s;
@@ -7468,15 +8448,14 @@ impl App {
                             }
                         }
                     }
-                    _ => {
-                        // 幻灯片放映:提供循环开关与间隔设置,默认 3 秒。
+                    3 => {
                         let mut itv = self
                             .store
                             .get_setting("slideshow_interval")
                             .and_then(|v| v.parse::<f32>().ok())
                             .unwrap_or(3.0);
                         if ui
-                            .add(egui::Slider::new(&mut itv, 1.0..=10.0).text("每张停留(秒)"))
+                            .add(egui::Slider::new(&mut itv, 1.0..=10.0).text(t("每张停留(秒)")))
                             .changed()
                         {
                             let _ = self.store.set_setting("slideshow_interval", &format!("{itv:.1}"));
@@ -7486,11 +8465,20 @@ impl App {
                             .get_setting("slideshow_loop")
                             .map(|v| v != "0")
                             .unwrap_or(true);
-                        if ui.checkbox(&mut lp, "循环放映").changed() {
+                        if ui.checkbox(&mut lp, t("循环放映")).changed() {
                             let _ =
                                 self.store.set_setting("slideshow_loop", if lp { "1" } else { "0" });
                         }
                     }
+                    #[cfg(feature = "ai")]
+                    4 => self.ai_options_ui(ui),
+                    #[cfg(feature = "ai")]
+                    5 => self.ai_models_ui(ui),
+                    #[cfg(not(feature = "ai"))]
+                    4 | 5 => {
+                        ui.label(t("本版本未启用 AI 管线(编译时未带 ai 特性)。"));
+                    }
+                    _ => {}
                 }
             });
         self.show_options = opts_open && self.show_options;
@@ -7568,9 +8556,12 @@ impl App {
                     .and_then(|p| ids.iter().position(|&x| x == p))
                     .map(|i| i + 1)
                     .unwrap_or(0);
-                let mut line = format!("{} / {}    空格 暂停 · Esc 退出", pos, n);
+                let mut line = t_with(
+                    "{p1} / {p2}    空格 暂停 · Esc 退出",
+                    &[("p1", (pos).to_string()), ("p2", (n).to_string())],
+                );
                 if self.slide_pause {
-                    line = format!("[已暂停]  {line}");
+                    line = t_with("[已暂停]  {line}", &[("line", line.to_string())]);
                 }
                 let cap = self
                     .preview
@@ -7604,7 +8595,7 @@ impl App {
         let (y0, y1) = (ay.min(by), ay.max(by));
         let (w, h) = (x1 - x0, y1 - y0);
         if w < 0.02 || h < 0.02 {
-            self.fx_msg = "裁剪区域太小".into();
+            self.fx_msg = t("裁剪区域太小").into();
             return;
         }
         let mut params = std::collections::BTreeMap::new();
@@ -7616,7 +8607,7 @@ impl App {
         self.crop_drag = None;
         self.fx_commit_effect(
             id,
-            "裁剪",
+            t("裁剪"),
             crate::effects::Effect {
                 name: "crop".into(),
                 params,
@@ -7640,7 +8631,7 @@ impl App {
             _ => return,
         };
         self.gallery_scroll_target = Some(target);
-        self.status = format!("已派发 {event}");
+        self.status = t_with("已派发 {event}", &[("event", event.to_string())]);
     }
 
     /// 用位移阻尼曲线整形本帧滚动速度,
@@ -7687,7 +8678,7 @@ impl App {
             .iter()
             .any(|d| d.eq_ignore_ascii_case(name));
         if already || is_default {
-            self.status = format!("排除规则「{name}」已存在");
+            self.status = t_with("排除规则「{name}」已存在", &[("name", name.to_string())]);
             return;
         }
         if !cur.is_empty() && !cur.ends_with('\n') {
@@ -7695,8 +8686,10 @@ impl App {
         }
         cur.push_str(name);
         match self.store.set_setting("exclude_dirs", &cur) {
-            Ok(()) => self.status = format!("已添加排除目录「{name}」"),
-            Err(e) => self.status = format!("添加失败: {e}"),
+            Ok(()) => {
+                self.status = t_with("已添加排除目录「{name}」", &[("name", name.to_string())])
+            }
+            Err(e) => self.status = t_with("添加失败: {e}", &[("e", e.to_string())]),
         }
     }
 
@@ -7709,8 +8702,10 @@ impl App {
             .collect();
         let newv = kept.join("\n");
         match self.store.set_setting("exclude_dirs", &newv) {
-            Ok(()) => self.status = format!("已移除排除目录「{name}」"),
-            Err(e) => self.status = format!("移除失败: {e}"),
+            Ok(()) => {
+                self.status = t_with("已移除排除目录「{name}」", &[("name", name.to_string())])
+            }
+            Err(e) => self.status = t_with("移除失败: {e}", &[("e", e.to_string())]),
         }
     }
 
@@ -7719,14 +8714,17 @@ impl App {
         match timeline::remove_photos_under(&self.store, folder) {
             Ok(n) => {
                 let _ = self.store.remove_watched(Path::new(folder));
-                self.status = format!("已移除 {folder} 下 {n} 张索引(未删除磁盘文件)");
+                self.status = t_with(
+                    "已移除 {folder} 下 {n} 张索引(未删除磁盘文件)",
+                    &[("folder", folder.to_string()), ("n", n.to_string())],
+                );
                 self.sel.clear();
                 self.preview = None;
                 self.preview_tex = None;
                 self.rebuild();
                 self.watched = self.store.watched_stats();
             }
-            Err(e) => self.status = format!("移除失败: {e}"),
+            Err(e) => self.status = t_with("移除失败: {e}", &[("e", e.to_string())]),
         }
     }
 
@@ -7741,7 +8739,10 @@ impl App {
         let rows = self.store.refresh_pending_dirs().unwrap_or(0);
         let _ = self.store.set_setting("force_thumb_update", "0");
         self.rebuild();
-        self.status = format!("{dirs} 个目录 / {rows} 行已退回待派生,后台正在重出缩略图");
+        self.status = t_with(
+            "{dirs} 个目录 / {rows} 行已退回待派生,后台正在重出缩略图",
+            &[("dirs", dirs.to_string()), ("rows", rows.to_string())],
+        );
     }
 
     /// 启动时续做上次没跑完的强制刷新(偏好还挂着 = 上次中途退出)。
@@ -7753,19 +8754,22 @@ impl App {
         let rows = self.store.refresh_pending_dirs().unwrap_or(0);
         let _ = self.store.set_setting("force_thumb_update", "0");
         if rows > 0 {
-            self.status = format!("上次未完成的强制刷新已续做:{rows} 行退回待派生");
+            self.status = t_with(
+                "上次未完成的强制刷新已续做:{rows} 行退回待派生",
+                &[("rows", rows.to_string())],
+            );
         }
     }
 
     /// 工具 > 图库维护 > 备份索引到…(VACUUM INTO,后台线程)。
     fn start_backup(&mut self) {
         if self.maint_rx.is_some() {
-            self.status = "维护操作进行中…".into();
+            self.status = t("维护操作进行中…").into();
             return;
         }
         let Some(dest) = rfd::FileDialog::new()
-            .set_title("备份索引数据库")
-            .add_filter("SQLite 数据库", &["db"])
+            .set_title(t("备份索引数据库"))
+            .add_filter(t("SQLite 数据库"), &["db"])
             .set_file_name("maliang-index-backup.db")
             .save_file()
         else {
@@ -7774,11 +8778,11 @@ impl App {
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.maint_rx = Some(rx);
-        self.status = "正在备份索引…".into();
+        self.status = t("正在备份索引…").into();
         std::thread::spawn(move || {
             let r = store
                 .backup_to(&dest)
-                .map(|_| format!("索引已备份到 {}", dest.display()))
+                .map(|_| t_with("索引已备份到 {p1}", &[("p1", (dest.display()).to_string())]))
                 .map_err(|e| e.to_string());
             let _ = tx.send(r);
         });
@@ -7787,17 +8791,17 @@ impl App {
     /// 工具 > 图库维护 > 压缩索引(VACUUM,后台线程)。
     fn start_compact(&mut self) {
         if self.maint_rx.is_some() {
-            self.status = "维护操作进行中…".into();
+            self.status = t("维护操作进行中…").into();
             return;
         }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.maint_rx = Some(rx);
-        self.status = "正在压缩索引…".into();
+        self.status = t("正在压缩索引…").into();
         std::thread::spawn(move || {
             let r = store
                 .compact()
-                .map(|_| "索引已压缩(VACUUM)".to_string())
+                .map(|_| t("索引已压缩(VACUUM)").to_string())
                 .map_err(|e| e.to_string());
             let _ = tx.send(r);
         });
@@ -7808,24 +8812,26 @@ impl App {
     /// 语义见 timeline::import_xmp_batch:一次性导入,DB 有值不复活。
     fn start_xmp_import(&mut self, reset: bool) {
         if self.maint_rx.is_some() {
-            self.status = "维护操作进行中…".into();
+            self.status = t("维护操作进行中…").into();
             return;
         }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.maint_rx = Some(rx);
-        self.status = "正在从 XMP 导入标签/星标…".into();
+        self.status = t("正在从 XMP 导入标签/星标…").into();
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<String> {
                 if reset {
-                    store
-                        .write(|conn| -> anyhow::Result<()> {
-                            conn.execute("UPDATE photos SET xmp_imported=0", [])?;
-                            Ok(())
-                        })?;
+                    store.write(|conn| -> anyhow::Result<()> {
+                        conn.execute("UPDATE photos SET xmp_imported=0", [])?;
+                        Ok(())
+                    })?;
                 }
                 let (stars, tagged) = timeline::import_xmp_batch(&store, 1_000_000)?;
-                Ok(format!("XMP 导入完成:{stars} 张星标,{tagged} 张标签"))
+                Ok(t_with(
+                    "XMP 导入完成:{stars} 张星标,{tagged} 张标签",
+                    &[("stars", stars.to_string()), ("tagged", tagged.to_string())],
+                ))
             })()
             .map_err(|e| e.to_string());
             let _ = tx.send(r);
@@ -7852,7 +8858,7 @@ impl App {
         let gone = match self.store.drop_missing_paths(&paths) {
             Ok(v) => v,
             Err(e) => {
-                self.status = format!("清理缺失文件失败: {e}");
+                self.status = t_with("清理缺失文件失败: {e}", &[("e", e.to_string())]);
                 return;
             }
         };
@@ -7883,23 +8889,31 @@ impl App {
                 }
             }
         }
-        self.status = format!("{} 张照片的原文件已不存在,已移出图库", gone.len());
+        self.status = t_with(
+            "{p1} 张照片的原文件已不存在,已移出图库",
+            &[("p1", (gone.len()).to_string())],
+        );
     }
 
     /// 工具 > 图库维护 > 清理已缺失文件的索引(后台线程)。
     fn clean_missing(&mut self) {
         if self.maint_rx.is_some() {
-            self.status = "维护操作进行中…".into();
+            self.status = t("维护操作进行中…").into();
             return;
         }
         let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.maint_rx = Some(rx);
-        self.status = "正在检查缺失文件…".into();
+        self.status = t("正在检查缺失文件…").into();
         std::thread::spawn(move || {
             let r = store
                 .mark_missing()
-                .map(|v| format!("已清理 {} 条缺失文件的索引", v.len()))
+                .map(|v| {
+                    t_with(
+                        "已清理 {p1} 条缺失文件的索引",
+                        &[("p1", (v.len()).to_string())],
+                    )
+                })
                 .map_err(|e| e.to_string());
             let _ = tx.send(r);
         });
@@ -7909,11 +8923,11 @@ impl App {
     fn export_kml(&mut self) {
         let pts = timeline::gps_points(&self.store).unwrap_or_default();
         if pts.is_empty() {
-            self.status = "没有带 GPS 坐标的照片(需原图 EXIF 含定位信息)".into();
+            self.status = t("没有带 GPS 坐标的照片(需原图 EXIF 含定位信息)").into();
             return;
         }
         let Some(dest) = rfd::FileDialog::new()
-            .set_title("导出地理标记 KML")
+            .set_title(t("导出地理标记 KML"))
             .add_filter("KML", &["kml"])
             .set_file_name("geotag.kml")
             .save_file()
@@ -7983,8 +8997,16 @@ impl App {
 ",
         );
         match std::fs::write(&dest, out.as_bytes()) {
-            Ok(()) => self.status = format!("已导出 {} 个地理标记到 {}", pts.len(), dest.display()),
-            Err(e) => self.status = format!("KML 导出失败: {e}"),
+            Ok(()) => {
+                self.status = t_with(
+                    "已导出 {p1} 个地理标记到 {p2}",
+                    &[
+                        ("p1", (pts.len()).to_string()),
+                        ("p2", (dest.display()).to_string()),
+                    ],
+                )
+            }
+            Err(e) => self.status = t_with("KML 导出失败: {e}", &[("e", e.to_string())]),
         }
     }
 
@@ -8002,7 +9024,7 @@ impl App {
         };
         match path {
             Some(p) => show_in_explorer(&p),
-            None => self.status = "没有可定位的照片(先预览或选中一张)".into(),
+            None => self.status = t("没有可定位的照片(先预览或选中一张)").into(),
         }
     }
 
@@ -8157,7 +9179,7 @@ impl App {
             if !kids.is_empty() {
                 if ui
                     .small_button(if open { "▾" } else { "▸" })
-                    .on_hover_text("展开 / 收起")
+                    .on_hover_text(t("展开 / 收起"))
                     .clicked()
                 {
                     if open {
@@ -8269,9 +9291,12 @@ impl App {
     fn recent_header(&mut self, ui: &mut egui::Ui) {
         let n = self.recent_idxs.len();
         let sub = if self.recent_date.is_empty() {
-            format!("{n} 张照片")
+            t_with("{n} 张照片", &[("n", n.to_string())])
         } else {
-            format!("{} · {n} 张照片", self.recent_date)
+            t_with(
+                "{p1} · {n} 张照片",
+                &[("p1", (self.recent_date).to_string()), ("n", n.to_string())],
+            )
         };
         let mut act_play = false;
         let mut act_mail = false;
@@ -8282,7 +9307,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 ui.add(
-                    egui::Label::new(egui::RichText::new("最近更新").size(17.0).strong())
+                    egui::Label::new(egui::RichText::new(t("最近更新")).size(17.0).strong())
                         .selectable(false),
                 );
                 ui.add(
@@ -8297,21 +9322,21 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("refresh", false))
-                    .on_hover_text("刷新最近更新")
+                    .on_hover_text(t("刷新最近更新"))
                     .clicked()
                 {
                     act_refresh = true;
                 }
                 if ui
                     .add(tool_button("mail", false))
-                    .on_hover_text("以邮件发送本相册照片")
+                    .on_hover_text(t("以邮件发送本相册照片"))
                     .clicked()
                 {
                     act_mail = true;
                 }
                 if ui
                     .add(tool_button("play", false))
-                    .on_hover_text("放映本相册幻灯片")
+                    .on_hover_text(t("放映本相册幻灯片"))
                     .clicked()
                 {
                     act_play = true;
@@ -8320,7 +9345,10 @@ impl App {
         });
         if act_refresh {
             self.rebuild();
-            self.status = format!("最近更新已刷新:{} 张", self.recent_idxs.len());
+            self.status = t_with(
+                "最近更新已刷新:{p1} 张",
+                &[("p1", (self.recent_idxs.len()).to_string())],
+            );
         }
         if act_play {
             let ids = self.view_ids();
@@ -8344,25 +9372,22 @@ impl App {
     /// 放映与邮件复用视图级入口:先把视图范围收窄到本组,再调现成的
     /// `start_slideshow` / 邮件窗口 —— 不必为幻灯片另开一条 id 队列。
     #[allow(clippy::too_many_arguments)]
-    fn album_label(
-        &mut self,
-        ui: &mut egui::Ui,
-        folder: &str,
-        date: &str,
-        count: usize,
-    ) {
+    fn album_label(&mut self, ui: &mut egui::Ui, folder: &str, date: &str, count: usize) {
         let mut name = Path::new(folder.trim_end_matches(['\\', '/']))
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| folder.to_string());
         if name.is_empty() {
-            name = "(未知位置)".into();
+            name = t("(未知位置)").into();
         }
         // 组内全无 EXIF 拍摄时间时 date 是空串:只报张数,不编日期。
         let sub = if date.is_empty() {
-            format!("{count} 张")
+            t_with("{count} 张", &[("count", count.to_string())])
         } else {
-            format!("{date} · {count} 张")
+            t_with(
+                "{date} · {count} 张",
+                &[("date", date.to_string()), ("count", count.to_string())],
+            )
         };
         let muted = crate::theme::p().muted;
         let mut act_play = false;
@@ -8387,21 +9412,21 @@ impl App {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add(tool_button("mail", false))
-                    .on_hover_text("以邮件发送本组照片")
+                    .on_hover_text(t("以邮件发送本组照片"))
                     .clicked()
                 {
                     act_mail = true;
                 }
                 if ui
                     .add(tool_button("folder-open", false))
-                    .on_hover_text("在资源管理器中打开该文件夹")
+                    .on_hover_text(t("在资源管理器中打开该文件夹"))
                     .clicked()
                 {
                     act_open = true;
                 }
                 if ui
                     .add(tool_button("play", false))
-                    .on_hover_text("放映本组幻灯片")
+                    .on_hover_text(t("放映本组幻灯片"))
                     .clicked()
                 {
                     act_play = true;
@@ -8409,7 +9434,10 @@ impl App {
             });
         });
         if act_open && !crate::win::shell_open(Path::new(folder)) {
-            self.status = format!("无法在资源管理器中打开:{folder}");
+            self.status = t_with(
+                "无法在资源管理器中打开:{folder}",
+                &[("folder", folder.to_string())],
+            );
         }
         if act_play || act_mail {
             // 只在点击时反查一次左栏槽位(逐帧扫 folders 列表没必要)。
@@ -8444,26 +9472,26 @@ impl App {
             let show_all = self.folder_show_all;
             if ui
                 .add_enabled(!show_all, tool_button("list", self.folder_details))
-                .on_hover_text("详细列表视图(点列头排序)")
+                .on_hover_text(t("详细列表视图(点列头排序)"))
                 .clicked()
             {
                 self.set_folder_details(true);
             }
             if ui
                 .add_enabled(!show_all, tool_button("layout-grid", !self.folder_details))
-                .on_hover_text("缩略图视图")
+                .on_hover_text(t("缩略图视图"))
                 .clicked()
             {
                 self.set_folder_details(false);
             }
             ui.separator();
             ui.add_enabled(!show_all, toolbar_icon("funnel"))
-                .on_hover_text("只显示文件名含关键词的照片(仅当前文件夹)");
+                .on_hover_text(t("只显示文件名含关键词的照片(仅当前文件夹)"));
             ui.add_enabled(
                 !show_all,
                 egui::TextEdit::singleline(&mut self.folder_filter)
                     .desired_width(240.0)
-                    .hint_text("在此文件夹内过滤文件名…"),
+                    .hint_text(t("在此文件夹内过滤文件名…")),
             );
             if !show_all
                 && !self.folder_filter.is_empty()
@@ -8473,7 +9501,7 @@ impl App {
             }
             if show_all {
                 ui.label(
-                    egui::RichText::new("铺开所有文件夹:选中左侧某个目录后可用过滤与明细视图。")
+                    egui::RichText::new(t("铺开所有文件夹:选中左侧某个目录后可用过滤与明细视图。"))
                         .size(11.0)
                         .color(crate::theme::p().muted),
                 );
@@ -8512,10 +9540,7 @@ impl App {
             }
             let pos = |x: i64| view.iter().position(|&p| p == x);
             let clicked = pos(id).unwrap_or(0);
-            let anchor = self
-                .sel_anchor
-                .and_then(pos)
-                .unwrap_or(clicked);
+            let anchor = self.sel_anchor.and_then(pos).unwrap_or(clicked);
             let (lo, hi) = if anchor <= clicked {
                 (anchor, clicked)
             } else {
@@ -8535,7 +9560,7 @@ impl App {
         if movie {
             if let Some(p) = self.photo_path(id) {
                 if !crate::win::shell_open(Path::new(&p)) {
-                    self.status = format!("无法打开视频(无关联播放器):{p}");
+                    self.status = t_with("无法打开视频(无关联播放器):{p}", &[("p", p.to_string())]);
                 }
             }
         } else {
@@ -8573,7 +9598,8 @@ impl App {
                     id: r.id,
                     star: r.star != 0,
                     movie: r.kind == crate::video::kind::MOVIE,
-                    name: r.path
+                    name: r
+                        .path
                         .rsplit(['\\', '/'])
                         .next()
                         .unwrap_or(&r.path)
@@ -8605,15 +9631,18 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let cols = [
-                    ("名称", name_w, timeline::SortBy::Name, false),
-                    ("创建日期", date_w, timeline::SortBy::Recent, false),
-                    ("大小", size_w, timeline::SortBy::Size, true),
+                    (t("名称"), name_w, timeline::SortBy::Name, false),
+                    (t("创建日期"), date_w, timeline::SortBy::Recent, false),
+                    (t("大小"), size_w, timeline::SortBy::Size, true),
                 ];
                 for (col_label, w, col, right) in cols {
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(w, 20.0), egui::Sense::hover());
-                    let hit =
-                        ui.interact(rect, egui::Id::new(("col-head", col.key())), egui::Sense::click());
+                    let hit = ui.interact(
+                        rect,
+                        egui::Id::new(("col-head", col.key())),
+                        egui::Sense::click(),
+                    );
                     let active = self.sort_by == col;
                     let mut disp = col_label.to_string();
                     if active {
@@ -8654,7 +9683,10 @@ impl App {
                         }
                         self.apply_view_state();
                     }
-                    hit.on_hover_text(format!("按{col_label}排序(再点一次反向)"));
+                    hit.on_hover_text(t_with(
+                        "按{col_label}排序(再点一次反向)",
+                        &[("col_label", col_label.to_string())],
+                    ));
                 }
             });
             ui.separator();
@@ -8721,14 +9753,15 @@ impl App {
                     egui::Sense::hover(),
                 )
                 .on_hover_text(&it.dir);
-                let date_c = egui::pos2(
-                    rect.left() + 8.0 + name_w + 8.0,
-                    rect.center().y,
-                );
+                let date_c = egui::pos2(rect.left() + 8.0 + name_w + 8.0, rect.center().y);
                 ui.painter().text(
                     date_c,
                     egui::Align2::LEFT_CENTER,
-                    if it.created.is_empty() { "—" } else { &it.created },
+                    if it.created.is_empty() {
+                        "—"
+                    } else {
+                        &it.created
+                    },
                     egui::FontId::proportional(12.0),
                     if it.created.is_empty() { faint } else { muted },
                 );
@@ -8753,7 +9786,11 @@ impl App {
                     );
                 }
                 // —— 交互(与 photo_cell 同一套语义)——
-                let hit = ui.interact(rect, egui::Id::new(("detail-hit", it.id)), egui::Sense::click());
+                let hit = ui.interact(
+                    rect,
+                    egui::Id::new(("detail-hit", it.id)),
+                    egui::Sense::click(),
+                );
                 let mut star_clicked = false;
                 let mut preview_clicked = false;
                 let t = CtxPhoto {
@@ -8765,19 +9802,14 @@ impl App {
                     selected,
                 };
                 hit.context_menu(|ui| {
-                    self.photo_ctx_menu(
-                        ui,
-                        &t,
-                        &mut star_clicked,
-                        &mut preview_clicked,
-                    )
+                    self.photo_ctx_menu(ui, &t, &mut star_clicked, &mut preview_clicked)
                 });
                 if hit.clicked() {
                     // 单击只是选中,与网格一致;缺缓存的行由渲染帧按张排队,
                     // 不再因为派生状态去做「纳入目录」这一步。
                     // 点选语义与网格一致:单击只选、Ctrl 加减选、Shift 连选。
-                    let (ctrl, shift) = ui
-                        .input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
+                    let (ctrl, shift) =
+                        ui.input(|i| (i.modifiers.ctrl || i.modifiers.command, i.modifiers.shift));
                     self.select_by_click(it.id, ctrl, shift);
                 }
                 if hit.double_clicked() {
@@ -8904,7 +9936,11 @@ impl App {
         preview_clicked: &mut bool,
     ) {
         if ui
-            .button(if t.movie { "播放" } else { "预览" })
+            .button(if t.movie {
+                crate::i18n::t("播放")
+            } else {
+                crate::i18n::t("预览")
+            })
             .clicked()
         {
             *preview_clicked = true;
@@ -8914,14 +9950,20 @@ impl App {
         let batch = t.selected && self.sel.len() > 1;
         let label = if batch {
             if target == 1 {
-                format!("给选中的 {} 张加星标", self.sel.len())
+                t_with(
+                    "给选中的 {p1} 张加星标",
+                    &[("p1", (self.sel.len()).to_string())],
+                )
             } else {
-                format!("给选中的 {} 张取消星标", self.sel.len())
+                t_with(
+                    "给选中的 {p1} 张取消星标",
+                    &[("p1", (self.sel.len()).to_string())],
+                )
             }
         } else if target == 1 {
-            "加星标".to_string()
+            crate::i18n::t("加星标").to_string()
         } else {
-            "取消星标".to_string()
+            crate::i18n::t("取消星标").to_string()
         };
         if ui.button(label).clicked() {
             if batch {
@@ -8931,15 +9973,15 @@ impl App {
             }
             ui.close();
         }
-        if ui.button("在资源管理器中显示").clicked() {
+        if ui.button(crate::i18n::t("在资源管理器中显示")).clicked() {
             show_in_explorer(&t.path);
             ui.close();
         }
         // 加入相簿(相簿不移动文件;已加入的打勾,点击移除)。
-        ui.menu_button("加入相簿…", |ui| {
+        ui.menu_button(crate::i18n::t("加入相簿…"), |ui| {
             let albums = self.store.albums();
             if albums.is_empty() {
-                ui.label("(还没有相簿:视图 > 相簿 里新建)");
+                ui.label(crate::i18n::t("(还没有相簿:视图 > 相簿 里新建)"));
             }
             let member: Vec<i64> = self
                 .store
@@ -8950,17 +9992,17 @@ impl App {
             for (aid, name, _) in albums {
                 let in_album = member.contains(&aid);
                 let label = if in_album {
-                    format!("✓ 「{name}」(点击移出)")
+                    t_with("✓ 「{name}」(点击移出)", &[("name", name.to_string())])
                 } else {
                     format!("「{name}」")
                 };
                 if ui.button(label).clicked() {
                     if in_album {
                         let _ = self.store.album_remove_photo(aid, t.id);
-                        self.fx_msg = format!("已移出相簿「{name}」");
+                        self.fx_msg = t_with("已移出相簿「{name}」", &[("name", name.to_string())]);
                     } else {
                         let _ = self.store.album_add_photo(aid, t.id);
-                        self.fx_msg = format!("已加入相簿「{name}」");
+                        self.fx_msg = t_with("已加入相簿「{name}」", &[("name", name.to_string())]);
                     }
                     ui.close();
                 }
@@ -8968,7 +10010,7 @@ impl App {
         });
         if self.view == ViewKind::Albums {
             if let Some(a) = self.sel_album {
-                if ui.button("从相簿移除").clicked() {
+                if ui.button(crate::i18n::t("从相簿移除")).clicked() {
                     let _ = self.store.album_remove_photo(a, t.id);
                     ui.close();
                 }
@@ -8976,20 +10018,23 @@ impl App {
         }
         ui.separator();
         // 用编辑器打开。
-        if ui.button("用编辑器打开").clicked() {
+        if ui.button(crate::i18n::t("用编辑器打开")).clicked() {
             let p = PathBuf::from(&t.path);
             if !crate::win::shell_edit(&p) {
-                self.status = format!("无法打开(未关联编辑器):{}", p.display());
+                self.status = t_with(
+                    "无法打开(未关联编辑器):{p1}",
+                    &[("p1", (p.display()).to_string())],
+                );
             }
             ui.close();
         }
         // 设为桌面壁纸。
-        if ui.button("设为桌面壁纸").clicked() {
+        if ui.button(crate::i18n::t("设为桌面壁纸")).clicked() {
             self.set_wallpaper(&t.path);
             ui.close();
         }
         ui.separator();
-        if ui.button("从图库中移除…").clicked() {
+        if ui.button(crate::i18n::t("从图库中移除…")).clicked() {
             let id = t.id;
             self.sel.clear();
             self.sel.insert(id);
@@ -9003,16 +10048,25 @@ impl App {
         // 这里不给按钮 —— 给了也是点不开的死键。
         let parent = t.parent.clone();
         if !self.store.adoptable_dir(&parent, false) && self.store.adoptable_dir(&parent, true) {
-            if ui.button("纳入此目录(覆盖排除名单)").clicked() {
+            if ui
+                .button(crate::i18n::t("纳入此目录(覆盖排除名单)"))
+                .clicked()
+            {
                 let ok =
                     self.include_dir(&parent, crate::db::INTENT_IMPORTED, crate::db::SRC_IMPORT);
                 if ok {
                     self.publish_visible(&parent);
                 }
                 self.status = if ok {
-                    format!("已纳入 {parent}:该目录的照片正在生成缩略图")
+                    t_with(
+                        "已纳入 {parent}:该目录的照片正在生成缩略图",
+                        &[("parent", parent.to_string())],
+                    )
                 } else {
-                    format!("{parent} 仍不能纳入(硬排除名单)")
+                    t_with(
+                        "{parent} 仍不能纳入(硬排除名单)",
+                        &[("parent", parent.to_string())],
+                    )
                 };
                 ui.close();
             }
@@ -9021,22 +10075,31 @@ impl App {
         // Hide / Don't Hide):立过案的文件不再每轮重试,这里给两个方向的开关。
         let p = t.path.clone();
         if self.store.is_bad_media(&p) {
-            if ui.button("不隐藏此文件(重试缩略图)").clicked() {
+            if ui
+                .button(crate::i18n::t("不隐藏此文件(重试缩略图)"))
+                .clicked()
+            {
                 self.status = match self.store.unmark_bad_media(&p) {
-                    Ok(()) => format!("已销案,重新排队派生:{p}"),
-                    Err(e) => format!("销案失败: {e}"),
+                    Ok(()) => t_with("已销案,重新排队派生:{p}", &[("p", p.to_string())]),
+                    Err(e) => t_with("销案失败: {e}", &[("e", e.to_string())]),
                 };
                 ui.close();
             }
-        } else if ui.button("隐藏此文件(不再重试缩略图)").clicked() {
-            self.status = match self.store.mark_bad_media(&p, "用户手动隐藏") {
-                Ok(()) => format!("已隐藏,不再重试:{p}"),
-                Err(e) => format!("隐藏失败: {e}"),
+        } else if ui
+            .button(crate::i18n::t("隐藏此文件(不再重试缩略图)"))
+            .clicked()
+        {
+            self.status = match self
+                .store
+                .mark_bad_media(&p, crate::i18n::t("用户手动隐藏"))
+            {
+                Ok(()) => t_with("已隐藏,不再重试:{p}", &[("p", p.to_string())]),
+                Err(e) => t_with("隐藏失败: {e}", &[("e", e.to_string())]),
             };
             ui.close();
         }
         // 属性(置于末项;未开预览时属性窗取选中项)。
-        if ui.button("属性…").clicked() {
+        if ui.button(crate::i18n::t("属性…")).clicked() {
             let id = t.id;
             self.sel.clear();
             self.sel.insert(id);
@@ -9125,8 +10188,7 @@ impl App {
         };
         ui.painter()
             .rect_filled(rect, crate::theme::CARD_RADIUS, card_fill);
-        let img_rect =
-            egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(w, h));
+        let img_rect = egui::Rect::from_min_size(rect.min + egui::vec2(pad, pad), egui::vec2(w, h));
         // 保留照片本身的宽高比:等比缩进到格子里,不居中裁切。
         // 缺档时 fit_rect 就是整格,占位块仍铺满格子。
         let fit_rect = match &tex {
@@ -9159,9 +10221,9 @@ impl App {
             // 占位只有两种:真的读不出来,以及还在准备。派生进度是内部实现,
             // 不印在格子上给用户看。
             let ph = if rich == crate::db::RICH_BAD {
-                "读取失败"
+                t("读取失败")
             } else {
-                "载入中…"
+                t("载入中…")
             };
             ui.painter().text(
                 img_rect.center(),
@@ -9185,10 +10247,7 @@ impl App {
         let hit = ui.interact(rect, egui::Id::new(("thumb-hit", id)), egui::Sense::click());
         // 坏文件格给诊断与销案出口;其余占位只是「还在准备」,不必解释内部状态。
         let hit = if bad {
-            hit.on_hover_text(
-                "这张照片读取失败(文件损坏或无权限),已记入坏文件台账并隔离,不再重试。\
-                 在「工具 → 图库维护 → 坏文件台账…」里可以看明细或整批销案。",
-            )
+            hit.on_hover_text(t("这张照片读取失败(文件损坏或无权限),已记入坏文件台账并隔离,不再重试。在「工具 → 图库维护 → 坏文件台账…」里可以看明细或整批销案。"))
         } else {
             hit
         };
@@ -9271,13 +10330,13 @@ impl App {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)?;
         match ext.as_str() {
-            "gif" => Some("GIF 只读速看:逐帧播放,不保存、不旋转、不编辑原文件"),
-            "webp" if self.readonly_media(id) => {
-                Some("动图 WebP 只读速看:逐帧播放,不保存、不旋转、不编辑原文件")
-            }
-            "psd" | "psb" => Some(
+            "gif" => Some(t("GIF 只读速看:逐帧播放,不保存、不旋转、不编辑原文件")),
+            "webp" if self.readonly_media(id) => Some(t(
+                "动图 WebP 只读速看:逐帧播放,不保存、不旋转、不编辑原文件",
+            )),
+            "psd" | "psb" => Some(t(
                 "PSD/PSB 只读速看:显示合并合成图,可能与图层结果不同;不保存、不旋转、不编辑",
-            ),
+            )),
             _ => None,
         }
     }
@@ -9390,16 +10449,29 @@ impl App {
         if st.id != id {
             return None;
         }
-        Some(format!(
-            "动图 {}/{} 帧 · {}",
-            st.frame.min(st.clip.len() - 1) + 1,
-            st.clip.len(),
-            if st.playing { "播放中" } else { "已暂停" }
+        Some(t_with(
+            "动图 {p1}/{p2} 帧 · {p3}",
+            &[
+                ("p1", (st.frame.min(st.clip.len() - 1) + 1).to_string()),
+                ("p2", (st.clip.len()).to_string()),
+                (
+                    "p3",
+                    (if st.playing {
+                        t("播放中")
+                    } else {
+                        t("已暂停")
+                    })
+                    .to_string(),
+                ),
+            ],
         ))
     }
 
     pub(super) fn anim_playing(&self, id: i64) -> bool {
-        self.anim.as_ref().map(|a| a.id == id && a.playing).unwrap_or(false)
+        self.anim
+            .as_ref()
+            .map(|a| a.id == id && a.playing)
+            .unwrap_or(false)
     }
 
     /// 预览大图纹理(最长边 ≤ 1024;首次打开同步加载一次,按 EXIF 方向摆正)。
@@ -9543,7 +10615,7 @@ impl App {
                 if self.show_face_boxes {
                     for f in crate::faces::faces_for_photo(&self.store, id) {
                         let (r, _, _) = orient_rect(f.x1, f.y1, f.x2, f.y2, w, h, orient);
-                        out.push((r, "人脸".to_string()));
+                        out.push((r, t("人脸").to_string()));
                     }
                 }
                 if self.show_ocr_boxes && self.ocr_photo == Some(id) {
@@ -9834,34 +10906,58 @@ impl eframe::App for App {
             self.slideshow_ui(ctx);
             return;
         }
+        // 打开预览即把这张提到 AI 队列最前(每张只做一次)。
+        #[cfg(feature = "ai")]
+        if let Some(id) = self.preview {
+            if self.ai_preview_for != Some(id) {
+                self.ai_preview_for = Some(id);
+                if self.ai_enabled {
+                    crate::ai_queue::enqueue_current(&self.store, id);
+                }
+            }
+        }
         // 轮询扫描结果
         if let Some(rx) = &self.scan_rx {
             if let Ok(r) = rx.try_recv() {
                 self.scan_rx = None;
                 self.scan_ctrl = None;
+                #[cfg(feature = "ai")]
+                let ai_enqueue =
+                    r.err.is_none() && !r.cancelled && r.indexed > 0 && self.ai_enabled;
                 self.status = match r.err {
-                    Some(e) => format!("{}{}失败: {e}", self.scan_verb, r.scope),
-                    None if r.cancelled => format!(
-                        "{}{}已取消:已索引 {} 张(已处理 {} 个文件)",
-                        self.scan_verb, r.scope, r.indexed, r.scanned
+                    Some(e) => t_with(
+                        "{p1}{p2}失败: {e}",
+                        &[
+                            ("p1", (self.scan_verb).to_string()),
+                            ("p2", (r.scope).to_string()),
+                            ("e", e.to_string()),
+                        ],
+                    ),
+                    None if r.cancelled => t_with(
+                        "{p1}{p2}已取消:已索引 {p3} 张(已处理 {p4} 个文件)",
+                        &[
+                            ("p1", (self.scan_verb).to_string()),
+                            ("p2", (r.scope).to_string()),
+                            ("p3", (r.indexed).to_string()),
+                            ("p4", (r.scanned).to_string()),
+                        ],
                     ),
                     None => {
-                        let mut msg = format!(
-                            "{}{}完成:发现 {} 个文件,索引 {} 张(未变跳过 {} 张,排除目录 {} 个)",
-                            self.scan_verb,
-                            r.scope,
-                            r.scanned,
-                            r.indexed,
-                            r.unchanged,
-                            r.excluded_dirs
-                        );
+                        let mut msg = t_with("{p1}{p2}完成:发现 {p3} 个文件,索引 {p4} 张(未变跳过 {p5} 张,排除目录 {p6} 个)", &[("p1", (self.scan_verb).to_string()), ("p2", (r.scope).to_string()), ("p3", (r.scanned).to_string()), ("p4", (r.indexed).to_string()), ("p5", (r.unchanged).to_string()), ("p6", (r.excluded_dirs).to_string())]);
                         if r.removed > 0 {
-                            msg.push_str(&format!(";{} 个已消失文件移出图库", r.removed));
+                            msg.push_str(&t_with(
+                                ";{p1} 个已消失文件移出图库",
+                                &[("p1", (r.removed).to_string())],
+                            ));
                         }
                         msg
                     }
                 };
                 self.rebuild();
+                #[cfg(feature = "ai")]
+                if ai_enqueue {
+                    self.enqueue_all_ai();
+                }
             }
         }
         // 设备热插拔事件("置刷新标志 + 触发刷新")。
@@ -9879,21 +10975,28 @@ impl eframe::App for App {
                 if !added.is_empty() {
                     // 新设备接入 → 扫描新卷(设备到达 → 分派 → 重建列表 → 导入)。
                     let roots = added.clone();
-                    self.status = format!(
-                        "检测到新设备({}),正在扫描 {}",
-                        ev.label(),
-                        added
-                            .iter()
-                            .map(|p| p.to_string_lossy().to_string())
-                            .collect::<Vec<_>>()
-                            .join("、")
+                    self.status = t_with(
+                        "检测到新设备({p1}),正在扫描 {p2}",
+                        &[
+                            ("p1", (ev.label()).to_string()),
+                            (
+                                "p2",
+                                (added
+                                    .iter()
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("、"))
+                                .to_string(),
+                            ),
+                        ],
                     );
                     // 设备列表缓存失效(WM_DEVICECHANGE 链路会重建设备列表);
                     // 若导入窗口开着,下次重绘即看到新设备。
                     self.refresh_import_devices();
-                    self.start_scan_roots(roots, "新接入的设备");
+                    self.start_scan_roots(roots, t("新接入的设备"));
                 } else {
-                    self.status = format!("检测到设备变化({})", ev.label());
+                    self.status =
+                        t_with("检测到设备变化({p1})", &[("p1", (ev.label()).to_string())]);
                     self.refresh_import_devices();
                 }
             }
@@ -9914,6 +11017,11 @@ impl eframe::App for App {
                 // 库里刚多了一批已生成记录,顺手刷新;不写 status ——
                 // 逐批覆盖会让状态栏文字一直跳,进度看「N缓存 x/y」就够了。
                 self.refresh_tier_count();
+                // 缩略图就位且索引已启用才排入语义向量阶段。
+                #[cfg(feature = "ai")]
+                if self.ai_enabled {
+                    crate::ai_queue::enqueue_for_ids(&self.store, crate::ai_queue::Stage::Clip, &got);
+                }
                 ctx.request_repaint();
             }
         }
@@ -9953,7 +11061,10 @@ impl eframe::App for App {
                 ctx.request_repaint();
             }
             if failed > 0 {
-                self.status = format!("{failed} 张预览生成失败(格式不支持或文件已移动)");
+                self.status = t_with(
+                    "{failed} 张预览生成失败(格式不支持或文件已移动)",
+                    &[("failed", failed.to_string())],
+                );
             }
             if !missing.is_empty() {
                 for (id, p) in missing {
@@ -9966,8 +11077,8 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.bake_rx = None;
                 self.status = match res {
-                    Ok(()) => "保存完成:已备份原稿并重写原图".into(),
-                    Err(e) => format!("保存失败: {e}"),
+                    Ok(()) => t("保存完成:已备份原稿并重写原图").into(),
+                    Err(e) => t_with("保存失败: {e}", &[("e", e.to_string())]),
                 };
                 self.rebuild();
             }
@@ -9980,13 +11091,16 @@ impl eframe::App for App {
             if let Ok((ok, errs)) = rx.try_recv() {
                 self.export_rx = None;
                 self.status = if errs.is_empty() {
-                    format!("导出完成 {ok} 张")
+                    t_with("导出完成 {ok} 张", &[("ok", ok.to_string())])
                 } else {
                     let first: Vec<String> = errs.iter().take(2).cloned().collect();
-                    format!(
-                        "导出完成 {ok} 张,失败 {} 个: {}",
-                        errs.len(),
-                        first.join("; ")
+                    t_with(
+                        "导出完成 {ok} 张,失败 {p1} 个: {p2}",
+                        &[
+                            ("ok", ok.to_string()),
+                            ("p1", (errs.len()).to_string()),
+                            ("p2", (first.join("; ")).to_string()),
+                        ],
                     )
                 };
                 self.status = self.status.replace('\n', " ");
@@ -10001,7 +11115,7 @@ impl eframe::App for App {
                 self.share_rx = None;
                 self.status = match res {
                     Ok(msg) => msg,
-                    Err(e) => format!("分享失败: {e}"),
+                    Err(e) => t_with("分享失败: {e}", &[("e", e.to_string())]),
                 };
                 self.status = self.status.replace('\n', " ");
             }
@@ -10015,7 +11129,7 @@ impl eframe::App for App {
                 self.wallpaper_rx = None;
                 self.status = match res {
                     Ok(msg) => msg,
-                    Err(e) => format!("设为壁纸失败: {e}"),
+                    Err(e) => t_with("设为壁纸失败: {e}", &[("e", e.to_string())]),
                 };
             }
         }
@@ -10025,7 +11139,7 @@ impl eframe::App for App {
                 self.maint_rx = None;
                 self.status = match res {
                     Ok(msg) => msg,
-                    Err(e) => format!("维护失败: {e}"),
+                    Err(e) => t_with("维护失败: {e}", &[("e", e.to_string())]),
                 };
                 self.rebuild();
             }
@@ -10054,12 +11168,15 @@ impl eframe::App for App {
                         self.ocr_results = rows;
                         self.ocr_panel = true;
                         self.status = if self.ocr_results.is_empty() {
-                            "OCR 完成:未识别到文本".into()
+                            t("OCR 完成:未识别到文本").into()
                         } else {
-                            format!("OCR 完成:识别到 {} 处文本", self.ocr_results.len())
+                            t_with(
+                                "OCR 完成:识别到 {p1} 处文本",
+                                &[("p1", (self.ocr_results.len()).to_string())],
+                            )
                         };
                     }
-                    Err(e) => self.status = format!("OCR 失败: {e}"),
+                    Err(e) => self.status = t_with("OCR 失败: {e}", &[("e", e.to_string())]),
                 }
             }
         }
@@ -10084,9 +11201,12 @@ impl eframe::App for App {
                 self.face_prog = (0, 0);
                 match res {
                     Ok((np, nf)) => {
-                        self.status = format!("人脸扫描完成:{np} 张照片,检出 {nf} 张人脸")
+                        self.status = t_with(
+                            "人脸扫描完成:{np} 张照片,检出 {nf} 张人脸",
+                            &[("np", np.to_string()), ("nf", nf.to_string())],
+                        )
                     }
-                    Err(e) => self.status = format!("人脸扫描失败: {e}"),
+                    Err(e) => self.status = t_with("人脸扫描失败: {e}", &[("e", e.to_string())]),
                 }
                 self.refresh_people_and_suggestions();
                 if let Some(c) = self.sel_cluster {
@@ -10109,8 +11229,13 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.clip_index_rx = None;
                 match res {
-                    Ok((n, ok)) => self.status = format!("语义索引完成:{n} 张照片,嵌入 {ok} 张"),
-                    Err(e) => self.status = format!("语义索引失败: {e}"),
+                    Ok((n, ok)) => {
+                        self.status = t_with(
+                            "语义索引完成:{n} 张照片,嵌入 {ok} 张",
+                            &[("n", n.to_string()), ("ok", ok.to_string())],
+                        )
+                    }
+                    Err(e) => self.status = t_with("语义索引失败: {e}", &[("e", e.to_string())]),
                 }
             }
         }
@@ -10127,9 +11252,9 @@ impl eframe::App for App {
                     Ok(hits) => {
                         let n = hits.len();
                         self.clip_results = hits;
-                        self.status = format!("语义搜索完成:{n} 个结果");
+                        self.status = t_with("语义搜索完成:{n} 个结果", &[("n", n.to_string())]);
                     }
-                    Err(e) => self.status = format!("语义搜索失败: {e}"),
+                    Err(e) => self.status = t_with("语义搜索失败: {e}", &[("e", e.to_string())]),
                 }
             }
         }
@@ -10206,7 +11331,7 @@ impl eframe::App for App {
                 // 没有扫描时才关闭预览窗(同时丢弃编辑视图里未提交的工具草稿)。
                 if let Some(ctrl) = &self.scan_ctrl {
                     ctrl.cancel();
-                    self.status = format!("正在取消{}…", self.scan_verb);
+                    self.status = t_with("正在取消{p1}…", &[("p1", (self.scan_verb).to_string())]);
                 } else {
                     // 与左栏「返回到图片库」走同一套清理,避免两处状态不一致。
                     self.editor_back_to_library();
@@ -10274,7 +11399,7 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("马良")
+                        egui::RichText::new(t("马良"))
                             .size(15.0)
                             .strong()
                             .color(crate::theme::p().accent),
@@ -10287,12 +11412,12 @@ impl eframe::App for App {
                     ui.add_space(2.0);
                     ui.separator();
                     // —— 文件 ——
-                    ui.menu_button("文件(F)", |ui| {
+                    ui.menu_button(t("文件(F)"), |ui| {
                         // 属性窗口。
                         if ui
                             .add_enabled(
                                 self.preview.is_some() || !self.sel.is_empty(),
-                                egui::Button::new("属性…"),
+                                egui::Button::new(t("属性…")),
                             )
                             .clicked()
                         {
@@ -10300,13 +11425,13 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("添加文件夹到图库…").clicked() {
+                        if ui.button(t("添加文件夹到图库…")).clicked() {
                             self.add_folder_to_library();
                             ui.close();
                         }
                         let scanning = self.scan_busy.load(Ordering::Relaxed);
                         if ui
-                            .add_enabled(!scanning, egui::Button::new("重新扫描监听目录…"))
+                            .add_enabled(!scanning, egui::Button::new(t("重新扫描监听目录…")))
                             .clicked()
                         {
                             self.start_scan_full();
@@ -10317,42 +11442,42 @@ impl eframe::App for App {
                         }
                         // 范围只经文件夹管理器扩大,
                         // 这里只重扫已登记的监听目录,不新增范围。
-                        ui.small(format!(
-                            "监听 {} 个目录;扩大范围请用「添加文件夹到图库」",
-                            self.watched.len()
+                        ui.small(t_with(
+                            "监听 {p1} 个目录;扩大范围请用「添加文件夹到图库」",
+                            &[("p1", (self.watched.len()).to_string())],
                         ));
                         ui.separator();
-                        ui.menu_button("导入(I)", |ui| {
+                        ui.menu_button(t("导入(I)"), |ui| {
                             // 导入页:整页面板(选源 → 看清单 → 入库 → 返回)。
-                            if ui.button("导入页(选源入库)…").clicked() {
+                            if ui.button(t("导入页(选源入库)…")).clicked() {
                                 self.go_page(PageKind::Import);
                                 ui.close();
                             }
                             // 直接挑文件夹的一次性入口(不开页面)。
-                            if ui.button("添加文件夹到图库…").clicked() {
+                            if ui.button(t("添加文件夹到图库…")).clicked() {
                                 self.add_folder_to_library();
                                 ui.close();
                             }
                             // 从设备导入(设备选择窗口)。
-                            if ui.button("从设备(相机/手机)…").clicked() {
+                            if ui.button(t("从设备(相机/手机)…")).clicked() {
                                 self.open_import_devices();
                                 ui.close();
                             }
                             let label = if self.wifi.is_some() {
-                                "从手机(WiFi)导入…(运行中,点击停止)"
+                                t("从手机(WiFi)导入…(运行中,点击停止)")
                             } else {
-                                "从手机(WiFi)导入…"
+                                t("从手机(WiFi)导入…")
                             };
                             if ui.button(label).clicked() {
                                 self.toggle_wifi();
                                 ui.close();
                             }
                         });
-                        ui.menu_button("导出(E)", |ui| {
+                        ui.menu_button(t("导出(E)"), |ui| {
                             if ui
                                 .add_enabled(
                                     self.export_rx.is_none(),
-                                    egui::Button::new("导出到文件夹…"),
+                                    egui::Button::new(t("导出到文件夹…")),
                                 )
                                 .clicked()
                             {
@@ -10360,33 +11485,33 @@ impl eframe::App for App {
                                 ui.close();
                             }
                             // 导出时套用已保存的效果(不修改原图)。
-                            ui.checkbox(&mut self.export_with_effects, "套用已保存的效果");
+                            ui.checkbox(&mut self.export_with_effects, t("套用已保存的效果"));
                         });
                         // 分享(邮件 / 礼品光盘;上传目标服务已关停,不实现)。
-                        ui.menu_button("分享(S)", |ui| {
+                        ui.menu_button(t("分享(S)"), |ui| {
                             let busy = self.share_rx.is_some();
                             if ui
-                                .add_enabled(!busy, egui::Button::new("以邮件发送…"))
+                                .add_enabled(!busy, egui::Button::new(t("以邮件发送…")))
                                 .clicked()
                             {
                                 self.email_win = true;
                                 ui.close();
                             }
                             if ui
-                                .add_enabled(!busy, egui::Button::new("制作礼品光盘…"))
+                                .add_enabled(!busy, egui::Button::new(t("制作礼品光盘…")))
                                 .clicked()
                             {
                                 self.cd_win = true;
                                 ui.close();
                             }
                             ui.separator();
-                            ui.small("网络上传:目前无可用实现。");
+                            ui.small(t("网络上传:目前无可用实现。"));
                         });
                         ui.separator();
                         if ui
                             .add_enabled(
                                 self.preview.is_some() && self.bake_rx.is_none(),
-                                egui::Button::new("保存  F2"),
+                                egui::Button::new(t("保存  F2")),
                             )
                             .clicked()
                         {
@@ -10396,13 +11521,13 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("退出(X)").clicked() {
+                        if ui.button(t("退出(X)")).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                             ui.close();
                         }
                     });
                     // —— 编辑 ——
-                    ui.menu_button("编辑(E)", |ui| {
+                    ui.menu_button(t("编辑(E)"), |ui| {
                         let ids = self.view_ids();
                         let empty_view = ids.is_empty();
                         let starred: Vec<i64> = self
@@ -10412,14 +11537,14 @@ impl eframe::App for App {
                             .map(|r| r.id)
                             .collect();
                         if ui
-                            .add_enabled(!empty_view, egui::Button::new("全选  Ctrl+A"))
+                            .add_enabled(!empty_view, egui::Button::new(t("全选  Ctrl+A")))
                             .clicked()
                         {
                             self.sel = ids.iter().copied().collect();
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!empty_view, egui::Button::new("选择加星标的照片"))
+                            .add_enabled(!empty_view, egui::Button::new(t("选择加星标的照片")))
                             .clicked()
                         {
                             let view_set: BTreeSet<i64> = ids.iter().copied().collect();
@@ -10431,7 +11556,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!empty_view, egui::Button::new("反向选择"))
+                            .add_enabled(!empty_view, egui::Button::new(t("反向选择")))
                             .clicked()
                         {
                             let all: BTreeSet<i64> = ids.iter().copied().collect();
@@ -10439,7 +11564,7 @@ impl eframe::App for App {
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!self.sel.is_empty(), egui::Button::new("清除选择"))
+                            .add_enabled(!self.sel.is_empty(), egui::Button::new(t("清除选择")))
                             .clicked()
                         {
                             self.sel.clear();
@@ -10447,12 +11572,15 @@ impl eframe::App for App {
                         }
                         ui.separator();
                         // 效果面板。
-                        if ui.selectable_label(self.fx_panel, "效果面板").clicked() {
+                        if ui.selectable_label(self.fx_panel, t("效果面板")).clicked() {
                             self.fx_panel = !self.fx_panel;
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!self.sel.is_empty(), egui::Button::new("从图库中移除…"))
+                            .add_enabled(
+                                !self.sel.is_empty(),
+                                egui::Button::new(t("从图库中移除…")),
+                            )
                             .clicked()
                         {
                             self.confirm_remove = true;
@@ -10460,16 +11588,16 @@ impl eframe::App for App {
                         }
                     });
                     // —— 视图 ——
-                    ui.menu_button("视图(V)", |ui| {
+                    ui.menu_button(t("视图(V)"), |ui| {
                         if ui
-                            .selectable_label(self.view == ViewKind::Recent, "最近更新")
+                            .selectable_label(self.view == ViewKind::Recent, t("最近更新"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Recent);
                             ui.close();
                         }
                         if ui
-                            .selectable_label(self.view == ViewKind::Timeline, "时间线")
+                            .selectable_label(self.view == ViewKind::Timeline, t("时间线"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Timeline);
@@ -10477,7 +11605,7 @@ impl eframe::App for App {
                         }
                         // 相簿列表。
                         if ui
-                            .selectable_label(self.view == ViewKind::Albums, "相簿")
+                            .selectable_label(self.view == ViewKind::Albums, t("相簿"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Albums);
@@ -10485,7 +11613,7 @@ impl eframe::App for App {
                         }
                         #[cfg(feature = "ai")]
                         if ui
-                            .selectable_label(self.view == ViewKind::Faces, "人物")
+                            .selectable_label(self.view == ViewKind::Faces, t("人物"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Faces);
@@ -10493,14 +11621,14 @@ impl eframe::App for App {
                         }
                         #[cfg(feature = "ai")]
                         if ui
-                            .selectable_label(self.view == ViewKind::Semantic, "语义搜索")
+                            .selectable_label(self.view == ViewKind::Semantic, t("语义搜索"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Semantic);
                             ui.close();
                         }
                         if ui
-                            .selectable_label(self.view == ViewKind::Search, "快速查找")
+                            .selectable_label(self.view == ViewKind::Search, t("快速查找"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Search);
@@ -10509,14 +11637,14 @@ impl eframe::App for App {
                             ui.close();
                         }
                         if ui
-                            .selectable_label(self.view == ViewKind::Tags, "标签")
+                            .selectable_label(self.view == ViewKind::Tags, t("标签"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Tags);
                             ui.close();
                         }
                         if ui
-                            .selectable_label(self.view == ViewKind::Folder, "文件夹")
+                            .selectable_label(self.view == ViewKind::Folder, t("文件夹"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Folder);
@@ -10524,13 +11652,13 @@ impl eframe::App for App {
                         }
                         ui.separator();
                         // 幻灯片放映(当前视图逐张全屏)。
-                        if ui.button("幻灯片放映").clicked() {
+                        if ui.button(t("幻灯片放映")).clicked() {
                             self.start_slideshow();
                             ui.close();
                         }
                         // 缩略图说明。
                         if ui
-                            .checkbox(&mut self.thumb_captions, "缩略图说明")
+                            .checkbox(&mut self.thumb_captions, t("缩略图说明"))
                             .changed()
                         {
                             let _ = self.store.set_setting(
@@ -10539,15 +11667,18 @@ impl eframe::App for App {
                             );
                         }
                         // 文件夹视图形态(树形 / 平铺)。
-                        ui.menu_button("文件夹视图", |ui| {
+                        ui.menu_button(t("文件夹视图"), |ui| {
                             if ui
-                                .selectable_label(!self.folder_tree, "平铺文件夹视图")
+                                .selectable_label(!self.folder_tree, t("平铺文件夹视图"))
                                 .clicked()
                             {
                                 self.set_folder_tree(false);
                                 ui.close();
                             }
-                            if ui.selectable_label(self.folder_tree, "树形视图").clicked() {
+                            if ui
+                                .selectable_label(self.folder_tree, t("树形视图"))
+                                .clicked()
+                            {
                                 self.set_folder_tree(true);
                                 ui.close();
                             }
@@ -10555,18 +11686,21 @@ impl eframe::App for App {
                         ui.separator();
                         // 四种排序是同一层菜单项(不套子菜单),顺序沿用经典布局。
                         for s in timeline::SortBy::ALL {
-                            if ui.selectable_label(self.sort_by == s, s.label()).clicked() {
+                            if ui
+                                .selectable_label(self.sort_by == s, t(s.label()))
+                                .clicked()
+                            {
                                 self.sort_by = s;
                                 self.apply_view_state();
                                 ui.close();
                             }
                         }
-                        if ui.selectable_label(self.sort_rev, "反向排序").clicked() {
+                        if ui.selectable_label(self.sort_rev, t("反向排序")).clicked() {
                             self.sort_rev = !self.sort_rev;
                             self.apply_view_state();
                             ui.close();
                         }
-                        ui.menu_button("缩略图", |ui| {
+                        ui.menu_button(t("缩略图"), |ui| {
                             // 多档缩略图(四个视图尺寸菜单项)。
                             for tier in crate::thumbs::ALL_TIERS {
                                 if ui
@@ -10582,7 +11716,7 @@ impl eframe::App for App {
                         if ui
                             .add_enabled(
                                 self.preview.is_some() || !self.sel.is_empty(),
-                                egui::Button::new("在资源管理器中显示"),
+                                egui::Button::new(t("在资源管理器中显示")),
                             )
                             .clicked()
                         {
@@ -10591,19 +11725,55 @@ impl eframe::App for App {
                         }
                     });
                     // —— 工具 ——
-                    ui.menu_button("工具(T)", |ui| {
+                    ui.menu_button(t("工具(T)"), |ui| {
                         // 选项(分页设置窗)。
-                        if ui.button("选项…").clicked() {
+                        if ui.button(t("选项…")).clicked() {
                             self.show_options = true;
                             ui.close();
                         }
                         ui.separator();
                         #[cfg(feature = "ai")]
                         {
+                            let ai_paused = self
+                                .ai_sched
+                                .as_ref()
+                                .map(|s| s.is_paused())
+                                .unwrap_or(true);
+                            if ui
+                                .button(if ai_paused {
+                                    t("继续 AI 索引")
+                                } else {
+                                    t("暂停 AI 索引")
+                                })
+                                .clicked()
+                            {
+                                let _ = self
+                                    .store
+                                    .set_setting("ai_enabled", if ai_paused { "1" } else { "0" });
+                                if let Some(s) = &self.ai_sched {
+                                    if ai_paused {
+                                        s.resume();
+                                    } else {
+                                        s.pause();
+                                    }
+                                }
+                                self.ai_enabled = ai_paused;
+                                if ai_paused {
+                                    self.enqueue_all_ai();
+                                }
+                                self.status = if ai_paused {
+                                    t("AI 索引已继续")
+                                } else {
+                                    t("AI 索引已暂停")
+                                }
+                                .into();
+                                ui.close();
+                            }
+                            ui.separator();
                             if ui
                                 .add_enabled(
                                     self.face_rx.is_none(),
-                                    egui::Button::new("人脸识别扫描…"),
+                                    egui::Button::new(t("人脸识别扫描…")),
                                 )
                                 .clicked()
                             {
@@ -10617,7 +11787,7 @@ impl eframe::App for App {
                             if ui
                                 .add_enabled(
                                     self.preview.is_some() && self.ocr_rx.is_none(),
-                                    egui::Button::new("文字识别(OCR)…"),
+                                    egui::Button::new(t("文字识别(OCR)…")),
                                 )
                                 .clicked()
                             {
@@ -10632,7 +11802,7 @@ impl eframe::App for App {
                             if ui
                                 .add_enabled(
                                     self.clip_index_rx.is_none(),
-                                    egui::Button::new("语义索引…"),
+                                    egui::Button::new(t("语义索引…")),
                                 )
                                 .clicked()
                             {
@@ -10646,33 +11816,33 @@ impl eframe::App for App {
                             ui.separator();
                         }
                         ui.separator();
-                        if ui.button("文件夹管理器…").clicked() {
+                        if ui.button(t("文件夹管理器…")).clicked() {
                             self.open_folder_mgr();
                             ui.close();
                         }
                         let mut watching = self.watch_on.load(Ordering::SeqCst);
-                        if ui.checkbox(&mut watching, "监听文件夹变化").clicked() {
+                        if ui.checkbox(&mut watching, t("监听文件夹变化")).clicked() {
                             self.watch_on.store(watching, Ordering::SeqCst);
                             self.status = if watching {
-                                "已开启文件夹监听(事件驱动,不可用时自动降级轮询)".into()
+                                t("已开启文件夹监听(事件驱动,不可用时自动降级轮询)").into()
                             } else {
-                                "已暂停文件夹监听".into()
+                                t("已暂停文件夹监听").into()
                             };
                             ui.close();
                         }
                         if ui
-                            .selectable_label(self.view == ViewKind::Duplicates, "重复照片")
+                            .selectable_label(self.view == ViewKind::Duplicates, t("重复照片"))
                             .clicked()
                         {
                             self.set_view(ViewKind::Duplicates);
                             ui.close();
                         }
                         ui.separator();
-                        ui.menu_button("图库维护", |ui| {
+                        ui.menu_button(t("图库维护"), |ui| {
                             if ui
                                 .add_enabled(
                                     self.maint_rx.is_none(),
-                                    egui::Button::new("备份索引到…"),
+                                    egui::Button::new(t("备份索引到…")),
                                 )
                                 .clicked()
                             {
@@ -10680,7 +11850,10 @@ impl eframe::App for App {
                                 ui.close();
                             }
                             if ui
-                                .add_enabled(self.maint_rx.is_none(), egui::Button::new("压缩索引"))
+                                .add_enabled(
+                                    self.maint_rx.is_none(),
+                                    egui::Button::new(t("压缩索引")),
+                                )
                                 .clicked()
                             {
                                 self.start_compact();
@@ -10689,7 +11862,7 @@ impl eframe::App for App {
                             if ui
                                 .add_enabled(
                                     self.maint_rx.is_none(),
-                                    egui::Button::new("清理已缺失文件的索引"),
+                                    egui::Button::new(t("清理已缺失文件的索引")),
                                 )
                                 .clicked()
                             {
@@ -10697,12 +11870,12 @@ impl eframe::App for App {
                                 ui.close();
                             }
                             // 目录级失效的用户出口。
-                            if ui.button("重建全部缩略图").clicked() {
+                            if ui.button(t("重建全部缩略图")).clicked() {
                                 self.force_thumb_update();
                                 ui.close();
                             }
                             // 坏文件台账(整批销案在这里)。
-                            if ui.button("坏文件台账…").clicked() {
+                            if ui.button(t("坏文件台账…")).clicked() {
                                 self.bad_media_rows = self.store.bad_media();
                                 self.show_bad_media = true;
                                 ui.close();
@@ -10710,7 +11883,7 @@ impl eframe::App for App {
                             if ui
                                 .add_enabled(
                                     self.maint_rx.is_none(),
-                                    egui::Button::new("从 XMP 导入标签…"),
+                                    egui::Button::new(t("从 XMP 导入标签…")),
                                 )
                                 .clicked()
                             {
@@ -10718,22 +11891,28 @@ impl eframe::App for App {
                                 ui.close();
                             }
                             // 变更历史(可回溯的变更日志)。
-                            if ui.button("变更历史…").clicked() {
+                            if ui.button(t("变更历史…")).clicked() {
                                 self.show_changes = true;
                                 self.reload_changes();
                                 ui.close();
                             }
                             // 给还没有 uid64 的照片补一个持久唯一标识。
-                            if ui.button("分配唯一标识(uid64)…").clicked() {
+                            if ui.button(t("分配唯一标识(uid64)…")).clicked() {
                                 match self.store.backfill_uid64() {
                                     Ok(n) => {
-                                        self.status = format!("已为 {n} 张照片分配 uid64");
+                                        self.status = t_with(
+                                            "已为 {n} 张照片分配 uid64",
+                                            &[("n", n.to_string())],
+                                        );
                                     }
-                                    Err(e) => self.status = format!("分配 uid64 失败: {e}"),
+                                    Err(e) => {
+                                        self.status =
+                                            t_with("分配 uid64 失败: {e}", &[("e", e.to_string())])
+                                    }
                                 }
                                 ui.close();
                             }
-                            if ui.button("按唯一标识查找…").clicked() {
+                            if ui.button(t("按唯一标识查找…")).clicked() {
                                 self.show_uid_lookup = true;
                                 self.uid_lookup_result = None;
                                 ui.close();
@@ -10742,24 +11921,24 @@ impl eframe::App for App {
                                 ui.spinner();
                             }
                         });
-                        if ui.button("导出地理标记(KML)…").clicked() {
+                        if ui.button(t("导出地理标记(KML)…")).clicked() {
                             self.export_kml();
                             ui.close();
                         }
                     });
                     // —— 帮助 ——
-                    ui.menu_button("帮助(H)", |ui| {
-                        if ui.button("键盘快捷键…").clicked() {
+                    ui.menu_button(t("帮助(H)"), |ui| {
+                        if ui.button(t("键盘快捷键…")).clicked() {
                             self.show_shortcuts = true;
                             ui.close();
                         }
-                        if ui.button("检查更新…").clicked() {
+                        if ui.button(t("检查更新…")).clicked() {
                             // 手动入口:立刻联网,不等空闲窗口,也不看检查间隔。
                             self.updater.check_now();
                             self.updater.win_open = true;
                             ui.close();
                         }
-                        if ui.button("关于 Maliang…").clicked() {
+                        if ui.button(t("关于 Maliang…")).clicked() {
                             self.show_about = true;
                             ui.close();
                         }
@@ -10781,80 +11960,70 @@ impl eframe::App for App {
                 // 一行排完:输入框在左、类别档位在右,共用同一条水平基线。
                 // 输入框按「可用宽 - 档位宽 - 间距」定尺寸,不再用「剩余宽 - 6」
                 // 那种估算 —— 文本控件自带内边距,估算偏大就会把档位挤歪或换行。
-                ui.with_layout(
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        let combo_w = 84.0;
-                        let clear_w = 26.0;
-                        let gap = ui.spacing().item_spacing.x;
-                        let edit_w = (ui.available_width()
-                            - combo_w
-                            - clear_w
-                            - gap * 2.0)
-                            .max(80.0);
-                        let resp = ui.add_sized(
-                            egui::vec2(edit_w, 24.0),
-                            egui::TextEdit::singleline(&mut self.name_query)
-                                .hint_text("全盘快速查找:文件名 / 文件夹名片段,即输即搜…"),
-                        );
-                        // 档位框钉进与输入框同高的 24px 槽里再垂直居中:
-                        // ComboBox 自身高度跟字体/内边距走,直接放进居中布局
-                        // 会和 24 高的输入框差半截 —— 套同高槽位后两者共用
-                        // 一条水平基线。
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(combo_w, 24.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                egui::ComboBox::from_id_salt("top-name-class")
-                                    .width(combo_w)
-                                    .selected_text(self.name_class.label())
-                                    .show_ui(ui, |ui| {
-                                        for c in crate::nameidx::FileClass::all() {
-                                            if ui
-                                                .selectable_label(
-                                                    self.name_class == c,
-                                                    c.label(),
-                                                )
-                                                .clicked()
-                                            {
-                                                self.name_class = c;
-                                                // 换档即重查(缓存未命中时走后台线程)。
-                                                if !self.name_query.trim().is_empty() {
-                                                    self.dispatch_name_search();
-                                                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let combo_w = 84.0;
+                    let clear_w = 26.0;
+                    let gap = ui.spacing().item_spacing.x;
+                    let edit_w = (ui.available_width() - combo_w - clear_w - gap * 2.0).max(80.0);
+                    let resp = ui.add_sized(
+                        egui::vec2(edit_w, 24.0),
+                        egui::TextEdit::singleline(&mut self.name_query)
+                            .hint_text(t("全盘快速查找:文件名 / 文件夹名片段,即输即搜…")),
+                    );
+                    // 档位框钉进与输入框同高的 24px 槽里再垂直居中:
+                    // ComboBox 自身高度跟字体/内边距走,直接放进居中布局
+                    // 会和 24 高的输入框差半截 —— 套同高槽位后两者共用
+                    // 一条水平基线。
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(combo_w, 24.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            egui::ComboBox::from_id_salt("top-name-class")
+                                .width(combo_w)
+                                .selected_text(t(self.name_class.label()))
+                                .show_ui(ui, |ui| {
+                                    for c in crate::nameidx::FileClass::all() {
+                                        if ui
+                                            .selectable_label(self.name_class == c, c.label())
+                                            .clicked()
+                                        {
+                                            self.name_class = c;
+                                            // 换档即重查(缓存未命中时走后台线程)。
+                                            if !self.name_query.trim().is_empty() {
+                                                self.dispatch_name_search();
                                             }
                                         }
-                                    });
-                            },
-                        );
-                        // 清除按钮:一键清空搜索框并退出查找页(与手动删空
-                        // 输入框同一套状态复位)。没有内容时置灰。
-                        if ui
-                            .add_enabled(!self.name_query.is_empty(), tool_button("x", false))
-                            .on_hover_text("清除搜索内容")
-                            .clicked()
-                        {
-                            self.name_query.clear();
+                                    }
+                                });
+                        },
+                    );
+                    // 清除按钮:一键清空搜索框并退出查找页(与手动删空
+                    // 输入框同一套状态复位)。没有内容时置灰。
+                    if ui
+                        .add_enabled(!self.name_query.is_empty(), tool_button("x", false))
+                        .on_hover_text(t("清除搜索内容"))
+                        .clicked()
+                    {
+                        self.name_query.clear();
+                        self.dispatch_name_search();
+                        if self.view == ViewKind::Search {
+                            self.set_view(ViewKind::Timeline);
+                        }
+                    }
+                    if resp.changed() {
+                        if self.name_query.trim().is_empty() {
                             self.dispatch_name_search();
                             if self.view == ViewKind::Search {
                                 self.set_view(ViewKind::Timeline);
                             }
+                        } else {
+                            self.set_view(ViewKind::Search);
+                            self.dispatch_name_search();
+                            #[cfg(windows)]
+                            self.svc_nudge_on_search_entry();
                         }
-                        if resp.changed() {
-                            if self.name_query.trim().is_empty() {
-                                self.dispatch_name_search();
-                                if self.view == ViewKind::Search {
-                                    self.set_view(ViewKind::Timeline);
-                                }
-                            } else {
-                                self.set_view(ViewKind::Search);
-                                self.dispatch_name_search();
-                                #[cfg(windows)]
-                                self.svc_nudge_on_search_entry();
-                            }
-                        }
-                    },
-                );
+                    }
+                });
             });
 
         // ===== 底部状态栏:先于左右侧面板添加 → 拉通整个窗口宽度,
@@ -10863,32 +12032,28 @@ impl eframe::App for App {
             .frame(crate::theme::bar_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(format!("共 {} 张", self.rows.len()))
+                    ui.label(t_with("共 {p1} 张", &[("p1", (self.rows.len()).to_string())]))
                         // 图库视图是 L2(SQLite)的结果,与顶部整条快速查找(L1
                         // 内存文件名索引)不是同一条路 —— 标出来,免得两处张数对不上时
                         // 用户以为是丢图。
-                        .on_hover_text(
-                            "来源 L2:图库数据库(SQLite photos 表)。\
-                             星级、人物、视频、地理标记等条件过滤都在这一层查;\
-                             顶部的全盘快速查找走的是另一条路(L1 内存文件名索引)。",
-                        );
+                        .on_hover_text(t("来源 L2:图库数据库(SQLite photos 表)。星级、人物、视频、地理标记等条件过滤都在这一层查;顶部的全盘快速查找走的是另一条路(L1 内存文件名索引)。"));
                     // 过滤开着时必须说清"这是过滤后的张数",否则看起来像丢图。
                     if !self.filters.is_none() {
-                        ui.label("(视图过滤中)");
-                        if ui.small_button("清除过滤").clicked() {
+                        ui.label(t("(视图过滤中)"));
+                        if ui.small_button(t("清除过滤")).clicked() {
                             self.filters = Default::default();
                             self.apply_view_state();
                         }
                     }
                     if !self.sel.is_empty() {
-                        ui.label(format!("已选 {} 张", self.sel.len()));
+                        ui.label(t_with("已选 {p1} 张", &[("p1", (self.sel.len()).to_string())]));
                     }
                     ui.separator();
                     ui.label(&self.status);
                     // 自动更新只在状态栏留一句可点的提示,不常驻弹窗打扰看图。
                     if let Some(hint) = self.updater.phase.status_hint() {
                         ui.separator();
-                        if ui.link(format!("{hint} · 点此查看")).clicked() {
+                        if ui.link(t_with("{hint} · 点此查看", &[("hint", hint.to_string())])).clicked() {
                             self.updater.win_open = true;
                         }
                     }
@@ -10898,7 +12063,7 @@ impl eframe::App for App {
                     let total = self.rows.len();
                     if cached < total {
                         ui.separator();
-                        ui.label(format!("{}缓存 {cached}/{total}", self.thumb_tier.label()));
+                        ui.label(t_with("{p1}缓存 {cached}/{total}", &[("p1", (self.thumb_tier.label()).to_string()), ("cached", cached.to_string()), ("total", total.to_string())]));
                     }
                     // 进度条 + 取消按钮(百分比显示,明细挂悬停;
                     // 扫描与导入共用通道,动词跟着任务走)。
@@ -10908,12 +12073,12 @@ impl eframe::App for App {
                         let verb = self.scan_verb;
                         ui.separator();
                         let pct = (frac * 100.0).round() as i32;
-                        ui.label(format!("正在{verb}… {pct}%"))
-                            .on_hover_text(format!("{done}/{total} 张已完成"));
+                        ui.label(t_with("正在{verb}… {pct}%", &[("verb", verb.to_string()), ("pct", pct.to_string())]))
+                            .on_hover_text(t_with("{done}/{total} 张已完成", &[("done", done.to_string()), ("total", total.to_string())]));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
-                        if ui.button(format!("取消{verb}")).clicked() {
+                        if ui.button(t_with("取消{verb}", &[("verb", verb.to_string())])).clicked() {
                             ctrl.cancel();
-                            self.status = format!("正在取消{verb}{}…", self.scan_scope);
+                            self.status = t_with("正在取消{verb}{p1}…", &[("verb", verb.to_string()), ("p1", (self.scan_scope).to_string())]);
                         }
                     }
                     // 人脸扫描进度(分母 = 本批待分析张数;逐张回报,不会卡在 0%)。
@@ -10922,16 +12087,13 @@ impl eframe::App for App {
                         let (d, t) = self.face_prog;
                         let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
                         ui.separator();
-                        ui.label(format!("正在扫描人物… {}%", (frac * 100.0).round() as i32))
-                            .on_hover_text(format!(
-                                "本批 {d}/{t} 张 · 全库剩 {} 张",
-                                crate::faces::remaining_count(&self.store)
-                            ));
+                        ui.label(t_with("正在扫描人物… {p1}%", &[("p1", ((frac * 100.0).round() as i32).to_string())]))
+                            .on_hover_text(t_with("本批 {d}/{t} 张 · 全库剩 {p1} 张", &[("d", d.to_string()), ("t", t.to_string()), ("p1", (crate::faces::remaining_count(&self.store)).to_string())]));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                         if let Some(c) = &self.face_cancel {
-                            if ui.button("取消人物扫描").clicked() {
+                            if ui.button(crate::i18n::t("取消人物扫描")).clicked() {
                                 c.store(true, std::sync::atomic::Ordering::Relaxed);
-                                self.status = "正在取消人物扫描…".into();
+                                self.status = crate::i18n::t("正在取消人物扫描…").into();
                             }
                         }
                     }
@@ -10949,12 +12111,8 @@ impl eframe::App for App {
                         let mb = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
                         let frac = if *total > 0 { *pct as f32 / 100.0 } else { 0.0 };
                         ui.separator();
-                        ui.label(format!("正在下载人脸模型 {file}… {pct}%"))
-                            .on_hover_text(format!(
-                                "第 {idx}/{count} 个:{} / {}",
-                                mb(*done),
-                                mb(*total)
-                            ));
+                        ui.label(t_with("正在下载人脸模型 {file}… {pct}%", &[("file", file.to_string()), ("pct", pct.to_string())]))
+                            .on_hover_text(t_with("第 {idx}/{count} 个:{p1} / {p2}", &[("idx", idx.to_string()), ("count", count.to_string()), ("p1", (mb(*done)).to_string()), ("p2", (mb(*total)).to_string())]));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                     }
                 });
@@ -10977,8 +12135,8 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                        self.fx_panel_ui(ui);
-                    });
+                            self.fx_panel_ui(ui);
+                        });
                 });
         }
 
@@ -10999,7 +12157,7 @@ impl eframe::App for App {
                     self.import_sources_ui(ui);
                     return;
                 }
-                crate::theme::section_title(ui, "库");
+                crate::theme::section_title(ui, t("库"));
                 // 左栏是四个可折叠分组头(相册 / 人物 / 文件夹 / 其他素材),
                 // 每条带 (n) 计数;分组区限高,下面留给随视图切换的明细面板。
                 let recent_n = self.recent_idxs.len();
@@ -11015,21 +12173,21 @@ impl eframe::App for App {
                     .auto_shrink([false, true])
                     .max_height(260.0)
                     .show(ui, |ui| {
-                        egui::CollapsingHeader::new(egui::RichText::new("相册").strong())
+                        egui::CollapsingHeader::new(egui::RichText::new(t("相册")).strong())
                             .default_open(true)
                             .show(ui, |ui| {
-                                self.nav_item(ui, "最近更新", ViewKind::Recent, Some(recent_n));
-                                self.nav_item(ui, "相簿", ViewKind::Albums, None);
+                                self.nav_item(ui, t("最近更新"), ViewKind::Recent, Some(recent_n));
+                                self.nav_item(ui, t("相簿"), ViewKind::Albums, None);
                             });
-                        egui::CollapsingHeader::new(egui::RichText::new("人物").strong())
+                        egui::CollapsingHeader::new(egui::RichText::new(t("人物")).strong())
                             .default_open(true)
                             .show(ui, |ui| {
                                 #[cfg(feature = "ai")]
-                                self.nav_item(ui, "人物", ViewKind::Faces, Some(people_n));
+                                self.nav_item(ui, t("人物"), ViewKind::Faces, Some(people_n));
                                 #[cfg(not(feature = "ai"))]
-                                ui.label("(未启用人物功能)");
+                                ui.label(t("(未启用人物功能)"));
                             });
-                        egui::CollapsingHeader::new(egui::RichText::new("文件夹").strong())
+                        egui::CollapsingHeader::new(egui::RichText::new(t("文件夹")).strong())
                             .default_open(true)
                             .show(ui, |ui| {
                                 // 常用位置:四个壳目录。点了直接定位到图库里
@@ -11037,7 +12195,7 @@ impl eframe::App for App {
                                 for (label, path) in crate::win::common_places() {
                                     if ui
                                         .selectable_label(false, label)
-                                        .on_hover_text("定位到这个常用位置")
+                                        .on_hover_text(t("定位到这个常用位置"))
                                         .clicked()
                                     {
                                         self.goto_known_dir(path, label);
@@ -11047,8 +12205,9 @@ impl eframe::App for App {
                                 // 不能走 nav_item —— 视图已经是 Folder 时 set_view 会
                                 // 提前返回,从某个具体目录点回来就铺不开了。
                                 let all_on = self.view == ViewKind::Folder && self.folder_show_all;
-                                let rt = egui::RichText::new(format!(
-                                    "所有文件夹 ({folders_n})"
+                                let rt = egui::RichText::new(t_with(
+                                    "所有文件夹 ({folders_n})",
+                                    &[("folders_n", folders_n.to_string())],
                                 ))
                                 .color(if all_on {
                                     crate::theme::p().accent_strong
@@ -11057,7 +12216,7 @@ impl eframe::App for App {
                                 });
                                 if ui
                                     .selectable_label(all_on, if all_on { rt.strong() } else { rt })
-                                    .on_hover_text("中间栏一次铺开所有文件夹(每组一个相册头)")
+                                    .on_hover_text(t("中间栏一次铺开所有文件夹(每组一个相册头)"))
                                     .clicked()
                                 {
                                     self.set_view(ViewKind::Folder);
@@ -11065,15 +12224,20 @@ impl eframe::App for App {
                                     self.subtree_sel = None;
                                 }
                             });
-                        egui::CollapsingHeader::new(egui::RichText::new("其他素材").strong())
+                        egui::CollapsingHeader::new(egui::RichText::new(t("其他素材")).strong())
                             .default_open(true)
                             .show(ui, |ui| {
-                                self.nav_item(ui, "时间线", ViewKind::Timeline, None);
-                                self.nav_item(ui, "标签", ViewKind::Tags, Some(tags_n));
+                                self.nav_item(ui, t("时间线"), ViewKind::Timeline, None);
+                                self.nav_item(ui, t("标签"), ViewKind::Tags, Some(tags_n));
                                 #[cfg(feature = "ai")]
-                                self.nav_item(ui, "语义搜索", ViewKind::Semantic, None);
-                                self.nav_item(ui, "重复照片", ViewKind::Duplicates, Some(dups_n));
-                                self.nav_item(ui, "快速查找", ViewKind::Search, None);
+                                self.nav_item(ui, t("语义搜索"), ViewKind::Semantic, None);
+                                self.nav_item(
+                                    ui,
+                                    t("重复照片"),
+                                    ViewKind::Duplicates,
+                                    Some(dups_n),
+                                );
+                                self.nav_item(ui, t("快速查找"), ViewKind::Search, None);
                             });
                     });
                 ui.add_space(6.0);
@@ -11082,7 +12246,7 @@ impl eframe::App for App {
                     ViewKind::Folder => {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("文件夹")
+                                egui::RichText::new(t("文件夹"))
                                     .size(12.0)
                                     .color(crate::theme::p().muted)
                                     .strong(),
@@ -11091,8 +12255,10 @@ impl eframe::App for App {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .small_button("全部文件夹")
-                                        .on_hover_text("中间栏一次铺开所有文件夹(每组一个相册头)")
+                                        .small_button(t("全部文件夹"))
+                                        .on_hover_text(t(
+                                            "中间栏一次铺开所有文件夹(每组一个相册头)",
+                                        ))
                                         .clicked()
                                     {
                                         self.folder_show_all = true;
@@ -11104,44 +12270,47 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                            if self.folder_tree {
-                                // 真递归目录树:每层缩进,三角展开/收起;
-                                // 只有装了照片的目录才是可选项(点父级 = 展开)。
-                                self.folder_tree_ui(ui, ctx);
-                            } else {
-                                // 扁平文件夹视图(平铺列表)。
-                                for (i, f) in self.folders.clone().iter().enumerate() {
-                                    let on = !self.folder_show_all && self.selected_folder == i;
-                                    if ui.selectable_label(on, f).clicked() {
-                                        self.selected_folder = i;
-                                        self.subtree_sel = None;
-                                        self.folder_show_all = false;
-                                        // 平铺列表同样是「进目录」:树形那条点完会补派生账,
-                                        // 这里漏掉就让两种文件夹视图行为不一致。
-                                        self.enter_dir(f);
-                                        self.tree_reveal(f);
+                                if self.folder_tree {
+                                    // 真递归目录树:每层缩进,三角展开/收起;
+                                    // 只有装了照片的目录才是可选项(点父级 = 展开)。
+                                    self.folder_tree_ui(ui, ctx);
+                                } else {
+                                    // 扁平文件夹视图(平铺列表)。
+                                    for (i, f) in self.folders.clone().iter().enumerate() {
+                                        let on = !self.folder_show_all && self.selected_folder == i;
+                                        if ui.selectable_label(on, f).clicked() {
+                                            self.selected_folder = i;
+                                            self.subtree_sel = None;
+                                            self.folder_show_all = false;
+                                            // 平铺列表同样是「进目录」:树形那条点完会补派生账,
+                                            // 这里漏掉就让两种文件夹视图行为不一致。
+                                            self.enter_dir(f);
+                                            self.tree_reveal(f);
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
                     }
                     // 相簿(照片 id 的命名集合,不动文件)。
                     ViewKind::Albums => {
-                        crate::theme::section_title(ui, "相簿");
+                        crate::theme::section_title(ui, t("相簿"));
                         let albums = self.store.albums();
                         ui.horizontal(|ui| {
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.album_input)
-                                    .hint_text("新相簿名称"),
+                                    .hint_text(t("新相簿名称")),
                             );
-                            if ui.button("新建").clicked() && !self.album_input.trim().is_empty()
+                            if ui.button(t("新建")).clicked() && !self.album_input.trim().is_empty()
                             {
                                 match self.store.album_create(self.album_input.trim()) {
                                     Ok(aid) => {
                                         self.sel_album = Some(aid);
                                         self.album_input.clear();
                                     }
-                                    Err(e) => self.fx_msg = format!("新建相簿失败: {e}"),
+                                    Err(e) => {
+                                        self.fx_msg =
+                                            t_with("新建相簿失败: {e}", &[("e", e.to_string())])
+                                    }
                                 }
                             }
                         });
@@ -11149,129 +12318,258 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                            for (aid, name, n) in albums {
-                                if ui
-                                    .selectable_label(
-                                        self.sel_album == Some(aid),
-                                        format!("{name} · {n} 张"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.sel_album = Some(aid);
+                                for (aid, name, n) in albums {
+                                    if ui
+                                        .selectable_label(
+                                            self.sel_album == Some(aid),
+                                            t_with(
+                                                "{name} · {n} 张",
+                                                &[("name", name.to_string()), ("n", n.to_string())],
+                                            ),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.sel_album = Some(aid);
+                                    }
                                 }
-                            }
-                        });
+                            });
                         if let Some(a) = self.sel_album {
                             ui.separator();
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut self.album_input)
-                                        .hint_text("重命名为"),
+                                        .hint_text(t("重命名为")),
                                 );
-                                if ui.button("重命名").clicked()
+                                if ui.button(t("重命名")).clicked()
                                     && !self.album_input.trim().is_empty()
                                 {
                                     if let Err(e) =
                                         self.store.album_rename(a, self.album_input.trim())
                                     {
-                                        self.fx_msg = format!("重命名失败: {e}");
+                                        self.fx_msg =
+                                            t_with("重命名失败: {e}", &[("e", e.to_string())]);
                                     } else {
                                         self.album_input.clear();
                                     }
                                 }
                             });
-                            if ui.button("删除当前相簿").clicked() {
+                            if ui.button(t("删除当前相簿")).clicked() {
                                 let _ = self.store.album_delete(a);
                                 self.sel_album = None;
                             }
                         }
                     }
                     ViewKind::Tags => {
-                        crate::theme::section_title(ui, "标签");
-                        ui.label(format!("共 {} 个(右键设颜色)", self.tags.len()));
+                        crate::theme::section_title(ui, t("标签"));
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                            for t in self.tags.clone() {
-                                ui.horizontal(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(10.0, 10.0),
-                                        egui::Sense::hover(),
+                                #[cfg(feature = "ai")]
+                                {
+                                    ui.label(t("库内检索:标签或图中文字"));
+                                    let resp = ui.add(
+                                        egui::TextEdit::singleline(&mut self.ai_query)
+                                            .hint_text(t("输入标签名 / 图中文字,即输即搜…"))
+                                            .desired_width(f32::INFINITY),
                                     );
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        2.0,
-                                        tag_color(t.color.as_deref())
-                                            .unwrap_or_else(|| egui::Color32::from_gray(90)),
-                                    );
-                                    let resp = ui.selectable_label(
-                                        self.sel_tag.as_deref() == Some(t.name.as_str()),
-                                        format!("{}  ·  {} 张", t.name, t.count),
-                                    );
-                                    if resp.clicked() {
-                                        // 再次点击已选中的标签 = 取消筛选(回到全部)
-                                        if self.sel_tag.as_deref() == Some(t.name.as_str()) {
-                                            self.sel_tag = None;
-                                        } else {
-                                            self.sel_tag = Some(t.name.clone());
+                                    if resp.changed() {
+                                        self.sel_tag = None;
+                                        self.sel_category = None;
+                                        self.ai_query_hits.clear();
+                                        let q = self.ai_query.trim().to_string();
+                                        if !q.is_empty() {
+                                            let tag_ver = crate::ai_queue::stage_version(
+                                                &self.store,
+                                                crate::ai_queue::Stage::Tags,
+                                            );
+                                            let tags = crate::ai_search::tag_search(
+                                                &self.store, &tag_ver, &q, 200,
+                                            );
+                                            let ocr =
+                                                crate::ai_ocr::search(&self.store, &q, 200);
+                                            self.ai_query_hits = crate::ai_search::fuse(
+                                                &[tags, ocr],
+                                                60.0,
+                                                200,
+                                            )
+                                            .into_iter()
+                                            .map(|(id, _)| id)
+                                            .collect();
                                         }
                                     }
-                                    resp.context_menu(|ui| {
-                                        ui.label("标签颜色");
-                                        for (cname, cval) in TAG_COLORS {
-                                            let mark =
-                                                if Some(cval) == tag_color(t.color.as_deref()) {
+                                    ui.separator();
+                                    ui.label(t("AI 分类"));
+                                    let fresh = self
+                                        .ai_category_cache
+                                        .as_ref()
+                                        .map(|(t, _)| {
+                                            t.elapsed() < std::time::Duration::from_secs(5)
+                                        })
+                                        .unwrap_or(false);
+                                    if !fresh {
+                                        let tag_ver = crate::ai_queue::stage_version(
+                                            &self.store,
+                                            crate::ai_queue::Stage::Tags,
+                                        );
+                                        let list = crate::ai_tags::CATEGORIES
+                                            .iter()
+                                            .map(|(node, label)| {
+                                                let n = crate::ai_tags::category_ids(
+                                                    &self.store,
+                                                    node,
+                                                    &tag_ver,
+                                                    usize::MAX,
+                                                )
+                                                .len();
+                                                (*node, *label, n)
+                                            })
+                                            .collect();
+                                        self.ai_category_cache =
+                                            Some((std::time::Instant::now(), list));
+                                    }
+                                    let cats = self
+                                        .ai_category_cache
+                                        .as_ref()
+                                        .map(|(_, v)| v.clone())
+                                        .unwrap_or_default();
+                                    for (node, label, n) in cats {
+                                        let resp = ui.selectable_label(
+                                            self.sel_category.as_deref() == Some(node),
+                                            t_with(
+                                                "{p1}  ·  {p2} 张",
+                                                &[
+                                                    ("p1", t(label).to_string()),
+                                                    ("p2", (n).to_string()),
+                                                ],
+                                            ),
+                                        );
+                                        if resp.clicked() {
+                                            if self.sel_category.as_deref() == Some(node) {
+                                                self.sel_category = None;
+                                            } else {
+                                                self.sel_category = Some(node.to_string());
+                                                self.sel_tag = None;
+                                                self.ai_query.clear();
+                                                self.ai_query_hits.clear();
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
+                                }
+                                ui.label(t_with(
+                                    "共 {p1} 个(右键设颜色)",
+                                    &[("p1", (self.tags.len()).to_string())],
+                                ));
+                                for t in self.tags.clone() {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(10.0, 10.0),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            2.0,
+                                            tag_color(t.color.as_deref())
+                                                .unwrap_or_else(|| egui::Color32::from_gray(90)),
+                                        );
+                                        let resp = ui.selectable_label(
+                                            self.sel_tag.as_deref() == Some(t.name.as_str()),
+                                            t_with(
+                                                "{p1}  ·  {p2} 张",
+                                                &[
+                                                    ("p1", (t.name).to_string()),
+                                                    ("p2", (t.count).to_string()),
+                                                ],
+                                            ),
+                                        );
+                                        if resp.clicked() {
+                                            // 再次点击已选中的标签 = 取消筛选(回到全部)
+                                            if self.sel_tag.as_deref() == Some(t.name.as_str()) {
+                                                self.sel_tag = None;
+                                            } else {
+                                                self.sel_tag = Some(t.name.clone());
+                                            }
+                                            #[cfg(feature = "ai")]
+                                            {
+                                                self.sel_category = None;
+                                                self.ai_query.clear();
+                                                self.ai_query_hits.clear();
+                                            }
+                                        }
+                                        resp.context_menu(|ui| {
+                                            ui.label(crate::i18n::t("标签颜色"));
+                                            for (cname, cval) in TAG_COLORS {
+                                                let mark = if Some(cval)
+                                                    == tag_color(t.color.as_deref())
+                                                {
                                                     "● "
                                                 } else {
                                                     "○ "
                                                 };
-                                            if ui.button(format!("{mark}{cname}")).clicked() {
+                                                if ui
+                                                    .button(format!(
+                                                        "{mark}{}",
+                                                        crate::i18n::t(tag_color_name(cname))
+                                                    ))
+                                                    .clicked()
+                                                {
+                                                    let _ = timeline::set_tag_color(
+                                                        &self.store,
+                                                        &t.name,
+                                                        Some(cname),
+                                                    );
+                                                    self.tags = timeline::all_tags(&self.store)
+                                                        .unwrap_or_default();
+                                                    ui.close();
+                                                }
+                                            }
+                                            if ui.button(crate::i18n::t("无颜色")).clicked() {
                                                 let _ = timeline::set_tag_color(
                                                     &self.store,
                                                     &t.name,
-                                                    Some(cname),
+                                                    None,
                                                 );
                                                 self.tags = timeline::all_tags(&self.store)
                                                     .unwrap_or_default();
                                                 ui.close();
                                             }
-                                        }
-                                        if ui.button("无颜色").clicked() {
-                                            let _ =
-                                                timeline::set_tag_color(&self.store, &t.name, None);
-                                            self.tags =
-                                                timeline::all_tags(&self.store).unwrap_or_default();
-                                            ui.close();
-                                        }
+                                        });
                                     });
-                                });
-                            }
-                        });
+                                }
+                            });
                     }
                     #[cfg(feature = "ai")]
                     ViewKind::Faces => {
-                        crate::theme::section_title(ui, "人脸簇");
+                        crate::theme::section_title(ui, t("人脸簇"));
                         ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.face_hide_low, "隐藏低质量");
-                            ui.checkbox(&mut self.face_show_ignored, "显示已忽略");
+                            ui.checkbox(&mut self.face_hide_low, t("隐藏低质量"));
+                            ui.checkbox(&mut self.face_show_ignored, t("显示已忽略"));
                         });
-                        ui.label(format!(
-                            "共 {} 簇 · 未分析 {} 张",
-                            self.face_people.len(),
-                            crate::faces::remaining_count(&self.store)
+                        ui.label(t_with(
+                            "共 {p1} 簇 · 未分析 {p2} 张",
+                            &[
+                                ("p1", (self.face_people.len()).to_string()),
+                                (
+                                    "p2",
+                                    (crate::faces::remaining_count(&self.store)).to_string(),
+                                ),
+                            ],
                         ));
                         // 全量重聚类:增量聚类只增不改,分错的簇不会自己长好;
                         // 把全部向量按质量降序重分一遍(已命名按质心最近迁移)。
-                        if ui.button("重新聚类").clicked() {
+                        if ui.button(t("重新聚类")).clicked() {
                             match crate::faces::recluster_all(
                                 &self.store,
                                 crate::faces::cluster_thr(&self.store),
-                            )
-                            {
+                            ) {
                                 Ok(n) => {
-                                    self.status = format!("重新聚类完成:共 {n} 簇");
+                                    self.status =
+                                        t_with("重新聚类完成:共 {n} 簇", &[("n", n.to_string())]);
                                 }
-                                Err(e) => self.status = format!("重新聚类失败: {e}"),
+                                Err(e) => {
+                                    self.status =
+                                        t_with("重新聚类失败: {e}", &[("e", e.to_string())])
+                                }
                             }
                             self.refresh_people_and_suggestions();
                             self.sel_cluster = None;
@@ -11280,14 +12578,19 @@ impl eframe::App for App {
                         // 命名建议(未命名簇按质心相似度推荐)
                         if !self.face_sugs.is_empty() {
                             ui.separator();
-                            ui.label("命名建议:");
+                            ui.label(t("命名建议:"));
                             for s in self.face_sugs.clone() {
                                 ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "簇 {} → {} ({:.2} · {} 张)",
-                                        s.cluster, s.name, s.score, s.count
+                                    ui.label(t_with(
+                                        "簇 {p1} → {p2} ({p3} · {p4} 张)",
+                                        &[
+                                            ("p1", (s.cluster).to_string()),
+                                            ("p2", (s.name).to_string()),
+                                            ("p3", format!("{p3:.2}", p3 = (s.score))),
+                                            ("p4", (s.count).to_string()),
+                                        ],
                                     ));
-                                    if ui.small_button("应用").clicked() {
+                                    if ui.small_button(t("应用")).clicked() {
                                         let _ = crate::faces::rename_cluster(
                                             &self.store,
                                             s.cluster,
@@ -11301,55 +12604,65 @@ impl eframe::App for App {
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                            for p in self.sorted_people() {
-                                let display = p
-                                    .person
-                                    .clone()
-                                    .unwrap_or_else(|| format!("簇 {}", p.cluster));
-                                let label = format!(
-                                    "{display}  ·  {} 张  · 质量 {:.2}",
-                                    p.count, p.quality
-                                );
-                                if ui
-                                    .selectable_label(self.sel_cluster == Some(p.cluster), label)
-                                    .clicked()
-                                {
-                                    self.sel_cluster = Some(p.cluster);
-                                    self.face_hits = crate::faces::faces_for_cluster(
-                                        &self.store,
-                                        p.cluster,
-                                        self.face_show_ignored,
-                                        if self.face_hide_low { 0.4 } else { 0.0 },
+                                for p in self.sorted_people() {
+                                    let display = p.person.clone().unwrap_or_else(|| {
+                                        t_with("簇 {p1}", &[("p1", (p.cluster).to_string())])
+                                    });
+                                    let label = t_with(
+                                        "{display}  ·  {p1} 张  · 质量 {p2}",
+                                        &[
+                                            ("display", display.to_string()),
+                                            ("p1", (p.count).to_string()),
+                                            ("p2", format!("{p2:.2}", p2 = (p.quality))),
+                                        ],
                                     );
-                                }
-                            }
-                            // 已忽略簇(可选中后恢复)
-                            if self.face_show_ignored {
-                                for cid in crate::faces::ignored_clusters(&self.store) {
-                                    let label = format!("簇 {cid}  · 已忽略");
                                     if ui
-                                        .selectable_label(self.sel_cluster == Some(cid), label)
+                                        .selectable_label(
+                                            self.sel_cluster == Some(p.cluster),
+                                            label,
+                                        )
                                         .clicked()
                                     {
-                                        self.sel_cluster = Some(cid);
+                                        self.sel_cluster = Some(p.cluster);
                                         self.face_hits = crate::faces::faces_for_cluster(
                                             &self.store,
-                                            cid,
-                                            true,
-                                            0.0,
+                                            p.cluster,
+                                            self.face_show_ignored,
+                                            if self.face_hide_low { 0.4 } else { 0.0 },
                                         );
                                     }
                                 }
-                            }
-                        });
+                                // 已忽略簇(可选中后恢复)
+                                if self.face_show_ignored {
+                                    for cid in crate::faces::ignored_clusters(&self.store) {
+                                        let label = t_with(
+                                            "簇 {cid}  · 已忽略",
+                                            &[("cid", cid.to_string())],
+                                        );
+                                        if ui
+                                            .selectable_label(self.sel_cluster == Some(cid), label)
+                                            .clicked()
+                                        {
+                                            self.sel_cluster = Some(cid);
+                                            self.face_hits = crate::faces::faces_for_cluster(
+                                                &self.store,
+                                                cid,
+                                                true,
+                                                0.0,
+                                            );
+                                        }
+                                    }
+                                }
+                            });
                     }
                     #[cfg(feature = "ai")]
                     ViewKind::Semantic => {
-                        crate::theme::section_title(ui, "语义搜索");
+                        crate::theme::section_title(ui, t("语义搜索"));
                         let resp = ui.text_edit_singleline(&mut self.input_query);
                         let enter =
                             resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (enter || ui.button("搜索").clicked()) && self.clip_search_rx.is_none()
+                        if (enter || ui.button(t("搜索")).clicked())
+                            && self.clip_search_rx.is_none()
                         {
                             let q = self.input_query.trim().to_string();
                             if !q.is_empty() {
@@ -11358,79 +12671,110 @@ impl eframe::App for App {
                         }
                         if self.clip_search_rx.is_some() {
                             ui.spinner();
-                            ui.label("搜索中…");
+                            ui.label(t("搜索中…"));
                         }
                         ui.separator();
                         // 索引语言单选(中英双模型;搜索按查询含 CJK 自动匹配)
                         ui.horizontal(|ui| {
-                            ui.label("模型:");
-                            ui.selectable_value(&mut self.clip_lang, crate::clip::Lang::En, "英文");
-                            ui.selectable_value(&mut self.clip_lang, crate::clip::Lang::Zh, "中文");
+                            ui.label(t("模型:"));
+                            ui.selectable_value(
+                                &mut self.clip_lang,
+                                crate::clip::Lang::En,
+                                t("英文"),
+                            );
+                            ui.selectable_value(
+                                &mut self.clip_lang,
+                                crate::clip::Lang::Zh,
+                                t("中文"),
+                            );
                         });
                         // 模型目录里实际放了哪些 .onnx:一个都没有就直说,
                         // 免得用户点了「语义索引」才在后台线程里撞到"模型缺失"。
                         let models = crate::ai::available_models();
                         if models.is_empty() {
-                            ui.small("模型目录还没有 .onnx 模型文件,请先放入后再索引");
+                            ui.small(t("模型目录还没有 .onnx 模型文件,请先放入后再索引"));
                             ui.small(
                                 crate::ai::models_dir()
-                                    .map(|d| format!("模型目录:{}", d.display()))
+                                    .map(|d| {
+                                        t_with(
+                                            "模型目录:{p1}",
+                                            &[("p1", (d.display()).to_string())],
+                                        )
+                                    })
                                     .unwrap_or_default(),
                             );
                         } else {
-                            ui.small(format!("已装模型:{}", models.join("、")));
+                            ui.small(t_with(
+                                "已装模型:{p1}",
+                                &[("p1", (models.join("、")).to_string())],
+                            ));
                         }
                         let indexed = crate::clip::clip_count_lang(&self.store, self.clip_lang);
                         let total_zh =
                             crate::clip::clip_count_lang(&self.store, crate::clip::Lang::Zh);
                         let total_en =
                             crate::clip::clip_count_lang(&self.store, crate::clip::Lang::En);
-                        ui.label(format!(
-                            "已索引({}){indexed} / {} 张",
-                            self.clip_lang.label(),
-                            self.rows.len()
+                        ui.label(t_with(
+                            "已索引({p1}){indexed} / {p2} 张",
+                            &[
+                                ("p1", (self.clip_lang.label()).to_string()),
+                                ("indexed", indexed.to_string()),
+                                ("p2", (self.rows.len()).to_string()),
+                            ],
                         ));
                         if indexed < self.rows.len() {
-                            ui.label(format!(
-                                "点 工具 > 语义索引 补嵌(当前{}模型,较慢)",
-                                self.clip_lang.label()
+                            ui.label(t_with(
+                                "点 工具 > 语义索引 补嵌(当前{p1}模型,较慢)",
+                                &[("p1", (self.clip_lang.label()).to_string())],
                             ));
                         }
                         if total_en + total_zh > 0 {
-                            ui.label(format!("中/英索引量:{total_zh} / {total_en}"));
+                            ui.label(t_with(
+                                "中/英索引量:{total_zh} / {total_en}",
+                                &[
+                                    ("total_zh", total_zh.to_string()),
+                                    ("total_en", total_en.to_string()),
+                                ],
+                            ));
                         }
                         ui.separator();
-                        ui.label(format!("结果 {} 张", self.clip_results.len()));
+                        ui.label(t_with(
+                            "结果 {p1} 张",
+                            &[("p1", (self.clip_results.len()).to_string())],
+                        ));
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, true])
                             .show(ui, |ui| {
-                            for (pid, score) in self.clip_results.clone() {
-                                let path = self
-                                    .id_row
-                                    .get(&pid)
-                                    .map(|&i| self.rows[i].path.clone())
-                                    .unwrap_or_default();
-                                let fname = Path::new(&path)
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or(path);
-                                if ui
-                                    .selectable_label(false, format!("{score:.3}  {fname}"))
-                                    .clicked()
-                                {
-                                    if self.id_row.contains_key(&pid) {
-                                        self.preview = Some(pid);
+                                for (pid, score) in self.clip_results.clone() {
+                                    let path = self
+                                        .id_row
+                                        .get(&pid)
+                                        .map(|&i| self.rows[i].path.clone())
+                                        .unwrap_or_default();
+                                    let fname = Path::new(&path)
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or(path);
+                                    if ui
+                                        .selectable_label(false, format!("{score:.3}  {fname}"))
+                                        .clicked()
+                                    {
+                                        if self.id_row.contains_key(&pid) {
+                                            self.preview = Some(pid);
+                                        }
                                     }
                                 }
-                            }
-                        });
+                            });
                     }
                     ViewKind::Recent
                     | ViewKind::Timeline
                     | ViewKind::Duplicates
                     | ViewKind::Search => {
-                        crate::theme::section_title(ui, "当前视图");
-                        ui.label(format!("{} 张", self.view_ids().len()));
+                        crate::theme::section_title(ui, t("当前视图"));
+                        ui.label(t_with(
+                            "{p1} 张",
+                            &[("p1", (self.view_ids().len()).to_string())],
+                        ));
                     }
                     #[cfg(not(feature = "ai"))]
                     ViewKind::Faces | ViewKind::Semantic => {}
@@ -11478,17 +12822,11 @@ impl eframe::App for App {
                         self.recent_header(ui);
                         ui.add_space(6.0);
                         if self.recent_idxs.is_empty() {
-                            ui.label(
-                                "最近更新里还没有照片:等缩略图生成后点上方「刷新」,\
-                                 或到「文件夹」里点开一个目录。",
-                            );
+                            ui.label(t("最近更新里还没有照片:等缩略图生成后点上方「刷新」,或到「文件夹」里点开一个目录。"));
                         } else {
                             if self.recent_idxs.len() < 20 && !self.watched.is_empty() {
                                 ui.label(
-                                    egui::RichText::new(
-                                        "首页只显示已纳入管理的文件夹里的照片;\
-                                         要收进更多目录,到「文件夹」视图里添加监听。",
-                                    )
+                                    egui::RichText::new(t("首页只显示已纳入管理的文件夹里的照片;要收进更多目录,到「文件夹」视图里添加监听。"))
                                     .size(11.0)
                                     .color(crate::theme::p().muted),
                                 );
@@ -11517,16 +12855,16 @@ impl eframe::App for App {
                     }
                     ViewKind::Duplicates => {
                         let near_label = if self.dup_near {
-                            format!("重复照片 {} 组(含近似)", self.dups.len())
+                            t_with("重复照片 {p1} 组(含近似)", &[("p1", (self.dups.len()).to_string())])
                         } else {
-                            format!("重复照片 {} 组", self.dups.len())
+                            t_with("重复照片 {p1} 组", &[("p1", (self.dups.len()).to_string())])
                         };
                         ui.horizontal(|ui| {
                             ui.heading(near_label);
                             if ui
                                 .checkbox(
                                     &mut self.dup_near,
-                                    format!("包含近似重复(hamming≤{NEAR_DUP_DIST})"),
+                                    t_with("包含近似重复(hamming≤{NEAR_DUP_DIST})", &[("NEAR_DUP_DIST", NEAR_DUP_DIST.to_string())]),
                                 )
                                 .changed()
                             {
@@ -11541,18 +12879,18 @@ impl eframe::App for App {
                         ui.add_space(4.0);
                         if self.dups.is_empty() {
                             ui.label(if self.dup_near {
-                                "没有检测到重复或近似重复"
+                                t("没有检测到重复或近似重复")
                             } else {
-                                "没有检测到重复(哈希精确一致才计为一组;勾选下方可含近似重复)"
+                                t("没有检测到重复(哈希精确一致才计为一组;勾选下方可含近似重复)")
                             });
                         }
                         let dups = std::mem::take(&mut self.dups);
                         for (h, ids) in &dups {
                             ui.separator();
                             if self.dup_near {
-                                ui.heading(format!("近似组  ·  {} 张", ids.len()));
+                                ui.heading(t_with("近似组  ·  {p1} 张", &[("p1", (ids.len()).to_string())]));
                             } else {
-                                ui.heading(format!("组 {h:016x}  ·  {} 张", ids.len()));
+                                ui.heading(t_with("组 {h}  ·  {p1} 张", &[("h", format!("{h:016x}")), ("p1", (ids.len()).to_string())]));
                             }
                             let cells: Vec<usize> = ids
                                 .iter()
@@ -11566,13 +12904,11 @@ impl eframe::App for App {
                         #[cfg(feature = "ai")]
                         match self.sel_cluster {
                             None => {
-                                ui.heading("人脸");
+                                ui.heading(t("人脸"));
                                 let algo = crate::faces::current_algo(&self.store);
                                 if !crate::ai::face::Faces::models_present(algo) {
                                     let (det_f, rec_f) = algo.files();
-                                    ui.label(format!(
-                                        "还没有人脸模型,无法识别(需要 {det_f} 与 {rec_f}):"
-                                    ));
+                                    ui.label(t_with("还没有人脸模型,无法识别(需要 {det_f} 与 {rec_f}):", &[("det_f", det_f.to_string()), ("rec_f", rec_f.to_string())]));
                                     ui.small(
                                         crate::ai::models_dir()
                                             .map(|d| d.display().to_string())
@@ -11581,7 +12917,7 @@ impl eframe::App for App {
                                     self.face_model_compact_ui(ui, algo);
                                 } else {
                                     ui.label(
-                                        "左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。",
+                                        t("左侧选择一个人脸簇查看照片;识别用 工具 > 人脸识别扫描。"),
                                     );
                                 }
                             }
@@ -11598,17 +12934,13 @@ impl eframe::App for App {
                                     .face_people
                                     .iter()
                                     .find(|p| p.cluster == c)
-                                    .map(|p| format!(" · 平均质量 {:.2}", p.quality))
+                                    .map(|p| t_with(" · 平均质量 {p1}", &[("p1", format!("{p1:.2}", p1 = (p.quality)))]))
                                     .unwrap_or_default();
-                                ui.heading(format!(
-                                    "簇 {c} · {} 张照片 / {} 个人脸框{q_txt}",
-                                    cells.len(),
-                                    self.face_hits.len()
-                                ));
+                                ui.heading(t_with("簇 {c} · {p1} 张照片 / {p2} 个人脸框{q_txt}", &[("c", c.to_string()), ("p1", (cells.len()).to_string()), ("p2", (self.face_hits.len()).to_string()), ("q_txt", q_txt.to_string())]));
                                 self.photo_grid(ui, "faces-grid", &cells);
                                 ui.add_space(8.0);
                                 ui.separator();
-                                ui.label("人脸框明细(按质量降序;质量低的可整簇忽略):");
+                                ui.label(t("人脸框明细(按质量降序;质量低的可整簇忽略):"));
                                 let mut qs: Vec<(String, f32)> = self
                                     .face_hits
                                     .iter()
@@ -11634,17 +12966,17 @@ impl eframe::App for App {
                                     .max_height(150.0)
                                     .show(ui, |ui| {
                                         for (fname, q) in qs {
-                                            ui.label(format!("{fname} · 质量 {q:.2}"));
+                                            ui.label(t_with("{fname} · 质量 {q:.2}", &[("fname", fname.to_string()), ("q", format!("{q:.2}"))]));
                                         }
                                     });
                                 ui.add_space(8.0);
                                 ui.separator();
-                                ui.heading("重命名这个簇");
+                                ui.heading(t("重命名这个簇"));
                                 ui.horizontal(|ui| {
                                     let resp = ui.text_edit_singleline(&mut self.input_rename);
                                     if (resp.lost_focus()
                                         && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                                        || ui.button("重命名").clicked()
+                                        || ui.button(t("重命名")).clicked()
                                     {
                                         let name = std::mem::take(&mut self.input_rename);
                                         if !name.is_empty() {
@@ -11656,7 +12988,7 @@ impl eframe::App for App {
                                 });
                                 // 忽略/恢复(误检簇一键排除)
                                 ui.horizontal(|ui| {
-                                    if ui.button("忽略此簇").clicked() {
+                                    if ui.button(t("忽略此簇")).clicked() {
                                         let _ = crate::faces::ignore_cluster(&self.store, c, true);
                                         self.face_show_ignored = true;
                                         self.refresh_people_and_suggestions();
@@ -11667,7 +12999,7 @@ impl eframe::App for App {
                                             0.0,
                                         );
                                     }
-                                    if ui.button("恢复此簇").clicked() {
+                                    if ui.button(t("恢复此簇")).clicked() {
                                         let _ = crate::faces::ignore_cluster(&self.store, c, false);
                                         self.refresh_people_and_suggestions();
                                         self.face_hits = crate::faces::faces_for_cluster(
@@ -11678,47 +13010,116 @@ impl eframe::App for App {
                                         );
                                     }
                                 });
+                                ui.add_space(8.0);
+                                ui.separator();
+                                ui.heading(t("合并 / 拆分审核"));
+                                let mine: Vec<(i64, i64, crate::ai_review::Kind)> =
+                                    crate::ai_review::all(&self.store)
+                                        .into_iter()
+                                        .filter(|(a, b, _)| {
+                                            self.face_hits
+                                                .iter()
+                                                .any(|h| h.face_id == *a || h.face_id == *b)
+                                        })
+                                        .collect();
+                                if mine.is_empty() {
+                                    ui.small(t("这个簇还没有人工约束。"));
+                                }
+                                let in_this: HashSet<i64> =
+                                    self.face_hits.iter().map(|h| h.face_id).collect();
+                                for (a, b, k) in mine {
+                                    ui.horizontal(|ui| {
+                                        let kind = match k {
+                                            crate::ai_review::Kind::Must => t("同一人"),
+                                            crate::ai_review::Kind::Never => t("不同人"),
+                                        };
+                                        let clash = k == crate::ai_review::Kind::Never
+                                            && in_this.contains(&a)
+                                            && in_this.contains(&b);
+                                        ui.label(t_with("{kind}: 人脸 {a} ↔ {b}{p1}", &[("kind", kind.to_string()), ("a", a.to_string()), ("b", b.to_string()), ("p1", (if clash { t("(已同簇,需拆分)") } else { "" }).to_string())]));
+                                        if ui.small_button(t("删除")).clicked() {
+                                            let _ = crate::ai_review::remove(&self.store, a, b);
+                                        }
+                                    });
+                                }
+                                let cur_face = self
+                                    .face_hits
+                                    .iter()
+                                    .max_by(|x, y| {
+                                        x.quality
+                                            .partial_cmp(&y.quality)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|h| h.face_id);
+                                let others: Vec<(i64, usize)> = self
+                                    .face_people
+                                    .iter()
+                                    .filter(|p| p.cluster != c)
+                                    .map(|p| (p.cluster, p.count))
+                                    .collect();
+                                let mut add_kind: Option<crate::ai_review::Kind> = None;
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("face-constraint-target")
+                                        .selected_text(
+                                            self.face_merge_target
+                                                .map(|t| t_with("簇 {t}", &[("t", t.to_string())]))
+                                                .unwrap_or_else(|| t("选择另一个簇").into()),
+                                        )
+                                        .show_ui(ui, |ui| {
+                                            for (cid, cnt) in &others {
+                                                ui.selectable_value(
+                                                    &mut self.face_merge_target,
+                                                    Some(*cid),
+                                                    t_with("簇 {cid} · {cnt} 张", &[("cid", cid.to_string()), ("cnt", cnt.to_string())]),
+                                                );
+                                            }
+                                        });
+                                    if ui.button(t("同一人(合并)")).clicked() {
+                                        add_kind = Some(crate::ai_review::Kind::Must);
+                                    }
+                                    if ui.button(t("不同人(拆分)")).clicked() {
+                                        add_kind = Some(crate::ai_review::Kind::Never);
+                                    }
+                                });
+                                if let (Some(kind), Some(cf), Some(t)) =
+                                    (add_kind, cur_face, self.face_merge_target)
+                                {
+                                    let other = crate::faces::faces_for_cluster(
+                                        &self.store, t, false, 0.0,
+                                    )
+                                    .into_iter()
+                                    .max_by(|x, y| {
+                                        x.quality
+                                            .partial_cmp(&y.quality)
+                                            .unwrap_or(std::cmp::Ordering::Equal)
+                                    })
+                                    .map(|h| h.face_id);
+                                    if let Some(of) = other {
+                                        let _ = crate::ai_review::add(&self.store, cf, of, kind);
+                                        self.status = t_with("已记录约束:簇 {c} ↔ 簇 {t}", &[("c", c.to_string()), ("t", t.to_string())]);
+                                    }
+                                }
+                                ui.small(t("约束在点「重新聚类」后生效;「不同人」只阻止合并。"));
                             }
                         }
                         #[cfg(not(feature = "ai"))]
                         {
-                            ui.heading("人物");
+                            ui.heading(t("人物"));
                             ui.label(
-                                "人脸功能未编译进当前构建(构建时用了 --no-default-features)。",
+                                t("人脸功能未编译进当前构建(构建时用了 --no-default-features)。"),
                             );
                         }
                     }
-                    ViewKind::Tags => match self.sel_tag.clone() {
-                        None => {
-                            ui.heading("标签");
-                            ui.label("左侧选择一个标签,查看标有该标签的照片。");
-                        }
-                        Some(tag) => {
-                            let ids =
-                                timeline::photos_by_tag(&self.store, &tag).unwrap_or_default();
-                            let cells: Vec<usize> = ids
-                                .iter()
-                                .filter_map(|id| self.id_row.get(id).copied())
-                                .collect();
-                            ui.heading(format!("标签 «{tag}» · {} 张", cells.len()));
-                            self.photo_grid(ui, "tags-grid", &cells);
-                        }
-                    },
+                    ViewKind::Tags => self.tags_view(ui),
                     ViewKind::Semantic => {
                         #[cfg(feature = "ai")]
                         {
                             if self.clip_results.is_empty() {
-                                ui.heading("语义搜索");
-                                ui.label(
-                                    "左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");\
-                                     首次使用请先 工具 > 语义索引。",
-                                );
+                                ui.heading(t("语义搜索"));
+                                ui.label(t("左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");首次使用请先 工具 > 语义索引。"));
                             } else {
                                 let q = self.input_query.trim().to_string();
-                                ui.heading(format!(
-                                    "语义结果 {} 张(查询:{q})",
-                                    self.clip_results.len()
-                                ));
+                                ui.heading(t_with("语义结果 {p1} 张(查询:{q})", &[("p1", (self.clip_results.len()).to_string()), ("q", q.to_string())]));
                                 let cells: Vec<usize> = self
                                     .clip_results
                                     .iter()
@@ -11729,9 +13130,9 @@ impl eframe::App for App {
                         }
                         #[cfg(not(feature = "ai"))]
                         {
-                            ui.heading("语义搜索");
+                            ui.heading(t("语义搜索"));
                             ui.label(
-                                "语义搜索未编译进当前构建(构建时用了 --no-default-features)。",
+                                t("语义搜索未编译进当前构建(构建时用了 --no-default-features)。"),
                             );
                         }
                     }
@@ -11747,7 +13148,7 @@ impl eframe::App for App {
                                 ui.add_space(16.0);
                             }
                             if self.rows.is_empty() {
-                                ui.label("图库里还没有照片,或当前过滤把照片都滤掉了。");
+                                ui.label(t("图库里还没有照片,或当前过滤把照片都滤掉了。"));
                             }
                             self.folder_groups.1 = groups;
                             return;
@@ -11804,21 +13205,14 @@ impl eframe::App for App {
                         self.album_label(ui, &folder, &date, cells.len());
                         if filtered {
                             ui.label(
-                                egui::RichText::new(format!(
-                                    "文件名过滤:匹配 {} / 共 {} 张",
-                                    cells.len(),
-                                    idxs.len()
-                                ))
+                                egui::RichText::new(t_with("文件名过滤:匹配 {p1} / 共 {p2} 张", &[("p1", (cells.len()).to_string()), ("p2", (idxs.len()).to_string())]))
                                 .size(11.5)
                                 .color(crate::theme::p().muted),
                             );
                         }
                         ui.add_space(4.0);
                         if cells.is_empty() && filtered {
-                            ui.label(format!(
-                                "此文件夹里没有文件名含「{}」的照片。",
-                                self.folder_filter.trim()
-                            ));
+                            ui.label(t_with("此文件夹里没有文件名含「{p1}」的照片。", &[("p1", (self.folder_filter.trim()).to_string())]));
                         } else if self.folder_details {
                             self.photo_details(ui, "folder-details", cells);
                         } else {
@@ -11832,14 +13226,14 @@ impl eframe::App for App {
                     ViewKind::Albums => {
                         match self.sel_album {
                             None => {
-                                ui.heading("相簿");
+                                ui.heading(t("相簿"));
                                 ui.label(
-                                    "在左侧选择或新建一个相簿。相簿是照片的命名集合,不会移动文件。",
+                                    t("在左侧选择或新建一个相簿。相簿是照片的命名集合,不会移动文件。"),
                                 );
                             }
                             Some(a) => {
                                 let name = self.store.album_name(a).unwrap_or_default();
-                                ui.heading(format!("相簿:{name}"));
+                                ui.heading(t_with("相簿:{name}", &[("name", name.to_string())]));
                                 // 相簿成员按加入顺序显示(链上 pos 序)。
                                 let ids = self.store.album_photo_ids(a);
                                 let idxs: Vec<usize> = ids
@@ -11847,7 +13241,7 @@ impl eframe::App for App {
                                     .filter_map(|id| self.id_row.get(id).copied())
                                     .collect();
                                 if idxs.is_empty() {
-                                    ui.label("(空相簿)用照片右键菜单的「加入相簿」添加。");
+                                    ui.label(t("(空相簿)用照片右键菜单的「加入相簿」添加。"));
                                 } else {
                                     self.photo_grid(ui, "album-grid", &idxs);
                                 }
@@ -11868,7 +13262,7 @@ impl eframe::App for App {
         // WiFi 导入面板(M4a)
         let mut wifi_open = self.wifi_panel;
         if wifi_open {
-            egui::Window::new("WiFi 导入")
+            egui::Window::new(t("WiFi 导入"))
                 .open(&mut wifi_open)
                 .default_width(480.0)
                 .show(ctx, |ui| {
@@ -11878,17 +13272,17 @@ impl eframe::App for App {
                         .map(|h| (h.addr.clone(), h.received.load(Ordering::SeqCst)));
                     match running {
                         Some((addr, n)) => {
-                            ui.label(format!("运行中:http://{addr}/"));
-                            ui.label(format!("已接收 {n} 张"));
-                            ui.label("手机浏览器打开以上地址,选择照片即自动上传到本机 Incoming 目录并入库。");
+                            ui.label(t_with("运行中:http://{addr}/", &[("addr", addr.to_string())]));
+                            ui.label(t_with("已接收 {n} 张", &[("n", n.to_string())]));
+                            ui.label(t("手机浏览器打开以上地址,选择照片即自动上传到本机 Incoming 目录并入库。"));
                             ui.add_space(8.0);
-                            if ui.button("停止").clicked() {
+                            if ui.button(t("停止")).clicked() {
                                 self.toggle_wifi();
                             }
                         }
                         None => {
-                            ui.label("未启动。启动后手机需与电脑在同一局域网。");
-                            if ui.button("启动").clicked() {
+                            ui.label(t("未启动。启动后手机需与电脑在同一局域网。"));
+                            if ui.button(t("启动")).clicked() {
                                 self.toggle_wifi();
                             }
                         }
@@ -11904,27 +13298,27 @@ impl eframe::App for App {
         if self.album_new_win {
             let mut open = self.album_new_win;
             let mut close = false;
-            egui::Window::new("新建相簿")
+            egui::Window::new(t("新建相簿"))
                 .open(&mut open)
                 .default_width(360.0)
                 .show(ctx, |ui| {
                     let n = self.sel.len();
                     ui.small(if n == 0 {
-                        "相簿是照片 id 的命名集合,不移动文件。"
+                        t("相簿是照片 id 的命名集合,不移动文件。")
                     } else {
-                        "将把选中的照片一并放入新相簿。"
+                        t("将把选中的照片一并放入新相簿。")
                     });
                     let resp = ui.add(
-                        egui::TextEdit::singleline(&mut self.album_input).hint_text("相簿名称"),
+                        egui::TextEdit::singleline(&mut self.album_input).hint_text(t("相簿名称")),
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let name = self.album_input.trim().to_string();
-                    let ok = (ui.button("创建").clicked() || enter) && !name.is_empty();
+                    let ok = (ui.button(t("创建")).clicked() || enter) && !name.is_empty();
                     ui.horizontal(|ui| {
                         if n > 0 {
-                            ui.small(format!("已选中 {n} 张"));
+                            ui.small(t_with("已选中 {n} 张", &[("n", n.to_string())]));
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(t("取消")).clicked() {
                             close = true;
                         }
                     });
@@ -11942,13 +13336,18 @@ impl eframe::App for App {
                                 self.set_view(ViewKind::Albums);
                                 self.album_input.clear();
                                 self.status = if added == 0 {
-                                    format!("已创建相簿「{name}」")
+                                    t_with("已创建相簿「{name}」", &[("name", name.to_string())])
                                 } else {
-                                    format!("已创建相簿「{name}」,放入 {added} 张")
+                                    t_with(
+                                        "已创建相簿「{name}」,放入 {added} 张",
+                                        &[("name", name.to_string()), ("added", added.to_string())],
+                                    )
                                 };
                                 close = true;
                             }
-                            Err(e) => self.status = format!("创建相簿失败: {e}"),
+                            Err(e) => {
+                                self.status = t_with("创建相簿失败: {e}", &[("e", e.to_string())])
+                            }
                         }
                     }
                 });
@@ -11958,31 +13357,26 @@ impl eframe::App for App {
         // 从设备导入窗口(统一设备列表)。
         if self.show_import_devices {
             let mut open = self.show_import_devices;
-            egui::Window::new("从设备导入")
+            egui::Window::new(t("从设备导入"))
                 .open(&mut open)
                 .default_width(520.0)
                 .show(ctx, |ui| {
                     ui.small(
-                        "WPD 便携设备(相机/手机)+ 可移动磁盘统一列表",
+                        t("WPD 便携设备(相机/手机)+ 可移动磁盘统一列表"),
                     );
                     ui.horizontal(|ui| {
-                        if ui.button("刷新").clicked() {
+                        if ui.button(t("刷新")).clicked() {
                             self.refresh_import_devices();
                         }
-                        ui.small(format!(
-                            "共 {} 台(便携 {} + 磁盘 {})",
-                            self.import_devices.len(),
-                            self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Portable(_))).count(),
-                            self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Volume(_))).count(),
-                        ));
+                        ui.small(t_with("共 {p1} 台(便携 {p2} + 磁盘 {p3})", &[("p1", (self.import_devices.len()).to_string()), ("p2", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Portable(_))).count()).to_string()), ("p3", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Volume(_))).count()).to_string())]));
                     });
                     if !self.import_devices_err.is_empty() {
                         ui.colored_label(egui::Color32::RED, self.import_devices_err.clone());
                     }
                     ui.separator();
                     if self.import_devices.is_empty() {
-                        ui.label("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。");
-                        ui.small("提示:WPD 服务不可用时只显示盘符卷(WPD 设备枚举尽力而为)。");
+                        ui.label(t("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。"));
+                        ui.small(t("提示:WPD 服务不可用时只显示盘符卷(WPD 设备枚举尽力而为)。"));
                     } else {
                         // 索引先行:避免闭包里同时借 self.import_devices 和 self.store
                         let entries: Vec<crate::wpd::DeviceEntry> = self.import_devices.clone();
@@ -11999,7 +13393,7 @@ impl eframe::App for App {
                                             ui.small(w.device_id.clone());
                                         }
                                         crate::wpd::DeviceEntry::Volume(p) => {
-                                            if ui.button("扫描此卷").clicked() {
+                                            if ui.button(t("扫描此卷")).clicked() {
                                                 scan_request = Some(p.clone());
                                             }
                                         }
@@ -12008,11 +13402,11 @@ impl eframe::App for App {
                             }
                         });
                         if let Some(root) = scan_request {
-                            self.start_scan_roots(vec![root], "设备导入");
+                            self.start_scan_roots(vec![root], t("设备导入"));
                             self.show_import_devices = false;
                         }
                         ui.separator();
-                        ui.small("便携设备(MTP/PTP)的照片传输需 WPD 对象流,当前版本未实现—— U 盘/读卡器请用「扫描此卷」。");
+                        ui.small(t("便携设备(MTP/PTP)的照片传输需 WPD 对象流,当前版本未实现—— U 盘/读卡器请用「扫描此卷」。"));
                     }
                 });
             self.show_import_devices = open;
@@ -12021,31 +13415,31 @@ impl eframe::App for App {
         // 邮件发送窗口(尺寸档 1600/1024/800)。
         if self.email_win {
             let mut open = self.email_win;
-            egui::Window::new("以邮件发送")
+            egui::Window::new(t("以邮件发送"))
                 .open(&mut open)
                 .default_width(420.0)
                 .show(ctx, |ui| {
                     ui.small(
-                        "把当前视图的照片缩放为 JPEG,交给系统默认邮件客户端(Simple MAPI 链路,MAPI 动态加载)。",
+                        t("把当前视图的照片缩放为 JPEG,交给系统默认邮件客户端(Simple MAPI 链路,MAPI 动态加载)。"),
                     );
                     ui.separator();
-                    ui.label("附件尺寸:");
+                    ui.label(t("附件尺寸:"));
                     for s in crate::share::ShareSize::ALL {
-                        ui.radio_value(&mut self.email_size, s, s.label());
+                        ui.radio_value(&mut self.email_size, s, t(s.label()));
                     }
                     ui.separator();
                     let n = self.view_ids().len();
                     if ui
                         .add_enabled(
                             self.share_rx.is_none(),
-                            egui::Button::new(format!("发送当前视图 {n} 张")),
+                            egui::Button::new(t_with("发送当前视图 {n} 张", &[("n", n.to_string())])),
                         )
                         .clicked()
                     {
                         self.start_email();
                     }
                     if self.share_rx.is_some() {
-                        ui.small("后台准备附件/等待邮件客户端中…");
+                        ui.small(t("后台准备附件/等待邮件客户端中…"));
                     }
                 });
             self.email_win = open;
@@ -12054,29 +13448,34 @@ impl eframe::App for App {
         // 礼品光盘窗口(IMAPI2 刻录)。
         if self.cd_win {
             let mut open = self.cd_win;
-            egui::Window::new("制作礼品光盘")
+            egui::Window::new(t("制作礼品光盘"))
                 .open(&mut open)
                 .default_width(420.0)
                 .show(ctx, |ui| {
-                    ui.small("把当前视图的照片写入光盘(走 IMAPI2 引擎;卷标沿用默认命名)。");
+                    ui.small(t(
+                        "把当前视图的照片写入光盘(走 IMAPI2 引擎;卷标沿用默认命名)。",
+                    ));
                     ui.separator();
-                    ui.label("照片尺寸:");
+                    ui.label(t("照片尺寸:"));
                     for s in crate::share::ShareSize::ALL {
-                        ui.radio_value(&mut self.cd_size, s, s.label());
+                        ui.radio_value(&mut self.cd_size, s, t(s.label()));
                     }
                     ui.separator();
                     let n = self.view_ids().len();
                     if ui
                         .add_enabled(
                             self.share_rx.is_none(),
-                            egui::Button::new(format!("刻录当前视图 {n} 张")),
+                            egui::Button::new(t_with(
+                                "刻录当前视图 {n} 张",
+                                &[("n", n.to_string())],
+                            )),
                         )
                         .clicked()
                     {
                         self.start_gift_cd();
                     }
                     if self.share_rx.is_some() {
-                        ui.small("后台暂存内容/刻录中…(请放入空盘)");
+                        ui.small(t("后台暂存内容/刻录中…(请放入空盘)"));
                     }
                 });
             self.cd_win = open;
@@ -12085,25 +13484,28 @@ impl eframe::App for App {
         // 变更历史窗口(可回溯的变更日志)。
         if self.show_changes {
             let mut open = self.show_changes;
-            egui::Window::new("变更历史")
+            egui::Window::new(t("变更历史"))
                 .open(&mut open)
                 .default_width(720.0)
                 .min_height(360.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("共 {} 条记录", self.store.change_count()));
-                        if ui.button("刷新").clicked() {
+                        ui.label(t_with(
+                            "共 {p1} 条记录",
+                            &[("p1", (self.store.change_count()).to_string())],
+                        ));
+                        if ui.button(t("刷新")).clicked() {
                             self.reload_changes();
                         }
-                        if ui.button("清空").clicked() {
+                        if ui.button(t("清空")).clicked() {
                             let _ = self.store.clear_changes();
                             self.reload_changes();
-                            self.status = "变更历史已清空".into();
+                            self.status = t("变更历史已清空").into();
                         }
                     });
                     ui.separator();
                     if self.change_log.is_empty() {
-                        ui.label("(暂无变更记录 —— 扫描或监听到变化后会记录在这里)");
+                        ui.label(t("(暂无变更记录 —— 扫描或监听到变化后会记录在这里)"));
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for (ts, path, action) in &self.change_log {
@@ -12123,7 +13525,7 @@ impl eframe::App for App {
                         });
                     }
                     ui.separator();
-                    ui.small("说明:变更日志持久化存储,可回溯。");
+                    ui.small(t("说明:变更日志持久化存储,可回溯。"));
                 });
             self.show_changes = open;
         }
@@ -12132,20 +13534,20 @@ impl eframe::App for App {
         // 这里给整批销案的出口 —— 网格右键只能一张一张来。
         if self.show_bad_media {
             let mut open = self.show_bad_media;
-            egui::Window::new("坏文件台账")
+            egui::Window::new(t("坏文件台账"))
                 .open(&mut open)
                 .default_width(760.0)
                 .min_height(320.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(format!("共 {} 条", self.bad_media_rows.len()));
-                        if ui.button("刷新").clicked() {
+                        ui.label(t_with("共 {p1} 条", &[("p1", (self.bad_media_rows.len()).to_string())]));
+                        if ui.button(t("刷新")).clicked() {
                             self.bad_media_rows = self.store.bad_media();
                         }
                     });
                     ui.separator();
                     if self.bad_media_rows.is_empty() {
-                        ui.label("(台账是空的 —— 派生连续失败 3 次的文件才会立案到这里)");
+                        ui.label(t("(台账是空的 —— 派生连续失败 3 次的文件才会立案到这里)"));
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for b in &self.bad_media_rows {
@@ -12157,14 +13559,14 @@ impl eframe::App for App {
                         });
                     }
                     ui.separator();
-                    ui.small("立案的文件不再自动重试缩略图。网格右键单个文件可「不隐藏」,或在这里整批销案。");
-                    if ui.button("全部销案(重新排队派生)").clicked() {
+                    ui.small(t("立案的文件不再自动重试缩略图。网格右键单个文件可「不隐藏」,或在这里整批销案。"));
+                    if ui.button(t("全部销案(重新排队派生)")).clicked() {
                         let n = self.bad_media_rows.len();
                         for b in std::mem::take(&mut self.bad_media_rows) {
                             let _ = self.store.unmark_bad_media(&b.path);
                         }
                         self.rebuild();
-                        self.status = format!("已销案 {n} 条,后台会重新尝试派生");
+                        self.status = t_with("已销案 {n} 条,后台会重新尝试派生", &[("n", n.to_string())]);
                     }
                 });
             self.show_bad_media = open;
@@ -12182,23 +13584,25 @@ impl eframe::App for App {
         // 按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。
         if self.show_uid_lookup {
             let mut open = self.show_uid_lookup;
-            egui::Window::new("按唯一标识(uid64)查找")
+            egui::Window::new(t("按唯一标识(uid64)查找"))
                 .open(&mut open)
                 .default_width(520.0)
                 .show(ctx, |ui| {
-                    ui.label("uid64 是照片的持久唯一标识(内容+路径派生,重新扫描不变)。");
+                    ui.label(t(
+                        "uid64 是照片的持久唯一标识(内容+路径派生,重新扫描不变)。",
+                    ));
                     ui.horizontal(|ui| {
                         let mut input = self.uid_input.clone();
                         if ui
                             .add(
                                 egui::TextEdit::singleline(&mut input)
-                                    .hint_text("十进制或 0x 十六进制"),
+                                    .hint_text(t("十进制或 0x 十六进制")),
                             )
                             .changed()
                         {
                             self.uid_input = input.clone();
                         }
-                        if ui.button("查找").clicked() {
+                        if ui.button(t("查找")).clicked() {
                             self.uid_lookup_result = Some(self.lookup_uid());
                         }
                     });
@@ -12206,7 +13610,7 @@ impl eframe::App for App {
                         Some(Ok(path)) => {
                             ui.separator();
                             ui.label(egui::RichText::new(path).strong());
-                            if ui.button("在资源管理器中显示").clicked() {
+                            if ui.button(t("在资源管理器中显示")).clicked() {
                                 show_in_explorer(path);
                             }
                         }
@@ -12225,16 +13629,22 @@ impl eframe::App for App {
         {
             let mut ocr_open = self.ocr_panel;
             if ocr_open {
-                egui::Window::new("OCR 识别结果")
+                egui::Window::new(t("OCR 识别结果"))
                     .open(&mut ocr_open)
                     .default_width(420.0)
                     .show(ctx, |ui| {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             if self.ocr_results.is_empty() {
-                                ui.label("(未识别到文本)");
+                                ui.label(t("(未识别到文本)"));
                             }
                             for t in &self.ocr_results {
-                                ui.label(format!("{}   置信度 {:.2}", t.text, t.conf));
+                                ui.label(t_with(
+                                    "{p1}   置信度 {p2}",
+                                    &[
+                                        ("p1", (t.text).to_string()),
+                                        ("p2", format!("{p2:.2}", p2 = (t.conf))),
+                                    ],
+                                ));
                             }
                         });
                     });
@@ -12245,18 +13655,18 @@ impl eframe::App for App {
         // 帮助 > 键盘快捷键
         if self.show_shortcuts {
             let mut open = self.show_shortcuts;
-            egui::Window::new("键盘快捷键")
+            egui::Window::new(t("键盘快捷键"))
                 .open(&mut open)
                 .default_width(380.0)
                 .show(ctx, |ui| {
-                    ui.label("Ctrl+A        全选当前视图的照片");
-                    ui.label("Ctrl+点击     选中 / 取消选中单张照片");
-                    ui.label("F2            保存(烘培)当前预览照片");
-                    ui.label("Ctrl+R        预览中顺时针旋转 90°(自定)");
-                    ui.label("Ctrl+Shift+R  预览中逆时针旋转 90°(自定)");
-                    ui.label("← / →         预览上一张 / 下一张");
-                    ui.label("Esc           关闭预览");
-                    ui.label("右键          照片上下文菜单");
+                    ui.label(t("Ctrl+A        全选当前视图的照片"));
+                    ui.label(t("Ctrl+点击     选中 / 取消选中单张照片"));
+                    ui.label(t("F2            保存(烘培)当前预览照片"));
+                    ui.label(t("Ctrl+R        预览中顺时针旋转 90°(自定)"));
+                    ui.label(t("Ctrl+Shift+R  预览中逆时针旋转 90°(自定)"));
+                    ui.label(t("← / →         预览上一张 / 下一张"));
+                    ui.label(t("Esc           关闭预览"));
+                    ui.label(t("右键          照片上下文菜单"));
                 });
             self.show_shortcuts = open;
         }
@@ -12264,7 +13674,7 @@ impl eframe::App for App {
         // 帮助 > 关于
         if self.show_about {
             let mut open = self.show_about;
-            egui::Window::new("关于 Maliang")
+            egui::Window::new(t("关于 Maliang"))
                 .open(&mut open)
                 .default_width(560.0)
                 .default_height(620.0)
@@ -12281,39 +13691,38 @@ impl eframe::App for App {
                         ui.vertical(|ui| {
                             ui.add_space(6.0);
                             // 英文品牌名
-                            ui.label(
-                                egui::RichText::new("Maliang")
-                                    .size(18.0)
-                                    .strong(),
-                            );
+                            ui.label(egui::RichText::new("Maliang").size(18.0).strong());
                             ui.add_space(2.0);
                             // 主标语:大而醒目
                             ui.label(
-                                egui::RichText::new("神笔马良,本地照片 AI 管家")
+                                egui::RichText::new(t("神笔马良,本地照片 AI 管家"))
                                     .size(24.0)
                                     .strong(),
                             );
                             // 副标语:比主标语小,但仍醒目
                             ui.label(
-                                egui::RichText::new("秒查速览、智能标签、对话搜图、一键搞定")
+                                egui::RichText::new(t("秒查速览、智能标签、对话搜图、一键搞定"))
                                     .size(15.0)
                                     .strong(),
                             );
                             ui.add_space(4.0);
-                            ui.label(format!(
-                                "当前版本 {} · Rust + egui 编写 · Apache 2.0 开源",
-                                env!("CARGO_PKG_VERSION")
+                            ui.label(t_with(
+                                "当前版本 {p1} · Rust + egui 编写 · Apache 2.0 开源",
+                                &[("p1", (env!("CARGO_PKG_VERSION")).to_string())],
                             ));
                         });
                     });
                     ui.separator();
-                    ui.heading("更新日志");
+                    ui.heading(t("更新日志"));
                     egui::ScrollArea::vertical()
                         .id_salt("about_changelog")
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            egui_commonmark::CommonMarkViewer::new()
-                                .show(ui, &mut self.about_cache, about_changelog_md());
+                            egui_commonmark::CommonMarkViewer::new().show(
+                                ui,
+                                &mut self.about_cache,
+                                about_changelog_md(),
+                            );
                         });
                 });
             self.show_about = open;
@@ -12327,34 +13736,34 @@ impl eframe::App for App {
         if self.show_folder_mgr {
             let mut open = self.show_folder_mgr;
             let mut close = false;
-            egui::Window::new("文件夹管理器")
+            egui::Window::new(t("文件夹管理器"))
                 .open(&mut open)
                 .default_width(660.0)
                 .min_height(340.0)
                 .show(ctx, |ui| {
                     ui.horizontal_wrapped(|ui| {
-                        if ui.button("添加文件夹…").clicked() {
+                        if ui.button(t("添加文件夹…")).clicked() {
                             self.add_folder_to_library();
                             close = true;
                         }
-                        if ui.button("全部重新扫描").clicked() {
+                        if ui.button(t("全部重新扫描")).clicked() {
                             let roots: Vec<PathBuf> =
                                 self.watched.iter().map(|(p, _)| PathBuf::from(p)).collect();
                             if roots.is_empty() {
-                                self.status = "图库中还没有监听任何文件夹".into();
+                                self.status = t("图库中还没有监听任何文件夹").into();
                             } else {
-                                self.start_scan_roots(roots, "全部文件夹");
+                                self.start_scan_roots(roots, t("全部文件夹"));
                                 close = true;
                             }
                         }
-                        if ui.button("清理已缺失文件").clicked() {
+                        if ui.button(t("清理已缺失文件")).clicked() {
                             self.clean_missing();
                             close = true;
                         }
                     });
                     ui.separator();
                     if self.watched.is_empty() {
-                        ui.label("(空)用上面的「添加文件夹…」把图片文件夹加入图库。");
+                        ui.label(t("(空)用上面的「添加文件夹…」把图片文件夹加入图库。"));
                     }
                     let watched = self.watched.clone();
                     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -12364,21 +13773,25 @@ impl eframe::App for App {
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new(&path).strong());
                                     ui.small(if exists {
-                                        format!("{count} 张照片 · 状态正常")
+                                        t_with(
+                                            "{count} 张照片 · 状态正常",
+                                            &[("count", count.to_string())],
+                                        )
                                     } else {
-                                        format!(
-                                            "{count} 张照片 · 文件夹已不在磁盘上(可清理缺失索引)"
+                                        t_with(
+                                            "{count} 张照片 · 文件夹已不在磁盘上(可清理缺失索引)",
+                                            &[("count", count.to_string())],
                                         )
                                     });
                                 });
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
-                                        if ui.button("从图库移除…").clicked() {
+                                        if ui.button(t("从图库移除…")).clicked() {
                                             self.confirm_folder_remove = Some(path.clone());
                                             close = true;
                                         }
-                                        if ui.button("重新扫描").clicked() {
+                                        if ui.button(t("重新扫描")).clicked() {
                                             self.start_scan_roots(
                                                 vec![PathBuf::from(&path)],
                                                 &path,
@@ -12391,12 +13804,16 @@ impl eframe::App for App {
                             ui.separator();
                         }
                     });
-                    ui.small("提示:移除只删除数据库索引,磁盘文件原样保留;重新扫描会再次加入。");
+                    ui.small(t(
+                        "提示:移除只删除数据库索引,磁盘文件原样保留;重新扫描会再次加入。",
+                    ));
                     // 扫描排除规则 + 监听模式。
                     let excl = crate::scan::Exclusions::from_store(&self.store);
                     ui.separator();
-                    ui.label("扫描时排除的目录");
-                    ui.small("系统目录、应用缓存、回收站一类不会被收录;可在这里增删规则。");
+                    ui.label(t("扫描时排除的目录"));
+                    ui.small(t(
+                        "系统目录、应用缓存、回收站一类不会被收录;可在这里增删规则。",
+                    ));
                     let mut to_remove: Option<String> = None;
                     egui::ScrollArea::vertical()
                         .max_height(120.0)
@@ -12410,8 +13827,8 @@ impl eframe::App for App {
                                         .iter()
                                         .any(|d| d.eq_ignore_ascii_case(name));
                                     if is_default {
-                                        ui.small("(默认)");
-                                    } else if ui.button("移除").clicked() {
+                                        ui.small(t("(默认)"));
+                                    } else if ui.button(t("移除")).clicked() {
                                         to_remove = Some(name.clone());
                                     }
                                 });
@@ -12421,7 +13838,7 @@ impl eframe::App for App {
                     // 名字表,也没有「移除」—— 用户搬了缓存位置,这里跟着变。
                     let own = excl.own_prefixes().to_vec();
                     if !own.is_empty() {
-                        ui.small("以下目录由本程序自己写入,始终不会收录:");
+                        ui.small(t("以下目录由本程序自己写入,始终不会收录:"));
                         for p in own {
                             ui.small(p.display().to_string());
                         }
@@ -12433,13 +13850,14 @@ impl eframe::App for App {
                         let mut input = self.exclude_input.clone();
                         if ui
                             .add(
-                                egui::TextEdit::singleline(&mut input).hint_text("目录名,如 Cache"),
+                                egui::TextEdit::singleline(&mut input)
+                                    .hint_text(t("目录名,如 Cache")),
                             )
                             .changed()
                         {
                             self.exclude_input = input.clone();
                         }
-                        if ui.button("添加排除目录").clicked() {
+                        if ui.button(t("添加排除目录")).clicked() {
                             let t = self.exclude_input.trim().to_string();
                             if !t.is_empty() {
                                 self.add_exclude_dir(&t);
@@ -12453,7 +13871,10 @@ impl eframe::App for App {
                         } else {
                             crate::watch::Mode::Event
                         };
-                        ui.small(format!("文件夹监听模式:{}", mode.label()));
+                        ui.small(t_with(
+                            "文件夹监听模式:{p1}",
+                            &[("p1", (mode.label()).to_string())],
+                        ));
                     }
                 });
             self.show_folder_mgr = open && !close;
@@ -12462,22 +13883,23 @@ impl eframe::App for App {
         // 文件夹管理器 > 从图库移除(二次确认;只删索引,不删文件)
         if let Some(folder) = self.confirm_folder_remove.clone() {
             let mut open = true;
-            egui::Window::new("从图库中移除文件夹")
+            egui::Window::new(t("从图库中移除文件夹"))
                 .open(&mut open)
                 .collapsible(false)
                 .default_width(460.0)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "确定把「{folder}」及其子文件夹下的所有照片从图库索引中移除吗?"
+                    ui.label(t_with(
+                        "确定把「{folder}」及其子文件夹下的所有照片从图库索引中移除吗?",
+                        &[("folder", folder.to_string())],
                     ));
-                    ui.label("只移除索引记录,不会删除磁盘上的任何文件。");
+                    ui.label(t("只移除索引记录,不会删除磁盘上的任何文件。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("移除").clicked() {
+                        if ui.button(t("移除")).clicked() {
                             self.remove_folder_from_library(&folder);
                             self.confirm_folder_remove = None;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(t("取消")).clicked() {
                             self.confirm_folder_remove = None;
                         }
                     });
@@ -12492,26 +13914,23 @@ impl eframe::App for App {
         if let Some(pend) = self.face_algo_pending {
             let mut open = true;
             let mut decision: u8 = 0; // 1=切换并重建 2=切换暂留 3=取消
-            egui::Window::new("切换人脸识别方案")
+            egui::Window::new(t("切换人脸识别方案"))
                 .open(&mut open)
                 .collapsible(false)
                 .resizable(false)
                 .default_width(480.0)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "切换到「{}」后,现有的人脸特征向量与簇不通用,需要重建。",
-                        pend.label()
-                    ));
-                    ui.small("重建 = 清除全部人脸数据(含人物命名)并按新方案重新扫描;暂留 = 旧簇照旧显示,待下次扫描再慢慢换血。");
+                    ui.label(t_with("切换到「{p1}」后,现有的人脸特征向量与簇不通用,需要重建。", &[("p1", (pend.label()).to_string())]));
+                    ui.small(t("重建 = 清除全部人脸数据(含人物命名)并按新方案重新扫描;暂留 = 旧簇照旧显示,待下次扫描再慢慢换血。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("切换并重建").clicked() {
+                        if ui.button(t("切换并重建")).clicked() {
                             decision = 1;
                         }
-                        if ui.button("切换,暂留旧数据").clicked() {
+                        if ui.button(t("切换,暂留旧数据")).clicked() {
                             decision = 2;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(t("取消")).clicked() {
                             decision = 3;
                         }
                     });
@@ -12528,15 +13947,12 @@ impl eframe::App for App {
                     self.refresh_people_and_suggestions();
                     if crate::ai::face::Faces::models_present(pend) {
                         self.start_face_scan();
-                        self.status = format!(
-                            "已切换到 {},现有人脸数据已清除,正在按新方案重新扫描",
-                            pend.label()
+                        self.status = t_with(
+                            "已切换到 {p1},现有人脸数据已清除,正在按新方案重新扫描",
+                            &[("p1", (pend.label()).to_string())],
                         );
                     } else {
-                        self.status = format!(
-                            "已切换到 {},人脸数据已清除;模型未就位,请到 选项 > 人脸识别 下载后再扫描",
-                            pend.label()
-                        );
+                        self.status = t_with("已切换到 {p1},人脸数据已清除;模型未就位,请到 选项 > AI 模型 下载后再扫描", &[("p1", (pend.label()).to_string())]);
                     }
                 }
                 2 => {
@@ -12544,10 +13960,7 @@ impl eframe::App for App {
                     let tag = crate::faces::algo_tag(&self.store);
                     let _ = self.store.set_setting("face_algo_version", &tag);
                     self.refresh_people_and_suggestions();
-                    self.status = format!(
-                        "已切换到 {},旧的人脸数据保留;重新扫描后新旧结果可能混排,建议用「切换并重建」",
-                        pend.label()
-                    );
+                    self.status = t_with("已切换到 {p1},旧的人脸数据保留;重新扫描后新旧结果可能混排,建议用「切换并重建」", &[("p1", (pend.label()).to_string())]);
                 }
                 _ => {}
             }
@@ -12557,23 +13970,23 @@ impl eframe::App for App {
         #[cfg(feature = "ai")]
         if self.face_version_warn {
             let mut open = self.face_version_warn;
-            egui::Window::new("人脸数据需要更新")
+            egui::Window::new(t("人脸数据需要更新"))
                 .open(&mut open)
                 .collapsible(false)
                 .default_width(480.0)
                 .show(ctx, |ui| {
-                    ui.label("检测到人脸识别算法已升级(现有数据由旧版本生成),旧的人脸簇和特征向量无法与新算法的结果正确比较。");
-                    ui.label("建议清除旧人脸数据并重新扫描;也可以暂时保留(新旧簇可能分开显示)。");
+                    ui.label(t("检测到人脸识别算法已升级(现有数据由旧版本生成),旧的人脸簇和特征向量无法与新算法的结果正确比较。"));
+                    ui.label(t("建议清除旧人脸数据并重新扫描;也可以暂时保留(新旧簇可能分开显示)。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("清除并重新扫描").clicked() {
+                        if ui.button(t("清除并重新扫描")).clicked() {
                             let _ = crate::faces::wipe_faces(&self.store);
                             let tag = crate::faces::algo_tag(&self.store);
                             let _ = self.store.set_setting("face_algo_version", &tag);
                             self.face_version_warn = false;
                             self.start_face_scan();
                         }
-                        if ui.button("保留旧数据").clicked() {
+                        if ui.button(t("保留旧数据")).clicked() {
                             let tag = crate::faces::algo_tag(&self.store);
                             let _ = self.store.set_setting("face_algo_version", &tag);
                             self.face_version_warn = false;
@@ -12598,9 +14011,9 @@ impl eframe::App for App {
             let two_pages = svc_page_open && self.scope_ask;
             let on_scope_page = !svc_page_open || self.wizard_page >= 1;
             let title = if on_scope_page {
-                "选择照片范围"
+                t("选择照片范围")
             } else {
-                "启用全盘快速查找"
+                t("启用全盘快速查找")
             };
             // 系统对话框式:屏幕居中、无原生标题条(拖不了就对了);配色自绘,
             // 推荐档绿底,拒绝档深蓝。标题与页码随当前步变化。
@@ -12615,7 +14028,8 @@ impl eframe::App for App {
                         egui::vec2(ui.available_width(), 36.0),
                         egui::Sense::hover(),
                     );
-                    ui.painter().rect_filled(hdr, egui::CornerRadius::same(6), Self::GRANT_GREEN);
+                    ui.painter()
+                        .rect_filled(hdr, egui::CornerRadius::same(6), Self::GRANT_GREEN);
                     ui.painter().text(
                         egui::pos2(hdr.center().x, hdr.center().y),
                         egui::Align2::CENTER_CENTER,
@@ -12638,11 +14052,17 @@ impl eframe::App for App {
                             egui::Color32::WHITE,
                         );
                         ui.painter().line_segment(
-                            [egui::pos2(xc.x - xr, xc.y - xr), egui::pos2(xc.x + xr, xc.y + xr)],
+                            [
+                                egui::pos2(xc.x - xr, xc.y - xr),
+                                egui::pos2(xc.x + xr, xc.y + xr),
+                            ],
                             x_stroke,
                         );
                         ui.painter().line_segment(
-                            [egui::pos2(xc.x - xr, xc.y + xr), egui::pos2(xc.x + xr, xc.y - xr)],
+                            [
+                                egui::pos2(xc.x - xr, xc.y + xr),
+                                egui::pos2(xc.x + xr, xc.y - xr),
+                            ],
                             x_stroke,
                         );
                         if x.clicked() {
@@ -12652,7 +14072,10 @@ impl eframe::App for App {
                     ui.add_space(14.0);
                     if two_pages {
                         let step = if on_scope_page { 2 } else { 1 };
-                        ui.small(format!("第 {step} 步,共 2 步"));
+                        ui.small(t_with(
+                            "第 {step} 步,共 2 步",
+                            &[("step", step.to_string())],
+                        ));
                         ui.add_space(4.0);
                     }
                     if on_scope_page {
@@ -12674,16 +14097,17 @@ impl eframe::App for App {
                         self.link_declined = false;
                         let _ = self.store.set_setting("svc_declined", "0");
                         self.status =
-                            "本次跳过全盘快查,下次启动会再问(勾选「不再提示」可免打扰)。".into();
+                            t("本次跳过全盘快查,下次启动会再问(勾选「不再提示」可免打扰)。").into();
                     }
                     g => {
                         #[cfg(windows)]
                         self.svc_apply_want(g);
                         if matches!(g, SvcWant::No) && checked {
                             let _ = self.store.set_setting("svc_never_ask", "1");
-                            self.status =
-                                "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。"
-                                    .into();
+                            self.status = t(
+                                "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。",
+                            )
+                            .into();
                         }
                     }
                 }
@@ -12697,7 +14121,8 @@ impl eframe::App for App {
                 if self.svc_never_ask {
                     let _ = self.store.set_setting("svc_never_ask", "1");
                     self.status =
-                        "已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。".into();
+                        t("已选「不再提示」:以后启动不再询问全盘快查(入口仍在,随时可启用)。")
+                            .into();
                 }
                 self.svc_ask_grant = false;
                 if self.scope_ask {
@@ -12715,22 +14140,22 @@ impl eframe::App for App {
 
         // 编辑 > 从图库中移除(二次确认;只删索引,不删文件)
         if self.confirm_remove {
-            egui::Window::new("从图库中移除")
+            egui::Window::new(t("从图库中移除"))
                 .collapsible(false)
                 .default_width(400.0)
                 .show(ctx, |ui| {
-                    ui.label(format!(
-                        "确定把选中的 {} 张照片从图库索引中移除吗?",
-                        self.sel.len()
+                    ui.label(t_with(
+                        "确定把选中的 {p1} 张照片从图库索引中移除吗?",
+                        &[("p1", (self.sel.len()).to_string())],
                     ));
-                    ui.label("只移除索引记录,不会删除磁盘上的原文件。");
+                    ui.label(t("只移除索引记录,不会删除磁盘上的原文件。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button("移除").clicked() {
+                        if ui.button(t("移除")).clicked() {
                             self.remove_selection();
                             self.confirm_remove = false;
                         }
-                        if ui.button("取消").clicked() {
+                        if ui.button(t("取消")).clicked() {
                             self.confirm_remove = false;
                         }
                     });

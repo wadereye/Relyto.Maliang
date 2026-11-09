@@ -81,9 +81,19 @@ pub fn read_meta(p: &std::path::Path) -> Meta {
     };
 
     // GPS
-    m.gps = gps_coord(&exif, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef, b'S')
-        .zip(gps_coord(&exif, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef, b'W'))
-        .filter(|(lat, lon)| (-90.0..=90.0).contains(lat) && (-180.0..=180.0).contains(lon));
+    m.gps = gps_coord(
+        &exif,
+        exif::Tag::GPSLatitude,
+        exif::Tag::GPSLatitudeRef,
+        b'S',
+    )
+    .zip(gps_coord(
+        &exif,
+        exif::Tag::GPSLongitude,
+        exif::Tag::GPSLongitudeRef,
+        b'W',
+    ))
+    .filter(|(lat, lon)| (-90.0..=90.0).contains(lat) && (-180.0..=180.0).contains(lon));
 
     // 像素宽高
     let px = |tag: exif::Tag| -> Option<i32> {
@@ -110,7 +120,11 @@ pub fn read_orientation(p: &std::path::Path) -> u32 {
         Err(_) => return 1,
     };
     match exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY) {
-        Some(f) => f.value.get_uint(0).filter(|v| (1..=8).contains(v)).unwrap_or(1),
+        Some(f) => f
+            .value
+            .get_uint(0)
+            .filter(|v| (1..=8).contains(v))
+            .unwrap_or(1),
         None => 1,
     }
 }
@@ -122,8 +136,18 @@ pub fn read_gps(p: &std::path::Path) -> Option<(f64, f64)> {
     let file = std::fs::File::open(p).ok()?;
     let mut buf = std::io::BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut buf).ok()?;
-    let lat = gps_coord(&exif, exif::Tag::GPSLatitude, exif::Tag::GPSLatitudeRef, b'S')?;
-    let lon = gps_coord(&exif, exif::Tag::GPSLongitude, exif::Tag::GPSLongitudeRef, b'W')?;
+    let lat = gps_coord(
+        &exif,
+        exif::Tag::GPSLatitude,
+        exif::Tag::GPSLatitudeRef,
+        b'S',
+    )?;
+    let lon = gps_coord(
+        &exif,
+        exif::Tag::GPSLongitude,
+        exif::Tag::GPSLongitudeRef,
+        b'W',
+    )?;
     if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) {
         return None; // 范围过滤
     }
@@ -131,7 +155,12 @@ pub fn read_gps(p: &std::path::Path) -> Option<(f64, f64)> {
 }
 
 /// 度分秒有理数 + 参考方向 -> 十进制度。
-fn gps_coord(exif: &exif::Exif, val_tag: exif::Tag, ref_tag: exif::Tag, neg_ref: u8) -> Option<f64> {
+fn gps_coord(
+    exif: &exif::Exif,
+    val_tag: exif::Tag,
+    ref_tag: exif::Tag,
+    neg_ref: u8,
+) -> Option<f64> {
     let f = exif.get_field(val_tag, exif::In::PRIMARY)?;
     let rats: Vec<exif::Rational> = match &f.value {
         exif::Value::Rational(v) => v.clone(),
@@ -612,7 +641,12 @@ mod tests {
     }
 
     /// 最小 JPEG + Exif + GPS(小端 TIFF)。
-    fn jpeg_with_gps(lat: (u32, u32, u32), lat_ref: u8, lon: (u32, u32, u32), lon_ref: u8) -> Vec<u8> {
+    fn jpeg_with_gps(
+        lat: (u32, u32, u32),
+        lat_ref: u8,
+        lon: (u32, u32, u32),
+        lon_ref: u8,
+    ) -> Vec<u8> {
         let mut tiff: Vec<u8> = Vec::new();
         tiff.extend_from_slice(b"II");
         tiff.extend_from_slice(&42u16.to_le_bytes());
@@ -625,9 +659,21 @@ mod tests {
         let entries_len = 2 + 4 * 12 + 4;
         let lat_at = gps_at + entries_len;
         let lon_at = lat_at + 24;
-        push_tiff_entry(&mut tiff, 0x0001, 2, 2, u32::from_le_bytes([lat_ref, 0, 0, 0]));
+        push_tiff_entry(
+            &mut tiff,
+            0x0001,
+            2,
+            2,
+            u32::from_le_bytes([lat_ref, 0, 0, 0]),
+        );
         push_tiff_entry(&mut tiff, 0x0002, 5, 3, lat_at as u32);
-        push_tiff_entry(&mut tiff, 0x0003, 2, 2, u32::from_le_bytes([lon_ref, 0, 0, 0]));
+        push_tiff_entry(
+            &mut tiff,
+            0x0003,
+            2,
+            2,
+            u32::from_le_bytes([lon_ref, 0, 0, 0]),
+        );
         push_tiff_entry(&mut tiff, 0x0004, 5, 3, lon_at as u32);
         tiff.extend_from_slice(&0u32.to_le_bytes()); // next=0
         for (n, d) in [(lat.0, 1u32), (lat.1, 1), (lat.2, 100)] {
@@ -688,7 +734,7 @@ mod tests {
         tiff.extend_from_slice(b"II");
         tiff.extend_from_slice(&42u16.to_le_bytes());
         tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 @8
-        // IFD0 是空的:8(TIFF 头)+ 2(计数=0)+ 0 条目录项 + 4(next 指针)。
+                                                     // IFD0 是空的:8(TIFF 头)+ 2(计数=0)+ 0 条目录项 + 4(next 指针)。
         let ifd1_at = 8 + 2 + 4;
         tiff.extend_from_slice(&0u16.to_le_bytes()); // IFD0 空
         tiff.extend_from_slice(&(ifd1_at as u32).to_le_bytes()); // next=IFD1

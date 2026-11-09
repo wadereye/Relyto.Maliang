@@ -165,7 +165,10 @@ mod tests {
         let img = image::RgbImage::from_pixel(16, 16, image::Rgb([100, 100, 100]));
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
         let src_bytes_before = std::fs::read(&src).unwrap();
@@ -185,7 +188,11 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), src_bytes_before);
         // 副本存在且被提亮
         let got = image::open(out.join("a.jpg")).unwrap().to_rgb8();
-        assert!(got.get_pixel(8, 8)[0] > 100, "副本应被提亮, got {}", got.get_pixel(8, 8)[0]);
+        assert!(
+            got.get_pixel(8, 8)[0] > 100,
+            "副本应被提亮, got {}",
+            got.get_pixel(8, 8)[0]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

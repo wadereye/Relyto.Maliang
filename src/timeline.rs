@@ -1,4 +1,5 @@
 use crate::db::Store;
+use crate::i18n::t;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::Path;
@@ -84,10 +85,10 @@ impl SortBy {
     /// 菜单文案(按拍摄日期 / 最近更改 / 大小 / 文件名)。
     pub fn label(self) -> &'static str {
         match self {
-            SortBy::Date => "按拍摄日期",
-            SortBy::Recent => "按最近更改日期",
-            SortBy::Size => "按大小",
-            SortBy::Name => "按名称",
+            SortBy::Date => t("按拍摄日期"),
+            SortBy::Recent => t("按最近更改日期"),
+            SortBy::Size => t("按大小"),
+            SortBy::Name => t("按名称"),
         }
     }
 
@@ -108,12 +109,15 @@ impl SortBy {
 
 /// 四个过滤开关的(图标, 悬停文案),索引顺序即工具栏从左到右与设置串顺序。
 /// 四枚开关对应搜索框右端的那四个小图标,顺序也沿用。
-pub const FILTER_BTNS: [(&str, &str); 4] = [
-    ("star", "只显示加星标的照片"),
-    ("smile", "只显示有人物头像的照片"),
-    ("video", "只显示视频"),
-    ("map-pin", "只显示有地理标记的照片"),
-];
+/// 过滤按钮(键,悬停提示)。提示随界面语言变,不能是 const。
+pub fn filter_btns() -> [(&'static str, &'static str); 4] {
+    [
+        ("star", t("只显示加星标的照片")),
+        ("smile", t("只显示有人物头像的照片")),
+        ("video", t("只显示视频")),
+        ("map-pin", t("只显示有地理标记的照片")),
+    ]
+}
 
 impl Filters {
     /// 是否没有任何过滤(用于状态栏与 SQL 短路)。
@@ -145,7 +149,7 @@ impl Filters {
     /// 设置项里存的 4 位开关串,顺序即 `FILTER_BTNS`。
     /// 搜索文本是临时输入,不落库。
     pub fn as_setting(&self) -> String {
-        (0..FILTER_BTNS.len())
+        (0..filter_btns().len())
             .map(|i| if self.flag(i) { '1' } else { '0' })
             .collect()
     }
@@ -153,7 +157,7 @@ impl Filters {
     /// 解析 `as_setting`;长度不符或含非 0/1 一律回退全关(宁可不带过滤,不炸启动)。
     pub fn from_setting(s: &str) -> Filters {
         let mut f = Filters::default();
-        for i in 0..FILTER_BTNS.len() {
+        for i in 0..filter_btns().len() {
             if s.as_bytes().get(i) == Some(&b'1') {
                 f.flip(i);
             }
@@ -318,13 +322,10 @@ pub fn load_recent(store: &Store, roots: &[String], limit: usize) -> Result<Vec<
     store.read(|conn| -> Result<Vec<i64>> {
         let mut st = conn.prepare(&sql)?;
         let mut ids = Vec::with_capacity(limit);
-        let mut it = st.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut it = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         while let Some(row) = it.next() {
             let (id, parent) = row?;
-            let in_scope = roots.is_empty()
-                || roots.iter().any(|r| under_root(&parent, r));
+            let in_scope = roots.is_empty() || roots.iter().any(|r| under_root(&parent, r));
             if in_scope {
                 ids.push(id);
                 if ids.len() >= limit {
@@ -397,7 +398,7 @@ pub fn by_month(rows: &[PhotoRow]) -> Vec<(String, Vec<usize>)> {
             .as_ref()
             .filter(|t| t.len() >= 7)
             .map(|t| t[..7].to_string())
-            .unwrap_or_else(|| "未知时间".into());
+            .unwrap_or_else(|| t("未知时间").into());
         buckets.entry(bucket).or_default().push(i);
     }
     buckets.into_iter().collect()
@@ -764,7 +765,9 @@ mod tests {
     use crate::db::Store;
 
     fn one_photo(store: &Store) -> i64 {
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "INSERT INTO photos(path,parent,mtime,size) VALUES('a.jpg','.',0,0)",
                 [],
             )
@@ -865,16 +868,22 @@ mod tests {
     fn remove_photos_clears_clips() {
         let store = Store::open_mem().unwrap();
         let id = one_photo(&store);
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "INSERT INTO clips(photo_id,dim,vec) VALUES(?1,2,X'0000803f0000003f')",
                 rusqlite::params![id],
             )
             .unwrap();
-        let n: i64 = store.test_conn().query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+        let n: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
         remove_photos(&store, &[id]).unwrap();
-        let n2: i64 = store.test_conn().query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+        let n2: i64 = store
+            .test_conn()
+            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n2, 0, "clips 行应随照片索引一并删除");
     }
@@ -917,7 +926,9 @@ mod tests {
 
         let store = Store::open_mem().unwrap();
         let id = one_photo(&store);
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "UPDATE photos SET path=?1 WHERE id=?2",
                 rusqlite::params![p1.to_string_lossy(), id],
             )
@@ -938,7 +949,9 @@ mod tests {
         assert!(tags_of(&store, id).unwrap().is_empty());
 
         // 3. 重置标记 → 合理重导(仅补 DB 空值)
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "UPDATE photos SET xmp_imported=0 WHERE id=?1",
                 rusqlite::params![id],
             )
@@ -947,14 +960,18 @@ mod tests {
         assert_eq!((s3, t3), (1, 1));
 
         // 4. 无 sidecar 的照片:直接标记,不报错
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'.',0,0)",
                 rusqlite::params![dir.join("b.jpg").to_string_lossy()],
             )
             .unwrap();
         let (s4, t4) = import_xmp_batch(&store, 100).unwrap();
         assert_eq!((s4, t4), (0, 0));
-        let left: i64 = store.test_conn().query_row(
+        let left: i64 = store
+            .test_conn()
+            .query_row(
                 "SELECT COUNT(*) FROM photos WHERE xmp_imported=0",
                 [],
                 |r| r.get(0),
@@ -1041,7 +1058,9 @@ mod tests {
     }
 
     fn add_face(store: &Store, photo_id: i64, ignored: i32) {
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "INSERT INTO faces(photo_id,x1,y1,x2,y2,ignored) VALUES(?1,0.1,0.1,0.5,0.5,?2)",
                 rusqlite::params![photo_id, ignored],
             )
@@ -1196,7 +1215,9 @@ mod tests {
             400,
             None,
         );
-        store.test_conn().execute(
+        store
+            .test_conn()
+            .execute(
                 "UPDATE photos SET caption='海边日落' WHERE id=?1",
                 rusqlite::params![titled],
             )

@@ -261,13 +261,13 @@ impl FileClass {
     /// 下拉框显示名。
     pub fn label(self) -> &'static str {
         match self {
-            FileClass::All => "全部",
-            FileClass::Image => "图片类",
-            FileClass::Video => "视频类",
-            FileClass::Audio => "音频类",
-            FileClass::Archive => "压缩包类",
-            FileClass::Executable => "可执行类",
-            FileClass::Document => "文档类",
+            FileClass::All => crate::i18n::t("全部"),
+            FileClass::Image => crate::i18n::t("图片类"),
+            FileClass::Video => crate::i18n::t("视频类"),
+            FileClass::Audio => crate::i18n::t("音频类"),
+            FileClass::Archive => crate::i18n::t("压缩包类"),
+            FileClass::Executable => crate::i18n::t("可执行类"),
+            FileClass::Document => crate::i18n::t("文档类"),
         }
     }
 
@@ -286,7 +286,9 @@ impl FileClass {
 }
 
 /// 音频扩展名(常见格式)。
-const AUDIO_EXTS: &[&str] = &["mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "ape", "mid"];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "opus", "ape", "mid",
+];
 /// 压缩包/镜像扩展名。
 const ARCHIVE_EXTS: &[&str] = &[
     "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "cab", "iso",
@@ -438,7 +440,10 @@ fn range_from_cmp(c: Cmp, v: u64) -> Range {
             lo: v.saturating_add(1),
             hi: u64::MAX,
         },
-        Cmp::Ge => Range { lo: v, hi: u64::MAX },
+        Cmp::Ge => Range {
+            lo: v,
+            hi: u64::MAX,
+        },
         Cmp::Lt => Range {
             lo: 0,
             hi: v.saturating_sub(1),
@@ -516,14 +521,24 @@ fn last_day_of_month(y: i32, m: u32) -> u32 {
 fn local_day_start(y: i32, m: u32, d: u32) -> Option<i64> {
     use chrono::TimeZone;
     let naive = chrono::NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(0, 0, 0)?;
-    Some(chrono::Local.from_local_datetime(&naive).earliest()?.timestamp())
+    Some(
+        chrono::Local
+            .from_local_datetime(&naive)
+            .earliest()?
+            .timestamp(),
+    )
 }
 
 /// 本地日历日的终点(23:59:59)→ UNIX 秒。
 fn local_day_end(y: i32, m: u32, d: u32) -> Option<i64> {
     use chrono::TimeZone;
     let naive = chrono::NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(23, 59, 59)?;
-    Some(chrono::Local.from_local_datetime(&naive).latest()?.timestamp())
+    Some(
+        chrono::Local
+            .from_local_datetime(&naive)
+            .latest()?
+            .timestamp(),
+    )
 }
 
 /// 一个（可能只写到年或月的）日期字面量 → 它覆盖的整段 [起, 止](UNIX 秒)。
@@ -960,7 +975,12 @@ pub fn search_class(
         return Vec::new();
     }
     // 跨块重叠窗口:最长名字子串少一个字节就够(子串起点落在上一块里)。
-    let overlap = terms.iter().map(Term::name_len).max().unwrap_or(0).saturating_sub(1);
+    let overlap = terms
+        .iter()
+        .map(Term::name_len)
+        .max()
+        .unwrap_or(0)
+        .saturating_sub(1);
     let bit = class_bit(class);
     // (卷序, 条目下标, 命中字节位)
     let mut hits: Vec<(usize, u32, usize)> = Vec::new();
@@ -1104,8 +1124,11 @@ impl VolumeIndex {
             // 进去 —— 不必把百万条全部重排。那一步在服务里拿着 state 锁做,
             // C: 卷每秒都有增量,全量重排一次几百毫秒,期间所有快查/Stat
             // 都在排队(查询延迟 2ms↔900ms 双峰,即此因)。
-            self.fold
-                .extend(self.pool[pool_before..].iter().map(|b| b.to_ascii_lowercase()));
+            self.fold.extend(
+                self.pool[pool_before..]
+                    .iter()
+                    .map(|b| b.to_ascii_lowercase()),
+            );
             self.merge_new_into_order(entries_before);
             self.build_csr();
             return counts;
@@ -1125,7 +1148,11 @@ impl VolumeIndex {
         }
         let mut adds: Vec<u32> = (from as u32..self.off.len() as u32).collect();
         let VolumeIndex {
-            fold, off, len, order, ..
+            fold,
+            off,
+            len,
+            order,
+            ..
         } = self;
         adds.sort_unstable_by(|&a, &b| folded_cmp(fold, off, len, a, b));
         let mut merged = Vec::with_capacity(order.len() + adds.len());
@@ -1210,7 +1237,11 @@ impl VolumeIndex {
         self.order.clear();
         self.order.extend(0..n as u32);
         let VolumeIndex {
-            fold, off, len, order, ..
+            fold,
+            off,
+            len,
+            order,
+            ..
         } = self;
         order.sort_unstable_by(|&a, &b| folded_cmp(fold, off, len, a, b));
         self.build_csr();
@@ -1422,7 +1453,8 @@ impl VolumeIndex {
         }
         let b_lo = self.off[lo] as usize;
         let last = hi - 1;
-        let b_hi = (self.off[last] as usize + self.len[last] as usize + overlap).min(self.fold.len());
+        let b_hi =
+            (self.off[last] as usize + self.len[last] as usize + overlap).min(self.fold.len());
         if b_lo >= b_hi {
             return out;
         }
@@ -1526,7 +1558,11 @@ pub struct IndexFile {
 }
 
 /// 原子写索引文件(先写 `.tmp` 再改名;数百万条目写一半崩溃不留半个索引)。
-pub fn save(path: &Path, vols: &[VolumeIndex], journals: &HashMap<char, crate::mft::JournalState>) -> Result<()> {
+pub fn save(
+    path: &Path,
+    vols: &[VolumeIndex],
+    journals: &HashMap<char, crate::mft::JournalState>,
+) -> Result<()> {
     let tmp = path.with_extension("bin.tmp");
     let f = std::fs::File::create(&tmp)?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
@@ -1873,10 +1909,7 @@ pub fn refresh_volume(v: &mut VolumeIndex, journal_id: u64, start_usn: i64) -> F
 /// 三个条件缺一不可:日志还是同一个实例(id 相同 = 没被重建)、
 /// checkpoint 没落到已回收区(`>= first_usn`)、也没跑到未来(`<= next_usn`)。
 /// 任一不满足就只能全量重建。
-pub fn can_resume(
-    saved: Option<crate::mft::JournalState>,
-    cur: &crate::mft::JournalState,
-) -> bool {
+pub fn can_resume(saved: Option<crate::mft::JournalState>, cur: &crate::mft::JournalState) -> bool {
     saved
         .map(|s| {
             s.journal_id == cur.journal_id
@@ -1943,8 +1976,7 @@ pub fn l1_rows_for_frns(v: &VolumeIndex, frns: &[u64]) -> Vec<crate::db::L1Row> 
     if frns.is_empty() {
         return Vec::new();
     }
-    let want: std::collections::HashSet<u64> =
-        frns.iter().map(|f| f & FRN_INDEX_MASK).collect();
+    let want: std::collections::HashSet<u64> = frns.iter().map(|f| f & FRN_INDEX_MASK).collect();
     (0..v.count())
         .filter(|&i| v.is_indexable(i) && want.contains(&(v.frn_of(i) & FRN_INDEX_MASK)))
         .map(|i| l1_row(v, i))
@@ -2125,7 +2157,10 @@ pub fn build_volume(
                 true
             })?;
             (
-                format!("USN 记录 {} 条(文件 {},目录 {})", st.records, st.files, st.dirs),
+                format!(
+                    "USN 记录 {} 条(文件 {},目录 {})",
+                    st.records, st.files, st.dirs
+                ),
                 Some(format!(
                     "直读 $MFT 失败({e:#}),退回全量枚举 USN(size/mtime 将留空)"
                 )),
@@ -2260,7 +2295,15 @@ fn cli_mft_scan_run(spec: Option<&str>) -> Result<()> {
                         p.letter, st.records, c.added, c.updated, c.removed, st.next_usn, t1.elapsed().as_secs_f64()
                     ));
                     if let Some(s) = &store {
-                        l2_ingest_delta(s, &vols[vi], p.letter, &up_frns, &del_frns, st.next_usn, &mut say);
+                        l2_ingest_delta(
+                            s,
+                            &vols[vi],
+                            p.letter,
+                            &up_frns,
+                            &del_frns,
+                            st.next_usn,
+                            &mut say,
+                        );
                     }
                     incr_ok = true;
                     touched += 1;
@@ -2288,7 +2331,9 @@ fn cli_mft_scan_run(spec: Option<&str>) -> Result<()> {
         ));
         let built = build_volume(&p, Some(&ctrl), |n| {
             // 逐秒条数写进报告,界面可见进度。
-            say(format!("PROGRESS {frac:.2} [{letter}:] 全量读取中…已 {n} 条"));
+            say(format!(
+                "PROGRESS {frac:.2} [{letter}:] 全量读取中…已 {n} 条"
+            ));
         })?;
         if let Some(d) = &built.degraded {
             say(format!("[{letter}:] {d}"));
@@ -2435,7 +2480,11 @@ pub fn cli_mft_check() -> Result<()> {
             t1.elapsed().as_secs_f64() * 1000.0
         );
         for h in &hits {
-            println!("  {} {}", if h.is_dir { "<目录>" } else { "      " }, h.path);
+            println!(
+                "  {} {}",
+                if h.is_dir { "<目录>" } else { "      " },
+                h.path
+            );
         }
         if hits.is_empty() {
             println!("  (无命中)");
@@ -2681,7 +2730,11 @@ mod tests {
     fn compile_classifies_predicates() {
         let ts = compile_query("ext:JPG|png size:>10mb date:2024-05");
         assert_eq!(ts.len(), 3);
-        assert_eq!(alt_kinds(&ts[0]), vec!["ext", "ext"], "前导 `ext:` 管住整个词");
+        assert_eq!(
+            alt_kinds(&ts[0]),
+            vec!["ext", "ext"],
+            "前导 `ext:` 管住整个词"
+        );
         assert_eq!(ts[0].alts[0], Alt::Ext(b"jpg".to_vec()), "ext 值折叠小写");
         assert_eq!(alt_kinds(&ts[1]), vec!["size"]);
         assert_eq!(alt_kinds(&ts[2]), vec!["date"]);
@@ -2717,7 +2770,10 @@ mod tests {
             2,
             "`|` 两侧各是一段日期"
         );
-        assert_eq!(alt_kinds(&compile_query("size:1kb|>10mb")[0]), vec!["size", "size"]);
+        assert_eq!(
+            alt_kinds(&compile_query("size:1kb|>10mb")[0]),
+            vec!["size", "size"]
+        );
         // 没有前导谓词时才逐候选各自判类型。
         assert_eq!(
             alt_kinds(&compile_query("a|ext:jpg")[0]),
@@ -2729,7 +2785,10 @@ mod tests {
             compile_query("size:abc|1kb")[0].alts,
             vec![Alt::Size(Range { lo: 1024, hi: 1024 })]
         );
-        assert!(compile_query("size:abc|").is_empty(), "全部候选作废 → 整词作废");
+        assert!(
+            compile_query("size:abc|").is_empty(),
+            "全部候选作废 → 整词作废"
+        );
     }
 
     /// 谓词写错 → 整词作废;**整条查询作废时必须回空,不能退化成全命中**。
@@ -2808,11 +2867,17 @@ mod tests {
         );
         assert_eq!(
             parse_range("1mb..10mb", parse_size_value),
-            Some(Range { lo: mb, hi: 10 * mb })
+            Some(Range {
+                lo: mb,
+                hi: 10 * mb
+            })
         );
         assert_eq!(
             parse_range("10mb..1mb", parse_size_value),
-            Some(Range { lo: mb, hi: 10 * mb }),
+            Some(Range {
+                lo: mb,
+                hi: 10 * mb
+            }),
             "写反自动对调,不当空集"
         );
         assert_eq!(
@@ -2929,9 +2994,25 @@ mod tests {
         let jan = local_day_start(2023, 1, 2).unwrap() as u64 * 1_000_000;
         let mut b = VolumeIndexBuilder::new('C');
         push(&mut b, 0x1000, 5, ATTR_DIRECTORY, "Pics");
-        push_meta(&mut b, 0x1001, 0x1000, 0x20, "big.jpg", 20 * 1024 * 1024, may);
+        push_meta(
+            &mut b,
+            0x1001,
+            0x1000,
+            0x20,
+            "big.jpg",
+            20 * 1024 * 1024,
+            may,
+        );
         push_meta(&mut b, 0x1002, 0x1000, 0x20, "small.png", 1024, jan);
-        push_meta(&mut b, 0x1003, 0x1000, 0x20, "big.mp4", 20 * 1024 * 1024, may);
+        push_meta(
+            &mut b,
+            0x1003,
+            0x1000,
+            0x20,
+            "big.mp4",
+            20 * 1024 * 1024,
+            may,
+        );
         push_meta(&mut b, 0x1004, 0x1000, 0x20, "notes.txt", 1024, jan);
         push(&mut b, 0x1005, 0x1000, 0x20, "unknown.jpg");
         b.finish()
@@ -3035,11 +3116,9 @@ mod tests {
         );
         assert!(search(std::slice::from_ref(&v), "date:2024-06", 100).is_empty());
         // mtime 列的 0 = 「拿不到」→ 不命中任何日期区间。
-        assert!(
-            search(std::slice::from_ref(&v), "date:>1970", 100)
-                .iter()
-                .all(|h| h.name != "unknown.jpg")
-        );
+        assert!(search(std::slice::from_ref(&v), "date:>1970", 100)
+            .iter()
+            .all(|h| h.name != "unknown.jpg"));
         // 三类谓词叠一起。
         assert_eq!(
             names(&search(
@@ -3156,7 +3235,15 @@ mod tests {
         push(&mut b, 0x1000, 5, ATTR_DIRECTORY, "Pics");
         for i in 0..n {
             // 定长 8 位数字名:只有跨块边界那一处的「尾 4 位 + 头 4 位」拼接是唯一的。
-            push_meta(&mut b, 0x2000 + i as u64, 0x1000, 0x20, &format!("{i:08}"), 1024, 0);
+            push_meta(
+                &mut b,
+                0x2000 + i as u64,
+                0x1000,
+                0x20,
+                &format!("{i:08}"),
+                1024,
+                0,
+            );
         }
         let v = b.finish();
         // 块边界**不是** 4096 的整数倍:`step = n.div_ceil(chunks)`,而 chunks 又被
@@ -3215,7 +3302,10 @@ mod tests {
         let n = CHUNK_RECORDS * 2 + 5;
         let v = wide_volume(n);
         // `img_0004` 命中 i = 40..49 这 10 条(名字是 img_{i:05})。
-        assert_eq!(names(&search(std::slice::from_ref(&v), "img_0004", 100)).len(), 10);
+        assert_eq!(
+            names(&search(std::slice::from_ref(&v), "img_0004", 100)).len(),
+            10
+        );
         assert_eq!(
             names(&search(std::slice::from_ref(&v), "img_0004 ext:jpg", 100)).len(),
             10,
@@ -3252,11 +3342,20 @@ mod tests {
         assert!(search_class(std::slice::from_ref(&v), "img", 10, FileClass::Archive).is_empty());
         // 目录名无扩展名 → 只归「全部」。
         assert!(search_class(std::slice::from_ref(&v), "pics", 10, FileClass::Image).is_empty());
-        assert_eq!(search_class(std::slice::from_ref(&v), "pics", 10, FileClass::All).len(), 1);
+        assert_eq!(
+            search_class(std::slice::from_ref(&v), "pics", 10, FileClass::All).len(),
+            1
+        );
         // RAW 扩展名归图片类(与收录口径一致)。
-        assert_eq!(search_class(std::slice::from_ref(&v), ".nef", 10, FileClass::Image).len(), 1);
+        assert_eq!(
+            search_class(std::slice::from_ref(&v), ".nef", 10, FileClass::Image).len(),
+            1
+        );
         // 视频/音频类各归各表。
-        assert_eq!(search_class(std::slice::from_ref(&v), "dsc", 10, FileClass::Video).len(), 0);
+        assert_eq!(
+            search_class(std::slice::from_ref(&v), "dsc", 10, FileClass::Video).len(),
+            0
+        );
         // search() 默认全部档。
         assert_eq!(search(std::slice::from_ref(&v), "img", 10).len(), 1);
     }
@@ -3305,7 +3404,14 @@ mod tests {
     #[test]
     fn metadata_survives_save_load_roundtrip() {
         let mut b = VolumeIndexBuilder::new('C');
-        b.push_mft(&mft_rec(0x100, 5, "a.nef", 0x20, 1_234_567, FT_EPOCH + 10_000_000));
+        b.push_mft(&mft_rec(
+            0x100,
+            5,
+            "a.nef",
+            0x20,
+            1_234_567,
+            FT_EPOCH + 10_000_000,
+        ));
         let v = b.finish();
         let dir = std::env::temp_dir().join(format!("rk-nameidx-meta-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3323,7 +3429,14 @@ mod tests {
     #[test]
     fn mft_build_carries_size_and_mtime() {
         let mut b = VolumeIndexBuilder::new('C');
-        b.push_mft(&mft_rec(0x100, 5, "a.jpg", 0x20, 4096, FT_EPOCH + 10_000_000));
+        b.push_mft(&mft_rec(
+            0x100,
+            5,
+            "a.jpg",
+            0x20,
+            4096,
+            FT_EPOCH + 10_000_000,
+        ));
         b.push_mft(&mft_rec(0x101, 5, "dir", ATTR_DIRECTORY, 0, 0));
         // 卷根(下标 5)与无名记录不进索引。
         b.push_mft(&mft_rec(5, 5, "", ATTR_DIRECTORY, 0, 0));
@@ -3331,7 +3444,11 @@ mod tests {
         assert_eq!(v.count(), 2);
         assert_eq!(v.size_of(0), 4096);
         assert_eq!(v.mtime_of(0), 1_000_000, "FILETIME → UNIX 微秒");
-        assert_eq!(v.mtime_usn_of(0), 0, "不是 journal 事件写进来的,变更时刻留空");
+        assert_eq!(
+            v.mtime_usn_of(0),
+            0,
+            "不是 journal 事件写进来的,变更时刻留空"
+        );
         assert!(v.is_indexable(0));
         assert!(v.is_dir(1));
         assert!(!v.is_indexable(1));
@@ -3367,7 +3484,10 @@ mod tests {
             "RAW2",
         ))]);
         let hits = search(std::slice::from_ref(&v), "dsc.nef", 10);
-        assert_eq!(hits[0].path, r"C:\Pics\RAW2\DSC.NEF", "目录改名后子路径应跟随");
+        assert_eq!(
+            hits[0].path, r"C:\Pics\RAW2\DSC.NEF",
+            "目录改名后子路径应跟随"
+        );
     }
 
     #[test]
@@ -3389,7 +3509,10 @@ mod tests {
         let _ = v.apply_delta(vec![DeltaOp::Delete(0x2000)]);
         let hits = search(std::slice::from_ref(&v), "dsc.nef", 10);
         assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].path, r"C:\DSC.NEF", "父目录被删 → 子条目路径退化为自身");
+        assert_eq!(
+            hits[0].path, r"C:\DSC.NEF",
+            "父目录被删 → 子条目路径退化为自身"
+        );
     }
 
     #[test]
@@ -3474,8 +3597,14 @@ mod tests {
             );
             assert_eq!(v.order, twin.order, "第 {r} 轮后有序视图应与全量重建一致");
             assert_eq!(v.fold, twin.fold, "第 {r} 轮后折叠池应与全量重建一致");
-            assert_eq!(v.csr_start, twin.csr_start, "第 {r} 轮后 CSR 应与全量重建一致");
-            assert_eq!(v.csr_child, twin.csr_child, "第 {r} 轮后 CSR 应与全量重建一致");
+            assert_eq!(
+                v.csr_start, twin.csr_start,
+                "第 {r} 轮后 CSR 应与全量重建一致"
+            );
+            assert_eq!(
+                v.csr_child, twin.csr_child,
+                "第 {r} 轮后 CSR 应与全量重建一致"
+            );
         }
         let hits = search(std::slice::from_ref(&v), "batch11_img2", 10);
         assert_eq!(hits.len(), 1, "最后一轮新增的名字必须立即可查");
@@ -3517,7 +3646,14 @@ mod tests {
     #[test]
     fn delta_does_not_wipe_mft_metadata() {
         let mut b = VolumeIndexBuilder::new('C');
-        b.push_mft(&mft_rec(0x100, 5, "a.jpg", 0x20, 4096, FT_EPOCH + 10_000_000));
+        b.push_mft(&mft_rec(
+            0x100,
+            5,
+            "a.jpg",
+            0x20,
+            4096,
+            FT_EPOCH + 10_000_000,
+        ));
         let mut v = b.finish();
         let mut u = up(0x100, 5, 0x20, "b.jpg");
         u.mtime_usn = 777;

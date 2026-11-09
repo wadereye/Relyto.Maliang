@@ -91,8 +91,9 @@ impl Curve {
             if h_prev == 0.0 || h_next == 0.0 {
                 continue;
             }
-            let alpha = 3.0 * ((self.points[i + 1].y - self.points[i].y) / h_next
-                - (self.points[i].y - self.points[i - 1].y) / h_prev);
+            let alpha = 3.0
+                * ((self.points[i + 1].y - self.points[i].y) / h_next
+                    - (self.points[i].y - self.points[i - 1].y) / h_prev);
             if i == 1 {
                 diag[i] = 2.0 * (h_prev + h_next);
                 rhs[i] = alpha;
@@ -196,11 +197,7 @@ impl Curves {
             let r = self.red.eval(m);
             let g = self.green.eval(m);
             let b = self.blue.eval(m);
-            lut[i] = [
-                clamp_u8(r),
-                clamp_u8(g),
-                clamp_u8(b),
-            ];
+            lut[i] = [clamp_u8(r), clamp_u8(g), clamp_u8(b)];
         }
         lut
     }
@@ -223,8 +220,15 @@ pub fn exposure_points(stops: f32) -> Vec<Point> {
     if stops == 0.0 {
         return Vec::new();
     }
-    let key = if stops > 0.0 { "exposure.pos" } else { "exposure.neg" };
-    crate::assets::pairs(key).into_iter().map(|(x, y)| Point::new(x, y)).collect()
+    let key = if stops > 0.0 {
+        "exposure.pos"
+    } else {
+        "exposure.neg"
+    };
+    crate::assets::pairs(key)
+        .into_iter()
+        .map(|(x, y)| Point::new(x, y))
+        .collect()
 }
 
 /// 把 LUT 应用到图像,每个通道用自己的码值索引查表。
@@ -255,7 +259,10 @@ pub mod presets {
 
     /// 读取一条曲线;段不存在或为空时返回恒等曲线。
     fn curve_of(name: &str) -> Curve {
-        let pts: Vec<Point> = assets::pairs(name).into_iter().map(|(x, y)| Point::new(x, y)).collect();
+        let pts: Vec<Point> = assets::pairs(name)
+            .into_iter()
+            .map(|(x, y)| Point::new(x, y))
+            .collect();
         if pts.is_empty() {
             Curve::new()
         } else {
@@ -482,7 +489,11 @@ mod tests {
         let mut img = image::RgbaImage::from_pixel(1, 1, image::Rgba([200, 120, 40, 255]));
         apply_curves(&mut img, &presets::soft_glow(50.0));
         let p = img.get_pixel(0, 0);
-        assert!(p[0] > p[1] && p[1] > p[2], "色彩层次被抹平:{:?}", [p[0], p[1], p[2]]);
+        assert!(
+            p[0] > p[1] && p[1] > p[2],
+            "色彩层次被抹平:{:?}",
+            [p[0], p[1], p[2]]
+        );
     }
 
     #[test]

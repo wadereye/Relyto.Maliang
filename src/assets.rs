@@ -196,7 +196,10 @@ mod tests {
     fn luma_weights_are_ordered_and_normalized() {
         let w = f64s("luma.weights");
         assert_eq!(w.len(), 3);
-        assert!(w[1] > w[0] && w[0] > w[2], "亮度权重应为 绿>红>蓝,got {w:?}");
+        assert!(
+            w[1] > w[0] && w[0] > w[2],
+            "亮度权重应为 绿>红>蓝,got {w:?}"
+        );
         let sum: f64 = w.iter().sum();
         assert!((sum - 1.0).abs() < 0.01, "亮度权重之和应接近 1,got {sum}");
     }

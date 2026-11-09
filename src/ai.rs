@@ -17,15 +17,44 @@ pub(crate) fn env() -> &'static Environment {
     ENV.get_or_init(|| ort::init().build().expect("初始化 onnxruntime 失败"))
 }
 
-/// 用 onnxruntime 加载一个模型,返回其输入输出签名(连通性冒烟/排障用)。
-#[allow(dead_code)]
-pub fn try_load(path: &std::path::Path) -> Result<String, String> {
+/// 用 onnxruntime 加载一个模型,返回输入输出名(连通性冒烟/导入校验用)。
+pub fn inspect(path: &std::path::Path) -> Result<(Vec<String>, Vec<String>), String> {
     let session = Session::builder(env())
         .map_err(|e| format!("会话构建: {e}"))?
         .commit_from_file(path)
         .map_err(|e| format!("加载模型: {e}"))?;
-    let inputs: Vec<&str> = session.inputs().iter().map(|i| i.name()).collect();
-    let outputs: Vec<&str> = session.outputs().iter().map(|o| o.name()).collect();
+    let inputs: Vec<String> = session
+        .inputs()
+        .iter()
+        .map(|i| i.name().to_string())
+        .collect();
+    let outputs: Vec<String> = session
+        .outputs()
+        .iter()
+        .map(|o| o.name().to_string())
+        .collect();
+    Ok((inputs, outputs))
+}
+
+/// 首个张量输出的最后一维(语义嵌入维度校验用)。
+pub fn output_dim(path: &std::path::Path) -> Option<i32> {
+    let session = Session::builder(env()).ok()?.commit_from_file(path).ok()?;
+    for o in session.outputs() {
+        if let ort::value::ValueType::Tensor { shape, .. } = o.dtype() {
+            if let Some(&d) = shape.last() {
+                if d > 0 {
+                    return Some(d as i32);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 加载模型的签名串(排障用)。
+#[allow(dead_code)]
+pub fn try_load(path: &std::path::Path) -> Result<String, String> {
+    let (inputs, outputs) = inspect(path)?;
     Ok(format!("{path:?}: inputs={inputs:?}, outputs={outputs:?}"))
 }
 
@@ -70,6 +99,7 @@ pub mod ocr {
         det: Session,
         rec: Session,
         dict: Vec<String>,
+        cls: Option<Session>,
     }
 
     fn open_session(p: &std::path::Path) -> Result<Session, String> {
@@ -80,29 +110,99 @@ pub mod ocr {
     }
 
     impl Ocr {
-        pub fn load() -> Result<Self, String> {
-            let dir = models_dir().ok_or("无数据目录")?;
-            let det = open_session(&dir.join("ch_PP-OCRv4_det_infer.onnx"))?;
-            let rec = open_session(&dir.join("ch_PP-OCRv4_rec_infer.onnx"))?;
-            let dict = std::fs::read_to_string(dir.join("ppocr_keys_v1.txt"))
+        /// 按槽位目录加载(旧平铺文件自动回退)。
+        pub fn load(store: &crate::db::Store) -> Result<Self, String> {
+            let det = crate::ai_models::file_path(store, "ocr_det", "det.onnx")
+                .or_else(|| {
+                    crate::ai_models::file_path(store, "ocr_det", "ch_PP-OCRv4_det_infer.onnx")
+                })
+                .ok_or("缺少文字检测模型")?;
+            let rec = crate::ai_models::file_path(store, "ocr_rec", "rec.onnx")
+                .or_else(|| {
+                    crate::ai_models::file_path(store, "ocr_rec", "ch_PP-OCRv4_rec_infer.onnx")
+                })
+                .ok_or("缺少文字识别模型")?;
+            let dict_path = crate::ai_models::file_path(store, "ocr_rec", "ppocr_keys_v1.txt")
+                .or_else(|| models_dir().map(|d| d.join("ppocr_keys_v1.txt")))
+                .ok_or("缺少字符表")?;
+            let cls = crate::ai_models::file_path(store, "ocr_cls", "cls.onnx")
+                .or_else(|| models_dir().map(|d| d.join("ch_ppocr_mobile_v2.0_cls_infer.onnx")));
+            Self::from_paths(&det, &rec, &dict_path, cls.as_deref())
+        }
+
+        /// 显式路径加载,便于单测与替换流程。
+        pub fn from_paths(
+            det: &std::path::Path,
+            rec: &std::path::Path,
+            dict_path: &std::path::Path,
+            cls: Option<&std::path::Path>,
+        ) -> Result<Self, String> {
+            let det = open_session(det)?;
+            let rec = open_session(rec)?;
+            let cls = cls.filter(|p| p.is_file()).map(open_session).transpose()?;
+            let dict = std::fs::read_to_string(dict_path)
                 .map_err(|e| format!("读字符表: {e}"))?
                 .lines()
                 .filter(|l| !l.is_empty())
                 .map(|l| l.to_string())
                 .collect();
-            Ok(Self { det, rec, dict })
+            Ok(Self {
+                det,
+                rec,
+                dict,
+                cls,
+            })
         }
 
-        fn det_map(&mut self, img: &image::DynamicImage) -> Result<(Vec<u32>, u32, u32, f32), String> {
+        /// 文字行方向分类:返回 true 表示需要旋转 180 度。
+        fn flipped(&mut self, crop: &image::RgbImage) -> bool {
+            let Some(cls) = self.cls.as_mut() else {
+                return false;
+            };
+            let rs = image::imageops::resize(crop, 192, 48, image::imageops::FilterType::Triangle);
+            let mut data = Vec::with_capacity(192 * 48 * 3);
+            for &c in &[2u8, 1, 0] {
+                for p in rs.pixels() {
+                    data.push((p.0[c as usize] as f32 / 255.0 - 0.5) / 0.5);
+                }
+            }
+            let Ok(input) = Tensor::from_array(([1usize, 3, 48usize, 192usize], data)) else {
+                return false;
+            };
+            let Ok(out) = cls.run(ort::inputs!["x" => &input]) else {
+                return false;
+            };
+            let Some(v) = out.values().next() else {
+                return false;
+            };
+            let Ok((_, logits)) = v.try_extract_tensor::<f32>() else {
+                return false;
+            };
+            logits.len() >= 2 && logits[1] > logits[0]
+        }
+
+        fn det_map(
+            &mut self,
+            img: &image::DynamicImage,
+        ) -> Result<(Vec<u32>, u32, u32, f32), String> {
             let (w, h) = (img.width(), img.height());
             // 短边缩到 640 附近,长边最多 960,只缩不放
             let scale = (640.0 / w.min(h) as f32)
                 .min(960.0 / w.max(h) as f32)
                 .min(1.0);
-            let (rw0, rh0) = ((w as f32 * scale).max(1.0) as u32, (h as f32 * scale).max(1.0) as u32);
+            let (rw0, rh0) = (
+                (w as f32 * scale).max(1.0) as u32,
+                (h as f32 * scale).max(1.0) as u32,
+            );
             let pad32 = |v: u32| ((v + 31) / 32) * 32;
             let (fw, fh) = (pad32(rw0), pad32(rh0.max(32)));
-            let rs = img.resize_exact(rw0.max(1), rh0.max(1), image::imageops::FilterType::Triangle).to_rgb8();
+            let rs = img
+                .resize_exact(
+                    rw0.max(1),
+                    rh0.max(1),
+                    image::imageops::FilterType::Triangle,
+                )
+                .to_rgb8();
             let mut canvas = image::RgbImage::new(fw, fh);
             image::imageops::replace(&mut canvas, &rs, 0, 0);
             const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -123,7 +223,12 @@ pub mod ocr {
             let (_, map): (&ort::value::Shape, &[f32]) = outputs["sigmoid_0.tmp_0"]
                 .try_extract_tensor::<f32>()
                 .map_err(|e| e.to_string())?;
-            Ok((map.iter().map(|f| (f * u16::MAX as f32) as u32).collect(), fw, fh, scale))
+            Ok((
+                map.iter().map(|f| (f * u16::MAX as f32) as u32).collect(),
+                fw,
+                fh,
+                scale,
+            ))
         }
 
         /// 整图 OCR,返回识别文本(原图坐标)。
@@ -180,10 +285,15 @@ pub mod ocr {
             let rgb = img.to_rgb8();
             let mut out = Vec::new();
             for &(bx0, by0, bx1, by1) in &boxes {
-                let crop = image::imageops::crop_imm(&rgb, bx0, by0, bx1 - bx0, by1 - by0).to_image();
+                let mut crop =
+                    image::imageops::crop_imm(&rgb, bx0, by0, bx1 - bx0, by1 - by0).to_image();
+                if self.flipped(&crop) {
+                    crop = image::imageops::rotate180(&crop);
+                }
                 let (cw, ch) = (crop.width(), crop.height());
                 let rw = (((cw as f32 / ch as f32) * 48.0) as u32).clamp(8, 320);
-                let c48 = image::imageops::resize(&crop, rw, 48, image::imageops::FilterType::Triangle);
+                let c48 =
+                    image::imageops::resize(&crop, rw, 48, image::imageops::FilterType::Triangle);
                 let mut data = Vec::with_capacity(48 * rw as usize * 3);
                 for &c in &[2u8, 1, 0] {
                     for p in c48.pixels() {
@@ -232,7 +342,14 @@ pub mod ocr {
                 if conf < 0.6 {
                     continue;
                 }
-                out.push(Txt { text, conf, x0: bx0, y0: by0, x1: bx1, y1: by1 });
+                out.push(Txt {
+                    text,
+                    conf,
+                    x0: bx0,
+                    y0: by0,
+                    x1: bx1,
+                    y1: by1,
+                });
             }
             Ok(out)
         }
@@ -253,13 +370,24 @@ pub mod ocr {
                 eprintln!("无 {} 跳过", fixture.display());
                 return;
             }
-            let mut ocr = Ocr::load().unwrap_or_else(|e| panic!("加载 OCR 失败: {e}"));
-            let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
+            let store = crate::db::Store::open_mem().unwrap();
+            let mut ocr = Ocr::load(&store).unwrap_or_else(|e| panic!("加载 OCR 失败: {e}"));
+            let img = image::ImageReader::open(&fixture)
+                .unwrap()
+                .decode()
+                .unwrap();
             let out = ocr.extract(&img).unwrap();
-            let joined: String = out.iter().map(|t| t.text.as_str()).collect::<Vec<_>>().join(" ");
+            let joined: String = out
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!("识别结果: {out:?}");
             assert!(!out.is_empty(), "未能识别出文本");
-            assert!(joined.contains("HELLO") || joined.contains("123"), "结果不含目标: {joined}");
+            assert!(
+                joined.contains("HELLO") || joined.contains("123"),
+                "结果不含目标: {joined}"
+            );
         }
     }
 }
@@ -309,9 +437,9 @@ pub mod face {
 
         pub fn label(self) -> &'static str {
             match self {
-                Self::SFace => "YuNet + SFace(推荐,Apache-2.0 含权重)",
-                Self::AdaFace => "YuNet + AdaFace(权重许可非商用,自备)",
-                Self::AntelopeV2 => "insightface antelopev2(权重非商用,自备)",
+                Self::SFace => crate::i18n::t("YuNet + SFace(推荐,Apache-2.0 含权重)"),
+                Self::AdaFace => crate::i18n::t("YuNet + AdaFace(权重许可非商用,自备)"),
+                Self::AntelopeV2 => crate::i18n::t("insightface antelopev2(权重非商用,自备)"),
             }
         }
 
@@ -423,7 +551,14 @@ pub mod face {
             let det_yunet = det.outputs().len() == 1;
             let rec = open_session(&dir.join(rec_f))?;
             let rec_out = rec.outputs()[0].name().to_string();
-            Ok(Self { algo, det, det_out, det_yunet, rec, rec_out })
+            Ok(Self {
+                algo,
+                det,
+                det_out,
+                det_yunet,
+                rec,
+                rec_out,
+            })
         }
 
         /// 指定方案的模型文件(检测+识别)是否已就位。
@@ -447,7 +582,11 @@ pub mod face {
             };
             // NMS(IoU 0.4)
             let mut dets = dets;
-            dets.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            dets.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let mut keep: Vec<Det> = Vec::new();
             for d in dets {
                 let ok = keep.iter().all(|k: &Det| {
@@ -552,7 +691,11 @@ pub mod face {
                 .det
                 .run(ort::inputs!["input.1" => &input])
                 .map_err(|e| format!("det 运行: {e}"))?;
-            let strides = [(8usize, "448", "451", "454"), (16, "471", "474", "477"), (32, "494", "497", "500")];
+            let strides = [
+                (8usize, "448", "451", "454"),
+                (16, "471", "474", "477"),
+                (32, "494", "497", "500"),
+            ];
             let mut dets: Vec<Det> = Vec::new();
             for (stride, sn, bn, kn) in strides {
                 let (_s_shape, s_vals) = outputs[sn]
@@ -591,7 +734,10 @@ pub mod face {
                     let k: Vec<(f32, f32)> = (0..5)
                         .map(|j| {
                             let kv = &k_vals[i * 10..i * 10 + 10];
-                            (ax + kv[j * 2] * stride as f32, ay + kv[j * 2 + 1] * stride as f32)
+                            (
+                                ax + kv[j * 2] * stride as f32,
+                                ay + kv[j * 2 + 1] * stride as f32,
+                            )
                         })
                         .collect();
                     dets.push(Det {
@@ -600,7 +746,10 @@ pub mod face {
                         x1: x1 / scale,
                         y1: y1 / scale,
                         score: s_vals[i],
-                        kps: k.iter().map(|(x, y)| (x / scale, y / scale)).collect::<Vec<_>>()
+                        kps: k
+                            .iter()
+                            .map(|(x, y)| (x / scale, y / scale))
+                            .collect::<Vec<_>>()
                             .try_into()
                             .unwrap(),
                     });
@@ -737,17 +886,30 @@ pub mod face {
                 eprintln!("无 {} 跳过", fixture.display());
                 return;
             }
-            let mut f = Faces::load(FaceAlgo::AdaFace)
-                .unwrap_or_else(|e| panic!("加载人脸模型失败: {e}"));
-            let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
+            let mut f =
+                Faces::load(FaceAlgo::AdaFace).unwrap_or_else(|e| panic!("加载人脸模型失败: {e}"));
+            let img = image::ImageReader::open(&fixture)
+                .unwrap()
+                .decode()
+                .unwrap();
             let out = f.analyze(&img).unwrap();
             eprintln!(
                 "检测到 {} 张脸, 首个: {:?}",
                 out.len(),
-                out.first().map(|x| (x.det.x0, x.det.y0, x.det.x1, x.det.y1, x.det.score, x.det.kps))
+                out.first().map(|x| (
+                    x.det.x0,
+                    x.det.y0,
+                    x.det.x1,
+                    x.det.y1,
+                    x.det.score,
+                    x.det.kps
+                ))
             );
             assert!(!out.is_empty(), "未检测到人脸");
-            assert!(out[0].emb.len() == FaceAlgo::AdaFace.emb_dim(), "嵌入维度错误");
+            assert!(
+                out[0].emb.len() == FaceAlgo::AdaFace.emb_dim(),
+                "嵌入维度错误"
+            );
             assert!(out[0].det.score > 0.5);
         }
     }
@@ -773,7 +935,8 @@ mod tests {
             return;
         }
         for p in models {
-            let info = try_load(&p).unwrap_or_else(|e| panic!("加载模型 {} 失败: {e}", p.display()));
+            let info =
+                try_load(&p).unwrap_or_else(|e| panic!("加载模型 {} 失败: {e}", p.display()));
             eprintln!("{info}");
         }
     }

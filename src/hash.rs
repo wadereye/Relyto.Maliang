@@ -2,12 +2,8 @@
 use image::DynamicImage;
 
 pub fn dhash_u64(img: &DynamicImage) -> u64 {
-    let gray = image::imageops::resize(
-        &img.to_luma8(),
-        9,
-        8,
-        image::imageops::FilterType::Triangle,
-    );
+    let gray =
+        image::imageops::resize(&img.to_luma8(), 9, 8, image::imageops::FilterType::Triangle);
     let mut hash = 0u64;
     for y in 0..8 {
         for x in 0..8 {

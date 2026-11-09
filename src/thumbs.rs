@@ -56,10 +56,10 @@ impl Tier {
     /// 供 UI 展示的档位名。
     pub fn label(self) -> &'static str {
         match self {
-            Tier::Small => "小缩略图 (96px)",
-            Tier::Normal => "普通缩略图 (256px)",
-            Tier::Big => "大缩略图 (512px)",
-            Tier::Preview => "预览图 (1024px)",
+            Tier::Small => crate::i18n::t("小缩略图 (96px)"),
+            Tier::Normal => crate::i18n::t("普通缩略图 (256px)"),
+            Tier::Big => crate::i18n::t("大缩略图 (512px)"),
+            Tier::Preview => crate::i18n::t("预览图 (1024px)"),
         }
     }
 
@@ -144,8 +144,7 @@ pub fn gc_orphans(store: &crate::db::Store, cache_root: &std::path::Path) -> usi
         candidates.dedup();
         for chunk in candidates.chunks(500) {
             let alive: std::collections::HashSet<i64> = store.read(|conn| {
-                let mut sql =
-                    String::from("SELECT id FROM photos WHERE id IN (");
+                let mut sql = String::from("SELECT id FROM photos WHERE id IN (");
                 for k in 0..chunk.len() {
                     sql.push_str(&if k == 0 {
                         format!("?{}", k + 1)
@@ -159,13 +158,18 @@ pub fn gc_orphans(store: &crate::db::Store, cache_root: &std::path::Path) -> usi
                     Err(_) => return Default::default(),
                 };
                 let params: Vec<i64> = chunk.to_vec();
-                st.query_map(rusqlite::params_from_iter(params.iter()), |r| r.get::<_, i64>(0))
-                    .map(|it| it.filter_map(|r| r.ok()).collect())
-                    .unwrap_or_default()
+                st.query_map(rusqlite::params_from_iter(params.iter()), |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
             });
             for id in chunk {
                 if !alive.contains(id)
-                    && std::fs::remove_file(cache_root.join(tier.dir_name()).join(format!("{id}.jpg"))).is_ok()
+                    && std::fs::remove_file(
+                        cache_root.join(tier.dir_name()).join(format!("{id}.jpg")),
+                    )
+                    .is_ok()
                 {
                     removed += 1;
                 }
@@ -208,7 +212,11 @@ pub fn gc_missing_tiers(store: &crate::db::Store, cache_root: &std::path::Path) 
             .iter()
             .filter(|(id, tier)| {
                 !cache_root
-                    .join(Tier::from_u8(*tier).map(|t| t.dir_name()).unwrap_or_default())
+                    .join(
+                        Tier::from_u8(*tier)
+                            .map(|t| t.dir_name())
+                            .unwrap_or_default(),
+                    )
                     .join(format!("{id}.jpg"))
                     .exists()
             })
@@ -289,7 +297,9 @@ fn downscale(img: image::DynamicImage, size: u32) -> image::DynamicImage {
     }
     if w.max(h) >= size.saturating_mul(8) {
         let (mw, mh) = fit_dims(w, h, size.saturating_mul(2).max(1));
-        return img.thumbnail(mw, mh).resize(size, size, FilterType::Triangle);
+        return img
+            .thumbnail(mw, mh)
+            .resize(size, size, FilterType::Triangle);
     }
     img.resize(size, size, FilterType::Triangle)
 }
@@ -303,11 +313,7 @@ fn downscale(img: image::DynamicImage, size: u32) -> image::DynamicImage {
 /// 「orientation 6/8 时交换请求宽高」在这里是恒等变换:
 /// `image` crate 不支持缩放解码,而各档的目标框都是正方形,交换宽高不变 ——
 /// 能省的只有**顺序**这一项。
-fn fit_oriented(
-    img: image::DynamicImage,
-    size: u32,
-    orient: u32,
-) -> image::DynamicImage {
+fn fit_oriented(img: image::DynamicImage, size: u32, orient: u32) -> image::DynamicImage {
     apply_exif_rotation(downscale(img, size), orient)
 }
 
@@ -358,7 +364,10 @@ fn decode_base(src: &Path, target: u32) -> Result<(image::DynamicImage, u32)> {
         if let Some(t) = decode_via_shell_sized(src, target) {
             return Ok((t, 1));
         }
-        return Err(anyhow::anyhow!("无可用预览(合成图缺失或色彩模式暂不支持): {}", src.display()));
+        return Err(anyhow::anyhow!(
+            "无可用预览(合成图缺失或色彩模式暂不支持): {}",
+            src.display()
+        ));
     }
     // 5) 常规格式:按**魔数**分派解码器,不是按扩展名。
     //    `image::open` 是照扩展名挑解码器的:缓存台账里 3,340 条
@@ -598,28 +607,28 @@ fn backfill_rows(
         Vec<(i64, &String, String)>,
     ) = thumb_pool().install(|| {
         rows.par_iter()
-        .filter_map(|(id, path)| {
-            // 云盘占位文件(OneDrive / SeaFile 按需下载):生成缩略图要打开
-            // 内容,会把占位文件整个拉下来。跳过且**不记账**——这不是坏文件,
-            // 用户以后打开/钉住文件后,行还在缺失队列里自然补上。
-            if crate::win::is_cloud_placeholder(Path::new(path)) {
-                return None;
-            }
-            Some(match generate_tier(tier, *id, Path::new(path)) {
-                Ok(h) => {
-                    // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读:
-                    // 发现路径不打开文件内容,这里是唯一读它的地方。
-                    // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
-                    let d = (tier == Tier::Normal)
-                        .then(|| crate::scan::read_derived(Path::new(path)));
-                    rayon::iter::Either::Left((*id, h, d))
+            .filter_map(|(id, path)| {
+                // 云盘占位文件(OneDrive / SeaFile 按需下载):生成缩略图要打开
+                // 内容,会把占位文件整个拉下来。跳过且**不记账**——这不是坏文件,
+                // 用户以后打开/钉住文件后,行还在缺失队列里自然补上。
+                if crate::win::is_cloud_placeholder(Path::new(path)) {
+                    return None;
                 }
-                // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
-                // worker 永远空转在开头(已知问题: 回收站 $I*.jpg 元数据)。
-                Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
+                Some(match generate_tier(tier, *id, Path::new(path)) {
+                    Ok(h) => {
+                        // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读:
+                        // 发现路径不打开文件内容,这里是唯一读它的地方。
+                        // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
+                        let d = (tier == Tier::Normal)
+                            .then(|| crate::scan::read_derived(Path::new(path)));
+                        rayon::iter::Either::Left((*id, h, d))
+                    }
+                    // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
+                    // worker 永远空转在开头(已知问题: 回收站 $I*.jpg 元数据)。
+                    Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
+                })
             })
-        })
-        .partition_map(|either| either)
+            .partition_map(|either| either)
     });
     for (id, path, why) in &failed {
         escalate_failure(store, *id, path, why);
@@ -641,10 +650,8 @@ fn backfill_rows(
     }
     if tier == Tier::Normal {
         // 派生列 + thumb_ok + dhash + rich_state 一条 UPDATE 落定(见 `mark_derived`)。
-        let batch: Vec<(i64, u64, Option<&crate::scan::Derived>)> = ok
-            .iter()
-            .map(|(id, h, d)| (*id, *h, d.as_ref()))
-            .collect();
+        let batch: Vec<(i64, u64, Option<&crate::scan::Derived>)> =
+            ok.iter().map(|(id, h, d)| (*id, *h, d.as_ref())).collect();
         store.mark_derived(&batch)?;
     }
     for (id, _, _) in &ok {
@@ -931,7 +938,9 @@ pub fn spawn_preview_worker(store: Arc<crate::db::Store>) -> PreviewWorker {
                 let _ = done_tx.send((id, Ok(true)));
                 continue;
             }
-            let res = build_preview(id, Path::new(&path)).map(|_| true).map_err(|e| e.to_string());
+            let res = build_preview(id, Path::new(&path))
+                .map(|_| true)
+                .map_err(|e| e.to_string());
             if res.is_ok() {
                 if store.photo_alive(id, &path) {
                     let _ = store.mark_tier_done(id, Tier::Preview as u8);
@@ -1034,10 +1043,7 @@ mod tests {
         }
         purge_cache(id);
         for tier in ALL_TIERS {
-            assert!(
-                !tier_path(tier, id).exists(),
-                "{tier:?} 缓存清理后不应残留"
-            );
+            assert!(!tier_path(tier, id).exists(), "{tier:?} 缓存清理后不应残留");
         }
     }
 
@@ -1050,7 +1056,10 @@ mod tests {
         }
         let mut jpg_bytes: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut jpg_bytes), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut jpg_bytes),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         // 手工构造 APP1/Exif,IFD1 指向该 JPEG
         let mut tiff: Vec<u8> = Vec::new();
@@ -1092,10 +1101,7 @@ mod tests {
         purge_cache(tid);
         let h = generate(tid, &src).expect("内嵌缩略图路径应成功");
         assert!(h != 0, "dHash 不应为 0");
-        assert!(
-            tier_path(Tier::Normal, tid).exists(),
-            "应落盘缩略图"
-        );
+        assert!(tier_path(Tier::Normal, tid).exists(), "应落盘缩略图");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1112,7 +1118,10 @@ mod tests {
         }
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
@@ -1178,7 +1187,10 @@ mod tests {
         let src = dir.join("a.jpg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 24))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
@@ -1324,21 +1336,19 @@ mod tests {
         // gc_orphans 的根由调用方给:生产传 cache_dir(),测试传临时目录,
         // 绝不能拿真实缓存目录当试验场(会当成孤儿全清)。
         let moved = |tier: Tier, id: i64| root.join(tier.dir_name()).join(format!("{id}.jpg"));
-        for (tier, id) in [(Tier::Normal, alive_id), (Tier::Normal, dead_id), (Tier::Small, dead_id)] {
+        for (tier, id) in [
+            (Tier::Normal, alive_id),
+            (Tier::Normal, dead_id),
+            (Tier::Small, dead_id),
+        ] {
             let p = moved(tier, id);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, b"x").unwrap();
         }
         let removed = gc_orphans(&store, &root);
         assert!(removed >= 2, "至少应清掉无主的两枚,实际 {removed}");
-        assert!(
-            moved(Tier::Normal, alive_id).exists(),
-            "有行的缓存不该被清"
-        );
-        assert!(
-            !moved(Tier::Normal, dead_id).exists(),
-            "无主的缓存应被清"
-        );
+        assert!(moved(Tier::Normal, alive_id).exists(), "有行的缓存不该被清");
+        assert!(!moved(Tier::Normal, dead_id).exists(), "无主的缓存应被清");
         assert!(!moved(Tier::Small, dead_id).exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1378,7 +1388,10 @@ mod tests {
         }
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
@@ -1394,10 +1407,7 @@ mod tests {
             assert!(tier_path(tier, id).exists());
         }
         // 大档与小档是不同文件(不共用)。
-        assert_ne!(
-            tier_path(Tier::Small, id),
-            tier_path(Tier::Big, id)
-        );
+        assert_ne!(tier_path(Tier::Small, id), tier_path(Tier::Big, id));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1411,7 +1421,10 @@ mod tests {
         let src = dir.join("a.jpg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(32, 24))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
@@ -1461,7 +1474,10 @@ mod tests {
         }
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
@@ -1509,9 +1525,18 @@ mod tests {
     /// 大档看着就是一团糊 —— 这条锁住"边长要达到目标的一半"。
     #[test]
     fn embedded_preview_is_gated_by_tier_size() {
-        assert!(embedded_ok(160, 120, Tier::Small.size()), "96 档:160px 够用");
-        assert!(embedded_ok(160, 120, Tier::Normal.size()), "256 档:160×2=320 ≥ 256");
-        assert!(!embedded_ok(160, 120, Tier::Big.size()), "512 档:160px 不够,得整图解码");
+        assert!(
+            embedded_ok(160, 120, Tier::Small.size()),
+            "96 档:160px 够用"
+        );
+        assert!(
+            embedded_ok(160, 120, Tier::Normal.size()),
+            "256 档:160×2=320 ≥ 256"
+        );
+        assert!(
+            !embedded_ok(160, 120, Tier::Big.size()),
+            "512 档:160px 不够,得整图解码"
+        );
         assert!(!embedded_ok(160, 120, Tier::Preview.size()), "1024 档同上");
         assert!(embedded_ok(1600, 1200, Tier::Preview.size()));
         // 取的是**长边**:竖幅预览同样按长边判
@@ -1550,7 +1575,10 @@ mod tests {
                 })
                 .max()
                 .unwrap_or(0);
-            assert!(max_diff <= 2, "orient={orient} 换顺序后像素应一致,最大差 {max_diff}");
+            assert!(
+                max_diff <= 2,
+                "orient={orient} 换顺序后像素应一致,最大差 {max_diff}"
+            );
         }
         // 90° 类方向要把宽高换过来:横图 → 竖图
         let r = fit_oriented(img, 96, 6);
@@ -1578,7 +1606,11 @@ mod tests {
             "粗缩一趟不得改变尺寸口径"
         );
         // 小图照旧放大(网格要铺满格子)
-        let small = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(40, 30, image::Rgb([9, 9, 9])));
+        let small = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            40,
+            30,
+            image::Rgb([9, 9, 9]),
+        ));
         let up = downscale(small, 256);
         assert_eq!((up.width(), up.height()), (256, 192));
         assert_eq!(fit_dims(4000, 3000, 512), (512, 384));

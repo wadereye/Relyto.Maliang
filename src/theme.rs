@@ -189,7 +189,11 @@ pub fn switch(ctx: &egui::Context, k: Kind) {
 pub fn apply(ctx: &egui::Context) {
     let t = p();
     let mut style = (*ctx.style()).clone();
-    let mut v = if t.is_light { Visuals::light() } else { Visuals::dark() };
+    let mut v = if t.is_light {
+        Visuals::light()
+    } else {
+        Visuals::dark()
+    };
 
     v.panel_fill = t.bg;
     v.window_fill = t.surface;
@@ -247,11 +251,23 @@ pub fn apply(ctx: &egui::Context) {
     style.spacing.window_margin = Margin::same(10);
     style.spacing.menu_margin = Margin::same(6);
     style.text_styles = [
-        (TextStyle::Heading, FontId::new(18.0, FontFamily::Proportional)),
+        (
+            TextStyle::Heading,
+            FontId::new(18.0, FontFamily::Proportional),
+        ),
         (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
-        (TextStyle::Button, FontId::new(14.0, FontFamily::Proportional)),
-        (TextStyle::Small, FontId::new(12.0, FontFamily::Proportional)),
-        (TextStyle::Monospace, FontId::new(13.0, FontFamily::Monospace)),
+        (
+            TextStyle::Button,
+            FontId::new(14.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Small,
+            FontId::new(12.0, FontFamily::Proportional),
+        ),
+        (
+            TextStyle::Monospace,
+            FontId::new(13.0, FontFamily::Monospace),
+        ),
     ]
     .into();
 

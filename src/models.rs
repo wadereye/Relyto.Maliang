@@ -5,6 +5,7 @@
 //! 首启不自动开下 —— 只提示,用户点「下载」才联网;下载走后台线程分段续传,
 //! 界面显示当前文件与进度(进度只在下载区显示一份,避免各方案行都转圈)。
 
+use crate::i18n::{t, t_with};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,9 +58,9 @@ pub fn builtin_url_for(name: &str) -> Option<&'static str> {
 /// 不可代下方案的手动获取说明(官方地址)。
 pub fn manual_hint(algo: FaceAlgo) -> Option<&'static str> {
     match algo {
-        FaceAlgo::AntelopeV2 => Some(
-            "https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip",
-        ),
+        FaceAlgo::AntelopeV2 => {
+            Some("https://github.com/deepinsight/insightface/releases/download/v0.7/antelopev2.zip")
+        }
         _ => None,
     }
 }
@@ -103,9 +104,9 @@ impl SourcePref {
 
     pub fn label(self) -> &'static str {
         match self {
-            SourcePref::Auto => "自动(官方优先,镜像兜底)",
-            SourcePref::Official => "仅官方直链",
-            SourcePref::Mirror => "仅镜像",
+            SourcePref::Auto => t("自动(官方优先,镜像兜底)"),
+            SourcePref::Official => t("仅官方直链"),
+            SourcePref::Mirror => t("仅镜像"),
         }
     }
 }
@@ -121,7 +122,7 @@ pub struct SourceInfo {
 pub fn candidate_sources(cfg: &Config) -> Vec<SourceInfo> {
     let mut v = vec![SourceInfo {
         key: "official",
-        label: "官方直链(GitHub:OpenCV Zoo / AdaFace 社区导出)".into(),
+        label: t("官方直链(GitHub:OpenCV Zoo / AdaFace 社区导出)").into(),
         probe_url: YUNET_URL.to_string(),
     }];
     let base = cfg.model_url.trim();
@@ -129,7 +130,7 @@ pub fn candidate_sources(cfg: &Config) -> Vec<SourceInfo> {
         if let Ok(u) = file_url(base, "face_det.onnx") {
             v.push(SourceInfo {
                 key: "mirror",
-                label: format!("镜像({base})"),
+                label: t_with("镜像({base})", &[("base", base.to_string())]),
                 probe_url: u,
             });
         }
@@ -181,7 +182,7 @@ fn probe_one(cfg: &Config, s: &SourceInfo) -> ProbeResult {
                     .limit(262_144 + 1)
                     .read_to_vec()
                 {
-                    Err(e) => r.err = Some(format!("读取失败: {e}")),
+                    Err(e) => r.err = Some(t_with("读取失败: {e}", &[("e", e.to_string())])),
                     Ok(bytes) => {
                         r.ok = true;
                         let secs = r.ms.max(1) as f64 / 1000.0;
@@ -201,11 +202,14 @@ pub fn file_url(base: &str, name: &str) -> Result<String, String> {
     let base = base.trim();
     let lower = base.to_ascii_lowercase();
     if lower.starts_with("file:") || base.contains("://") && !is_http(&lower) {
-        return Err(format!("ModelURL 只支持 http/https:{base}"));
+        return Err(t_with(
+            "ModelURL 只支持 http/https:{base}",
+            &[("base", base.to_string())],
+        ));
     }
     let (scheme, rest) = base
         .split_once("://")
-        .ok_or_else(|| "ModelURL 不是合法的 http/https 目录地址".to_string())?;
+        .ok_or_else(|| t("ModelURL 不是合法的 http/https 目录地址").to_string())?;
     // CDN 签名常挂在 ModelURL 后面,取目录前先剥掉查询与片段。
     let clean = rest
         .split('#')
@@ -216,7 +220,7 @@ pub fn file_url(base: &str, name: &str) -> Result<String, String> {
         .unwrap_or(rest);
     let host_end = clean.find('/').unwrap_or(clean.len());
     if clean[..host_end].is_empty() {
-        return Err("ModelURL 缺少主机名".into());
+        return Err(t("ModelURL 缺少主机名").into());
     }
     let mut path = clean[host_end..].to_string();
     if !path.ends_with('/') {
@@ -232,13 +236,14 @@ fn is_http(lower: &str) -> bool {
 /// 下载完成后的门禁:先看 ONNX ModelProto 的首字段(`ir_version`,tag 字节 0x08),
 /// 再用 onnxruntime 真加载一次。服务端放错文件、传坏、被截断都进不了模型目录。
 fn verify_onnx(path: &Path) -> Result<(), String> {
-    let mut f = std::fs::File::open(path).map_err(|e| format!("打开模型文件失败: {e}"))?;
+    let mut f = std::fs::File::open(path)
+        .map_err(|e| t_with("打开模型文件失败: {e}", &[("e", e.to_string())]))?;
     let mut head = [0u8; 16];
     let n = f
         .read(&mut head)
-        .map_err(|e| format!("读取模型文件失败: {e}"))?;
+        .map_err(|e| t_with("读取模型文件失败: {e}", &[("e", e.to_string())]))?;
     if n < 16 || head[0] != 0x08 {
-        return Err("下载到的内容不是 ONNX 模型文件".into());
+        return Err(t("下载到的内容不是 ONNX 模型文件").into());
     }
     crate::ai::try_load(path).map(|_| ())
 }
@@ -299,19 +304,34 @@ impl Phase {
                 total,
             } => {
                 let mb = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
-                let which = format!("(第 {idx}/{count} 个)");
+                let which = t_with(
+                    "(第 {idx}/{count} 个)",
+                    &[("idx", idx.to_string()), ("count", count.to_string())],
+                );
                 if *total > 0 {
-                    format!(
-                        "正在下载 {file}… {pct}% ({}/{}) {which}",
-                        mb(*done),
-                        mb(*total)
+                    t_with(
+                        "正在下载 {file}… {pct}% ({p1}/{p2}) {which}",
+                        &[
+                            ("file", file.to_string()),
+                            ("pct", pct.to_string()),
+                            ("p1", (mb(*done)).to_string()),
+                            ("p2", (mb(*total)).to_string()),
+                            ("which", which.to_string()),
+                        ],
                     )
                 } else {
-                    format!("正在下载 {file}… 已收到 {} {which}", mb(*done))
+                    t_with(
+                        "正在下载 {file}… 已收到 {p1} {which}",
+                        &[
+                            ("file", file.to_string()),
+                            ("p1", (mb(*done)).to_string()),
+                            ("which", which.to_string()),
+                        ],
+                    )
                 }
             }
-            Phase::Ready => "人脸模型已就位".into(),
-            Phase::Failed(e) => format!("下载失败:{e}"),
+            Phase::Ready => t("人脸模型已就位").into(),
+            Phase::Failed(e) => t_with("下载失败:{e}", &[("e", e.to_string())]),
         }
     }
 
@@ -322,8 +342,8 @@ impl Phase {
     /// 状态栏与提示窗上的一句话;无事可报时不给。
     pub fn status_hint(&self) -> Option<String> {
         match self {
-            Phase::Ready => Some("人脸模型已就位,可以开始人脸识别".into()),
-            Phase::Failed(e) => Some(format!("人脸模型下载失败:{e}")),
+            Phase::Ready => Some(t("人脸模型已就位,可以开始人脸识别").into()),
+            Phase::Failed(e) => Some(t_with("人脸模型下载失败:{e}", &[("e", e.to_string())])),
             _ => None,
         }
     }
@@ -405,15 +425,10 @@ impl ModelDownloader {
         let dir = crate::ai::models_dir();
         let todo: Vec<String> = dir
             .as_ref()
-            .map(|d| {
-                files
-                    .into_iter()
-                    .filter(|f| !d.join(f).is_file())
-                    .collect()
-            })
+            .map(|d| files.into_iter().filter(|f| !d.join(f).is_file()).collect())
             .unwrap_or_default();
         if todo.is_empty() {
-            self.phase = Phase::Failed("所选模型文件都已就位,无需下载".into());
+            self.phase = Phase::Failed(t("所选模型文件都已就位,无需下载").into());
             return;
         }
         let count = todo.len();
@@ -449,7 +464,10 @@ impl ModelDownloader {
         let _ = std::thread::Builder::new()
             .name("maliang-model-probe".into())
             .spawn(move || {
-                let res = sources.iter().map(|s| probe_one(&cfg, s)).collect::<Vec<_>>();
+                let res = sources
+                    .iter()
+                    .map(|s| probe_one(&cfg, s))
+                    .collect::<Vec<_>>();
                 let _ = tx.send(res);
             });
     }
@@ -513,12 +531,7 @@ impl Drop for ModelDownloader {
     }
 }
 
-fn worker(
-    rx: Receiver<Cmd>,
-    tx: Sender<Event>,
-    stop: Arc<AtomicBool>,
-    cancel: Arc<AtomicBool>,
-) {
+fn worker(rx: Receiver<Cmd>, tx: Sender<Event>, stop: Arc<AtomicBool>, cancel: Arc<AtomicBool>) {
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -532,7 +545,7 @@ fn worker(
                 let dir = crate::ai::models_dir();
                 let out = match dir {
                     Some(d) => fetch_files(&d, &cfg, &files, pref, &tx, &cancel, verify_onnx),
-                    None => Err("没有数据目录,模型没地方放".to_string()),
+                    None => Err(t("没有数据目录,模型没地方放").to_string()),
                 };
                 match out {
                     Ok(()) => {
@@ -563,11 +576,12 @@ fn fetch_files(
     stop: &AtomicBool,
     verify: fn(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("建模型目录失败: {e}"))?;
+    std::fs::create_dir_all(dir)
+        .map_err(|e| t_with("建模型目录失败: {e}", &[("e", e.to_string())]))?;
     let count = files.len();
     for (i, name) in files.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
-            return Err("已取消下载".into());
+            return Err(t("已取消下载").into());
         }
         // 候选源按用户偏好来:「自动」= 内置官方直链在前、ModelURL(镜像)兜底;
         // 选定单源则只用该源。404 才换源(自动档),其余错误(断网/取消)当场
@@ -586,7 +600,10 @@ fn fetch_files(
             }
         }
         if urls.is_empty() {
-            return Err(format!("模型 {name} 在所选下载源上不可用,请换源或手动放置"));
+            return Err(t_with(
+                "模型 {name} 在所选下载源上不可用,请换源或手动放置",
+                &[("name", name.to_string())],
+            ));
         }
         for (si, url) in urls.iter().enumerate() {
             match download_one(dir, cfg, url, name, i + 1, count, tx, stop, verify) {
@@ -615,7 +632,7 @@ fn fetch_all(
     verify: fn(&Path) -> Result<(), String>,
 ) -> Result<(), String> {
     if !downloadable(algo) {
-        return Err("该方案的模型许可不允许程序代下载,请自行放置文件".into());
+        return Err(t("该方案的模型许可不允许程序代下载,请自行放置文件").into());
     }
     let names = missing_files(algo, dir);
     fetch_files(dir, cfg, &names, SourcePref::Auto, tx, stop, verify)
@@ -661,7 +678,7 @@ fn download_one(
 
     loop {
         if stop.load(Ordering::Relaxed) {
-            return Err("已取消下载".into());
+            return Err(t("已取消下载").into());
         }
         if total > 0 && have >= total {
             break;
@@ -685,17 +702,25 @@ fn download_one(
                 // 服务端没有这个文件(或不让取)是终态,重试只是白等四段。
                 if let ureq::Error::StatusCode(code) = &e {
                     if (400..=499).contains(code) && *code != 408 {
-                        return Err(format!("模型文件返回 HTTP {code}"));
+                        return Err(t_with(
+                            "模型文件返回 HTTP {code}",
+                            &[("code", code.to_string())],
+                        ));
                     }
                 }
                 attempts += 1;
                 if attempts >= MAX_SEGMENT_ATTEMPTS {
-                    return Err(format!(
-                        "下载连续 {attempts} 次失败: {e}(已保留 {have} 字节,再点下载可续传)"
+                    return Err(t_with(
+                        "下载连续 {attempts} 次失败: {e}(已保留 {have} 字节,再点下载可续传)",
+                        &[
+                            ("attempts", attempts.to_string()),
+                            ("e", e.to_string()),
+                            ("have", have.to_string()),
+                        ],
                     ));
                 }
                 if !sleep_or_stop(attempts, stop) {
-                    return Err("已取消下载".into());
+                    return Err(t("已取消下载").into());
                 }
                 continue;
             }
@@ -717,8 +742,9 @@ fn download_one(
         if status.as_u16() == 206 {
             let (start, cr_total) = cr.unwrap_or((have, 0));
             if start != have {
-                return Err(format!(
-                    "服务端 Range 起点不符(请求 {have},返回 {start}),已保留已下部分"
+                return Err(t_with(
+                    "服务端 Range 起点不符(请求 {have},返回 {start}),已保留已下部分",
+                    &[("have", have.to_string()), ("start", start.to_string())],
                 ));
             }
             if cr_total > 0 {
@@ -729,9 +755,9 @@ fn download_one(
                 .with_config()
                 .limit(chunk + 1)
                 .read_to_vec()
-                .map_err(|e| format!("读取模型内容失败: {e}"))?;
+                .map_err(|e| t_with("读取模型内容失败: {e}", &[("e", e.to_string())]))?;
             if bytes.len() as u64 > want {
-                return Err("服务端返回超出请求范围的数据,已丢弃本段".into());
+                return Err(t("服务端返回超出请求范围的数据,已丢弃本段").into());
             }
             append_all(&part, &bytes)?;
             have += bytes.len() as u64;
@@ -755,25 +781,28 @@ fn download_one(
             let _ = std::fs::remove_file(&part);
             have = 0;
             total = clen;
-            let mut file =
-                std::fs::File::create(&part).map_err(|e| format!("建下载文件失败: {e}"))?;
+            let mut file = std::fs::File::create(&part)
+                .map_err(|e| t_with("建下载文件失败: {e}", &[("e", e.to_string())]))?;
             let mut reader = resp.into_body().into_reader().take(MAX_MODEL + 1);
             let mut buf = [0u8; 64 * 1024];
             loop {
                 let n = match reader.read(&mut buf) {
                     Ok(n) => n,
                     Err(e) => {
-                        return Err(format!("下载中断: {e}(服务端不支持 Range,需重新完整下载)"))
+                        return Err(t_with(
+                            "下载中断: {e}(服务端不支持 Range,需重新完整下载)",
+                            &[("e", e.to_string())],
+                        ))
                     }
                 };
                 if n == 0 {
                     break;
                 }
                 file.write_all(&buf[..n])
-                    .map_err(|e| format!("写下载文件失败: {e}"))?;
+                    .map_err(|e| t_with("写下载文件失败: {e}", &[("e", e.to_string())]))?;
                 have += n as u64;
                 if have > MAX_MODEL {
-                    return Err("模型超过 1 GB 上限,已停止下载".into());
+                    return Err(t("模型超过 1 GB 上限,已停止下载").into());
                 }
                 report(
                     tx,
@@ -789,13 +818,16 @@ fn download_one(
             let _ = file.sync_all();
             break;
         } else {
-            return Err(format!("模型文件返回 HTTP {status}"));
+            return Err(t_with(
+                "模型文件返回 HTTP {status}",
+                &[("status", status.to_string())],
+            ));
         }
     }
 
     if have == 0 {
         let _ = std::fs::remove_file(&part);
-        return Err("服务端没有这个模型文件".into());
+        return Err(t("服务端没有这个模型文件").into());
     }
     if let Err(e) = verify(&part) {
         let _ = std::fs::remove_file(&part);
@@ -803,7 +835,7 @@ fn download_one(
     }
     // 定名:同目录同名只可能是另一个进程刚放好的文件,直接覆盖成刚校验过的这份。
     if let Err(e) = move_into(&part, &target) {
-        return Err(format!("模型定名失败: {e}"));
+        return Err(t_with("模型定名失败: {e}", &[("e", e.to_string())]));
     }
     Ok(())
 }
@@ -826,9 +858,9 @@ fn append_all(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("续写下载文件失败: {e}"))?;
+        .map_err(|e| t_with("续写下载文件失败: {e}", &[("e", e.to_string())]))?;
     f.write_all(bytes)
-        .map_err(|e| format!("写下载文件失败: {e}"))?;
+        .map_err(|e| t_with("写下载文件失败: {e}", &[("e", e.to_string())]))?;
     Ok(())
 }
 

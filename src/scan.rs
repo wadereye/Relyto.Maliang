@@ -24,7 +24,8 @@ pub const IMG_EXTS: [&str; 7] = ["jpg", "jpeg", "png", "webp", "bmp", "tiff", "g
 /// 相机 RAW 格式(image crate 解不了,缩略图走 Windows Shell 扩展;
 /// 索引仍照常收录,可按 EXIF 时间/相机/GPS 检索)。
 pub const RAW_EXTS: [&str; 14] = [
-    "nef", "cr2", "cr3", "arw", "raf", "orf", "rw2", "dng", "pef", "srw", "3fr", "erf", "iiq", "kdc",
+    "nef", "cr2", "cr3", "arw", "raf", "orf", "rw2", "dng", "pef", "srw", "3fr", "erf", "iiq",
+    "kdc",
 ];
 
 /// 是否本系统支持预览的图片(常规格式 + RAW + PSD 家族)。
@@ -49,8 +50,7 @@ pub fn is_readonly_media(p: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| {
             let e = e.to_ascii_lowercase();
-            matches!(e.as_str(), "gif" | "psd" | "psb")
-                || (e == "webp" && is_animated_webp(p))
+            matches!(e.as_str(), "gif" | "psd" | "psb") || (e == "webp" && is_animated_webp(p))
         })
         .unwrap_or(false)
 }
@@ -345,7 +345,9 @@ fn under_key(up: &str, base: &str) -> bool {
     if up == base {
         return true;
     }
-    up.len() > base.len() && up.starts_with(base) && matches!(up.as_bytes()[base.len()], b'\\' | b'/')
+    up.len() > base.len()
+        && up.starts_with(base)
+        && matches!(up.as_bytes()[base.len()], b'\\' | b'/')
 }
 
 /// 一条**结构**记录:发现路径只写这些列。
@@ -615,8 +617,8 @@ pub fn mft_candidates(
         if v.is_dir(i as usize) {
             // 自家缓存目录走整级路径前缀(见 `Exclusions::own_prefixes`);
             // 拼完整路径有成本,所以先按目录名粗筛。
-            let own = excl.own_leaf_may_match(&name)
-                && excl.under_own_prefix_str(&v.path_of(i as usize));
+            let own =
+                excl.own_leaf_may_match(&name) && excl.under_own_prefix_str(&v.path_of(i as usize));
             if excl.excludes_dir(&name) || own {
                 excluded_dirs += 1;
                 continue;
@@ -701,8 +703,7 @@ pub fn scan_dir_ctrl(
     // 快速路径基线:库内已有指纹
     let prints = load_fingerprints(store);
     // MFT 快路的卷数据(索引在位才有;Linux/无索引为 None → walkdir)。
-    let vols: Option<&[crate::nameidx::VolumeIndex]> =
-        index.map(|f| f.vols.as_slice());
+    let vols: Option<&[crate::nameidx::VolumeIndex]> = index.map(|f| f.vols.as_slice());
 
     let mut excluded_dirs = 0usize;
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -927,11 +928,7 @@ pub fn index_file(store: &Store, path: &Path) -> Result<bool> {
 /// 带取消检查的单文件入库(事件驱动路径)。
 ///
 /// `ctrl` 为 `Some` 时,入库前查一次取消标志 —— 取消后不再写库。
-pub fn index_file_ctrl(
-    store: &Store,
-    path: &Path,
-    ctrl: Option<&ScanControl>,
-) -> Result<bool> {
+pub fn index_file_ctrl(store: &Store, path: &Path, ctrl: Option<&ScanControl>) -> Result<bool> {
     if let Some(c) = ctrl {
         if c.is_cancelled() {
             return Ok(false);
@@ -969,8 +966,8 @@ pub fn index_file_ctrl(
             .ok();
         Ok(match old {
             Some((osize, omtime)) if osize == size && omtime == mtime => None,
-            Some(_) => Some(true),  // 已有记录但内容变了 → 修改
-            None => Some(false),    // 库里没有 → 新增
+            Some(_) => Some(true), // 已有记录但内容变了 → 修改
+            None => Some(false),   // 库里没有 → 新增
         })
     })? {
         Some(existed) => existed,
@@ -980,11 +977,7 @@ pub fn index_file_ctrl(
     let rec = read_record(path, size, mtime);
     store_insert(store, &[rec])?;
     // 事件驱动路径也要写变更日志(否则只有扫描会记,监听发现的变化会丢)。
-    let _ = store.log_change(
-        &key,
-        if existed { "modified" } else { "added" },
-        None,
-    );
+    let _ = store.log_change(&key, if existed { "modified" } else { "added" }, None);
     Ok(true)
 }
 
@@ -1061,7 +1054,7 @@ mod tests {
         let kept = root.join("kept.jpg");
         std::fs::write(&kept, b"x").unwrap();
         let gone = root.join("gone.jpg"); // 从未落盘
-        // 离线根:确定不存在的目录(不能用 Q: 这类盘符 —— 有些机器真有映射)。
+                                          // 离线根:确定不存在的目录(不能用 Q: 这类盘符 —— 有些机器真有映射)。
         let offline = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("target")
             .join(format!("rk-reconcile-offline-{}", std::process::id()));
@@ -1096,7 +1089,11 @@ mod tests {
         // 根之外的行不在此管。
         let o: i64 = store
             .test_conn()
-            .query_row("SELECT COUNT(*) FROM photos WHERE path=?1", [outside_file.to_string_lossy().as_ref()], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM photos WHERE path=?1",
+                [outside_file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(o, 1, "监听根之外的行必须保留");
         let _ = std::fs::remove_dir_all(&root);
@@ -1207,7 +1204,10 @@ mod tests {
         // JPEG 编码器需要可 seek 的 writer:先编码到内存,再落盘。
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&p, &buf).unwrap();
 
@@ -1236,7 +1236,10 @@ mod tests {
             let img = image::RgbImage::new(4, 4);
             let mut buf: Vec<u8> = Vec::new();
             image::DynamicImage::ImageRgb8(img)
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut buf),
+                    image::ImageFormat::Jpeg,
+                )
                 .unwrap();
             std::fs::write(p, &buf).unwrap();
         };
@@ -1259,7 +1262,10 @@ mod tests {
         let img = image::RgbImage::new(8, 6);
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&p, &buf).unwrap();
 
@@ -1284,7 +1290,10 @@ mod tests {
         let dir = scratch_dir("scanvideo");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(dir.join("a.jpg"), &buf).unwrap();
         std::fs::write(dir.join("clip.mp4"), b"\0\0\0\x18ftypmp42").unwrap();
@@ -1313,7 +1322,10 @@ mod tests {
         let p = bad.join("a.jpg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&p, &buf).unwrap();
 
@@ -1372,7 +1384,10 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let e = Exclusions::default().with_own_prefix(&own);
-        assert!(e.under_own_prefix_str(&own.to_string_lossy()), "缓存根本身算子树");
+        assert!(
+            e.under_own_prefix_str(&own.to_string_lossy()),
+            "缓存根本身算子树"
+        );
         assert!(
             e.under_own_prefix_str(&own.join("albums").join("2026").to_string_lossy()),
             "自家缓存的任意深度都归 own-prefix 管",
@@ -1469,7 +1484,10 @@ mod tests {
         for i in 0..8 {
             let mut buf: Vec<u8> = Vec::new();
             image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut buf),
+                    image::ImageFormat::Jpeg,
+                )
                 .unwrap();
             std::fs::write(dir.join(format!("a{i}.jpg")), &buf).unwrap();
         }
@@ -1494,7 +1512,10 @@ mod tests {
         for i in 0..n_files {
             buf.clear();
             image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
-                .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+                .write_to(
+                    &mut std::io::Cursor::new(&mut buf),
+                    image::ImageFormat::Jpeg,
+                )
                 .unwrap();
             std::fs::write(dir.join(format!("a{i}.jpg")), &buf).unwrap();
         }
@@ -1535,7 +1556,10 @@ mod tests {
         let dir = scratch_dir("uid");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(dir.join("a.jpg"), &buf).unwrap();
 
@@ -1544,12 +1568,16 @@ mod tests {
         assert_eq!(s.indexed, 1);
         assert!(!s.cancelled);
 
-        let uid: i64 = store.test_conn().query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
+        let uid: i64 = store
+            .test_conn()
+            .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
             .unwrap();
         assert_ne!(uid, 0, "uid64 应被分配");
         // 重新扫描不应改变 uid64(标识是持久的)。
         let _ = scan_dir(&store, &[dir.clone()]).unwrap();
-        let uid2: i64 = store.test_conn().query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
+        let uid2: i64 = store
+            .test_conn()
+            .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
             .unwrap();
         assert_eq!(uid, uid2, "重新扫描后 uid64 应保持不变");
 
@@ -1564,7 +1592,10 @@ mod tests {
         let p = dir.join("a.jpg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(&p, &buf).unwrap();
 
@@ -1595,7 +1626,10 @@ mod tests {
         let dir = scratch_dir("chg");
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 6))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         std::fs::write(dir.join("a.jpg"), &buf).unwrap();
 
@@ -1650,8 +1684,14 @@ mod tests {
         let mc =
             mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\Pics"), &excl, None).unwrap();
         assert_eq!(mc.paths.len(), 2, "实际: {:?}", mc.paths);
-        assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\IMG_0001.JPG")));
-        assert!(mc.paths.iter().any(|p| p == Path::new(r"C:\Pics\RAW\DSC.NEF")));
+        assert!(mc
+            .paths
+            .iter()
+            .any(|p| p == Path::new(r"C:\Pics\IMG_0001.JPG")));
+        assert!(mc
+            .paths
+            .iter()
+            .any(|p| p == Path::new(r"C:\Pics\RAW\DSC.NEF")));
         assert_eq!(mc.excluded_dirs, 1, "thumbs 应计一次目录排除");
 
         // 根目录大小写不敏感(与折叠池口径一致)。
@@ -1660,10 +1700,13 @@ mod tests {
         assert_eq!(mc2.paths.len(), 2);
 
         // 逐级失配 / 盘不在索引 → None(调用方回退 walkdir)。
-        assert!(
-            mft_candidates(std::slice::from_ref(&v), Path::new(r"C:\NoSuchDir"), &excl, None)
-                .is_none()
-        );
+        assert!(mft_candidates(
+            std::slice::from_ref(&v),
+            Path::new(r"C:\NoSuchDir"),
+            &excl,
+            None
+        )
+        .is_none());
         assert!(mft_candidates(&[], Path::new(r"C:\Pics"), &excl, None).is_none());
 
         // 卷根直扫:整卷候选(排除 thumbs 子树)。

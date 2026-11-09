@@ -63,7 +63,11 @@ impl Adjust {
 
     /// 从"名称 → 数值"参数表还原(未知参数忽略;缺省为 0)。
     pub fn from_params(map: &BTreeMap<String, String>) -> Adjust {
-        let g = |k: &str| map.get(k).and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0);
+        let g = |k: &str| {
+            map.get(k)
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(0.0)
+        };
         Adjust {
             brightness: g("brightness"),
             contrast: g("contrast"),
@@ -163,12 +167,7 @@ pub const SHADER_EFFECTS: &[&str] = &[
 
 /// 同一族里仍有含糊处的 4 项(系数 / 尾段语义未定),落地前不得进效果表。
 #[cfg(test)]
-pub const SHADER_PENDING: &[&str] = &[
-    "vibrance",
-    "smudge",
-    "hypnotic",
-    "adjustablethreshold",
-];
+pub const SHADER_PENDING: &[&str] = &["vibrance", "smudge", "hypnotic", "adjustablethreshold"];
 
 /// `tilt`(Straighten)滑杆满量程对应的角度。
 const TILT_MAX_DEG: f32 = 15.0;
@@ -183,20 +182,91 @@ const DOCUMENTED_NOOPS: &[&str] = &[
 /// 已知效果名清单(用于自检分类是否齐全)。
 #[cfg(test)]
 pub const REFERENCE_IDS: &[&str] = &[
-    "save", "crop64", "crop", "redeye", "retouch", "picnik", "rot",
+    "save",
+    "crop64",
+    "crop",
+    "redeye",
+    "retouch",
+    "picnik",
+    "rot",
     // 常规调整 / 工具 / 一键效果
-    "debug", "triple", "triple2", "triple3", "finetune", "finetune2", "colorfix",
-    "autobacklight", "autolight", "autocolor", "bw", "enhance", "warm", "grain",
-    "grain2", "sepia", "unsharp", "unsharp2", "autocontrast", "tilt", "rainbow",
-    "radblur", "radsat", "linblur", "ansel", "tint", "dir_tint", "radtint", "glow",
-    "glow2", "sat", "colortemp", "shadow", "blur", "contrast", "gamma", "backlight",
-    "fill", "whitept", "dir_sat", "dir_brite", "dir_sharp", "focalpixelate", "Boost",
-    "Border", "Cinemascope", "Comicize", "CrossProcess", "DropShadow",
-    "PicnikFocalPixelate", "FocalZoom", "PicnikGrain", "HDR", "HeatMap", "Holga",
-    "Invert", "IR", "LocalContrast", "Lomo", "Matte", "MuseumMatte", "Neon",
-    "NightVision", "Orton", "PencilSketch", "Pixelate", "Polaroid", "QuantizePalette",
-    "ReanimatedEyeColor", "RoundedEdges", "Sixties", "Soften", "PicnikTint", "TwoTone",
-    "Vignette", "moviestart", "movieend",
+    "debug",
+    "triple",
+    "triple2",
+    "triple3",
+    "finetune",
+    "finetune2",
+    "colorfix",
+    "autobacklight",
+    "autolight",
+    "autocolor",
+    "bw",
+    "enhance",
+    "warm",
+    "grain",
+    "grain2",
+    "sepia",
+    "unsharp",
+    "unsharp2",
+    "autocontrast",
+    "tilt",
+    "rainbow",
+    "radblur",
+    "radsat",
+    "linblur",
+    "ansel",
+    "tint",
+    "dir_tint",
+    "radtint",
+    "glow",
+    "glow2",
+    "sat",
+    "colortemp",
+    "shadow",
+    "blur",
+    "contrast",
+    "gamma",
+    "backlight",
+    "fill",
+    "whitept",
+    "dir_sat",
+    "dir_brite",
+    "dir_sharp",
+    "focalpixelate",
+    "Boost",
+    "Border",
+    "Cinemascope",
+    "Comicize",
+    "CrossProcess",
+    "DropShadow",
+    "PicnikFocalPixelate",
+    "FocalZoom",
+    "PicnikGrain",
+    "HDR",
+    "HeatMap",
+    "Holga",
+    "Invert",
+    "IR",
+    "LocalContrast",
+    "Lomo",
+    "Matte",
+    "MuseumMatte",
+    "Neon",
+    "NightVision",
+    "Orton",
+    "PencilSketch",
+    "Pixelate",
+    "Polaroid",
+    "QuantizePalette",
+    "ReanimatedEyeColor",
+    "RoundedEdges",
+    "Sixties",
+    "Soften",
+    "PicnikTint",
+    "TwoTone",
+    "Vignette",
+    "moviestart",
+    "movieend",
 ];
 
 /// 明确不做的效果名(测试已锁定分类)。
@@ -259,11 +329,11 @@ pub fn recipe_for(name: &str) -> Option<&'static str> {
 /// 效果名的支持状态。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Support {
-/// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
+    /// 有像素实现(自身算子或 [`crate::recipes`] 里的配方)。
     Pixel,
-/// 明确不做的效果名;理由见 [`REFERENCE_ONLY`]。
+    /// 明确不做的效果名;理由见 [`REFERENCE_ONLY`]。
     ReferenceOnly,
-/// 不在已知清单里、无法识别的名字(通常拼错或来路不明)。
+    /// 不在已知清单里、无法识别的名字(通常拼错或来路不明)。
     Unknown,
 }
 
@@ -352,14 +422,14 @@ impl Effect {
         }
     }
 
-/// 该项是否为一键效果。
-pub fn is_oneclick(&self) -> bool {
-    if crate::recipes::is_recipe(&self.name) {
-        return true;
+    /// 该项是否为一键效果。
+    pub fn is_oneclick(&self) -> bool {
+        if crate::recipes::is_recipe(&self.name) {
+            return true;
+        }
+        let name = self.name.to_ascii_lowercase();
+        PIXEL_EFFECTS.iter().any(|k| *k == name)
     }
-    let name = self.name.to_ascii_lowercase();
-    PIXEL_EFFECTS.iter().any(|k| *k == name)
-}
 }
 
 /// 曲线控制点序列化:`x,y;x,y`。
@@ -548,7 +618,13 @@ impl EditStack {
         let e = self.done.pop()?;
         let label = e.label.clone();
         self.undone.push(e);
-        Some((label, self.undone.last().map(|x| x.before.clone()).unwrap_or_default()))
+        Some((
+            label,
+            self.undone
+                .last()
+                .map(|x| x.before.clone())
+                .unwrap_or_default(),
+        ))
     }
 
     /// 重做 → 返回应恢复的栈(以及标签)。
@@ -556,7 +632,13 @@ impl EditStack {
         let e = self.undone.pop()?;
         let label = e.label.clone();
         self.done.push(e);
-        Some((label, self.done.last().map(|x| x.after.clone()).unwrap_or_default()))
+        Some((
+            label,
+            self.done
+                .last()
+                .map(|x| x.after.clone())
+                .unwrap_or_default(),
+        ))
     }
 }
 
@@ -567,17 +649,16 @@ pub fn sharpen_kernel(value: f32) -> [[f32; 3]; 3] {
     let v = value.clamp(0.0, 100.0);
     let a = v / -100.0;
     let c = 1.0 - 8.0 * a;
-    [
-        [a, a, a],
-        [a, c, a],
-        [a, a, a],
-    ]
+    [[a, a, a], [a, c, a], [a, a, a]]
 }
 
 /// 三次 box blur 的等效半径。
 pub fn blur_box_radii(radius: f32) -> [i32; 3] {
     let sigma = radius.clamp(0.0, 20.0)
-        * crate::assets::f64s("blur.sigma_scale").first().copied().unwrap_or(3.0) as f32;
+        * crate::assets::f64s("blur.sigma_scale")
+            .first()
+            .copied()
+            .unwrap_or(3.0) as f32;
     let factors = crate::assets::f64s("blur.box_factors");
     let default = [0.3f64, 0.7, 0.9];
     let mut out = [0i32; 3];
@@ -614,18 +695,32 @@ pub fn apply(img: &mut image::RgbaImage, adj: &Adjust) {
 }
 
 /// 3×3 色彩矩阵(对比度 / 亮度 / 饱和度)。
-pub fn apply_color_matrix(img: &mut image::RgbaImage, brightness: f32, contrast: f32, saturation: f32) {
+pub fn apply_color_matrix(
+    img: &mut image::RgbaImage,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+) {
     let k = 1.0 + contrast / 100.0; // 对比度:以中灰 127.5 为轴的线性缩放
     let boff = brightness / 100.0 * 127.5; // 亮度:平移量
-    // 饱和度:非对称增益 + 全库统一亮度权重
-    let s = 1.0 + (if saturation > 0.0 { 3.0 * saturation } else { saturation }) / 100.0;
+                                           // 饱和度:非对称增益 + 全库统一亮度权重
+    let s = 1.0
+        + (if saturation > 0.0 {
+            3.0 * saturation
+        } else {
+            saturation
+        }) / 100.0;
     let [wr, wg, wb] = crate::oneclick::luma_weights();
     for p in img.pixels_mut() {
         let r = p[0] as f32;
         let g = p[1] as f32;
         let b = p[2] as f32;
         // 对比度(围绕中灰 127.5,不再叠加重复平移)
-        let (r, g, b) = ((r - 127.5) * k + 127.5, (g - 127.5) * k + 127.5, (b - 127.5) * k + 127.5);
+        let (r, g, b) = (
+            (r - 127.5) * k + 127.5,
+            (g - 127.5) * k + 127.5,
+            (b - 127.5) * k + 127.5,
+        );
         // 亮度平移
         let (r, g, b) = (r + boff, g + boff, b + boff);
         // 饱和度(全库统一亮度加权)
@@ -932,8 +1027,7 @@ pub fn apply_effect(img: &mut image::RgbaImage, e: &Effect) {
             let deg = match e.params.get("angle").and_then(|v| v.parse::<f32>().ok()) {
                 Some(d) => d,
                 None => {
-                    (oneclick_amount(e, 50.0).clamp(0.0, 100.0) / 100.0 * 2.0 - 1.0)
-                        * TILT_MAX_DEG
+                    (oneclick_amount(e, 50.0).clamp(0.0, 100.0) / 100.0 * 2.0 - 1.0) * TILT_MAX_DEG
                 }
             };
             if deg != 0.0 {
@@ -1207,11 +1301,7 @@ fn parse_color(s: Option<&String>) -> Option<[u8; 3]> {
 // ===== 与索引库交互的纯函数(便于测试) =====
 
 /// 把一组调整提交到指定照片,写入 `photos.filters` 列,返回写入条数。
-pub fn commit_adjust(
-    store: &crate::db::Store,
-    ids: &[i64],
-    adj: &Adjust,
-) -> anyhow::Result<usize> {
+pub fn commit_adjust(store: &crate::db::Store, ids: &[i64], adj: &Adjust) -> anyhow::Result<usize> {
     let eff = Effect::enhance(adj);
     if eff.is_identity() {
         return Ok(0);
@@ -1241,11 +1331,7 @@ pub fn copy_from(store: &crate::db::Store, id: i64) -> FilterStack {
 }
 
 /// "粘贴所有效果":把效果栈写给多张照片。
-pub fn paste_to(
-    store: &crate::db::Store,
-    ids: &[i64],
-    st: &FilterStack,
-) -> anyhow::Result<usize> {
+pub fn paste_to(store: &crate::db::Store, ids: &[i64], st: &FilterStack) -> anyhow::Result<usize> {
     store.set_filters_many(ids, &st.serialize())
 }
 
@@ -1278,7 +1364,11 @@ mod tests {
     #[test]
     fn sharpen_kernel_matches_original_formula() {
         let k = sharpen_kernel(50.0);
-        assert!((k[1][1] - 5.0).abs() < 1e-6, "中心应为 1-8a=5, got {}", k[1][1]);
+        assert!(
+            (k[1][1] - 5.0).abs() < 1e-6,
+            "中心应为 1-8a=5, got {}",
+            k[1][1]
+        );
         assert!((k[0][0] + 0.5).abs() < 1e-6);
         let sum: f32 = k.iter().flatten().sum();
         assert!((sum - 1.0).abs() < 1e-6, "核和应为 1, got {sum}");
@@ -1384,10 +1474,7 @@ mod tests {
         };
         assert_eq!(run(128, 100.0), 128, "正满档:中灰必须仍是中灰");
         assert_eq!(run(128, -100.0), 127, "负满档:应折叠到中灰 127.5 而非纯白");
-        assert!(
-            run(200, 100.0) > run(200, 0.0),
-            "正对比度应把亮部继续推亮:"
-        );
+        assert!(run(200, 100.0) > run(200, 0.0), "正对比度应把亮部继续推亮:");
     }
 
     /// B2:色彩矩阵的饱和度必须走全库统一的亮度权重(0.3086/0.6094/0.082),
@@ -1407,8 +1494,14 @@ mod tests {
         let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([140, 120, 130, 255]));
         apply_color_matrix(&mut img, 0.0, 0.0, 100.0);
         let p = img.get_pixel(0, 0);
-        assert!((p[0] as i32 - 178).abs() <= 2, "s'=4 时 R 应约 178,实得 {p:?}");
-        assert!((p[1] as i32 - 98).abs() <= 2, "s'=4 时 G 应约 98,实得 {p:?}");
+        assert!(
+            (p[0] as i32 - 178).abs() <= 2,
+            "s'=4 时 R 应约 178,实得 {p:?}"
+        );
+        assert!(
+            (p[1] as i32 - 98).abs() <= 2,
+            "s'=4 时 G 应约 98,实得 {p:?}"
+        );
     }
 
     /// B8:调整面板的曝光必须走**曝光曲线**(样条)路径,而不是线性 `2^stops`。
@@ -1416,10 +1509,13 @@ mod tests {
     fn exposure_runs_through_the_curve_spline() {
         let run = |e: f32| {
             let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([100, 100, 100, 255]));
-            apply(&mut img, &Adjust {
-                exposure: e,
-                ..Default::default()
-            });
+            apply(
+                &mut img,
+                &Adjust {
+                    exposure: e,
+                    ..Default::default()
+                },
+            );
             img.get_pixel(0, 0)[0] as i32
         };
         let up = run(1.0);
@@ -1497,7 +1593,8 @@ mod tests {
         );
 
         // zerostate:不给参数时,5 个照明/微调类效果都应是恒等
-        let identity = image::RgbaImage::from_pixel(24, 24, image::Rgba([40, 90, 160, 255])).into_raw();
+        let identity =
+            image::RgbaImage::from_pixel(24, 24, image::Rgba([40, 90, 160, 255])).into_raw();
         for name in ["triple", "triple2", "triple3", "finetune", "finetune2"] {
             assert_eq!(run(name, &[]), identity, "{name} 的零档应是恒等");
         }
@@ -1506,10 +1603,13 @@ mod tests {
     #[test]
     fn brightness_increases_pixel_values() {
         let mut img = image::RgbaImage::from_pixel(4, 4, image::Rgba([100, 100, 100, 255]));
-        apply(&mut img, &Adjust {
-            brightness: 50.0,
-            ..Default::default()
-        });
+        apply(
+            &mut img,
+            &Adjust {
+                brightness: 50.0,
+                ..Default::default()
+            },
+        );
         let p = img.get_pixel(0, 0);
         assert!(p[0] > 100, "亮度应提升, got {}", p[0]);
         assert_eq!(p[3], 255, "alpha 不应被改");
@@ -1518,10 +1618,13 @@ mod tests {
     #[test]
     fn saturation_zero_gives_grayscale() {
         let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([200, 50, 100, 255]));
-        apply(&mut img, &Adjust {
-            saturation: -100.0,
-            ..Default::default()
-        });
+        apply(
+            &mut img,
+            &Adjust {
+                saturation: -100.0,
+                ..Default::default()
+            },
+        );
         let p = img.get_pixel(0, 0);
         assert_eq!(p[0], p[1]);
         assert_eq!(p[1], p[2]);
@@ -1532,10 +1635,13 @@ mod tests {
     fn exposure_extremes_stay_monotonic_and_in_range() {
         let run = |e: f32| {
             let mut img = image::RgbaImage::from_pixel(2, 2, image::Rgba([250, 250, 250, 255]));
-            apply(&mut img, &Adjust {
-                exposure: e,
-                ..Default::default()
-            });
+            apply(
+                &mut img,
+                &Adjust {
+                    exposure: e,
+                    ..Default::default()
+                },
+            );
             img.get_pixel(0, 0)[0]
         };
         assert_eq!(run(0.0), 250, "0 档应恒等");
@@ -1551,12 +1657,18 @@ mod tests {
         let mut img = image::RgbaImage::from_pixel(5, 5, image::Rgba([100, 100, 100, 255]));
         img.put_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
         let before = img.get_pixel(2, 3)[0];
-        apply(&mut img, &Adjust {
-            sharpen: 50.0,
-            ..Default::default()
-        });
+        apply(
+            &mut img,
+            &Adjust {
+                sharpen: 50.0,
+                ..Default::default()
+            },
+        );
         let after = img.get_pixel(2, 3)[0];
-        assert!(after < before, "锐化应加深暗侧(过冲), before={before} after={after}");
+        assert!(
+            after < before,
+            "锐化应加深暗侧(过冲), before={before} after={after}"
+        );
         // 远离亮点的像素应基本不变(核和=1,保亮度)。
         let far_before = 100u8;
         let far_after = img.get_pixel(0, 0)[0];
@@ -1575,12 +1687,18 @@ mod tests {
             }
         }
         let before = img.get_pixel(2, 3)[0];
-        apply(&mut img, &Adjust {
-            blur: 4.0,
-            ..Default::default()
-        });
+        apply(
+            &mut img,
+            &Adjust {
+                blur: 4.0,
+                ..Default::default()
+            },
+        );
         let after = img.get_pixel(2, 3)[0];
-        assert!(after > before, "模糊应把亮部渗到暗侧, before={before} after={after}");
+        assert!(
+            after > before,
+            "模糊应把亮部渗到暗侧, before={before} after={after}"
+        );
     }
 
     #[test]
@@ -2012,8 +2130,7 @@ mod tests {
             // 别名不能抢占已有的效果名:`apply_effect` 的显式分支优先于兜底,
             // 一旦重名,外部名会落到另一种算法上,而这正是 `vignette` 的情况。
             assert!(
-                !crate::effects::PIXEL_EFFECTS.contains(from)
-                    && !crate::recipes::is_recipe(from),
+                !crate::effects::PIXEL_EFFECTS.contains(from) && !crate::recipes::is_recipe(from),
                 "别名 {from} 与已有效果同名,会抢走既有分派"
             );
             let mut a = sample();
@@ -2022,7 +2139,10 @@ mod tests {
             let ran_a = crate::recipes::apply(&mut a, from, 100.0);
             let ran_b = crate::recipes::apply(&mut b, to, 100.0);
             // 外部名不进 recipes 的分派(那边只认配方名),走 effects 的别名解析
-            assert!(!ran_a, "{from} 应由 effects 侧别名解析,不该在 recipes 里被直接认下");
+            assert!(
+                !ran_a,
+                "{from} 应由 effects 侧别名解析,不该在 recipes 里被直接认下"
+            );
             assert!(ran_b, "{to} 应是可执行配方");
             let mut c = sample();
             apply_effect(
@@ -2049,7 +2169,9 @@ mod tests {
         // 统一成 LF 再解析:Windows 签出是 CRLF,顶层 `}` 那行会是 `}\r\n`,
         // 直接找 "\n}\n" 会一个都匹配不到(测试本身不该依赖签出的换行风格)。
         let src = include_str!("effects.rs").replace("\r\n", "\n");
-        let start = src.find("pub fn apply_effect").expect("apply_effect 应存在");
+        let start = src
+            .find("pub fn apply_effect")
+            .expect("apply_effect 应存在");
         let body = &src[start..];
         let end = body.find("\n}\n").expect("apply_effect 应以顶层 } 结束");
         let body = &body[..end];
@@ -2066,7 +2188,10 @@ mod tests {
                 continue;
             }
             let ok: Vec<&str> = head.split('|').map(|x| x.trim()).collect();
-            if ok.iter().any(|x| !(x.starts_with('"') && x.ends_with('"') && x.len() > 2)) {
+            if ok
+                .iter()
+                .any(|x| !(x.starts_with('"') && x.ends_with('"') && x.len() > 2))
+            {
                 continue;
             }
             for x in ok {
@@ -2201,7 +2326,12 @@ mod tests {
                     img.put_pixel(
                         x,
                         y,
-                        image::Rgba([(x * 9 + y) as u8, (y * 7 + 3) as u8, (x * 3 + y * 5) as u8, 255]),
+                        image::Rgba([
+                            (x * 9 + y) as u8,
+                            (y * 7 + 3) as u8,
+                            (x * 3 + y * 5) as u8,
+                            255,
+                        ]),
                     );
                 }
             }

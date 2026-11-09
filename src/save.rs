@@ -17,11 +17,9 @@ pub struct Baked {
 fn photo(store: &Store, id: i64) -> Result<(String, i32)> {
     store
         .read(|conn| {
-            conn.query_row(
-                "SELECT path, rot FROM photos WHERE id=?1",
-                [id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
-            )
+            conn.query_row("SELECT path, rot FROM photos WHERE id=?1", [id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?))
+            })
         })
         .context("照片不在索引中")
 }
@@ -120,7 +118,12 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
     let flat = crate::thumbs::apply_exif_rotation(img, rot as u32);
     let mut jpg: Vec<u8> = Vec::new();
     let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90);
-    enc.encode(flat.to_rgb8().as_raw(), flat.width(), flat.height(), image::ExtendedColorType::Rgb8)?;
+    enc.encode(
+        flat.to_rgb8().as_raw(),
+        flat.width(),
+        flat.height(),
+        image::ExtendedColorType::Rgb8,
+    )?;
     if src_bytes.get(0..2) == Some(&[0xFF, 0xD8]) {
         let payloads = jpeg_app1_payloads(&src_bytes);
         insert_app1(&mut jpg, &payloads); // 保留拍摄时间/相机等 EXIF
@@ -141,7 +144,10 @@ pub fn bake(store: &Store, id: i64) -> Result<Baked> {
         )?;
         Ok(())
     })?;
-    Ok(Baked { path: path_s, backup: backup_s })
+    Ok(Baked {
+        path: path_s,
+        backup: backup_s,
+    })
 }
 
 /// 把 epoch 秒格式化成**本地时间**的 `YYYYMMDD-HHMMSS`(备份文件名)。

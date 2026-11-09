@@ -69,11 +69,7 @@ pub enum Req {
     /// 握手:带客户端协议版本,服务回自己的能力摘要。
     Hello { proto: u8 },
     /// 快查。`class` 用 `nameidx::FileClass` 的判别值(见 [`class_to_wire`])。
-    Search {
-        text: String,
-        limit: u32,
-        class: u8,
-    },
+    Search { text: String, limit: u32, class: u8 },
     /// 卷内槽位 → 完整路径(结果列表只回槽位时用得上)。
     PathOf { letter: char, idx: u32 },
     /// 目录展开:回直接子项。
@@ -827,7 +823,13 @@ mod tests {
             let mut b = VolumeIndexBuilder::new('C');
             // 父 = 卷根 FRN(5)→ `Users` 落在卷根虚拟桶里;
             // 条目下标按推入顺序:0=Users,1=photo.jpg,2=notes.txt。
-            push(&mut b, 10, crate::mft::ROOT_FRN_INDEX, crate::nameidx::ATTR_DIRECTORY, "Users");
+            push(
+                &mut b,
+                10,
+                crate::mft::ROOT_FRN_INDEX,
+                crate::nameidx::ATTR_DIRECTORY,
+                "Users",
+            );
             push(&mut b, 100, 10, 0, "photo.jpg");
             push(&mut b, 101, 10, 0, "notes.txt");
             Fake {
@@ -935,13 +937,7 @@ mod tests {
     }
 
     /// 测试用建索引条目(与 nameidx/scan 测试里的同名助手一致口径)。
-    fn push(
-        b: &mut VolumeIndexBuilder,
-        frn: u64,
-        parent: u64,
-        attrs: u32,
-        name: &str,
-    ) {
+    fn push(b: &mut VolumeIndexBuilder, frn: u64, parent: u64, attrs: u32, name: &str) {
         let units: Vec<u16> = name.encode_utf16().collect();
         let e = crate::mft::UsnEntry {
             frn,
@@ -973,8 +969,14 @@ mod tests {
             limit: 500,
             class: class_to_wire(FileClass::Image),
         });
-        roundtrip_req(&Req::PathOf { letter: 'D', idx: 42 });
-        roundtrip_req(&Req::ChildrenOf { letter: 'C', idx: 0 });
+        roundtrip_req(&Req::PathOf {
+            letter: 'D',
+            idx: 42,
+        });
+        roundtrip_req(&Req::ChildrenOf {
+            letter: 'C',
+            idx: 0,
+        });
         roundtrip_req(&Req::Stat {
             path: r"C:\a\b.jpg".into(),
         });
@@ -1128,9 +1130,7 @@ mod tests {
     #[test]
     fn handle_dispatches_every_opcode() {
         let f = Fake::new();
-        let call = |req: &Req| -> Resp {
-            decode_resp(&handle(&encode_req(req), &f)).unwrap()
-        };
+        let call = |req: &Req| -> Resp { decode_resp(&handle(&encode_req(req), &f)).unwrap() };
         assert!(matches!(
             call(&Req::Hello {
                 proto: PROTO_VERSION
@@ -1178,7 +1178,7 @@ mod tests {
         );
         match call(&Req::ChildrenOf {
             letter: 'C',
-            idx: 0
+            idx: 0,
         }) {
             Resp::Children(c) => {
                 let mut names: Vec<_> = c.iter().map(|x| x.name.clone()).collect();
@@ -1202,20 +1202,17 @@ mod tests {
         assert_eq!(call(&Req::Flush), Resp::Ok);
         assert!(f.flushed.get());
         assert!(matches!(call(&Req::Status), Resp::Status(_)));
-        assert_eq!(call(&Req::JournalCursor), 
+        assert_eq!(
+            call(&Req::JournalCursor),
             Resp::Cursors(vec![Cursor {
                 letter: 'C',
                 journal_id: 0x1234,
                 first_usn: 0,
                 next_usn: 99,
                 l2_usn: 90,
-            }]));
-        assert_eq!(
-            call(&Req::Rebuild {
-                letters: vec!['D']
-            }),
-            Resp::Ok
+            }])
         );
+        assert_eq!(call(&Req::Rebuild { letters: vec!['D'] }), Resp::Ok);
         assert_eq!(*f.rebuilt.borrow(), vec!['D']);
     }
 

@@ -49,8 +49,8 @@ use windows::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW, TranslateMessage,
-    WINDOW_EX_STYLE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, PeekMessageW, RegisterClassW,
+    TranslateMessage, WINDOW_EX_STYLE, WNDCLASSW,
 };
 
 /// `WM_DEVICECHANGE`(`0x219`)。
@@ -79,9 +79,9 @@ impl DeviceEvent {
     /// 事件的可读描述(供 UI 状态栏显示)。
     pub fn label(&self) -> &'static str {
         match self {
-            DeviceEvent::Arrived => "设备接入",
-            DeviceEvent::Removed => "设备移除",
-            DeviceEvent::NodesChanged => "设备节点变化",
+            DeviceEvent::Arrived => crate::i18n::t("设备接入"),
+            DeviceEvent::Removed => crate::i18n::t("设备移除"),
+            DeviceEvent::NodesChanged => crate::i18n::t("设备节点变化"),
         }
     }
 }
@@ -160,13 +160,29 @@ pub struct DeviceWatcher {
 // 隐藏窗口的窗口类名(只用于本进程内的消息窗口)。
 #[cfg(windows)]
 const CLASS_NAME: &[u16] = &[
-    b'M' as u16, b'a' as u16, b'l' as u16, b'i' as u16, b'a' as u16, b'n' as u16, b'D' as u16,
-    b'e' as u16, b'v' as u16, b'i' as u16, b'c' as u16, b'e' as u16, 0,
+    b'M' as u16,
+    b'a' as u16,
+    b'l' as u16,
+    b'i' as u16,
+    b'a' as u16,
+    b'n' as u16,
+    b'D' as u16,
+    b'e' as u16,
+    b'v' as u16,
+    b'i' as u16,
+    b'c' as u16,
+    b'e' as u16,
+    0,
 ];
 
 /// 窗口过程:只处理 `WM_DEVICECHANGE`,其余交给 `DefWindowProcW`。
 #[cfg(windows)]
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_DEVICECHANGE {
         // 事件通过全局 channel 传出(窗口过程拿不到自定义数据指针,
         // 这里用一个进程内单例的 Sender)。
@@ -364,7 +380,10 @@ mod tests {
         // 类型不匹配 → 不处理
         let mut buf2 = [0u8; 32];
         buf2[0x04..0x08].copy_from_slice(&5i32.to_le_bytes()); // DBT_DEVTYP_HANDLE
-        assert_eq!(translate_device_change(DBT_DEVICEARRIVAL, buf2.as_ptr() as usize), None);
+        assert_eq!(
+            translate_device_change(DBT_DEVICEARRIVAL, buf2.as_ptr() as usize),
+            None
+        );
     }
 
     /// 回归测试:devicetype 读的是 **dword**(`*(int *)(lParam+4)`),

@@ -56,7 +56,10 @@ use std::collections::HashMap;
 pub fn pool_hash(s: &str) -> u32 {
     let mut h: i32 = 0x1234_5678u32 as i32;
     for &b in s.as_bytes() {
-        h = h ^ (h.wrapping_mul(0x20).wrapping_add(h >> 2).wrapping_add(b as i8 as i32));
+        h = h
+            ^ (h.wrapping_mul(0x20)
+                .wrapping_add(h >> 2)
+                .wrapping_add(b as i8 as i32));
     }
     h as u32
 }
@@ -208,7 +211,10 @@ impl PoolSet {
     /// 只保留 `live_by_pool[pool]` 中仍被引用的 id,并做 id 重映射。
     ///
     /// 返回 `{池名 → {旧id → 新id}}`。
-    pub fn vacuum_all(&mut self, live_by_pool: &HashMap<String, HashSet>) -> HashMap<String, HashMap<i64, i64>> {
+    pub fn vacuum_all(
+        &mut self,
+        live_by_pool: &HashMap<String, HashSet>,
+    ) -> HashMap<String, HashMap<i64, i64>> {
         let mut out = HashMap::new();
         for (name, pool) in &mut self.pools {
             let empty = HashSet::new();
@@ -244,11 +250,16 @@ impl PoolSet {
 /// 用存活 id 集合查询当前池,复用 `ColumnPool::get` 做孤儿判定
 /// (遍历池内全部 id 决定去留)。
 #[must_use]
-pub fn vacuum_plan(set: &PoolSet, live_by_pool: &HashMap<String, HashSet>) -> Vec<(String, usize, usize)> {
+pub fn vacuum_plan(
+    set: &PoolSet,
+    live_by_pool: &HashMap<String, HashSet>,
+) -> Vec<(String, usize, usize)> {
     let empty = HashSet::new();
     let mut out = Vec::new();
     for name in set.names() {
-        let Some(col) = set.column(name) else { continue };
+        let Some(col) = set.column(name) else {
+            continue;
+        };
         let live = live_by_pool.get(name).unwrap_or(&empty);
         // 存活条目数 = 存活集合里能在池中解析到字符串的个数
         let alive = live.iter().filter(|&&id| col.get(id).is_some()).count();
@@ -272,7 +283,10 @@ mod tests {
     fn hash_matches_original_seed_path() {
         // 手工按字符串查重哈希复算 "a" = 0x61
         let mut h: i32 = 0x1234_5678u32 as i32;
-        h = h ^ (h.wrapping_mul(0x20).wrapping_add(h >> 2).wrapping_add(0x61i32));
+        h = h
+            ^ (h.wrapping_mul(0x20)
+                .wrapping_add(h >> 2)
+                .wrapping_add(0x61i32));
         assert_eq!(pool_hash("a"), h as u32);
     }
 
@@ -281,13 +295,19 @@ mod tests {
         // UTF-8 的 ≥0x80 续字节按 (int)(char) 变负数 —— 即有符号扩展语义
         let mut a: i32 = 0x1234_5678u32 as i32;
         for &b in "é".as_bytes() {
-            a = a ^ (a.wrapping_mul(0x20).wrapping_add(a >> 2).wrapping_add(b as i8 as i32));
+            a = a
+                ^ (a.wrapping_mul(0x20)
+                    .wrapping_add(a >> 2)
+                    .wrapping_add(b as i8 as i32));
         }
         assert_eq!(pool_hash("é"), a as u32);
         // 若按无符号算会不同
         let mut c: i32 = 0x1234_5678u32 as i32;
         for &b in "é".as_bytes() {
-            c = c ^ (c.wrapping_mul(0x20).wrapping_add(c >> 2).wrapping_add(b as i32));
+            c = c
+                ^ (c.wrapping_mul(0x20)
+                    .wrapping_add(c >> 2)
+                    .wrapping_add(b as i32));
         }
         assert_ne!(pool_hash("é"), c as u32);
     }
@@ -354,11 +374,11 @@ mod tests {
     fn vacuum_remap_is_independent_of_set_iteration_order() {
         // 关键:HashSet 迭代序不确定,重映射必须按旧 id 升序分配才可复现
         let build = |n: usize| {
-let mut p = ColumnPool::new();
-        for i in 0..n {
-            p.intern(&format!("v{i}"));
-        }
-        p
+            let mut p = ColumnPool::new();
+            for i in 0..n {
+                p.intern(&format!("v{i}"));
+            }
+            p
         };
         let live: HashSet = (0..50).filter(|i| i % 3 == 0).collect();
         let a = build(50).vacuum(&live);
@@ -427,7 +447,13 @@ let mut p = ColumnPool::new();
     fn realistic_dedup_ratio() {
         // 1000 行照片,只有 5 种相机型号 → 池里只有 5 条
         let mut p = ColumnPool::new();
-        let cams = ["Nikon D850", "Canon R5", "Sony A7IV", "Fuji X-T5", "iPhone 15"];
+        let cams = [
+            "Nikon D850",
+            "Canon R5",
+            "Sony A7IV",
+            "Fuji X-T5",
+            "iPhone 15",
+        ];
         for i in 0..1000 {
             p.intern(cams[i % 5]);
         }

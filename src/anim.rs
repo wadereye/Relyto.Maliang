@@ -141,13 +141,20 @@ where
         } else {
             (f64::from(n) / f64::from(d)).round() as u32
         };
-        frames.push(Frame { rgba, delay_ms: ms.clamp(MIN_DELAY_MS, MAX_DELAY_MS) });
+        frames.push(Frame {
+            rgba,
+            delay_ms: ms.clamp(MIN_DELAY_MS, MAX_DELAY_MS),
+        });
     }
     if frames.len() < 2 {
         return None;
     }
     let total_ms = frames.iter().map(|f| u64::from(f.delay_ms)).sum();
-    Some(Clip { frames, loops, total_ms })
+    Some(Clip {
+        frames,
+        loops,
+        total_ms,
+    })
 }
 
 #[cfg(test)]
@@ -157,10 +164,17 @@ mod tests {
     fn clip(delays: &[u32], loops: LoopMode) -> Clip {
         let frames = delays
             .iter()
-            .map(|&d| Frame { rgba: RgbaImage::new(1, 1), delay_ms: d })
+            .map(|&d| Frame {
+                rgba: RgbaImage::new(1, 1),
+                delay_ms: d,
+            })
             .collect();
         let total_ms = delays.iter().map(|&d| u64::from(d)).sum();
-        Clip { frames, loops, total_ms }
+        Clip {
+            frames,
+            loops,
+            total_ms,
+        }
     }
 
     #[test]

@@ -28,10 +28,9 @@ fn parse(text: &str) -> Sections {
             out.entry(cur.clone().unwrap()).or_default();
         } else if let Some(c) = &cur {
             if let Some((k, v)) = l.split_once('=') {
-                out.entry(c.clone()).or_default().push((
-                    k.trim().to_ascii_lowercase(),
-                    v.trim().to_string(),
-                ));
+                out.entry(c.clone())
+                    .or_default()
+                    .push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
             }
         }
     }
@@ -57,7 +56,8 @@ fn serialize(sections: &Sections) -> String {
 
 fn write_all(folder: &Path, sections: &Sections) -> Result<()> {
     let p = folder.join(NAMES[0]);
-    std::fs::write(&p, serialize(sections)).with_context(|| format!("写 picasa.ini 失败: {}", p.display()))?;
+    std::fs::write(&p, serialize(sections))
+        .with_context(|| format!("写 picasa.ini 失败: {}", p.display()))?;
     Ok(())
 }
 

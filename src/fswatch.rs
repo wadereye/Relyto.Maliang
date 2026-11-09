@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::Storage::FileSystem as fs;
-use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{CreateEventW, WaitForMultipleObjects};
+use windows::Win32::System::IO::{CancelIo, GetOverlappedResult, OVERLAPPED};
 
 /// 事件缓冲 64KB:一次读不完内核会分批给,
 /// 每批都会触发一次完成事件,不会漏。
@@ -94,11 +94,7 @@ impl Fswatch {
 }
 
 /// 协调线程:处理挂/摘命令 + 每 100ms 收割原始事件、按去抖窗口批量转发。
-fn coordinator(
-    cmd_rx: Receiver<Cmd>,
-    ev_tx: Sender<Vec<FsEvent>>,
-    raw: Arc<Mutex<Vec<FsEvent>>>,
-) {
+fn coordinator(cmd_rx: Receiver<Cmd>, ev_tx: Sender<Vec<FsEvent>>, raw: Arc<Mutex<Vec<FsEvent>>>) {
     let mut roots: HashMap<PathBuf, StopFlag> = HashMap::new();
     let mut pending: Vec<FsEvent> = Vec::new();
     let mut pending_since: Option<Instant> = None;
@@ -127,7 +123,10 @@ fn coordinator(
             }
         }
         // 收割原始事件。
-        let drained: Vec<FsEvent> = raw.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+        let drained: Vec<FsEvent> = raw
+            .lock()
+            .map(|mut v| std::mem::take(&mut *v))
+            .unwrap_or_default();
         if !drained.is_empty() {
             pending_since.get_or_insert_with(Instant::now);
             pending.extend(drained);
@@ -182,7 +181,8 @@ fn root_thread_loop(root: PathBuf, stop: StopFlag, raw: Arc<Mutex<Vec<FsEvent>>>
             fs::FILE_FLAG_BACKUP_SEMANTICS | fs::FILE_FLAG_OVERLAPPED,
             None,
         )
-    };    let dir = match dir {
+    };
+    let dir = match dir {
         Ok(h) if h != INVALID_HANDLE_VALUE => h,
         _ => return,
     };
@@ -308,7 +308,13 @@ fn parse_notifications(root: &Path, data: &[u8], raw: &Arc<Mutex<Vec<FsEvent>>>)
             }
             a if a == fs::FILE_ACTION_RENAMED_NEW_NAME.0 => {
                 if let Some(old) = pending_old.take() {
-                    push(raw, FsEvent::Renamed { from: old, to: full });
+                    push(
+                        raw,
+                        FsEvent::Renamed {
+                            from: old,
+                            to: full,
+                        },
+                    );
                 } else {
                     // 没配对上的 NEW_NAME(丢批兜底):按新增处理。
                     push(raw, FsEvent::Changed(full));

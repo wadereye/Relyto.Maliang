@@ -772,9 +772,7 @@ mod io {
                     let (s, e) = r.byte_range(self.bpc);
                     byte_pos >= s && byte_pos < e
                 })
-                .ok_or_else(|| {
-                    anyhow!("$MFT 记录 {start}(字节 {byte_pos})不在任何 data run 内")
-                })?;
+                .ok_or_else(|| anyhow!("$MFT 记录 {start}(字节 {byte_pos})不在任何 data run 内"))?;
             let (run_start, run_end) = run.byte_range(self.bpc);
             // 本 run 内还能连续读多少条整记录(簇 ≥ 记录时至少 1 条)。
             let avail = ((run_end - byte_pos) / self.rs as u64).max(1);
@@ -818,8 +816,13 @@ mod io {
         let mut got = 0u32;
         // SAFETY: h 为调用方独占句柄;buf 长度恰为一条记录。
         let io = unsafe {
-            SetFilePointerEx(h, d.MftStartLcn * d.BytesPerCluster as i64, None, FILE_BEGIN)
-                .and_then(|_| ReadFile(h, Some(&mut buf), Some(&mut got), None))
+            SetFilePointerEx(
+                h,
+                d.MftStartLcn * d.BytesPerCluster as i64,
+                None,
+                FILE_BEGIN,
+            )
+            .and_then(|_| ReadFile(h, Some(&mut buf), Some(&mut got), None))
         };
         if io.is_err() || got as usize != rs {
             return Ok(linear(format!("读记录 0 失败/不足 {got}")));
@@ -911,7 +914,12 @@ mod io {
             // SAFETY: h 为调用方独占句柄;切片长度恰为 take。
             unsafe {
                 SetFilePointerEx(h, (r.lcn * bpc) as i64, None, FILE_BEGIN)?;
-                ReadFile(h, Some(&mut out[filled..filled + take]), Some(&mut got), None)?;
+                ReadFile(
+                    h,
+                    Some(&mut out[filled..filled + take]),
+                    Some(&mut got),
+                    None,
+                )?;
             }
             if got as usize != take {
                 return Err(anyhow!("非驻留属性读块不足:要 {take} 实得 {got}"));
@@ -1030,7 +1038,11 @@ mod io {
     fn pick_letters(spec: Option<&str>) -> Result<Vec<char>> {
         let probe = crate::mft::probe();
         match spec {
-            None => Ok(probe.iter().filter(|v| mft_readable(v)).map(|v| v.letter).collect()),
+            None => Ok(probe
+                .iter()
+                .filter(|v| mft_readable(v))
+                .map(|v| v.letter)
+                .collect()),
             Some(s) => {
                 let mut out = Vec::new();
                 for c in s.chars() {
@@ -1333,8 +1345,7 @@ mod io {
         // 目录统计分基记录 / 扩展记录:扩展记录(base_frn != 0)的 Flags 不代表目录身份,
         // 不该进这个不变式。基记录里也可能因为属性表外溢而暂时看不到 $INDEX_ROOT,[C2] 会回查。
         let (mut dirs_base, mut ix_base, mut dirs_ext) = (0u64, 0u64, 0u64);
-        let (mut c_si, mut c_fn, mut c_dres, mut c_dnon, mut c_al) =
-            (0u64, 0u64, 0u64, 0u64, 0u64);
+        let (mut c_si, mut c_fn, mut c_dres, mut c_dnon, mut c_al) = (0u64, 0u64, 0u64, 0u64, 0u64);
         let mut misaligned = 0u64;
         let mut recnum_mismatch = 0u64;
         // 在用的基记录必然带 $FILE_NAME(L1 的全部价值就在名字上)。缺名的只有两种合法来源:
@@ -1407,8 +1418,7 @@ mod io {
                         if dir_no_ix.len() < 5 {
                             dir_no_ix.push(format!(
                                 "idx={idx} in_use={} attr_list=1 next_attr_id={}",
-                                r.in_use as u8,
-                                r.next_attr_id
+                                r.in_use as u8, r.next_attr_id
                             ));
                         }
                     } else {
@@ -1416,8 +1426,7 @@ mod io {
                         if dir_no_ix.len() < 5 {
                             dir_no_ix.push(format!(
                                 "idx={idx} in_use={} attr_list=0 next_attr_id={} ← 无法解释",
-                                r.in_use as u8,
-                                r.next_attr_id
+                                r.in_use as u8, r.next_attr_id
                             ));
                         }
                     }
@@ -1448,9 +1457,7 @@ mod io {
                 if no_name_samples.len() < 5 {
                     no_name_samples.push(format!(
                         "idx={idx} is_dir={} attr_list={} next_attr_id={}",
-                        r.is_dir as u8,
-                        r.has_attr_list as u8,
-                        r.next_attr_id
+                        r.is_dir as u8, r.has_attr_list as u8, r.next_attr_id
                     ));
                 }
             }
@@ -1558,14 +1565,21 @@ mod io {
         if !c2_lines.is_empty() {
             out.push_str(&format!(
                 "    未命中(前 8):\n      {}\n",
-                c2_lines.iter().take(8).cloned().collect::<Vec<_>>().join("\n      ")
+                c2_lines
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n      ")
             ));
         }
 
         g.add(
             "定位正确:签名坏的全是零填充未分配记录,fixup/解析零失败",
             sig_nonzero == 0 && fx_bad == 0 && pr_bad == 0,
-            format!("非零签名坏 {sig_nonzero} · fixup {fx_bad} · 解析 {pr_bad} · 零填充 {sig_zero}"),
+            format!(
+                "非零签名坏 {sig_nonzero} · fixup {fx_bad} · 解析 {pr_bad} · 零填充 {sig_zero}"
+            ),
         );
         g.add(
             "头部偏移全卷自洽(FirstAttrOffset 对齐、RecNum 一致)",
@@ -1706,9 +1720,9 @@ mod io {
             // 直接和 si[i] 比。metadata 也是 100ns 粒度,只允许 as_nanos 截断带来的 ±1 tick。
             let mod_t = sys_to_filetime(meta.modified().ok());
             let acc_t = sys_to_filetime(meta.accessed().ok());
-            let near = |a: Option<u64>,
-                        b: Option<u64>|
-             -> bool { matches!((a, b), (Some(x), Some(y)) if x.abs_diff(y) <= 1) };
+            let near = |a: Option<u64>, b: Option<u64>| -> bool {
+                matches!((a, b), (Some(x), Some(y)) if x.abs_diff(y) <= 1)
+            };
             let si_d = pd.si;
             let si_i = pi.si;
             let t0 = si_d.map(|t| t[0]);
@@ -1728,7 +1742,9 @@ mod io {
             // 断言 3(投票):si[2]/si[3] 里谁更像 metadata.accessed()。热文件的盘上 MFT 记录
             // 会滞后于内存态,所以按「谁更近」投票,不要求逐个相等。
             let (vote3, vote2) = match (t2, t3, acc_t) {
-                (Some(a), Some(b), Some(c)) => (b.abs_diff(c) < a.abs_diff(c), a.abs_diff(c) < b.abs_diff(c)),
+                (Some(a), Some(b), Some(c)) => {
+                    (b.abs_diff(c) < a.abs_diff(c), a.abs_diff(c) < b.abs_diff(c))
+                }
                 _ => (false, false),
             };
             out.push_str(&format!(
@@ -1744,14 +1760,26 @@ mod io {
                 t3.unwrap_or(0),
                 si_d == si_i
             ));
-            out.push_str(&format!("    metadata tick:modified={mod_t:?} accessed={acc_t:?}
-"));
+            out.push_str(&format!(
+                "    metadata tick:modified={mod_t:?} accessed={acc_t:?}
+"
+            ));
             out.push_str(&format!(
                 "    次序判定:si[1]==modified → {} · 该样本能区分次序 → {} · accessed 更像 {}
 ",
                 if write_is_t1 { "成立" } else { "不成立" },
-                if discriminating { "是" } else { "否(时间重合,空断言)" },
-                if vote3 { "si[3]" } else if vote2 { "si[2]" } else { "无法判定" }
+                if discriminating {
+                    "是"
+                } else {
+                    "否(时间重合,空断言)"
+                },
+                if vote3 {
+                    "si[3]"
+                } else if vote2 {
+                    "si[2]"
+                } else {
+                    "无法判定"
+                }
             ));
             out.push_str(&format!(
                 "    记录字节:直读 vs 0x90068 = {}
@@ -1763,8 +1791,11 @@ mod io {
 ",
                 pd.rec_num, pi.rec_num, pd.first_attr_off, pi.first_attr_off
             ));
-            let ok_one =
-                size_direct == size_ioctl && size_ioctl == size_meta && byte_eq && si_d == si_i && write_is_t1;
+            let ok_one = size_direct == size_ioctl
+                && size_ioctl == size_meta
+                && byte_eq
+                && si_d == si_i
+                && write_is_t1;
             cross_seen += 1;
             cross_pass += ok_one as u32;
             cross_disc += discriminating as u32;
@@ -1774,10 +1805,8 @@ mod io {
         // 次序结论:[+0x00 created, +0x08 write, +0x10 mft_change, +0x18 access]。
         // 上一版按 FILE_ALL_INFORMATION 的 [created, access, write, change] 标注是错的,
         // 而 mtime 取错槽位会让整个 L2 的时间列全错 —— 所以这一条必须是门禁,不是备注。
-        let cross_ok = cross_seen > 0
-            && cross_pass == cross_seen
-            && cross_disc >= 1
-            && cross_v3 > cross_v2;
+        let cross_ok =
+            cross_seen > 0 && cross_pass == cross_seen && cross_disc >= 1 && cross_v3 > cross_v2;
         g.add(
             "三方交叉验证(size / SI 四时间次序 / 字节一致)",
             cross_ok,
@@ -1878,8 +1907,7 @@ mod tests {
             b[t + FN_NAME_LEN] = units.len() as u8;
             b[t + FN_NAME_NS] = ns;
             for (i, u) in units.iter().enumerate() {
-                b[t + FN_FIXED + i * 2..t + FN_FIXED + i * 2 + 2]
-                    .copy_from_slice(&u.to_le_bytes());
+                b[t + FN_FIXED + i * 2..t + FN_FIXED + i * 2 + 2].copy_from_slice(&u.to_le_bytes());
             }
             off += alen;
         }
@@ -2164,7 +2192,11 @@ mod tests {
         // ReparseTag = 0x0000_0003:低字节非零,若按 +0x3C 当名字长度就会读到 3。
         b[off + 0x18 + 0x3C..off + 0x18 + 0x40].copy_from_slice(&3u32.to_le_bytes());
         let r = parse_record(&b, 42).unwrap();
-        assert_eq!(r.name.as_deref(), Some("测试.jpg"), "ReparseTag 不许被当成名字长度");
+        assert_eq!(
+            r.name.as_deref(),
+            Some("测试.jpg"),
+            "ReparseTag 不许被当成名字长度"
+        );
         assert_eq!(r.name_ns, 1);
         assert_eq!(r.parent_frn, 9);
 

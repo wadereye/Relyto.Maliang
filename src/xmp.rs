@@ -9,7 +9,9 @@ pub struct Meta {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub fn sidecar_path(photo: &Path) -> PathBuf {
@@ -44,7 +46,8 @@ pub fn write(photo: &Path, meta: &Meta) -> Result<()> {
     let sp = sidecar_path(photo);
     let tmp = sp.with_extension("xmp.rk-tmp");
     std::fs::write(&tmp, xml.as_bytes())?;
-    std::fs::rename(&tmp, &sp).with_context(|| format!("写入 XMP sidecar 失败: {}", sp.display()))?;
+    std::fs::rename(&tmp, &sp)
+        .with_context(|| format!("写入 XMP sidecar 失败: {}", sp.display()))?;
     Ok(())
 }
 
@@ -54,7 +57,10 @@ pub fn write(photo: &Path, meta: &Meta) -> Result<()> {
 #[allow(dead_code)]
 pub fn read(photo: &Path) -> Meta {
     let sp = sidecar_path(photo);
-    let default = Meta { star: 0, tags: Vec::new() };
+    let default = Meta {
+        star: 0,
+        tags: Vec::new(),
+    };
     let data = match std::fs::read(&sp) {
         Ok(d) => d,
         Err(_) => return default,
@@ -68,7 +74,10 @@ pub fn read(photo: &Path) -> Meta {
             break;
         }
     }
-    let mut out = Meta { star, tags: Vec::new() };
+    let mut out = Meta {
+        star,
+        tags: Vec::new(),
+    };
     let mut rest = text.as_ref();
     while let Some(a) = rest.find("<rdf:li>") {
         let b = match rest[a..].find("</rdf:li>") {
@@ -97,18 +106,27 @@ mod tests {
         std::fs::write(&photo, b"not-a-real-jpeg").unwrap();
         write(
             &photo,
-            &Meta { star: 1, tags: vec!["cat".into(), "海边".into()] },
+            &Meta {
+                star: 1,
+                tags: vec!["cat".into(), "海边".into()],
+            },
         )
         .unwrap();
         let back = read(&photo);
         assert_eq!(back.star, 1);
         assert_eq!(back.tags, vec!["cat".to_string(), "海边".to_string()]);
         // DB 权威语义:标签清空后 XMP 镜像也为空(不会残留复活)
-        write(&photo, &Meta { star: 0, tags: Vec::new() }).unwrap();
+        write(
+            &photo,
+            &Meta {
+                star: 0,
+                tags: Vec::new(),
+            },
+        )
+        .unwrap();
         let back2 = read(&photo);
         assert_eq!(back2.star, 0);
         assert!(back2.tags.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-

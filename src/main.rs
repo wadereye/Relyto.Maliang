@@ -3,10 +3,10 @@
 // 命令行子命令的输出由 win::attach_parent_console 挂回调用方终端。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod anim;
 mod app;
 mod assets;
 mod assets_format;
-mod anim;
 mod curves;
 mod db;
 mod device;
@@ -15,6 +15,8 @@ mod exif;
 mod export;
 mod fswatch;
 mod hash;
+mod i18n;
+mod i18n_en;
 mod ipc;
 mod mft;
 mod nameidx;
@@ -54,6 +56,34 @@ mod models;
 #[cfg(feature = "ai")]
 mod clip;
 
+#[cfg(feature = "ai")]
+mod ai_queue;
+
+#[cfg(feature = "ai")]
+mod ai_sched;
+
+#[cfg(feature = "ai")]
+mod ai_models;
+
+#[cfg(feature = "ai")]
+mod ai_text;
+
+#[cfg(feature = "ai")]
+mod ai_tags;
+
+#[cfg(feature = "ai")]
+mod ai_ocr;
+
+#[cfg(feature = "ai")]
+mod ai_search;
+
+#[cfg(feature = "ai")]
+mod ai_parse;
+
+#[cfg(feature = "ai")]
+mod ai_review;
+
+use crate::i18n::{t, t_with};
 use eframe::egui;
 use std::sync::Arc;
 
@@ -79,33 +109,42 @@ fn handle_cli(args: &[String]) -> bool {
         "--export-assets" => {
             let out = args.get(1).cloned().unwrap_or_else(|| "presets.txt".into());
             match std::fs::write(&out, assets::export_text()) {
-                Ok(()) => println!("已导出资源包文本 -> {out}"),
-                Err(e) => eprintln!("导出失败:{e}"),
+                Ok(()) => println!(
+                    "{}",
+                    t_with("已导出资源包文本 -> {out}", &[("out", out.to_string())])
+                ),
+                Err(e) => eprintln!("{}", t_with("导出失败:{e}", &[("e", e.to_string())])),
             }
             true
         }
         "--import-assets" => {
             let Some(src) = args.get(1) else {
-                eprintln!("用法:--import-assets <文本路径>");
+                eprintln!("{}", t("用法:--import-assets <文本路径>"));
                 return true;
             };
             let text = match std::fs::read_to_string(src) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("读取失败:{e}");
+                    eprintln!("{}", t_with("读取失败:{e}", &[("e", e.to_string())]));
                     return true;
                 }
             };
             let bytes = match assets::import_text(&text) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("解析失败:{e}");
+                    eprintln!("{}", t_with("解析失败:{e}", &[("e", e.to_string())]));
                     return true;
                 }
             };
             match assets::write_user_asset(&bytes) {
-                Ok(p) => println!("已写入用户资源包 -> {}", p.display()),
-                Err(e) => eprintln!("写入失败:{e}"),
+                Ok(p) => println!(
+                    "{}",
+                    t_with(
+                        "已写入用户资源包 -> {p1}",
+                        &[("p1", (p.display()).to_string())]
+                    )
+                ),
+                Err(e) => eprintln!("{}", t_with("写入失败:{e}", &[("e", e.to_string())])),
             }
             true
         }
@@ -114,7 +153,7 @@ fn handle_cli(args: &[String]) -> bool {
         "--service" => {
             if let Err(e) = service::run_service() {
                 // 服务会话里没有控制台,eprintln 未必有人看;退出码才是给 SCM 的信号。
-                eprintln!("索引服务失败:{e:#}");
+                eprintln!("{}", t_with("索引服务失败:{e}", &[("e", format!("{e:#}"))]));
                 std::process::exit(1);
             }
             true
@@ -122,7 +161,10 @@ fn handle_cli(args: &[String]) -> bool {
         // 同一套引擎跑在前台控制台(调试用):日志同时打 stdout,Ctrl+C 退出。
         "--console" => {
             if let Err(e) = service::run_console() {
-                eprintln!("索引服务(控制台模式)失败:{e:#}");
+                eprintln!(
+                    "{}",
+                    t_with("索引服务(控制台模式)失败:{e}", &[("e", format!("{e:#}"))])
+                );
                 std::process::exit(1);
             }
             true
@@ -133,22 +175,40 @@ fn handle_cli(args: &[String]) -> bool {
             // 这个分支跑在提权进程里,是唯一能把数据目录告诉 LocalSystem 服务的机会:
             // 服务的「用户目录」是 systemprofile,读不到登录用户的 data.location。
             match db::sync_machine_marker() {
-                Ok(p) => println!("服务数据目录已写入:{p:?}"),
+                Ok(p) => println!(
+                    "{}",
+                    t_with("服务数据目录已写入:{p}", &[("p", format!("{p:?}"))])
+                ),
                 Err(e) => eprintln!(
-                    "警告:机器级数据目录写不进去({e}),服务会改建在 ProgramData 而不是 {:?}",
-                    db::data_dir()
+                    "{}",
+                    t_with(
+                        "警告:机器级数据目录写不进去({e}),服务会改建在 ProgramData 而不是 {p2}",
+                        &[
+                            ("e", e.to_string()),
+                            ("p2", format!("{:?}", db::data_dir()))
+                        ]
+                    )
                 ),
             }
             match std::env::current_exe() {
                 Ok(exe) => match win::service_install(&exe) {
-                    Ok(()) => println!("索引服务已安装并启动:{}", service::SERVICE_NAME),
+                    Ok(()) => println!(
+                        "{}",
+                        t_with(
+                            "索引服务已安装并启动:{p1}",
+                            &[("p1", service::SERVICE_NAME.to_string())]
+                        )
+                    ),
                     Err(e) => {
-                        eprintln!("安装索引服务失败:{e}");
+                        eprintln!(
+                            "{}",
+                            t_with("安装索引服务失败:{e}", &[("e", e.to_string())])
+                        );
                         std::process::exit(1);
                     }
                 },
                 Err(e) => {
-                    eprintln!("取自身路径失败:{e}");
+                    eprintln!("{}", t_with("取自身路径失败:{e}", &[("e", e.to_string())]));
                     std::process::exit(1);
                 }
             }
@@ -157,9 +217,12 @@ fn handle_cli(args: &[String]) -> bool {
         // 提权子命令:停服务 + 删注册(撤销授权)。幂等:没装过也算成功。
         "--uninstall-service" => {
             match win::service_uninstall() {
-                Ok(()) => println!("索引服务已卸载"),
+                Ok(()) => println!("{}", t("索引服务已卸载")),
                 Err(e) => {
-                    eprintln!("卸载索引服务失败:{e}");
+                    eprintln!(
+                        "{}",
+                        t_with("卸载索引服务失败:{e}", &[("e", e.to_string())])
+                    );
                     std::process::exit(1);
                 }
             }
@@ -170,9 +233,12 @@ fn handle_cli(args: &[String]) -> bool {
         // 这条路必须能在程序里点出来,而不是让用户去敲 `net stop` 或开 services.msc。
         "--stop-service" => {
             match win::service_stop() {
-                Ok(()) => println!("索引服务已停止(注册项保留)"),
+                Ok(()) => println!("{}", t("索引服务已停止(注册项保留)")),
                 Err(e) => {
-                    eprintln!("停止索引服务失败:{e}");
+                    eprintln!(
+                        "{}",
+                        t_with("停止索引服务失败:{e}", &[("e", e.to_string())])
+                    );
                     std::process::exit(1);
                 }
             }
@@ -182,9 +248,12 @@ fn handle_cli(args: &[String]) -> bool {
         // 停完只有这一条回头路,不用重新安装、也少一次 UAC 之外的等待。
         "--start-service" => {
             match win::service_start() {
-                Ok(()) => println!("索引服务已启动"),
+                Ok(()) => println!("{}", t("索引服务已启动")),
                 Err(e) => {
-                    eprintln!("启动索引服务失败:{e}");
+                    eprintln!(
+                        "{}",
+                        t_with("启动索引服务失败:{e}", &[("e", e.to_string())])
+                    );
                     std::process::exit(1);
                 }
             }
@@ -199,14 +268,14 @@ fn handle_cli(args: &[String]) -> bool {
             if args.iter().any(|a| a == "--mft-task")
                 && crate::win::service_state() == crate::win::ServiceState::Running
             {
-                println!("常驻索引服务在运行,本次定时扫描跳过");
+                println!("{}", t("常驻索引服务在运行,本次定时扫描跳过"));
                 return true;
             }
             let spec = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned();
             match nameidx::cli_mft_scan(spec.as_deref()) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("MFT 扫描失败:{e:#}");
+                    eprintln!("{}", t_with("MFT 扫描失败:{e}", &[("e", format!("{e:#}"))]));
                     std::process::exit(1);
                 }
             }
@@ -216,7 +285,7 @@ fn handle_cli(args: &[String]) -> bool {
         "--mft-check" => {
             match nameidx::cli_mft_check() {
                 Ok(()) => {}
-                Err(e) => eprintln!("索引检查失败:{e:#}"),
+                Err(e) => eprintln!("{}", t_with("索引检查失败:{e}", &[("e", format!("{e:#}"))])),
             }
             true
         }
@@ -236,7 +305,10 @@ fn handle_cli(args: &[String]) -> bool {
             ) {
                 Ok(()) => {}
                 Err(e) => {
-                    eprintln!("MFT 偏移诊断失败:{e:#}");
+                    eprintln!(
+                        "{}",
+                        t_with("MFT 偏移诊断失败:{e}", &[("e", format!("{e:#}"))])
+                    );
                     std::process::exit(1);
                 }
             }
@@ -251,7 +323,7 @@ fn handle_cli(args: &[String]) -> bool {
                 .map(|c| c.to_ascii_uppercase())
                 .unwrap_or('C');
             let Some(out) = args.get(2).cloned() else {
-                eprintln!("用法:--usn-dump <卷字母> <输出文件> [回看字节数]");
+                eprintln!("{}", t("用法:--usn-dump <卷字母> <输出文件> [回看字节数]"));
                 std::process::exit(1);
             };
             let tail: u64 = args
@@ -259,17 +331,21 @@ fn handle_cli(args: &[String]) -> bool {
                 .and_then(|a| a.parse().ok())
                 .unwrap_or(256 * 1024);
             match mft::cli_usn_dump(letter, &out, tail) {
-                Ok(()) => println!("USN 记录已写入:{out}"),
+                Ok(()) => println!(
+                    "{}",
+                    t_with("USN 记录已写入:{out}", &[("out", out.to_string())])
+                ),
                 Err(e) => {
-                    eprintln!("USN 诊断失败:{e:#}");
+                    eprintln!("{}", t_with("USN 诊断失败:{e}", &[("e", format!("{e:#}"))]));
                     std::process::exit(1);
                 }
             }
             true
         }
         // 人工验证更新配置:只查清单、不下载、不改程序文件。
-        "--check-update" => {            if let Err(e) = update::cli_check() {
-                eprintln!("检查更新失败:{e}");
+        "--check-update" => {
+            if let Err(e) = update::cli_check() {
+                eprintln!("{}", t_with("检查更新失败:{e}", &[("e", e.to_string())]));
                 std::process::exit(1);
             }
             true
@@ -277,7 +353,7 @@ fn handle_cli(args: &[String]) -> bool {
         // 部署时验证整条下载链:清单 → Range 分段 → 校验 → 落地,不安装。
         "--download-update" => {
             if let Err(e) = update::cli_download() {
-                eprintln!("下载更新失败:{e}");
+                eprintln!("{}", t_with("下载更新失败:{e}", &[("e", e.to_string())]));
                 std::process::exit(1);
             }
             true
@@ -290,7 +366,7 @@ fn handle_cli(args: &[String]) -> bool {
                 args.get(2).map(String::as_str),
                 args.get(3).map(String::as_str),
             ) {
-                eprintln!("应用更新失败:{e}");
+                eprintln!("{}", t_with("应用更新失败:{e}", &[("e", e.to_string())]));
                 std::process::exit(1);
             }
             true
@@ -298,14 +374,23 @@ fn handle_cli(args: &[String]) -> bool {
         // 更新途中 helper 被杀时的兜底:只把服务起回来,不动任何文件。
         "--restore-service" => {
             if let Err(e) = update::cli_restore_service(args.get(1).map(String::as_str)) {
-                eprintln!("恢复索引服务失败:{e}");
+                eprintln!(
+                    "{}",
+                    t_with("恢复索引服务失败:{e}", &[("e", e.to_string())])
+                );
                 std::process::exit(1);
             }
             true
         }
         // 打印版本号后退出。
         "--version" => {
-            println!("马良 (Relyto.Maliang) v{}", update::CURRENT_VERSION);
+            println!(
+                "{}",
+                t_with(
+                    "马良 (Relyto.Maliang) v{p1}",
+                    &[("p1", update::CURRENT_VERSION.to_string())]
+                )
+            );
             true
         }
         _ => false,
@@ -351,6 +436,8 @@ fn main() -> eframe::Result {
     if !is_service && !args.is_empty() {
         win::attach_parent_console();
     }
+    // 命令行分支不走 App::new,这里单独读一次界面语言设置。
+    crate::i18n::init_from_settings();
     if handle_cli(&args) {
         return Ok(());
     }

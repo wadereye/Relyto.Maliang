@@ -61,7 +61,8 @@ pub fn start(store: Arc<Store>) -> Result<WifiHandle> {
         while !stop2.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut sock, _peer)) => {
-                    sock.set_read_timeout(Some(std::time::Duration::from_secs(30))).ok();
+                    sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
+                        .ok();
                     match handle_one(&mut sock, &incoming) {
                         Some(crate::net::Reply::UploadOk) => {
                             let n = recv2.fetch_add(1, Ordering::SeqCst) + 1;

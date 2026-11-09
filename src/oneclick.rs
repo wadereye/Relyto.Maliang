@@ -109,7 +109,9 @@ impl Mt19937 {
         state[0] = seed;
         for i in 1..624 {
             let prev = state[i - 1];
-            state[i] = (prev ^ (prev >> 30)).wrapping_mul(0x1966_0d).wrapping_add(i as u32);
+            state[i] = (prev ^ (prev >> 30))
+                .wrapping_mul(0x1966_0d)
+                .wrapping_add(i as u32);
         }
         Mt19937 { state, index: 624 }
     }
@@ -361,7 +363,11 @@ pub fn apply_color_temp(img: &mut image::RgbaImage, temp: f32, white: f32) {
     let m = (temp * 256.0) as i32;
     let k = (((white.clamp(0.0, 1.0) * 128.0) as i32).clamp(0, 255)) as usize;
     let m_pos = m.max(0);
-    let step = if k < 256 { 0x10000 / (256 - k) as i32 } else { 0x10000 };
+    let step = if k < 256 {
+        0x10000 / (256 - k) as i32
+    } else {
+        0x10000
+    };
     let mut t = [0i32; 256];
     let mut u = [0i32; 256];
     let mut w = [0i32; 256];
@@ -376,9 +382,9 @@ pub fn apply_color_temp(img: &mut image::RgbaImage, temp: f32, white: f32) {
             let base = t[p[c] as usize].clamp(0, 255) as usize;
             let weight = w[base];
             let delta = match c {
-                0 => (weight * m) >> 15,          // 红
-                1 => (weight * m_pos) >> 17,      // 绿(半幅)
-                _ => -((weight * m) >> 15),       // 蓝
+                0 => (weight * m) >> 15,     // 红
+                1 => (weight * m_pos) >> 17, // 绿(半幅)
+                _ => -((weight * m) >> 15),  // 蓝
             };
             let v = (base as i32 + delta).clamp(0, 255) as usize;
             o[c] = u[v].clamp(0, 255) as u8;
@@ -688,7 +694,11 @@ pub fn apply_tint(img: &mut image::RgbaImage, color: [u8; 3], gamma: f32) {
     if (gamma - 1.0).abs() > 1e-6 {
         apply_gamma(img, gamma);
     }
-    let k = [color[0] as f32 / 255.0, color[1] as f32 / 255.0, color[2] as f32 / 255.0];
+    let k = [
+        color[0] as f32 / 255.0,
+        color[1] as f32 / 255.0,
+        color[2] as f32 / 255.0,
+    ];
     for p in img.pixels_mut() {
         for c in 0..3 {
             p[c] = (p[c] as f32 * k[c]).clamp(0.0, 255.0) as u8;
@@ -890,7 +900,9 @@ mod tests {
         state[0] = 5489;
         for i in 1..624 {
             let prev = state[i - 1];
-            state[i] = (prev ^ (prev >> 30)).wrapping_mul(0x1966_0d).wrapping_add(i as u32);
+            state[i] = (prev ^ (prev >> 30))
+                .wrapping_mul(0x1966_0d)
+                .wrapping_add(i as u32);
         }
         // twist
         const MATRIX_A: u32 = 0x9908_b0df;
@@ -967,14 +979,20 @@ mod tests {
         assert!(w[0] > w[2], "暖调应红 > 蓝,got {w:?}");
         let y_w = luma(w[0] as f32, w[1] as f32, w[2] as f32);
         let y_0 = luma(128.0, 128.0, 128.0);
-        assert!((y_w - y_0).abs() < 6.0, "暖调不应明显改变亮度:{y_w} vs {y_0}");
+        assert!(
+            (y_w - y_0).abs() < 6.0,
+            "暖调不应明显改变亮度:{y_w} vs {y_0}"
+        );
 
         let mut cool = image::RgbaImage::from_pixel(2, 2, gray);
         apply_cool(&mut cool, 100.0);
         let c = cool.get_pixel(0, 0);
         assert!(c[2] > c[0], "冷调应蓝 > 红,got {c:?}");
         let y_c = luma(c[0] as f32, c[1] as f32, c[2] as f32);
-        assert!((y_c - y_0).abs() < 6.0, "冷调不应明显改变亮度:{y_c} vs {y_0}");
+        assert!(
+            (y_c - y_0).abs() < 6.0,
+            "冷调不应明显改变亮度:{y_c} vs {y_0}"
+        );
     }
 
     /// amount=0 时效果应为恒等变换(不改动像素)。
@@ -986,7 +1004,11 @@ mod tests {
         apply_cool(&mut img, 0.0);
         apply_faded(&mut img, 0.0);
         let p = img.get_pixel(1, 1);
-        assert_eq!((p[0], p[1], p[2]), (30, 140, 220), "零强度应不动像素,got {p:?}");
+        assert_eq!(
+            (p[0], p[1], p[2]),
+            (30, 140, 220),
+            "零强度应不动像素,got {p:?}"
+        );
         // 暗角零强度同样不动(内部直接 return)
         let mut img2 = image::RgbaImage::from_pixel(4, 4, base);
         apply_vignette(&mut img2, 0.0);
@@ -1004,7 +1026,10 @@ mod tests {
         assert!(corner < 200, "四角应被压暗,got {corner}");
         // 从中心往外应单调不增(渐变而非硬边)
         let edge = img.get_pixel(32, 0)[0];
-        assert!(corner < edge && edge <= center, "应由中心向外递减:{center}/{edge}/{corner}");
+        assert!(
+            corner < edge && edge <= center,
+            "应由中心向外递减:{center}/{edge}/{corner}"
+        );
     }
 
     /// 褪色:抬黑位(纯黑变灰)+ 压白位(纯白不再满值)。
@@ -1012,11 +1037,19 @@ mod tests {
     fn faded_lifts_blacks_and_compresses_whites() {
         let mut black = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
         apply_faded(&mut black, 100.0);
-        assert!(black.get_pixel(0, 0)[0] > 8, "黑位应被抬起,got {:?}", black.get_pixel(0, 0));
+        assert!(
+            black.get_pixel(0, 0)[0] > 8,
+            "黑位应被抬起,got {:?}",
+            black.get_pixel(0, 0)
+        );
 
         let mut white = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 255, 255, 255]));
         apply_faded(&mut white, 100.0);
-        assert!(white.get_pixel(0, 0)[0] < 255, "白位应被压低,got {:?}", white.get_pixel(0, 0));
+        assert!(
+            white.get_pixel(0, 0)[0] < 255,
+            "白位应被压低,got {:?}",
+            white.get_pixel(0, 0)
+        );
     }
 
     // ===== 一键效果回归测试 =====
@@ -1045,7 +1078,10 @@ mod tests {
         // 暗部抬升应显著大于亮部抬升
         let d_shadow = after[0] as i32 - before[0] as i32;
         let d_high = after[3] as i32 - before[3] as i32;
-        assert!(d_shadow > d_high, "暗部抬升应大于亮部:{d_shadow} vs {d_high}");
+        assert!(
+            d_shadow > d_high,
+            "暗部抬升应大于亮部:{d_shadow} vs {d_high}"
+        );
         assert!(d_shadow > 100, "暗部应被大幅提亮,got {d_shadow}");
         // 纯黑保持纯黑(pow(0, x) = 0)
         let mut black = image::RgbaImage::from_pixel(2, 2, image::Rgba([0, 0, 0, 255]));
@@ -1204,7 +1240,10 @@ mod tests {
             "平坦区应大致保持,got {flat}"
         );
         // 尖峰被模糊摊薄 → 峰值下降
-        assert!(center < peak_before, "尖峰应被摊薄:{peak_before} → {center}");
+        assert!(
+            center < peak_before,
+            "尖峰应被摊薄:{peak_before} → {center}"
+        );
     }
 
     #[test]
@@ -1311,8 +1350,7 @@ mod tests {
     fn colortemp_white_shift_alone_is_near_identity() {
         for white in [0.0f32, 0.5, 1.0] {
             for x in [0u8, 64, 128, 200, 255] {
-                let mut img =
-                    image::RgbaImage::from_pixel(1, 1, image::Rgba([x, x, x, 255]));
+                let mut img = image::RgbaImage::from_pixel(1, 1, image::Rgba([x, x, x, 255]));
                 apply_color_temp(&mut img, 0.0, white);
                 let p = img.get_pixel(0, 0);
                 assert!(

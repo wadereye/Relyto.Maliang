@@ -43,6 +43,7 @@
 
 use crate::ai::{env, models_dir};
 use crate::db::Store;
+use crate::i18n::{t, t_with};
 use ort::session::Session;
 use ort::value::Tensor;
 use std::collections::HashMap;
@@ -93,7 +94,7 @@ impl Tokenizer {
     /// 从 merges.txt 加载;encoder 按 merges 重建。
     pub fn load(merges_path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(merges_path)
-            .map_err(|e| format!("读 merges: {e}"))?;
+            .map_err(|e| t_with("读 merges: {e}", &[("e", e.to_string())]))?;
         let (ordered, b2u) = bytes_to_unicode();
         let mut encoder: HashMap<String, u32> = HashMap::with_capacity(49408);
         let mut id = 0u32;
@@ -124,7 +125,13 @@ impl Tokenizer {
         id += 1;
         let eot = id;
         encoder.insert("<|endoftext|>".to_string(), id);
-        Ok(Self { b2u, encoder, ranks, sot, eot })
+        Ok(Self {
+            b2u,
+            encoder,
+            ranks,
+            sot,
+            eot,
+        })
     }
 
     /// encode:返回 `[SOT] + bpe tokens + [EOT]`(不含 padding;调用方负责截断/填充)。
@@ -288,7 +295,7 @@ fn match_lit<'a>(chars: &[char], i: usize, lit: &'a str) -> Option<&'a str> {
 fn l2_normalize(v: &[f32]) -> Result<Vec<f32>, String> {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if !norm.is_finite() || norm < 1e-12 {
-        return Err("嵌入范数异常(全零或 NaN)".into());
+        return Err(t("嵌入范数异常(全零或 NaN)").into());
     }
     Ok(v.iter().map(|x| x / norm).collect())
 }
@@ -314,9 +321,29 @@ fn is_punct(c: char) -> bool {
     {
         return true;
     }
-    matches!(c,
-        '，' | '。' | '！' | '？' | '；' | '：' | '、' | '“' | '”' | '‘' | '’'
-        | '（' | '）' | '《' | '》' | '【' | '】' | '—' | '…' | '·' | '～')
+    matches!(
+        c,
+        '，' | '。'
+            | '！'
+            | '？'
+            | '；'
+            | '：'
+            | '、'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+            | '（'
+            | '）'
+            | '《'
+            | '》'
+            | '【'
+            | '】'
+            | '—'
+            | '…'
+            | '·'
+            | '～'
+    )
 }
 
 /// 去控制字符 + 空白规范化(Bert _clean_text)。
@@ -349,8 +376,8 @@ pub struct BertTokenizer {
 
 impl BertTokenizer {
     pub fn load(path: &Path) -> Result<Self, String> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| format!("读 vocab: {e}"))?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| t_with("读 vocab: {e}", &[("e", e.to_string())]))?;
         let mut vocab = HashMap::with_capacity(22000);
         for (i, line) in text.lines().enumerate() {
             vocab.entry(line.to_string()).or_insert(i as u32);
@@ -421,11 +448,7 @@ impl BertTokenizer {
             let mut found = None;
             while start < end {
                 let sub: String = chars[start..end].iter().collect();
-                let key = if start > 0 {
-                    format!("##{sub}")
-                } else {
-                    sub
-                };
+                let key = if start > 0 { format!("##{sub}") } else { sub };
                 if let Some(&id) = self.vocab.get(&key) {
                     found = Some((id, end));
                     break;
@@ -463,7 +486,10 @@ fn preprocess_224(img: &image::DynamicImage) -> Result<Vec<f32>, String> {
     let cropped = resized.crop_imm(x0, y0, S.min(rw), S.min(rh)).to_rgb8();
     let (cw, ch) = (cropped.width(), cropped.height());
     if cw != S || ch != S {
-        return Err(format!("裁剪尺寸异常 {cw}x{ch}"));
+        return Err(t_with(
+            "裁剪尺寸异常 {cw}x{ch}",
+            &[("cw", cw.to_string()), ("ch", ch.to_string())],
+        ));
     }
     let mut data = Vec::with_capacity((S * S * 3) as usize);
     for c in 0..3usize {
@@ -481,32 +507,34 @@ pub struct ClipVision {
 
 impl ClipVision {
     pub fn load() -> Result<Self, String> {
-        let dir = models_dir().ok_or("无数据目录")?;
+        let dir = models_dir().ok_or(t("无数据目录"))?;
         let p = dir.join("clip_vision.onnx");
         if !p.is_file() {
-            return Err(format!("缺模型 {}", p.display()));
+            return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
         let vision = Session::builder(env())
-            .map_err(|e| format!("会话构建: {e}"))?
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
-            .map_err(|e| format!("加载 clip_vision: {e}"))?;
+            .map_err(|e| t_with("加载 clip_vision: {e}", &[("e", e.to_string())]))?;
         Ok(Self { vision })
     }
 
     /// 图像 → 512 维 L2 归一化嵌入(预处理见 preprocess_224)。
     pub fn embed_image(&mut self, img: &image::DynamicImage) -> Result<Vec<f32>, String> {
         let data = preprocess_224(img)?;
-        let input = Tensor::from_array(([1usize, 3, 224, 224], data))
-            .map_err(|e| e.to_string())?;
+        let input = Tensor::from_array(([1usize, 3, 224, 224], data)).map_err(|e| e.to_string())?;
         let outputs = self
             .vision
             .run(ort::inputs!["pixel_values" => &input])
-            .map_err(|e| format!("clip vision 运行: {e}"))?;
+            .map_err(|e| t_with("clip vision 运行: {e}", &[("e", e.to_string())]))?;
         let (_, vals): (&ort::value::Shape, &[f32]) = outputs["image_embeds"]
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         if vals.len() != DIM {
-            return Err(format!("clip 图像嵌入维度异常: {}", vals.len()));
+            return Err(t_with(
+                "clip 图像嵌入维度异常: {p1}",
+                &[("p1", (vals.len()).to_string())],
+            ));
         }
         l2_normalize(vals)
     }
@@ -520,15 +548,15 @@ pub struct ClipText {
 
 impl ClipText {
     pub fn load() -> Result<Self, String> {
-        let dir = models_dir().ok_or("无数据目录")?;
+        let dir = models_dir().ok_or(t("无数据目录"))?;
         let p = dir.join("clip_text.onnx");
         if !p.is_file() {
-            return Err(format!("缺模型 {}", p.display()));
+            return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
         let text = Session::builder(env())
-            .map_err(|e| format!("会话构建: {e}"))?
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
-            .map_err(|e| format!("加载 clip_text: {e}"))?;
+            .map_err(|e| t_with("加载 clip_text: {e}", &[("e", e.to_string())]))?;
         let tok = Tokenizer::load(&dir.join("clip_merges.txt"))?;
         Ok(Self { text, tok })
     }
@@ -544,8 +572,7 @@ impl ClipText {
             input_ids[i] = t as i64;
             mask[i] = 1;
         }
-        let ids_t = Tensor::from_array(([1usize, CTX], input_ids))
-            .map_err(|e| e.to_string())?;
+        let ids_t = Tensor::from_array(([1usize, CTX], input_ids)).map_err(|e| e.to_string())?;
         let mask_t = Tensor::from_array(([1usize, CTX], mask)).map_err(|e| e.to_string())?;
         let outputs = self
             .text
@@ -553,12 +580,15 @@ impl ClipText {
                 "input_ids" => &ids_t,
                 "attention_mask" => &mask_t
             ])
-            .map_err(|e| format!("clip text 运行: {e}"))?;
+            .map_err(|e| t_with("clip text 运行: {e}", &[("e", e.to_string())]))?;
         let (_, vals): (&ort::value::Shape, &[f32]) = outputs["text_embeds"]
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         if vals.len() != DIM {
-            return Err(format!("clip 文本嵌入维度异常: {}", vals.len()));
+            return Err(t_with(
+                "clip 文本嵌入维度异常: {p1}",
+                &[("p1", (vals.len()).to_string())],
+            ));
         }
         l2_normalize(vals)
     }
@@ -571,32 +601,34 @@ pub struct CnClipVision {
 
 impl CnClipVision {
     pub fn load() -> Result<Self, String> {
-        let dir = models_dir().ok_or("无数据目录")?;
+        let dir = models_dir().ok_or(t("无数据目录"))?;
         let p = dir.join("cn_clip_visual.onnx");
         if !p.is_file() {
-            return Err(format!("缺模型 {}", p.display()));
+            return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
         let vision = Session::builder(env())
-            .map_err(|e| format!("会话构建: {e}"))?
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
-            .map_err(|e| format!("加载 cn_clip_visual: {e}"))?;
+            .map_err(|e| t_with("加载 cn_clip_visual: {e}", &[("e", e.to_string())]))?;
         Ok(Self { vision })
     }
 
     /// 图像 → 512 维 L2 归一化嵌入。
     pub fn embed_image(&mut self, img: &image::DynamicImage) -> Result<Vec<f32>, String> {
         let data = preprocess_224(img)?;
-        let input = Tensor::from_array(([1usize, 3, 224, 224], data))
-            .map_err(|e| e.to_string())?;
+        let input = Tensor::from_array(([1usize, 3, 224, 224], data)).map_err(|e| e.to_string())?;
         let outputs = self
             .vision
             .run(ort::inputs!["pixel_values" => &input])
-            .map_err(|e| format!("cn_clip vision 运行: {e}"))?;
+            .map_err(|e| t_with("cn_clip vision 运行: {e}", &[("e", e.to_string())]))?;
         let (_, vals): (&ort::value::Shape, &[f32]) = outputs["image_features"]
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         if vals.len() != DIM {
-            return Err(format!("cn_clip 图像嵌入维度异常: {}", vals.len()));
+            return Err(t_with(
+                "cn_clip 图像嵌入维度异常: {p1}",
+                &[("p1", (vals.len()).to_string())],
+            ));
         }
         l2_normalize(vals)
     }
@@ -610,15 +642,15 @@ pub struct CnClipText {
 
 impl CnClipText {
     pub fn load() -> Result<Self, String> {
-        let dir = models_dir().ok_or("无数据目录")?;
+        let dir = models_dir().ok_or(t("无数据目录"))?;
         let p = dir.join("cn_clip_text.onnx");
         if !p.is_file() {
-            return Err(format!("缺模型 {}", p.display()));
+            return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
         let text = Session::builder(env())
-            .map_err(|e| format!("会话构建: {e}"))?
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
-            .map_err(|e| format!("加载 cn_clip_text: {e}"))?;
+            .map_err(|e| t_with("加载 cn_clip_text: {e}", &[("e", e.to_string())]))?;
         let tok = BertTokenizer::load(&dir.join("cn_clip_vocab.txt"))?;
         Ok(Self { text, tok })
     }
@@ -635,8 +667,7 @@ impl CnClipText {
             input_ids[i] = t as i64;
             mask[i] = 1;
         }
-        let ids_t = Tensor::from_array(([1usize, CN_CTX], input_ids))
-            .map_err(|e| e.to_string())?;
+        let ids_t = Tensor::from_array(([1usize, CN_CTX], input_ids)).map_err(|e| e.to_string())?;
         let mask_t = Tensor::from_array(([1usize, CN_CTX], mask)).map_err(|e| e.to_string())?;
         let type_t = Tensor::from_array(([1usize, CN_CTX], ttype)).map_err(|e| e.to_string())?;
         let outputs = self
@@ -646,12 +677,15 @@ impl CnClipText {
                 "attention_mask" => &mask_t,
                 "token_type_ids" => &type_t
             ])
-            .map_err(|e| format!("cn_clip text 运行: {e}"))?;
+            .map_err(|e| t_with("cn_clip text 运行: {e}", &[("e", e.to_string())]))?;
         let (_, vals): (&ort::value::Shape, &[f32]) = outputs["text_features"]
             .try_extract_tensor::<f32>()
             .map_err(|e| e.to_string())?;
         if vals.len() != DIM {
-            return Err(format!("cn_clip 文本嵌入维度异常: {}", vals.len()));
+            return Err(t_with(
+                "cn_clip 文本嵌入维度异常: {p1}",
+                &[("p1", (vals.len()).to_string())],
+            ));
         }
         l2_normalize(vals)
     }
@@ -697,21 +731,19 @@ impl Lang {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Lang::En => "英文",
-            Lang::Zh => "中文",
+            Lang::En => t("英文"),
+            Lang::Zh => t("中文"),
         }
     }
 }
 
 /// 写入某语言模型的嵌入(维度必须为 DIM)。
-pub fn save_clip_lang(
-    store: &Store,
-    lang: Lang,
-    photo_id: i64,
-    vec: &[f32],
-) -> Result<(), String> {
+pub fn save_clip_lang(store: &Store, lang: Lang, photo_id: i64, vec: &[f32]) -> Result<(), String> {
     if vec.len() != DIM {
-        return Err(format!("嵌入维度 {} != {DIM}", vec.len()));
+        return Err(t_with(
+            "嵌入维度 {p1} != {DIM}",
+            &[("p1", (vec.len()).to_string()), ("DIM", DIM.to_string())],
+        ));
     }
     let sql = format!(
         "INSERT OR REPLACE INTO {}(photo_id,dim,vec) VALUES(?1,?2,?3)",
@@ -746,11 +778,9 @@ pub fn clip_vec(store: &Store, photo_id: i64) -> Option<Vec<f32>> {
 /// 某语言模型已嵌入的照片数(GUI 显示"已索引 x/y")。
 pub fn clip_count_lang(store: &Store, lang: Lang) -> usize {
     store.read(|conn| {
-        conn.query_row(
-            &format!("SELECT COUNT(*) FROM {}", lang.table()),
-            [],
-            |r| r.get::<_, i64>(0),
-        )
+        conn.query_row(&format!("SELECT COUNT(*) FROM {}", lang.table()), [], |r| {
+            r.get::<_, i64>(0)
+        })
         .unwrap_or(0) as usize
     })
 }
@@ -811,8 +841,51 @@ pub fn scan_batch_lang(store: &Store, lang: Lang, cap: usize) -> Result<(usize, 
     Ok((todo.len(), ok))
 }
 
-/// 语义搜索:按语言选文本模型;中文查询自动套 Chinese-CLIP 模板
-/// "一张{}的照片"(输入已含"照片"则不重复套)。
+/// 新版自然语言检索:预处理 → MobileCLIP2 文本编码 → 向量/标签/OCR 融合。
+pub fn search_natural(store: &Store, query: &str, limit: usize) -> Result<Vec<(i64, f32)>, String> {
+    if !crate::ai_models::stage_ready(store, crate::ai_queue::Stage::Clip) {
+        return Err(t("缺少 MobileCLIP2 模型").into());
+    }
+    let dict = crate::ai_text::Dict::load(store);
+    let mut cache = crate::ai_text::QueryCache::default();
+    // 词典优先;词典未覆盖的部分若装了 Opus-MT 再兜底翻译。
+    let mut mt = crate::ai_text::MtTranslator::load(store).ok();
+    let prepared = crate::ai_text::prepare(
+        query,
+        &dict,
+        mt.as_mut()
+            .map(|t| t as &mut dyn crate::ai_text::Translator),
+        &mut cache,
+    );
+    let mut text = MobileClipText::load(store)?;
+    let emb = text.embed_text(&prepared.prompt)?;
+    let clip_ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Clip);
+    let tag_ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Tags);
+    let ids = crate::ai_search::hybrid(
+        store,
+        &clip_ver,
+        &tag_ver,
+        &prepared.stripped,
+        Some(&emb),
+        limit,
+    );
+    Ok(ids
+        .into_iter()
+        .enumerate()
+        .map(|(i, id)| (id, 1.0 / (1.0 + i as f32)))
+        .collect())
+}
+
+/// 中文查询模板(模型输入,不随界面语言变化)。
+pub fn zh_query_template(query: &str) -> String {
+    if query.contains("照片") {
+        query.to_string()
+    } else {
+        format!("一张{}的照片", query)
+    }
+}
+
+/// 语义搜索:按语言选文本模型;中文查询自动套中文模板。
 pub fn search_lang(
     store: &Store,
     lang: Lang,
@@ -825,33 +898,28 @@ pub fn search_lang(
             engine.embed_text(query)?
         }
         Lang::Zh => {
-            let q = if query.contains("照片") {
-                query.to_string()
-            } else {
-                format!("一张{}的照片", query)
-            };
+            let q = zh_query_template(query);
             let mut engine = CnClipText::load()?;
             engine.embed_text(&q)?
         }
     };
-    let rows: Vec<(i64, Vec<u8>)> = store.read(|conn| -> Result<Vec<(i64, Vec<u8>)>, String> {
-        let mut st = conn
-            .prepare(&format!("SELECT photo_id, vec FROM {}", lang.table()))
-            .map_err(|e| e.to_string())?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-            })
-            .map_err(|e| e.to_string())?;
-        let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
-        for row in rows {
-            if let Ok(r) = row {
-                out.push(r);
+    let rows: Vec<(i64, Vec<u8>)> = store
+        .read(|conn| -> Result<Vec<(i64, Vec<u8>)>, String> {
+            let mut st = conn
+                .prepare(&format!("SELECT photo_id, vec FROM {}", lang.table()))
+                .map_err(|e| e.to_string())?;
+            let rows = st
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))
+                .map_err(|e| e.to_string())?;
+            let mut out: Vec<(i64, Vec<u8>)> = Vec::new();
+            for row in rows {
+                if let Ok(r) = row {
+                    out.push(r);
+                }
             }
-        }
-        Ok(out)
-    })
-    .map_err(|e| e.to_string())?;
+            Ok(out)
+        })
+        .map_err(|e| e.to_string())?;
     let mut hits: Vec<(i64, f32)> = Vec::new();
     for (pid, blob) in rows {
         let v = blob_to_vec(&blob);
@@ -868,6 +936,134 @@ pub fn search_lang(
     Ok(hits)
 }
 
+/// MobileCLIP2 图像预处理:短边缩到 256、居中裁剪、ToTensor(0~1,官方不做均值方差归一化)。
+fn preprocess_256(img: &image::DynamicImage) -> Result<Vec<f32>, String> {
+    const S: u32 = 256;
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let scale = S as f32 / w.min(h) as f32;
+    let rw = ((w as f32 * scale).round() as u32).max(1);
+    let rh = ((h as f32 * scale).round() as u32).max(1);
+    let resized = img.resize_exact(rw, rh, image::imageops::FilterType::CatmullRom);
+    let x0 = rw.saturating_sub(S) / 2;
+    let y0 = rh.saturating_sub(S) / 2;
+    let cropped = resized.crop_imm(x0, y0, S.min(rw), S.min(rh)).to_rgb8();
+    let (cw, ch) = (cropped.width(), cropped.height());
+    if cw != S || ch != S {
+        return Err(t_with(
+            "裁剪尺寸异常 {cw}x{ch}",
+            &[("cw", cw.to_string()), ("ch", ch.to_string())],
+        ));
+    }
+    let mut data = Vec::with_capacity((S * S * 3) as usize);
+    for c in 0..3usize {
+        for p in cropped.pixels() {
+            data.push(p.0[c] as f32 / 255.0);
+        }
+    }
+    Ok(data)
+}
+
+fn first_embedding(
+    outputs: &ort::session::SessionOutputs<'_>,
+    preferred: &str,
+) -> Result<Vec<f32>, String> {
+    let first = outputs.values().next();
+    let v = outputs
+        .get(preferred)
+        .or(first.as_deref())
+        .ok_or(t("模型无输出"))?;
+    let (_, vals): (&ort::value::Shape, &[f32]) =
+        v.try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+    l2_normalize(vals)
+}
+
+/// MobileCLIP2-S2 视觉编码器(槽位 clip_vision,输入 256)。
+pub struct MobileClipVision {
+    vision: Session,
+}
+
+impl MobileClipVision {
+    /// 按槽位解析并加载。
+    pub fn load(store: &Store) -> Result<Self, String> {
+        let p = crate::ai_models::file_path(store, "clip_vision", "vision.onnx")
+            .or_else(|| crate::ai_models::file_path(store, "clip_vision", "clip_vision.onnx"))
+            .ok_or(t("缺少 MobileCLIP2 视觉模型"))?;
+        let vision = Session::builder(env())
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
+            .commit_from_file(&p)
+            .map_err(|e| t_with("加载视觉模型: {e}", &[("e", e.to_string())]))?;
+        Ok(Self { vision })
+    }
+
+    /// 图像 → L2 归一化嵌入。
+    pub fn embed_image(&mut self, img: &image::DynamicImage) -> Result<Vec<f32>, String> {
+        let data = preprocess_256(img)?;
+        let input = Tensor::from_array(([1usize, 3, 256, 256], data)).map_err(|e| e.to_string())?;
+        let outputs = self
+            .vision
+            .run(ort::inputs!["pixel_values" => &input])
+            .map_err(|e| t_with("视觉模型运行: {e}", &[("e", e.to_string())]))?;
+        first_embedding(&outputs, "image_embeds")
+    }
+}
+
+/// MobileCLIP2-S2 文本编码器(槽位 clip_text)。
+pub struct MobileClipText {
+    text: Session,
+    tok: Tokenizer,
+    /// 部分导出只声明 input_ids;有 attention_mask 输入时才一并喂入。
+    has_mask: bool,
+}
+
+impl MobileClipText {
+    /// 按槽位解析并加载(旧平铺 merges 自动回退)。
+    pub fn load(store: &Store) -> Result<Self, String> {
+        let p = crate::ai_models::file_path(store, "clip_text", "text.onnx")
+            .or_else(|| crate::ai_models::file_path(store, "clip_text", "clip_text.onnx"))
+            .ok_or(t("缺少 MobileCLIP2 文本模型"))?;
+        let merges = p
+            .parent()
+            .map(|d| d.join("merges.txt"))
+            .filter(|m| m.is_file())
+            .or_else(|| crate::ai_models::file_path(store, "clip_text", "clip_merges.txt"))
+            .ok_or(t("缺少分词表 merges.txt"))?;
+        let text = Session::builder(env())
+            .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
+            .commit_from_file(&p)
+            .map_err(|e| t_with("加载文本模型: {e}", &[("e", e.to_string())]))?;
+        let has_mask = text.inputs().iter().any(|i| i.name() == "attention_mask");
+        let tok = Tokenizer::load(&merges)?;
+        Ok(Self {
+            text,
+            tok,
+            has_mask,
+        })
+    }
+
+    /// 文本 → L2 归一化嵌入(截断到 77,不足用 pad(0)填充)。
+    pub fn embed_text(&mut self, s: &str) -> Result<Vec<f32>, String> {
+        let mut ids = self.tok.encode(s);
+        ids.truncate(CTX);
+        // 双向文本塔不屏蔽填充位时,填充值会参与注意力;官方分词器用 0 填充。
+        let mut input_ids = vec![0i64; CTX];
+        let mut mask = vec![0i64; CTX];
+        for (i, &t) in ids.iter().enumerate() {
+            input_ids[i] = t as i64;
+            mask[i] = 1;
+        }
+        let ids_t = Tensor::from_array(([1usize, CTX], input_ids)).map_err(|e| e.to_string())?;
+        let outputs = if self.has_mask {
+            let mask_t = Tensor::from_array(([1usize, CTX], mask)).map_err(|e| e.to_string())?;
+            self.text
+                .run(ort::inputs!["input_ids" => &ids_t, "attention_mask" => &mask_t])
+        } else {
+            self.text.run(ort::inputs!["input_ids" => &ids_t])
+        }
+        .map_err(|e| t_with("文本模型运行: {e}", &[("e", e.to_string())]))?;
+        first_embedding(&outputs, "text_embeds")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +1074,21 @@ mod tests {
 
     fn models_dir_present() -> bool {
         models_dir().map(|d| d.is_dir()).unwrap_or(false)
+    }
+
+    /// 中文查询模板是模型输入,不随界面语言变化。
+    #[test]
+    fn zh_prompt_is_language_independent() {
+        let probe = |l: crate::i18n::Lang| {
+            let _g = crate::i18n::LangGuard::to(l);
+            (
+                zh_query_template("一只猫"),
+                zh_query_template("一张人像的照片"),
+            )
+        };
+        assert_eq!(probe(crate::i18n::Lang::Zh), probe(crate::i18n::Lang::En));
+        assert_eq!(zh_query_template("一只猫"), "一张一只猫的照片");
+        assert_eq!(zh_query_template("一张人像的照片"), "一张人像的照片");
     }
 
     /// BertTokenizer 黄金序列。
@@ -894,7 +1105,10 @@ mod tests {
             tok.encode("一张人像的照片"),
             vec![101, 671, 2476, 782, 1008, 4638, 4212, 4275, 102]
         );
-        assert_eq!(tok.encode("Hello, World!"), vec![101, 8701, 117, 8572, 106, 102]);
+        assert_eq!(
+            tok.encode("Hello, World!"),
+            vec![101, 8701, 117, 8572, 106, 102]
+        );
         assert_eq!(tok.encode("猫和人。"), vec![101, 4344, 1469, 782, 511, 102]);
         // 语言探测:CJK → 中文
         assert_eq!(Lang::detect("一只猫"), Lang::Zh);
@@ -922,7 +1136,11 @@ mod tests {
         let v = vec![0.25f32; DIM];
         save_clip_lang(&store, Lang::Zh, 1, &v).unwrap();
         assert_eq!(clip_count_lang(&store, Lang::Zh), 1);
-        assert_eq!(clip_count_lang(&store, Lang::En), 0, "英文索引不受中文写入影响");
+        assert_eq!(
+            clip_count_lang(&store, Lang::En),
+            0,
+            "英文索引不受中文写入影响"
+        );
         assert!(save_clip_lang(&store, Lang::Zh, 2, &[0.0; 8]).is_err());
         // photos_todo 按语言过滤
         let todo = photos_todo_lang(&store, Lang::Zh, 10);
@@ -939,7 +1157,10 @@ mod tests {
         if !fixture.is_file() || !dir.join("cn_clip_vocab.txt").is_file() {
             return;
         }
-        let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
+        let img = image::ImageReader::open(&fixture)
+            .unwrap()
+            .decode()
+            .unwrap();
         let mut vis = CnClipVision::load().unwrap();
         let iv = vis.embed_image(&img).unwrap();
         let mut te = CnClipText::load().unwrap();
@@ -978,7 +1199,10 @@ mod tests {
             vec![49406, 585, 568, 320, 1628, 267, 272, 273, 274, 256, 49407]
         );
         // 大小写不敏感:'A PHOTO of a Dog' 与 'a photo of a dog' 同序
-        assert_eq!(tok.encode("A PHOTO of a Dog"), tok.encode("a photo of a dog"));
+        assert_eq!(
+            tok.encode("A PHOTO of a Dog"),
+            tok.encode("a photo of a dog")
+        );
     }
 
     #[test]
@@ -1040,7 +1264,10 @@ mod tests {
             return;
         }
         let mut e = ClipVision::load().unwrap();
-        let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
+        let img = image::ImageReader::open(&fixture)
+            .unwrap()
+            .decode()
+            .unwrap();
         let v = e.embed_image(&img).unwrap();
         assert_eq!(v.len(), DIM);
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -1072,7 +1299,10 @@ mod tests {
             }
         }
         let mut vis = ClipVision::load().unwrap();
-        let img = image::ImageReader::open(&fixture).unwrap().decode().unwrap();
+        let img = image::ImageReader::open(&fixture)
+            .unwrap()
+            .decode()
+            .unwrap();
         let v = vis.embed_image(&img).unwrap();
         save_clip_lang(&store, Lang::En, 1, &v).unwrap();
         // photo 2:与 v 严格正交的确定性向量(前后半交换+负号,点积恒 0)
@@ -1088,6 +1318,11 @@ mod tests {
         assert_eq!(hits[0].0, 1, "人脸照片应排第一");
         assert!(hits[0].1 > 0.15, "图文余弦应 > 0.15,实际 {}", hits[0].1);
         assert_eq!(hits[1].0, 2);
-        assert!(hits[1].1 < hits[0].1, "无关照片分数应更低:{} < {}", hits[1].1, hits[0].1);
+        assert!(
+            hits[1].1 < hits[0].1,
+            "无关照片分数应更低:{} < {}",
+            hits[1].1,
+            hits[0].1
+        );
     }
 }

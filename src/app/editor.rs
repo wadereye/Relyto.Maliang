@@ -6,6 +6,7 @@
 //! 点「应用」才写入效果栈并记一步撤销。
 
 use super::App;
+use crate::i18n::{t, t_with};
 use eframe::egui;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -59,12 +60,12 @@ impl EditorTab {
 
     fn label(self) -> &'static str {
         match self {
-            EditorTab::Basic => "基本修复",
-            EditorTab::Tuning => "微调",
-            EditorTab::Effects => "效果",
-            EditorTab::Curves => "曲线",
-            EditorTab::Crop => "裁剪",
-            EditorTab::Info => "信息",
+            EditorTab::Basic => t("基本修复"),
+            EditorTab::Tuning => t("微调"),
+            EditorTab::Effects => t("效果"),
+            EditorTab::Curves => t("曲线"),
+            EditorTab::Crop => t("裁剪"),
+            EditorTab::Info => t("信息"),
         }
     }
 }
@@ -136,27 +137,101 @@ struct Tile {
     act: Act,
 }
 
-/// 基本修复页的工具。每个格子都有简笔图标与中文名,点了就见效。
-const BASIC_TOOLS: &[Tile] = &[
-    Tile { glyph: "✂", label: "裁剪", act: Act::Page(EditorTab::Crop) },
-    Tile { glyph: "↗", label: "拉直", act: Act::Strength("tilt", 50.0) },
-    Tile { glyph: "✦", label: "手气不错", act: Act::Effect("enhance_auto", "手气不错") },
-    Tile { glyph: "◐", label: "自动对比度", act: Act::Effect("autocontrast", "自动对比度") },
-    Tile { glyph: "◑", label: "自动调色", act: Act::Effect("autocolor", "自动调色") },
-    Tile { glyph: "☼", label: "补光", act: Act::Strength("fill", 50.0) },
-    Tile { glyph: "◈", label: "锐化", act: Act::Strength("unsharp", 60.0) },
-    Tile { glyph: "◌", label: "暗角", act: Act::Strength("vignette", 50.0) },
-    Tile { glyph: "☾", label: "暗部高光", act: Act::Strength("shadow", 50.0) },
-    Tile { glyph: "▤", label: "黑白", act: Act::Effect("bw", "黑白") },
-    Tile { glyph: "▩", label: "棕褐色", act: Act::Effect("sepia", "棕褐色") },
-    Tile { glyph: "❄", label: "冷调", act: Act::Strength("cool", 50.0) },
-    Tile { glyph: "☀", label: "暖调", act: Act::Strength("warm", 50.0) },
-    Tile { glyph: "↺", label: "向左旋转", act: Act::Rotate(3) },
-    Tile { glyph: "↻", label: "向右旋转", act: Act::Rotate(1) },
-    Tile { glyph: "◍", label: "褪色", act: Act::Strength("faded", 50.0) },
-    Tile { glyph: "✳", label: "颗粒", act: Act::Strength("grain", 15.0) },
-    Tile { glyph: "✕", label: "清除效果", act: Act::Clear },
-];
+/// 基本修复页的工具。每个格子都有简笔图标与名称,点了就见效(语言可切换,不能是 const)。
+fn basic_tools() -> Vec<Tile> {
+    vec![
+        Tile {
+            glyph: "✂",
+            label: t("裁剪"),
+            act: Act::Page(EditorTab::Crop),
+        },
+        Tile {
+            glyph: "↗",
+            label: t("拉直"),
+            act: Act::Strength("tilt", 50.0),
+        },
+        Tile {
+            glyph: "✦",
+            label: t("手气不错"),
+            act: Act::Effect("enhance_auto", t("手气不错")),
+        },
+        Tile {
+            glyph: "◐",
+            label: t("自动对比度"),
+            act: Act::Effect("autocontrast", t("自动对比度")),
+        },
+        Tile {
+            glyph: "◑",
+            label: t("自动调色"),
+            act: Act::Effect("autocolor", t("自动调色")),
+        },
+        Tile {
+            glyph: "☼",
+            label: t("补光"),
+            act: Act::Strength("fill", 50.0),
+        },
+        Tile {
+            glyph: "◈",
+            label: t("锐化"),
+            act: Act::Strength("unsharp", 60.0),
+        },
+        Tile {
+            glyph: "◌",
+            label: t("暗角"),
+            act: Act::Strength("vignette", 50.0),
+        },
+        Tile {
+            glyph: "☾",
+            label: t("暗部高光"),
+            act: Act::Strength("shadow", 50.0),
+        },
+        Tile {
+            glyph: "▤",
+            label: t("黑白"),
+            act: Act::Effect("bw", t("黑白")),
+        },
+        Tile {
+            glyph: "▩",
+            label: t("棕褐色"),
+            act: Act::Effect("sepia", t("棕褐色")),
+        },
+        Tile {
+            glyph: "❄",
+            label: t("冷调"),
+            act: Act::Strength("cool", 50.0),
+        },
+        Tile {
+            glyph: "☀",
+            label: t("暖调"),
+            act: Act::Strength("warm", 50.0),
+        },
+        Tile {
+            glyph: "↺",
+            label: t("向左旋转"),
+            act: Act::Rotate(3),
+        },
+        Tile {
+            glyph: "↻",
+            label: t("向右旋转"),
+            act: Act::Rotate(1),
+        },
+        Tile {
+            glyph: "◍",
+            label: t("褪色"),
+            act: Act::Strength("faded", 50.0),
+        },
+        Tile {
+            glyph: "✳",
+            label: t("颗粒"),
+            act: Act::Strength("grain", 15.0),
+        },
+        Tile {
+            glyph: "✕",
+            label: t("清除效果"),
+            act: Act::Clear,
+        },
+    ]
+}
 
 /// 一个自绘的图标按钮:上方符号、下方中文名,整块可点。
 fn tool_tile(
@@ -316,7 +391,7 @@ fn split_paint(
     let half = (rect.width() - gap) * 0.5;
     let panes = [rect.left(), rect.left() + half + gap];
     let texs = [orig, Some(edited)];
-    let names = ["原图", "效果"];
+    let names = [t("原图"), t("效果")];
     for i in 0..2 {
         let r = egui::Rect::from_min_max(
             egui::pos2(panes[i], rect.top()),
@@ -341,7 +416,10 @@ fn split_paint(
             egui::FontId::proportional(12.0),
             egui::Color32::WHITE,
         );
-        let bg = egui::Rect::from_center_size(label + egui::vec2(0.0, galley.size().y * 0.5), galley.size() + egui::vec2(10.0, 4.0));
+        let bg = egui::Rect::from_center_size(
+            label + egui::vec2(0.0, galley.size().y * 0.5),
+            galley.size() + egui::vec2(10.0, 4.0),
+        );
         p.rect_filled(bg, 3.0, egui::Color32::from_black_alpha(150));
         p.galley(bg.min + egui::vec2(5.0, 2.0), galley, egui::Color32::WHITE);
     }
@@ -357,21 +435,21 @@ fn exif_rows(path: &Path) -> Vec<(String, String)> {
         return out;
     };
     let tags: &[(&str, exif::Tag)] = &[
-        ("厂商", exif::Tag::Make),
-        ("机型", exif::Tag::Model),
-        ("拍摄时间", exif::Tag::DateTimeOriginal),
-        ("快门", exif::Tag::ExposureTime),
-        ("光圈", exif::Tag::FNumber),
+        (t("厂商"), exif::Tag::Make),
+        (t("机型"), exif::Tag::Model),
+        (t("拍摄时间"), exif::Tag::DateTimeOriginal),
+        (t("快门"), exif::Tag::ExposureTime),
+        (t("光圈"), exif::Tag::FNumber),
         ("ISO", exif::Tag::ISOSpeed),
-        ("焦距", exif::Tag::FocalLength),
-        ("曝光补偿", exif::Tag::ExposureBiasValue),
-        ("测光模式", exif::Tag::MeteringMode),
-        ("曝光程序", exif::Tag::ExposureProgram),
-        ("闪光灯", exif::Tag::Flash),
-        ("白平衡", exif::Tag::WhiteBalance),
-        ("色彩空间", exif::Tag::ColorSpace),
-        ("方向", exif::Tag::Orientation),
-        ("软件", exif::Tag::Software),
+        (t("焦距"), exif::Tag::FocalLength),
+        (t("曝光补偿"), exif::Tag::ExposureBiasValue),
+        (t("测光模式"), exif::Tag::MeteringMode),
+        (t("曝光程序"), exif::Tag::ExposureProgram),
+        (t("闪光灯"), exif::Tag::Flash),
+        (t("白平衡"), exif::Tag::WhiteBalance),
+        (t("色彩空间"), exif::Tag::ColorSpace),
+        (t("方向"), exif::Tag::Orientation),
+        (t("软件"), exif::Tag::Software),
     ];
     for (label, tag) in tags {
         if let Some(field) = exif.get_field(*tag, exif::In::PRIMARY) {
@@ -434,40 +512,40 @@ pub(super) fn editor_params(name: &str, amount: f32) -> BTreeMap<String, String>
 /// 效果清单里显示中文名(存库仍用内部 id)。
 fn effect_label(name: &str) -> &str {
     match name {
-        "enhance" => "亮度 / 对比度调整",
-        "curves" => "色调曲线",
-        "crop" => "裁剪",
-        "rot" => "旋转",
-        "bw" => "黑白",
-        "sepia" => "棕褐色",
-        "grain" => "颗粒",
-        "unsharp" | "unsharp2" => "锐化",
-        "warm" => "暖调",
-        "cool" => "冷调",
-        "vignette" => "暗角",
-        "faded" => "褪色",
-        "tilt" => "拉直",
-        "shadow" => "暗部高光",
-        "fill" | "backlight" => "补光",
-        "autocontrast" => "自动对比度",
-        "enhance_auto" => "手气不错",
-        "autocolor" => "自动调色",
+        "enhance" => t("亮度 / 对比度调整"),
+        "curves" => t("色调曲线"),
+        "crop" => t("裁剪"),
+        "rot" => t("旋转"),
+        "bw" => t("黑白"),
+        "sepia" => t("棕褐色"),
+        "grain" => t("颗粒"),
+        "unsharp" | "unsharp2" => t("锐化"),
+        "warm" => t("暖调"),
+        "cool" => t("冷调"),
+        "vignette" => t("暗角"),
+        "faded" => t("褪色"),
+        "tilt" => t("拉直"),
+        "shadow" => t("暗部高光"),
+        "fill" | "backlight" => t("补光"),
+        "autocontrast" => t("自动对比度"),
+        "enhance_auto" => t("手气不错"),
+        "autocolor" => t("自动调色"),
         _ => name,
     }
 }
 
 fn strength_label(name: &str) -> &'static str {
     match name {
-        "tilt" => "扶正角度",
-        "fill" => "补光强度",
-        "unsharp" => "锐化强度",
-        "vignette" => "暗角强度",
-        "shadow" => "修复强度",
-        "cool" => "冷调强度",
-        "warm" => "暖调强度",
-        "faded" => "褪色强度",
-        "grain" => "颗粒强度",
-        _ => "强度",
+        "tilt" => t("扶正角度"),
+        "fill" => t("补光强度"),
+        "unsharp" => t("锐化强度"),
+        "vignette" => t("暗角强度"),
+        "shadow" => t("修复强度"),
+        "cool" => t("冷调强度"),
+        "warm" => t("暖调强度"),
+        "faded" => t("褪色强度"),
+        "grain" => t("颗粒强度"),
+        _ => t("强度"),
     }
 }
 
@@ -624,7 +702,7 @@ impl App {
                     self.zoom_pending = None;
                     // 记下失败照片,避免每帧重发一次全图解码线程。
                     self.zoom_failed_for = Some(rid);
-                    self.fx_msg = "原图过大或解码失败,放大显示停留在预览档清晰度".into();
+                    self.fx_msg = t("原图过大或解码失败,放大显示停留在预览档清晰度").into();
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -656,99 +734,105 @@ impl App {
             .show(ctx, |ui| {
                 egui::MenuBar::new().ui(ui, |ui| {
                     ui.label(
-                        egui::RichText::new("马良 · 编辑照片")
+                        egui::RichText::new(t("马良 · 编辑照片"))
                             .strong()
                             .color(crate::theme::p().accent),
                     );
                     ui.separator();
-                    ui.menu_button("文件(F)", |ui| {
+                    ui.menu_button(t("文件(F)"), |ui| {
                         if ui
-                            .add_enabled(!readonly, egui::Button::new("保存(烘培效果到原图)  F2"))
+                            .add_enabled(
+                                !readonly,
+                                egui::Button::new(t("保存(烘培效果到原图)  F2")),
+                            )
                             .clicked()
                         {
                             self.start_bake(id);
                             ui.close();
                         }
-                        if ui.button("在资源管理器中显示").clicked() {
+                        if ui.button(t("在资源管理器中显示")).clicked() {
                             if let Some(p) = self.photo_path(id) {
                                 super::show_in_explorer(&p);
                             }
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("返回到图片库  Esc").clicked() {
+                        if ui.button(t("返回到图片库  Esc")).clicked() {
                             self.editor_back_to_library();
                             ui.close();
                         }
                     });
-                    ui.menu_button("编辑(E)", |ui| {
-                        if ui.button("撤销  Ctrl+Z").clicked() {
+                    ui.menu_button(t("编辑(E)"), |ui| {
+                        if ui.button(t("撤销  Ctrl+Z")).clicked() {
                             self.fx_undo_step(id);
                             ui.close();
                         }
-                        if ui.button("重做  Ctrl+Y").clicked() {
+                        if ui.button(t("重做  Ctrl+Y")).clicked() {
                             self.fx_redo_step(id);
                             ui.close();
                         }
                         ui.separator();
-                        if ui.button("复制所有效果").clicked() {
+                        if ui.button(t("复制所有效果")).clicked() {
                             self.fx_copy_all(id);
                             ui.close();
                         }
-                        if ui.button("粘贴效果到这张").clicked() {
+                        if ui.button(t("粘贴效果到这张")).clicked() {
                             self.fx_paste_all(&[id]);
                             ui.close();
                         }
-                        if ui.button("清除这张的所有效果").clicked() {
+                        if ui.button(t("清除这张的所有效果")).clicked() {
                             self.editor_clear_effects(id);
                             ui.close();
                         }
                     });
-                    ui.menu_button("视图(V)", |ui| {
-                        if ui.button("▶ 幻灯片放映").clicked() {
+                    ui.menu_button(t("视图(V)"), |ui| {
+                        if ui.button(t("▶ 幻灯片放映")).clicked() {
                             self.start_slideshow();
                             ui.close();
                         }
+                        if ui.checkbox(&mut self.editor_props, t("属性面板")).clicked() {
+                            ui.close();
+                        }
                         if ui
-                            .checkbox(&mut self.editor_props, "属性面板")
+                            .checkbox(&mut self.editor_film, t("底部胶片带"))
                             .clicked()
                         {
                             ui.close();
                         }
-                        if ui.checkbox(&mut self.editor_film, "底部胶片带").clicked() {
-                            ui.close();
-                        }
                         ui.separator();
-                        if ui.button("选项…").clicked() {
+                        if ui.button(t("选项…")).clicked() {
                             self.show_options = true;
                             ui.close();
                         }
                     });
-                    ui.menu_button("图片(P)", |ui| {
-                        if ui.button("◀ 上一张").clicked() {
+                    ui.menu_button(t("图片(P)"), |ui| {
+                        if ui.button(t("◀ 上一张")).clicked() {
                             id = self.editor_step(-1);
                             ui.close();
                         }
-                        if ui.button("下一张 ▶").clicked() {
+                        if ui.button(t("下一张 ▶")).clicked() {
                             id = self.editor_step(1);
                             ui.close();
                         }
                         ui.separator();
                         if ui
-                            .add_enabled(!readonly, egui::Button::new("↺ 向左旋转  Ctrl+Shift+R"))
+                            .add_enabled(
+                                !readonly,
+                                egui::Button::new(t("↺ 向左旋转  Ctrl+Shift+R")),
+                            )
                             .clicked()
                         {
                             self.preview_rotate(id, 3);
                             ui.close();
                         }
                         if ui
-                            .add_enabled(!readonly, egui::Button::new("↻ 向右旋转  Ctrl+R"))
+                            .add_enabled(!readonly, egui::Button::new(t("↻ 向右旋转  Ctrl+R")))
                             .clicked()
                         {
                             self.preview_rotate(id, 1);
                             ui.close();
                         }
-                        if ui.button("☆ 切换星标").clicked() {
+                        if ui.button(t("☆ 切换星标")).clicked() {
                             self.toggle_star(id);
                             ui.close();
                         }
@@ -756,18 +840,18 @@ impl App {
                 });
                 ui.add_space(3.0);
                 ui.horizontal(|ui| {
-                    if ui.button("← 返回到图片库").clicked() {
+                    if ui.button(t("← 返回到图片库")).clicked() {
                         self.editor_back_to_library();
                     }
                     ui.separator();
-                    if ui.button("✦ 手气不错").clicked() {
+                    if ui.button(t("✦ 手气不错")).clicked() {
                         self.fx_commit_effect(
                             id,
-                            "手气不错",
+                            t("手气不错"),
                             crate::effects::Effect::oneclick("enhance_auto", BTreeMap::new()),
                         );
                     }
-                    if ui.button("▶ 播放").clicked() {
+                    if ui.button(t("▶ 播放")).clicked() {
                         self.start_slideshow();
                     }
                     ui.add_space(6.0);
@@ -800,9 +884,9 @@ impl App {
                         if ui
                             .selectable_label(self.editor_compare == n, name)
                             .on_hover_text(match n {
-                                0 => "显示效果(A)",
-                                1 => "显示原图(B)",
-                                _ => "原图 / 效果并排(AA)",
+                                0 => t("显示效果(A)"),
+                                1 => t("显示原图(B)"),
+                                _ => t("原图 / 效果并排(AA)"),
                             })
                             .clicked()
                         {
@@ -819,7 +903,7 @@ impl App {
                     if ui.small_button("+").clicked() {
                         self.editor_zoom_cmd = 3;
                     }
-                    if ui.small_button("适应窗口").clicked() {
+                    if ui.small_button(t("适应窗口")).clicked() {
                         self.editor_zoom_cmd = 2;
                     }
                     ui.small(format!("{:.0}%", self.preview_zoom * 100.0));
@@ -837,7 +921,11 @@ impl App {
                     if let Some(status) = self.anim_status(id) {
                         let playing = self.anim_playing(id);
                         if ui
-                            .small_button(if playing { "⏸ 暂停动图" } else { "▶ 播放动图" })
+                            .small_button(if playing {
+                                t("⏸ 暂停动图")
+                            } else {
+                                t("▶ 播放动图")
+                            })
                             .clicked()
                         {
                             self.anim_toggle();
@@ -845,13 +933,10 @@ impl App {
                         ui.small(status);
                         ui.separator();
                     }
-                    if ui
-                        .selectable_label(self.editor_props, "属性")
-                        .clicked()
-                    {
+                    if ui.selectable_label(self.editor_props, t("属性")).clicked() {
                         self.editor_props = !self.editor_props;
                     }
-                    if ui.selectable_label(self.editor_film, "胶片").clicked() {
+                    if ui.selectable_label(self.editor_film, t("胶片")).clicked() {
                         self.editor_film = !self.editor_film;
                     }
                 });
@@ -873,24 +958,26 @@ impl App {
                     .get(&id)
                     .and_then(|&i| self.rows.get(i))
                     .map(|r| {
-                    let name = Path::new(&r.path)
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| r.path.clone());
-                    let dims = match (r.width, r.height) {
-                        (Some(w), Some(h)) => format!("{w}×{h}"),
-                        _ => "—".into(),
-                    };
-                    format!(
-                        "{}    {}    {}    {}    第 {} 个,共 {} 个",
-                        name,
-                        r.taken.as_deref().unwrap_or(""),
-                        dims,
-                        super::fmt_size(r.size as u64),
-                        pos + 1,
-                        ids.len()
-                    )
-                });
+                        let name = Path::new(&r.path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| r.path.clone());
+                        let dims = match (r.width, r.height) {
+                            (Some(w), Some(h)) => format!("{w}×{h}"),
+                            _ => "—".into(),
+                        };
+                        t_with(
+                            "{p1}    {p2}    {p3}    {p4}    第 {p5} 个,共 {p6} 个",
+                            &[
+                                ("p1", (name).to_string()),
+                                ("p2", (r.taken.as_deref().unwrap_or("")).to_string()),
+                                ("p3", (dims).to_string()),
+                                ("p4", (super::fmt_size(r.size as u64)).to_string()),
+                                ("p5", (pos + 1).to_string()),
+                                ("p6", (ids.len()).to_string()),
+                            ],
+                        )
+                    });
                 egui::Frame::new()
                     .fill(t.accent)
                     .inner_margin(egui::Margin {
@@ -921,7 +1008,7 @@ impl App {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     if ids.is_empty() {
-                        ui.small("当前视图没有照片");
+                        ui.small(crate::i18n::t("当前视图没有照片"));
                         return;
                     }
                     let n = ids.len() as i32;
@@ -947,11 +1034,7 @@ impl App {
     }
 
     /// 邻片缩略图纹理(优先小档,回退中档/预览档;按 id 缓存)。
-    fn editor_thumb(
-        &mut self,
-        ctx: &egui::Context,
-        id: i64,
-    ) -> Option<egui::TextureHandle> {
+    fn editor_thumb(&mut self, ctx: &egui::Context, id: i64) -> Option<egui::TextureHandle> {
         if let Some(t) = self.editor_thumbs.get(&id) {
             return Some(t.clone());
         }
@@ -973,35 +1056,33 @@ impl App {
             .frame(crate::theme::side_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("属性").strong());
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("×").clicked() {
-                                self.editor_props = false;
-                            }
-                            if ui.small_button("«").on_hover_text("收起属性面板").clicked() {
-                                self.editor_props = false;
-                            }
-                        },
-                    );
+                    ui.label(egui::RichText::new(t("属性")).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("×").clicked() {
+                            self.editor_props = false;
+                        }
+                        if ui
+                            .small_button("«")
+                            .on_hover_text(t("收起属性面板"))
+                            .clicked()
+                        {
+                            self.editor_props = false;
+                        }
+                    });
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
                     for (i, (g, l)) in [
-                        ("ⓘ", "属性"),
-                        ("✎", "标题"),
-                        ("⚑", "标签"),
-                        ("✦", "效果"),
+                        ("ⓘ", t("属性")),
+                        ("✎", t("标题")),
+                        ("⚑", t("标签")),
+                        ("✦", t("效果")),
                     ]
                     .iter()
                     .enumerate()
                     {
                         if ui
-                            .selectable_label(
-                                self.editor_props_tab == i as u8,
-                                format!("{g} {l}"),
-                            )
+                            .selectable_label(self.editor_props_tab == i as u8, format!("{g} {l}"))
                             .clicked()
                         {
                             self.editor_props_tab = i as u8;
@@ -1015,14 +1096,14 @@ impl App {
                         0 => {
                             self.props_detail_ui(ui, id);
                             ui.separator();
-                            crate::theme::section_title(ui, "相机信息 / EXIF");
+                            crate::theme::section_title(ui, t("相机信息 / EXIF"));
                             let rows = self
                                 .editor_exif
                                 .as_ref()
                                 .map(|(_, v)| v.clone())
                                 .unwrap_or_default();
                             if rows.is_empty() {
-                                ui.small("没有可用的 EXIF 数据。");
+                                ui.small(t("没有可用的 EXIF 数据。"));
                             } else {
                                 egui::Grid::new("editor_props_exif")
                                     .num_columns(2)
@@ -1037,14 +1118,14 @@ impl App {
                             }
                         }
                         1 => {
-                            crate::theme::section_title(ui, "照片说明");
+                            crate::theme::section_title(ui, t("照片说明"));
                             self.caption_editor(ui, id);
                             ui.add_space(8.0);
                             if ui
                                 .button(if self.star_of(id) != 0 {
-                                    "★ 取消星标"
+                                    t("★ 取消星标")
                                 } else {
-                                    "☆ 加星"
+                                    t("☆ 加星")
                                 })
                                 .clicked()
                             {
@@ -1136,11 +1217,11 @@ impl App {
     fn editor_tab_body(&mut self, ui: &mut egui::Ui, id: i64) {
         match self.editor_tab {
             EditorTab::Basic => {
-                if let Some(act) = tool_grid(ui, BASIC_TOOLS, self.editor_tool) {
+                if let Some(act) = tool_grid(ui, &basic_tools(), self.editor_tool) {
                     self.editor_act(act, id);
                 }
                 ui.add_space(4.0);
-                ui.small("点一下即作用到这张照片;带强度的会先实时预览。");
+                ui.small(t("点一下即作用到这张照片;带强度的会先实时预览。"));
             }
             EditorTab::Tuning => self.editor_tuning_ui(ui, id),
             EditorTab::Effects => {
@@ -1188,7 +1269,7 @@ impl App {
             return;
         };
         ui.separator();
-        crate::theme::section_title(ui, "工具强度(实时预览)");
+        crate::theme::section_title(ui, t("工具强度(实时预览)"));
         if ui
             .add(
                 egui::Slider::new(&mut self.editor_tool_amount, 0.0..=100.0)
@@ -1199,7 +1280,7 @@ impl App {
             self.fx_applied_sig = None;
         }
         ui.horizontal(|ui| {
-            if ui.button("应用").clicked() {
+            if ui.button(t("应用")).clicked() {
                 let params = editor_params(name, self.editor_tool_amount);
                 self.fx_commit_effect(
                     id,
@@ -1209,7 +1290,7 @@ impl App {
                 self.editor_tool = None;
                 self.fx_applied_sig = None;
             }
-            if ui.button("取消").clicked() {
+            if ui.button(t("取消")).clicked() {
                 self.editor_tool = None;
                 self.fx_applied_sig = None;
             }
@@ -1217,39 +1298,39 @@ impl App {
     }
 
     fn editor_tuning_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        ui.small("亮度 / 对比度 / 饱和度 / 曝光 / 暗部 / 锐化 / 模糊");
+        ui.small(t("亮度 / 对比度 / 饱和度 / 曝光 / 暗部 / 锐化 / 模糊"));
         let mut d = self.fx_draft;
         let mut changed = false;
         changed |= ui
-            .add(egui::Slider::new(&mut d.brightness, -100.0..=100.0).text("亮度"))
+            .add(egui::Slider::new(&mut d.brightness, -100.0..=100.0).text(t("亮度")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.contrast, -100.0..=100.0).text("对比度"))
+            .add(egui::Slider::new(&mut d.contrast, -100.0..=100.0).text(t("对比度")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.saturation, -100.0..=100.0).text("饱和度"))
+            .add(egui::Slider::new(&mut d.saturation, -100.0..=100.0).text(t("饱和度")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.exposure, -3.0..=3.0).text("曝光(档)"))
+            .add(egui::Slider::new(&mut d.exposure, -3.0..=3.0).text(t("曝光(档)")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.blacks, -100.0..=100.0).text("暗部"))
+            .add(egui::Slider::new(&mut d.blacks, -100.0..=100.0).text(t("暗部")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.sharpen, 0.0..=100.0).text("锐化"))
+            .add(egui::Slider::new(&mut d.sharpen, 0.0..=100.0).text(t("锐化")))
             .changed();
         changed |= ui
-            .add(egui::Slider::new(&mut d.blur, 0.0..=20.0).text("模糊"))
+            .add(egui::Slider::new(&mut d.blur, 0.0..=20.0).text(t("模糊")))
             .changed();
         if changed {
             self.fx_draft = d;
             self.fx_applied_sig = None;
         }
         ui.horizontal(|ui| {
-            if ui.button("应用到这张").clicked() {
+            if ui.button(t("应用到这张")).clicked() {
                 self.fx_apply_draft(&[id]);
             }
-            if ui.button("重置").clicked() {
+            if ui.button(t("重置")).clicked() {
                 self.fx_draft = crate::effects::Adjust::default();
                 self.fx_applied_sig = None;
             }
@@ -1260,17 +1341,17 @@ impl App {
     fn editor_effect_list_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         let st = self.fx_stack_for(id);
         if st.is_empty() {
-            ui.small("这张照片还没有效果。");
+            ui.small(t("这张照片还没有效果。"));
         } else {
             for it in &st.items {
                 let tag = match crate::effects::support_of(&it.name) {
-                    crate::effects::Support::ReferenceOnly => "暂不支持",
-                    crate::effects::Support::Unknown => "未知名",
+                    crate::effects::Support::ReferenceOnly => t("暂不支持"),
+                    crate::effects::Support::Unknown => t("未知名"),
                     crate::effects::Support::Pixel => {
                         if it.is_oneclick() {
-                            "一键"
+                            t("一键")
                         } else {
-                            "调整"
+                            t("调整")
                         }
                     }
                 };
@@ -1279,28 +1360,28 @@ impl App {
         }
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button("复制所有效果").clicked() {
+            if ui.button(t("复制所有效果")).clicked() {
                 self.fx_copy_all(id);
             }
-            if ui.button("粘贴到这张").clicked() {
+            if ui.button(t("粘贴到这张")).clicked() {
                 self.fx_paste_all(&[id]);
             }
         });
-        if ui.button("清除这张的所有效果").clicked() {
+        if ui.button(t("清除这张的所有效果")).clicked() {
             self.editor_clear_effects(id);
         }
         ui.separator();
-        if ui.button("保存(烘培效果到原图)").clicked() {
+        if ui.button(t("保存(烘培效果到原图)")).clicked() {
             self.start_bake(id);
         }
-        ui.small("保存会先备份原稿,再写回带效果的原图。");
+        ui.small(t("保存会先备份原稿,再写回带效果的原图。"));
     }
 
     /// 裁剪页:比例预设 + 自定义比例;框在中间图区拖出来。
     fn editor_crop_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        ui.small("在中间照片上拖出裁剪框;应用后写进效果栈。");
+        ui.small(t("在中间照片上拖出裁剪框;应用后写进效果栈。"));
         if ui
-            .selectable_label(self.crop_mode, "✂ 裁剪工具")
+            .selectable_label(self.crop_mode, t("✂ 裁剪工具"))
             .clicked()
         {
             self.crop_mode = !self.crop_mode;
@@ -1313,13 +1394,13 @@ impl App {
             .map(|(_, img)| (img.width() as f32, img.height() as f32))
             .unwrap_or((4.0, 3.0));
         let mut presets: Vec<(String, Option<(f32, f32)>)> = vec![
-            ("自由".into(), None),
-            ("原比例".into(), Some((tw, th))),
-            ("4 : 3(屏幕)".into(), Some((4.0, 3.0))),
-            ("3 : 2(打印)".into(), Some((3.0, 2.0))),
-            ("16 : 9(电影)".into(), Some((16.0, 9.0))),
+            (t("自由").into(), None),
+            (t("原比例").into(), Some((tw, th))),
+            (t("4 : 3(屏幕)").into(), Some((4.0, 3.0))),
+            (t("3 : 2(打印)").into(), Some((3.0, 2.0))),
+            (t("16 : 9(电影)").into(), Some((16.0, 9.0))),
             ("16 : 10".into(), Some((16.0, 10.0))),
-            ("1 : 1(方形)".into(), Some((1.0, 1.0))),
+            (t("1 : 1(方形)").into(), Some((1.0, 1.0))),
             ("4 : 6".into(), Some((4.0, 6.0))),
             ("5 : 7".into(), Some((5.0, 7.0))),
             ("8 : 10".into(), Some((8.0, 10.0))),
@@ -1330,19 +1411,16 @@ impl App {
             presets.push((format!("{n}({w:.0}×{h:.0})"), Some((w, h))));
         }
         let cur = match self.crop_ratio {
-            None => "自由".to_string(),
+            None => t("自由").to_string(),
             Some((w, h)) => format!("{w:.0} : {h:.0}"),
         };
         ui.horizontal(|ui| {
-            ui.label("比例");
+            ui.label(t("比例"));
             egui::ComboBox::from_id_salt("editor_crop_ratio")
                 .selected_text(cur)
                 .show_ui(ui, |ui| {
                     for (label, r) in &presets {
-                        if ui
-                            .selectable_label(self.crop_ratio == *r, label)
-                            .clicked()
-                        {
+                        if ui.selectable_label(self.crop_ratio == *r, label).clicked() {
                             self.crop_ratio = *r;
                         }
                     }
@@ -1350,31 +1428,31 @@ impl App {
         });
         ui.horizontal(|ui| {
             if let Some((w, h)) = self.crop_ratio {
-                if ui.small_button("⇄ 对调").clicked() {
+                if ui.small_button(t("⇄ 对调")).clicked() {
                     self.crop_ratio = Some((h, w));
                 }
             }
-            if ui.button("应用裁剪").clicked() {
+            if ui.button(t("应用裁剪")).clicked() {
                 self.commit_crop(id);
             }
-            if ui.small_button("取消").clicked() {
+            if ui.small_button(t("取消")).clicked() {
                 self.crop_mode = false;
                 self.crop_rect = None;
                 self.crop_drag = None;
             }
         });
-        ui.label("自定义比例");
+        ui.label(t("自定义比例"));
         ui.horizontal(|ui| {
             ui.add(egui::TextEdit::singleline(&mut self.crop_cw).desired_width(36.0));
             ui.label("×");
             ui.add(egui::TextEdit::singleline(&mut self.crop_ch).desired_width(36.0));
             ui.add(
                 egui::TextEdit::singleline(&mut self.crop_cname)
-                    .hint_text("名称")
+                    .hint_text(t("名称"))
                     .desired_width(80.0),
             );
         });
-        if ui.small_button("保存为预设").clicked() {
+        if ui.small_button(t("保存为预设")).clicked() {
             if let (Ok(w), Ok(h)) = (
                 self.crop_cw.trim().parse::<f32>(),
                 self.crop_ch.trim().parse::<f32>(),
@@ -1396,24 +1474,24 @@ impl App {
     }
 
     fn editor_info_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        crate::theme::section_title(ui, "照片说明");
+        crate::theme::section_title(ui, t("照片说明"));
         self.caption_editor(ui, id);
         ui.add_space(4.0);
-        crate::theme::section_title(ui, "标签");
+        crate::theme::section_title(ui, t("标签"));
         self.tags_editor(ui, id);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             if ui
                 .button(if self.star_of(id) != 0 {
-                    "★ 取消星标"
+                    t("★ 取消星标")
                 } else {
-                    "☆ 加星"
+                    t("☆ 加星")
                 })
                 .clicked()
             {
                 self.toggle_star(id);
             }
-            if ui.small_button("资源管理器").clicked() {
+            if ui.small_button(t("资源管理器")).clicked() {
                 if let Some(p) = self.photo_path(id) {
                     super::show_in_explorer(&p);
                 }
@@ -1432,24 +1510,30 @@ impl App {
             let can_redo = self.fx_undo.get(&id).map(|s| s.can_redo()).unwrap_or(false);
             let w = (ui.available_width() - 12.0) * 0.5;
             if ui
-                .add_enabled(can_undo, egui::Button::new("↶ 撤销").min_size(egui::vec2(w, 26.0)))
+                .add_enabled(
+                    can_undo,
+                    egui::Button::new(t("↶ 撤销")).min_size(egui::vec2(w, 26.0)),
+                )
                 .clicked()
             {
                 self.fx_undo_step(id);
             }
             if ui
-                .add_enabled(can_redo, egui::Button::new("↷ 重做").min_size(egui::vec2(w, 26.0)))
+                .add_enabled(
+                    can_redo,
+                    egui::Button::new(t("↷ 重做")).min_size(egui::vec2(w, 26.0)),
+                )
                 .clicked()
             {
                 self.fx_redo_step(id);
             }
         });
         ui.add_space(4.0);
-        crate::theme::section_title(ui, "直方图和相机信息");
+        crate::theme::section_title(ui, t("直方图和相机信息"));
         match self.editor_hist.clone() {
             Some((hid, _, h)) if hid == id => draw_hist(ui, &h),
             _ => {
-                ui.small("直方图计算中…");
+                ui.small(t("直方图计算中…"));
             }
         }
         let rows = self
@@ -1461,7 +1545,7 @@ impl App {
             .default_open(true)
             .show(ui, |ui| {
                 if rows.is_empty() {
-                    ui.small("没有可用的 EXIF 数据。");
+                    ui.small(t("没有可用的 EXIF 数据。"));
                     return;
                 }
                 egui::ScrollArea::vertical()
@@ -1484,19 +1568,19 @@ impl App {
     fn editor_clear_effects(&mut self, id: i64) {
         let before = self.fx_stack_for(id);
         if before.is_empty() {
-            self.fx_msg = "这张照片没有效果".into();
+            self.fx_msg = t("这张照片没有效果").into();
             return;
         }
         let after = crate::effects::FilterStack::new();
         if let Err(e) = self.store.set_filters(id, &after.serialize()) {
-            self.fx_msg = format!("写入失败: {e}");
+            self.fx_msg = t_with("写入失败: {e}", &[("e", e.to_string())]);
             return;
         }
         let stack = self
             .fx_undo
             .entry(id)
             .or_insert_with(crate::effects::EditStack::new);
-        stack.commit("清除效果", before, after);
+        stack.commit(t("清除效果"), before, after);
         self.fx_applied_sig = None;
         self.fx_draft = crate::effects::Adjust::default();
         self.fx_draft_id = None;
@@ -1505,7 +1589,7 @@ impl App {
         self.editor_tool = None;
         self.fx_oneclick = None;
         self.fx_recipe = None;
-        self.fx_msg = "已清除效果".into();
+        self.fx_msg = t("已清除效果").into();
     }
 
     /// 未套效果栈的底图纹理(对比 B / 并排 AA 用)。
@@ -1540,20 +1624,20 @@ impl App {
         }
         let Some(t) = self.preview_tex(ctx) else {
             if self.preview_missing == Some(id) {
-                ui.label("原文件已不存在(可能被移动或删除),正在移出图库…");
+                ui.label(t("原文件已不存在(可能被移动或删除),正在移出图库…"));
             } else if self.preview_failed == Some(id) {
                 // 只读文档最常见的失败原因:没写合并合成图,机器上也没有系统缩略图。
                 ui.label(if hint.is_some() {
-                    "(只读速看预览生成失败:该文档可能未写入合并合成图,系统也未提供缩略图)"
+                    t("(只读速看预览生成失败:该文档可能未写入合并合成图,系统也未提供缩略图)")
                 } else {
-                    "(预览加载失败:格式不支持或解码出错)"
+                    t("(预览加载失败:格式不支持或解码出错)")
                 });
             } else if crate::thumbs::preview_path(id).exists() {
-                ui.label("(预览加载失败)");
+                ui.label(t("(预览加载失败)"));
             } else {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("预览生成中…(后台解码并缓存)");
+                    ui.label(t("预览生成中…(后台解码并缓存)"));
                 });
                 ctx.request_repaint_after(std::time::Duration::from_millis(150));
             }
@@ -1599,23 +1683,16 @@ impl App {
                     let z0 = self.preview_zoom;
                     let z1 = (z0 * f32::exp(sd * 0.0022)).clamp(ZOOM_MIN, ZOOM_MAX);
                     if (z1 - z0).abs() > f32::EPSILON {
-                        let c0 = egui::vec2(
-                            tw as f32 * fit_scale * z0,
-                            th as f32 * fit_scale * z0,
-                        );
-                        let img0 = egui::Rect::from_center_size(
-                            rect.center() + self.preview_pan,
-                            c0,
-                        );
+                        let c0 = egui::vec2(tw as f32 * fit_scale * z0, th as f32 * fit_scale * z0);
+                        let img0 =
+                            egui::Rect::from_center_size(rect.center() + self.preview_pan, c0);
                         if let Some(p) = resp.hover_pos() {
                             let uv = egui::vec2(
                                 ((p.x - img0.min.x) / c0.x).clamp(0.0, 1.0),
                                 ((p.y - img0.min.y) / c0.y).clamp(0.0, 1.0),
                             );
-                            let c1 = egui::vec2(
-                                tw as f32 * fit_scale * z1,
-                                th as f32 * fit_scale * z1,
-                            );
+                            let c1 =
+                                egui::vec2(tw as f32 * fit_scale * z1, th as f32 * fit_scale * z1);
                             self.preview_pan = p - uv * c1 + c1 * 0.5 - rect.center();
                         }
                         self.preview_zoom = z1;
@@ -1641,8 +1718,7 @@ impl App {
                 self.preview_pan.x.clamp(-max_pan.x, max_pan.x),
                 self.preview_pan.y.clamp(-max_pan.y, max_pan.y),
             );
-            let img_rect =
-                egui::Rect::from_center_size(rect.center() + self.preview_pan, content);
+            let img_rect = egui::Rect::from_center_size(rect.center() + self.preview_pan, content);
             if self.crop_mode {
                 if resp.drag_started() {
                     self.crop_drag = resp.interact_pointer_pos();
@@ -1697,16 +1773,14 @@ impl App {
                                 crate::exif::read_orientation(Path::new(&path)),
                             )
                         })
-                        .filter(|d| {
-                            (d.width() as u64) * (d.height() as u64) <= 40_000_000
-                        })
+                        .filter(|d| (d.width() as u64) * (d.height() as u64) <= 40_000_000)
                         .map(|d| d.to_rgba8());
                     let _ = tx.send((id, ok));
                 });
                 ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
-            let use_full = self.preview_zoom > 1.35
-                && self.preview_full.as_ref().map(|(k, _)| *k) == Some(id);
+            let use_full =
+                self.preview_zoom > 1.35 && self.preview_full.as_ref().map(|(k, _)| *k) == Some(id);
             let paint = if self.editor_compare == 1 {
                 // B 模式始终给未套效果栈的底图,放大态全图纹理不能盖过它。
                 orig.clone().or_else(|| Some(t.clone()))
@@ -1744,10 +1818,8 @@ impl App {
                             egui::FontId::proportional(11.0),
                             egui::Color32::WHITE,
                         );
-                        let bg = egui::Rect::from_min_size(
-                            r.min,
-                            galley.size() + egui::vec2(4.0, 2.0),
-                        );
+                        let bg =
+                            egui::Rect::from_min_size(r.min, galley.size() + egui::vec2(4.0, 2.0));
                         painter.rect_filled(bg, 0.0, egui::Color32::from_black_alpha(170));
                         painter.galley(bg.min + egui::vec2(2.0, 1.0), galley, egui::Color32::WHITE);
                     }
@@ -1766,22 +1838,34 @@ impl App {
                 match inner {
                     Some(r) => {
                         painter.rect_filled(
-                            egui::Rect::from_min_max(img_rect.min, egui::pos2(img_rect.max.x, r.top())),
+                            egui::Rect::from_min_max(
+                                img_rect.min,
+                                egui::pos2(img_rect.max.x, r.top()),
+                            ),
                             0.0,
                             dim,
                         );
                         painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(img_rect.min.x, r.bottom()), img_rect.max),
+                            egui::Rect::from_min_max(
+                                egui::pos2(img_rect.min.x, r.bottom()),
+                                img_rect.max,
+                            ),
                             0.0,
                             dim,
                         );
                         painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(img_rect.min.x, r.top()), egui::pos2(r.left(), r.bottom())),
+                            egui::Rect::from_min_max(
+                                egui::pos2(img_rect.min.x, r.top()),
+                                egui::pos2(r.left(), r.bottom()),
+                            ),
                             0.0,
                             dim,
                         );
                         painter.rect_filled(
-                            egui::Rect::from_min_max(egui::pos2(r.right(), r.top()), egui::pos2(img_rect.max.x, r.bottom())),
+                            egui::Rect::from_min_max(
+                                egui::pos2(r.right(), r.top()),
+                                egui::pos2(img_rect.max.x, r.bottom()),
+                            ),
                             0.0,
                             dim,
                         );
@@ -1796,8 +1880,14 @@ impl App {
                             let s = i as f32 / 3.0;
                             let x = r.left() + r.width() * s;
                             let y = r.top() + r.height() * s;
-                            painter.line_segment([egui::pos2(x, r.top()), egui::pos2(x, r.bottom())], lw);
-                            painter.line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], lw);
+                            painter.line_segment(
+                                [egui::pos2(x, r.top()), egui::pos2(x, r.bottom())],
+                                lw,
+                            );
+                            painter.line_segment(
+                                [egui::pos2(r.left(), y), egui::pos2(r.right(), y)],
+                                lw,
+                            );
                         }
                     }
                     None => {
@@ -1807,13 +1897,13 @@ impl App {
             }
         }
         ui.horizontal(|ui| {
-            ui.small("照片说明:");
+            ui.small(crate::i18n::t("照片说明:"));
             self.caption_editor(ui, id);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if self.editor_compare == 1 {
-                    ui.small("正在显示原图");
+                    ui.small(crate::i18n::t("正在显示原图"));
                 } else if self.editor_compare == 2 {
-                    ui.small("左:原图  右:效果");
+                    ui.small(crate::i18n::t("左:原图  右:效果"));
                 }
             });
         });
@@ -1852,14 +1942,23 @@ mod tests {
 
     #[test]
     fn tool_params_keep_grain_in_unit_range() {
-        assert_eq!(editor_params("grain", 15.0).get("amount").unwrap(), "0.1500");
-        assert_eq!(editor_params("grain", 100.0).get("amount").unwrap(), "1.0000");
-        assert_eq!(editor_params("warm", 50.0).get("amount").unwrap(), "50.0000");
+        assert_eq!(
+            editor_params("grain", 15.0).get("amount").unwrap(),
+            "0.1500"
+        );
+        assert_eq!(
+            editor_params("grain", 100.0).get("amount").unwrap(),
+            "1.0000"
+        );
+        assert_eq!(
+            editor_params("warm", 50.0).get("amount").unwrap(),
+            "50.0000"
+        );
     }
 
     #[test]
     fn every_basic_tool_points_at_a_known_effect() {
-        for t in BASIC_TOOLS {
+        for t in basic_tools() {
             if let Act::Effect(name, _) | Act::Strength(name, _) = t.act {
                 assert!(
                     matches!(

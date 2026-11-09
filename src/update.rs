@@ -21,6 +21,7 @@
 //! 所在目录解析(会剥掉查询串并规范化 `..`)。替换走「备份→换入→失败回滚」,
 //! 同一数据目录里的下载/安装由文件锁串行化。
 
+use crate::i18n::{t, t_with};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -132,7 +133,10 @@ impl DirLock {
         // 先清陈旧锁(崩溃残留),再尝试独占创建;create_new 是抢锁的原子操作。
         if path.exists() {
             let kv = parse_kv(&std::fs::read_to_string(&path).unwrap_or_default());
-            let ts = kv.get("time").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+            let ts = kv
+                .get("time")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
             if now_secs().saturating_sub(ts) < LOCK_STALE_SECS {
                 return None;
             }
@@ -258,17 +262,22 @@ fn now_secs() -> i64 {
 /// tmp 名字带 pid 是为了多开程序时不互相踩同一个临时文件。
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d).map_err(|e| format!("建目录 {}: {e}", d.display()))?;
+        std::fs::create_dir_all(d).map_err(|e| {
+            t_with(
+                "建目录 {p1}: {e}",
+                &[("p1", (d.display()).to_string()), ("e", e.to_string())],
+            )
+        })?;
     }
-    let name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let tmp = path.with_file_name(format!("{name}.{}.tmp", std::process::id()));
     write_all_synced(&tmp, bytes)?;
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
-        format!("落盘 {}: {e}", path.display())
+        t_with(
+            "落盘 {p1}: {e}",
+            &[("p1", (path.display()).to_string()), ("e", e.to_string())],
+        )
     })?;
     Ok(())
 }
@@ -276,11 +285,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// 写文件并刷到磁盘。更新包是 exe,换名之前要确认字节真的落了盘。
 fn write_all_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
     use std::io::Write;
-    let mut f = std::fs::File::create(path).map_err(|e| format!("建 {}: {e}", path.display()))?;
-    f.write_all(bytes)
-        .map_err(|e| format!("写 {}: {e}", path.display()))?;
-    f.sync_all()
-        .map_err(|e| format!("刷盘 {}: {e}", path.display()))?;
+    let mut f = std::fs::File::create(path).map_err(|e| {
+        t_with(
+            "建 {p1}: {e}",
+            &[("p1", (path.display()).to_string()), ("e", e.to_string())],
+        )
+    })?;
+    f.write_all(bytes).map_err(|e| {
+        t_with(
+            "写 {p1}: {e}",
+            &[("p1", (path.display()).to_string()), ("e", e.to_string())],
+        )
+    })?;
+    f.sync_all().map_err(|e| {
+        t_with(
+            "刷盘 {p1}: {e}",
+            &[("p1", (path.display()).to_string()), ("e", e.to_string())],
+        )
+    })?;
     Ok(())
 }
 
@@ -578,7 +600,10 @@ pub fn resolve_url(base: &str, link: &str) -> Result<String, String> {
     }
     // 别的 scheme 一律拒绝,别让它变成 host 后面一段奇怪的相对路径。
     if lower.contains("://") {
-        return Err(format!("更新包地址只支持 http/https:{link}"));
+        return Err(t_with(
+            "更新包地址只支持 http/https:{link}",
+            &[("link", link.to_string())],
+        ));
     }
     // 清单地址本身常带 CDN 签名(?token=...),取目录前必须剥掉查询与片段。
     let base_clean = base
@@ -590,15 +615,15 @@ pub fn resolve_url(base: &str, link: &str) -> Result<String, String> {
         .unwrap_or(base);
     let (scheme_raw, rest) = base_clean
         .split_once("://")
-        .ok_or_else(|| "UpdateURL 不是合法的 http/https 地址".to_string())?;
+        .ok_or_else(|| t("UpdateURL 不是合法的 http/https 地址").to_string())?;
     let scheme = scheme_raw.to_ascii_lowercase();
     if !matches!(scheme.as_str(), "http" | "https") {
-        return Err("UpdateURL 只支持 http/https".into());
+        return Err(t("UpdateURL 只支持 http/https").into());
     }
     let host_end = rest.find('/').unwrap_or(rest.len());
     let host = &rest[..host_end];
     if host.is_empty() {
-        return Err("UpdateURL 缺少主机名".into());
+        return Err(t("UpdateURL 缺少主机名").into());
     }
     if link.starts_with("//") {
         return Ok(format!("{scheme}:{link}"));
@@ -620,10 +645,13 @@ pub fn parse_manifest(text: &str, base: &str) -> Result<Manifest, String> {
     let kv = parse_kv(text);
     let version = kv.get("version").cloned().unwrap_or_default();
     if version.is_empty() {
-        return Err("版本清单缺少 Version".into());
+        return Err(t("版本清单缺少 Version").into());
     }
     if Version::parse(&version).is_none() {
-        return Err(format!("版本清单里的 Version 格式不对:{version}"));
+        return Err(t_with(
+            "版本清单里的 Version 格式不对:{version}",
+            &[("version", version.to_string())],
+        ));
     }
     let raw = kv
         .get("url")
@@ -632,7 +660,7 @@ pub fn parse_manifest(text: &str, base: &str) -> Result<Manifest, String> {
         .cloned()
         .unwrap_or_default();
     if raw.is_empty() {
-        return Err("版本清单缺少 URL".into());
+        return Err(t("版本清单缺少 URL").into());
     }
     let url = resolve_url(base, &raw)?;
     let sha256 = kv
@@ -641,21 +669,26 @@ pub fn parse_manifest(text: &str, base: &str) -> Result<Manifest, String> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if !sha256.is_empty()
-        && (sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()))
+    if !sha256.is_empty() && (sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        return Err("版本清单里的 Sha256 不是 64 位十六进制".into());
+        return Err(t("版本清单里的 Sha256 不是 64 位十六进制").into());
     }
     // 明文 http 没有哈希就等于把任意可执行文件的安装权交给链路上的任何人。
     if url.to_ascii_lowercase().starts_with("http://") && sha256.is_empty() {
-        return Err("更新包走明文 http,清单必须提供 Sha256(建议改用 https)".into());
+        return Err(t("更新包走明文 http,清单必须提供 Sha256(建议改用 https)").into());
     }
     let size = kv
         .get("size")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     if size > MAX_PACKAGE {
-        return Err(format!("更新包声明 {} 字节,超过 {} 字节上限", size, MAX_PACKAGE));
+        return Err(t_with(
+            "更新包声明 {p1} 字节,超过 {p2} 字节上限",
+            &[
+                ("p1", (size).to_string()),
+                ("p2", (MAX_PACKAGE).to_string()),
+            ],
+        ));
     }
     let notes = unesc(
         &kv.get("notes")
@@ -722,7 +755,10 @@ pub struct State {
 impl State {
     fn from_kv(kv: &BTreeMap<String, String>) -> State {
         State {
-            last_check: kv.get("lastcheck").and_then(|v| v.parse().ok()).unwrap_or(0),
+            last_check: kv
+                .get("lastcheck")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             skipped: kv.get("skipped").cloned().unwrap_or_default(),
             pending_version: kv.get("pendingversion").cloned().unwrap_or_default(),
             pending_file: kv.get("pendingfile").cloned().unwrap_or_default(),
@@ -769,7 +805,9 @@ impl State {
 }
 
 fn load_state_at(path: &Path) -> State {
-    State::from_kv(&parse_kv(&std::fs::read_to_string(path).unwrap_or_default()))
+    State::from_kv(&parse_kv(
+        &std::fs::read_to_string(path).unwrap_or_default(),
+    ))
 }
 
 fn save_state_at(path: &Path, s: &State) -> Result<(), String> {
@@ -831,12 +869,13 @@ fn arch_compatible(machine: u16) -> bool {
 
 fn check_pe_head(head: &[u8]) -> Result<(), String> {
     if head.len() < 2 || &head[..2] != b"MZ" {
-        return Err("更新包不是有效的 Windows 可执行程序(MZ 头不符),已丢弃".into());
+        return Err(t("更新包不是有效的 Windows 可执行程序(MZ 头不符),已丢弃").into());
     }
     match pe_machine(head) {
-        None => Err("更新包缺少合法的 PE 头,已丢弃".into()),
-        Some(m) if !arch_compatible(m) => Err(format!(
-            "更新包是另一种 CPU 架构的 PE(0x{m:04x}),与当前程序不符,已丢弃"
+        None => Err(t("更新包缺少合法的 PE 头,已丢弃").into()),
+        Some(m) if !arch_compatible(m) => Err(t_with(
+            "更新包是另一种 CPU 架构的 PE(0x{m:04x}),与当前程序不符,已丢弃",
+            &[("m", format!("{m}"))],
         )),
         Some(_) => Ok(()),
     }
@@ -844,13 +883,16 @@ fn check_pe_head(head: &[u8]) -> Result<(), String> {
 
 fn size_mismatch(got: u64, want: u64) -> Option<String> {
     (want > 0 && got != want).then(|| {
-        format!("更新包大小不符:声明 {want} 字节,收到 {got} 字节")
+        t_with(
+            "更新包大小不符:声明 {want} 字节,收到 {got} 字节",
+            &[("want", want.to_string()), ("got", got.to_string())],
+        )
     })
 }
 
 fn hash_mismatch(got: &str, want: &str) -> Option<String> {
     (!want.is_empty() && got != want.to_ascii_lowercase())
-        .then(|| "更新包 SHA256 校验不符,已丢弃".to_string())
+        .then(|| t("更新包 SHA256 校验不符,已丢弃").to_string())
 }
 
 /// 内存版校验,只给单测用;生产路径一律走 [`verify_file`] 流式版本。
@@ -869,7 +911,8 @@ fn verify_bytes(bytes: &[u8], size: u64, sha256: &str) -> Result<(), String> {
 /// 流式校验:不把整包读进内存,边读边算哈希。返回 (字节数, 十六进制哈希)。
 fn verify_file(path: &Path, size: u64, sha256: &str) -> Result<(u64, String), String> {
     use std::io::BufReader;
-    let f = std::fs::File::open(path).map_err(|e| format!("打开更新包失败: {e}"))?;
+    let f = std::fs::File::open(path)
+        .map_err(|e| t_with("打开更新包失败: {e}", &[("e", e.to_string())]))?;
     let mut reader = BufReader::new(f);
     let mut hasher = hmac_sha256::Hash::new();
     let mut total = 0u64;
@@ -878,7 +921,7 @@ fn verify_file(path: &Path, size: u64, sha256: &str) -> Result<(u64, String), St
     loop {
         let n = reader
             .read(&mut buf)
-            .map_err(|e| format!("读取更新包失败: {e}"))?;
+            .map_err(|e| t_with("读取更新包失败: {e}", &[("e", e.to_string())]))?;
         if n == 0 {
             break;
         }
@@ -887,7 +930,7 @@ fn verify_file(path: &Path, size: u64, sha256: &str) -> Result<(u64, String), St
         hasher.update(&buf[..n]);
         total += n as u64;
         if total > MAX_PACKAGE {
-            return Err("更新包超过 512 MB 上限,已停止下载".into());
+            return Err(t("更新包超过 512 MB 上限,已停止下载").into());
         }
     }
     check_pe_head(&head)?;
@@ -904,7 +947,8 @@ fn verify_file(path: &Path, size: u64, sha256: &str) -> Result<(u64, String), St
 /// 启动时的轻量检查:看头与长度即可,完整哈希留到真正安装前再算,
 /// 免得每次开程序都把几百 MB 读一遍。
 fn quick_verify_file(path: &Path, size: u64) -> Result<(), String> {
-    let meta = std::fs::metadata(path).map_err(|e| format!("读更新包属性失败: {e}"))?;
+    let meta = std::fs::metadata(path)
+        .map_err(|e| t_with("读更新包属性失败: {e}", &[("e", e.to_string())]))?;
     if let Some(e) = size_mismatch(meta.len(), size) {
         return Err(e);
     }
@@ -927,7 +971,7 @@ fn pending_at(root: &Path) -> Option<Pending> {
     if quick_verify_file(&path, st.pending_size).is_err() {
         let mut s = st.clone();
         clear_pending(&mut s);
-        s.last_error = "已下载的更新包校验不符,已丢弃".into();
+        s.last_error = t("已下载的更新包校验不符,已丢弃").into();
         let _ = save_state_at(&state_file, &s);
         let _ = std::fs::remove_file(&path);
         return None;
@@ -976,21 +1020,24 @@ fn fetch_manifest(cfg: &Config) -> Result<Manifest, String> {
 
 fn fetch_manifest_with(agent: &ureq::Agent, cfg: &Config) -> Result<Manifest, String> {
     if cfg.url.is_empty() {
-        return Err("UpdateURL 已置空,自动更新停用(见「打开配置文件」)".into());
+        return Err(t("UpdateURL 已置空,自动更新停用(见「打开配置文件」)").into());
     }
     let mut resp = agent
         .get(&cfg.url)
         .call()
-        .map_err(|e| format!("读取版本清单失败: {e}"))?;
+        .map_err(|e| t_with("读取版本清单失败: {e}", &[("e", e.to_string())]))?;
     if !resp.status().is_success() {
-        return Err(format!("版本清单返回 HTTP {}", resp.status()));
+        return Err(t_with(
+            "版本清单返回 HTTP {p1}",
+            &[("p1", (resp.status()).to_string())],
+        ));
     }
     let bytes = resp
         .body_mut()
         .with_config()
         .limit(MAX_MANIFEST)
         .read_to_vec()
-        .map_err(|e| format!("读取版本清单内容失败: {e}"))?;
+        .map_err(|e| t_with("读取版本清单内容失败: {e}", &[("e", e.to_string())]))?;
     let text = String::from_utf8_lossy(&bytes);
     parse_manifest(&text, &cfg.url)
 }
@@ -1009,9 +1056,9 @@ fn append_all(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("续写下载文件失败: {e}"))?;
+        .map_err(|e| t_with("续写下载文件失败: {e}", &[("e", e.to_string())]))?;
     f.write_all(bytes)
-        .map_err(|e| format!("写下载文件失败: {e}"))?;
+        .map_err(|e| t_with("写下载文件失败: {e}", &[("e", e.to_string())]))?;
     Ok(())
 }
 
@@ -1103,14 +1150,14 @@ fn run_download_in(
     let _lock = match DirLock::acquire_at(root) {
         Some(l) => l,
         None => {
-            return DownloadOutcome::Failed("另一个程序实例正在下载或安装更新,稍后再试".into())
+            return DownloadOutcome::Failed(t("另一个程序实例正在下载或安装更新,稍后再试").into())
         }
     };
     let state_file = state_path_at(root);
     let dir = pending_dir_at(root);
     let part = partial_path_at(root);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return DownloadOutcome::Failed(format!("建下载目录失败: {e}"));
+        return DownloadOutcome::Failed(t_with("建下载目录失败: {e}", &[("e", e.to_string())]));
     }
 
     // 已有成品:同版本不重复下,服务端版本回退也不会把较新的包覆盖掉。
@@ -1176,8 +1223,13 @@ fn run_download_in(
             Err(e) => {
                 attempts += 1;
                 if attempts >= MAX_SEGMENT_ATTEMPTS {
-                    return DownloadOutcome::Failed(format!(
-                        "下载连续 {attempts} 次失败: {e}(已保留 {have} 字节,下次自动续传)"
+                    return DownloadOutcome::Failed(t_with(
+                        "下载连续 {attempts} 次失败: {e}(已保留 {have} 字节,下次自动续传)",
+                        &[
+                            ("attempts", attempts.to_string()),
+                            ("e", e.to_string()),
+                            ("have", have.to_string()),
+                        ],
                     ));
                 }
                 if let Some(pre) = backoff_or_preempt(attempts, rx, stop) {
@@ -1203,25 +1255,22 @@ fn run_download_in(
         if status.as_u16() == 206 {
             let (start, cr_total) = cr.unwrap_or((have, 0));
             if start != have {
-                return DownloadOutcome::Failed(format!(
-                    "服务端 Range 起点不符(请求 {have},返回 {start}),已保留已下部分"
+                return DownloadOutcome::Failed(t_with(
+                    "服务端 Range 起点不符(请求 {have},返回 {start}),已保留已下部分",
+                    &[("have", have.to_string()), ("start", start.to_string())],
                 ));
             }
             if total == 0 && cr_total > 0 {
                 total = cr_total;
             }
-            let bytes = match resp
-                .body_mut()
-                .with_config()
-                .limit(chunk + 1)
-                .read_to_vec()
-            {
+            let bytes = match resp.body_mut().with_config().limit(chunk + 1).read_to_vec() {
                 Ok(b) => b,
                 Err(e) => {
                     attempts += 1;
                     if attempts >= MAX_SEGMENT_ATTEMPTS {
-                        return DownloadOutcome::Failed(format!(
-                            "下载读取连续失败: {e}(已保留 {have} 字节,下次自动续传)"
+                        return DownloadOutcome::Failed(t_with(
+                            "下载读取连续失败: {e}(已保留 {have} 字节,下次自动续传)",
+                            &[("e", e.to_string()), ("have", have.to_string())],
                         ));
                     }
                     if let Some(pre) = backoff_or_preempt(attempts, rx, stop) {
@@ -1231,7 +1280,9 @@ fn run_download_in(
                 }
             };
             if bytes.len() as u64 > want {
-                return DownloadOutcome::Failed("服务端返回超出请求范围的数据,已丢弃本段".into());
+                return DownloadOutcome::Failed(
+                    t("服务端返回超出请求范围的数据,已丢弃本段").into(),
+                );
             }
             if let Err(e) = append_all(&part, &bytes) {
                 return DownloadOutcome::Failed(e);
@@ -1253,7 +1304,12 @@ fn run_download_in(
             }
             let mut file = match std::fs::File::create(&part) {
                 Ok(f) => f,
-                Err(e) => return DownloadOutcome::Failed(format!("建下载文件失败: {e}")),
+                Err(e) => {
+                    return DownloadOutcome::Failed(t_with(
+                        "建下载文件失败: {e}",
+                        &[("e", e.to_string())],
+                    ))
+                }
             };
             let mut reader = resp.into_body().into_reader().take(MAX_PACKAGE + 1);
             let mut buf = [0u8; 64 * 1024];
@@ -1261,8 +1317,9 @@ fn run_download_in(
                 let n = match reader.read(&mut buf) {
                     Ok(n) => n,
                     Err(e) => {
-                        return DownloadOutcome::Failed(format!(
-                            "下载中断: {e}(服务端不支持 Range,需重新完整下载)"
+                        return DownloadOutcome::Failed(t_with(
+                            "下载中断: {e}(服务端不支持 Range,需重新完整下载)",
+                            &[("e", e.to_string())],
                         ))
                     }
                 };
@@ -1270,18 +1327,24 @@ fn run_download_in(
                     break;
                 }
                 if let Err(e) = file.write_all(&buf[..n]) {
-                    return DownloadOutcome::Failed(format!("写下载文件失败: {e}"));
+                    return DownloadOutcome::Failed(t_with(
+                        "写下载文件失败: {e}",
+                        &[("e", e.to_string())],
+                    ));
                 }
                 have += n as u64;
                 if have > MAX_PACKAGE {
-                    return DownloadOutcome::Failed("更新包超过 512 MB 上限,已停止下载".into());
+                    return DownloadOutcome::Failed(t("更新包超过 512 MB 上限,已停止下载").into());
                 }
                 report_progress(tx, have, total, &mut last_pct, &mut last_bytes);
             }
             let _ = file.sync_all();
             break;
         } else {
-            return DownloadOutcome::Failed(format!("更新包返回 HTTP {status}"));
+            return DownloadOutcome::Failed(t_with(
+                "更新包返回 HTTP {status}",
+                &[("status", status.to_string())],
+            ));
         }
     }
 
@@ -1309,7 +1372,7 @@ fn run_download_in(
         }
     }
     if let Err(e) = std::fs::rename(&part, &target) {
-        return DownloadOutcome::Failed(format!("下载包定名失败: {e}"));
+        return DownloadOutcome::Failed(t_with("下载包定名失败: {e}", &[("e", e.to_string())]));
     }
     let mut s = load_state_at(&state_file);
     s.pending_version = m.version.clone();
@@ -1334,7 +1397,9 @@ fn run_download_in(
 /// 备份 → 换入 → 失败回滚。抽成纯函数是为了能在临时目录里单测,不必碰真 exe。
 /// 备份名带 pid:多个实例或上次崩溃留下的 `.old` 不会互相覆盖。
 fn replace_exe_at(exe: &Path, src: &Path) -> Result<(), String> {
-    let dir = exe.parent().ok_or_else(|| "取程序目录失败".to_string())?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| t("取程序目录失败").to_string())?;
     let stem = exe
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1354,7 +1419,10 @@ fn replace_exe_at(exe: &Path, src: &Path) -> Result<(), String> {
         }
     }
     std::fs::copy(src, &staged).map_err(|e| {
-        format!("写入新程序文件失败(程序目录不可写 / 网络路径 / 被安全软件占用): {e}")
+        t_with(
+            "写入新程序文件失败(程序目录不可写 / 网络路径 / 被安全软件占用): {e}",
+            &[("e", e.to_string())],
+        )
     })?;
     // 换名之前先确认新字节真的落了盘。
     if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&staged) {
@@ -1363,20 +1431,30 @@ fn replace_exe_at(exe: &Path, src: &Path) -> Result<(), String> {
     // Windows 允许给正在运行的映像改名,但不能覆盖它 —— 所以先挪走再换入。
     std::fs::rename(exe, &backup).map_err(|e| {
         let _ = std::fs::remove_file(&staged);
-        format!("备份旧程序失败(程序文件仍被占用,可先关掉其它正在运行的实例): {e}")
+        t_with(
+            "备份旧程序失败(程序文件仍被占用,可先关掉其它正在运行的实例): {e}",
+            &[("e", e.to_string())],
+        )
     })?;
     if let Err(e) = std::fs::rename(&staged, exe) {
         match std::fs::rename(&backup, exe) {
             Ok(()) => {
                 let _ = std::fs::remove_file(&staged);
-                return Err(format!("替换程序文件失败,已恢复原文件: {e}"));
+                return Err(t_with(
+                    "替换程序文件失败,已恢复原文件: {e}",
+                    &[("e", e.to_string())],
+                ));
             }
             Err(e2) => {
                 // 最坏情况:主程序路径暂时空了。把备份路径写进错误,让人能手动改回来。
-                return Err(format!(
-                    "替换失败且自动回滚也失败: {e} / {e2}。请手动把 {} 改回 {}",
-                    backup.display(),
-                    exe.display()
+                return Err(t_with(
+                    "替换失败且自动回滚也失败: {e} / {e2}。请手动把 {p1} 改回 {p2}",
+                    &[
+                        ("e", e.to_string()),
+                        ("e2", e2.to_string()),
+                        ("p1", (backup.display()).to_string()),
+                        ("p2", (exe.display()).to_string()),
+                    ],
                 ));
             }
         }
@@ -1452,8 +1530,8 @@ fn wait_service_settled() -> crate::win::ServiceState {
 
 /// 提权 helper 的主体:等状态 → 立标记 → 停服务 → 换文件 → 起服务。
 fn do_replace(p: &Pending, restart_service: bool) -> Result<ApplyOutcome, String> {
-    let _lock = DirLock::acquire()
-        .ok_or_else(|| "另一个程序实例正在安装更新,稍后再试".to_string())?;
+    let _lock =
+        DirLock::acquire().ok_or_else(|| t("另一个程序实例正在安装更新,稍后再试").to_string())?;
     let st = load_state();
     // 安装前做一次完整流式校验:包可能躺了几天,期间磁盘换了内容也要能挡住。
     verify_file(&p.path, st.pending_size, &st.pending_sha256)?;
@@ -1464,10 +1542,14 @@ fn do_replace(p: &Pending, restart_service: bool) -> Result<ApplyOutcome, String
         mark_service_stopped();
         if let Err(e) = crate::win::service_stop() {
             // 停失败可能是「其实已经停了」,标记留着让启动兜底判断,不擅自清。
-            return Err(format!("停止索引服务失败(更新未继续): {e}"));
+            return Err(t_with(
+                "停止索引服务失败(更新未继续): {e}",
+                &[("e", e.to_string())],
+            ));
         }
     }
-    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| t_with("取自身路径失败: {e}", &[("e", e.to_string())]))?;
     let rep = replace_exe_at(&exe, &p.path);
 
     let mut warning = None;
@@ -1477,12 +1559,15 @@ fn do_replace(p: &Pending, restart_service: bool) -> Result<ApplyOutcome, String
                 Ok(()) => clear_service_marker(),
                 Err(e) => {
                     // 保留标记,下次启动会再试;文件已换成功,不能当整体失败。
-                    warning = Some(format!("索引服务没能自动恢复({e}),下次启动程序会自动重试"));
+                    warning = Some(t_with(
+                        "索引服务没能自动恢复({e}),下次启动程序会自动重试",
+                        &[("e", e.to_string())],
+                    ));
                 }
             }
         } else {
             clear_service_marker();
-            warning = Some("按配置保持索引服务停止,重启程序或开机后会自动启动".into());
+            warning = Some(t("按配置保持索引服务停止,重启程序或开机后会自动启动").into());
         }
     }
     rep?;
@@ -1505,7 +1590,7 @@ pub fn cli_apply_update(
     }
     let token = token.unwrap_or("").trim_matches('"');
     let restart = !matches!(restart_service.unwrap_or("1"), "0" | "false" | "no");
-    let p = pending().ok_or_else(|| "没有待安装的更新包".to_string())?;
+    let p = pending().ok_or_else(|| t("没有待安装的更新包").to_string())?;
     let out = do_replace(&p, restart);
     // 结果文件由父进程预先建好,这里原地覆写以保留原用户的 ACL(父进程才删得掉)。
     let text = match &out {
@@ -1536,7 +1621,7 @@ pub fn cli_apply_update(
 }
 
 fn apply_via_helper(cfg: &Config) -> Result<ApplyOutcome, String> {
-    let p = pending().ok_or_else(|| "没有待安装的更新包".to_string())?;
+    let p = pending().ok_or_else(|| t("没有待安装的更新包").to_string())?;
     #[cfg(windows)]
     {
         // UAC 只在这一步弹一次。helper 里已经有管理员权限,停服务与写程序目录
@@ -1549,10 +1634,7 @@ fn apply_via_helper(cfg: &Config) -> Result<ApplyOutcome, String> {
             .unwrap_or(0);
         let token = format!("{}-{}-{}", std::process::id(), now_secs(), nanos);
         // 先自己建一份占位结果:helper 覆写它,文件所有权仍归当前用户。
-        let _ = atomic_write(
-            &rp,
-            format!("Result=pending\nToken={token}\n").as_bytes(),
-        );
+        let _ = atomic_write(&rp, format!("Result=pending\nToken={token}\n").as_bytes());
         let params = format!(
             "--apply-update \"{}\" \"{}\" \"{}\"",
             update_dir().display(),
@@ -1560,17 +1642,17 @@ fn apply_via_helper(cfg: &Config) -> Result<ApplyOutcome, String> {
             if cfg.restart_service { 1 } else { 0 }
         );
         let code = crate::win::launch_update_helper(&params)?
-            .ok_or_else(|| "提权进程未返回退出码".to_string())?;
+            .ok_or_else(|| t("提权进程未返回退出码").to_string())?;
         let kv = parse_kv(&std::fs::read_to_string(&rp).unwrap_or_default());
         let _ = std::fs::remove_file(&rp);
         if kv.get("token").map(String::as_str) != Some(token.as_str()) {
-            return Err("安装结果无法确认(提权进程可能仍在运行),请稍后重试或重启程序".into());
+            return Err(t("安装结果无法确认(提权进程可能仍在运行),请稍后重试或重启程序").into());
         }
         let ok = code == 0 && kv.get("result").map(String::as_str) == Some("ok");
         let msg = kv.get("message").cloned().unwrap_or_default();
         if !ok {
             return Err(if msg.is_empty() {
-                format!("安装未完成(退出码 {code})")
+                t_with("安装未完成(退出码 {code})", &[("code", code.to_string())])
             } else {
                 msg
             });
@@ -1590,27 +1672,39 @@ fn apply_via_helper(cfg: &Config) -> Result<ApplyOutcome, String> {
 /// `--check-update`:命令行跑一次检查并打印,用来验证配置与清单格式。
 pub fn cli_check() -> Result<(), String> {
     let cfg = load_config();
-    println!("配置文件:{}", cfg.path.display());
+    println!(
+        "{}",
+        t_with("配置文件:{p1}", &[("p1", cfg.path.display().to_string())])
+    );
     if cfg.url.is_empty() {
-        println!("UpdateURL 已置空,自动更新处于停用状态");
+        println!("{}", t("UpdateURL 已置空,自动更新处于停用状态").to_string());
         return Ok(());
     }
-    println!("更新地址:{}", cfg.url);
+    println!("{}", t_with("更新地址:{p1}", &[("p1", cfg.url.clone())]));
     let m = fetch_manifest(&cfg)?;
     let st = load_state();
     let effective = effective_version(&st);
     println!(
-        "服务端版本:{}  本机版本:{}(运行中的映像 v{})  {}",
-        m.version,
-        effective,
-        CURRENT_VERSION,
-        if is_newer(&m.version, &effective) {
-            "有新版本"
-        } else {
-            "已是最新"
-        }
+        "{}",
+        t_with(
+            "服务端版本:{p1}  本机版本:{p2}(运行中的映像 v{ver})  {p3}",
+            &[
+                ("p1", m.version.clone()),
+                ("p2", effective.to_string()),
+                ("ver", CURRENT_VERSION.to_string()),
+                (
+                    "p3",
+                    if is_newer(&m.version, &effective) {
+                        t("有新版本")
+                    } else {
+                        t("已是最新")
+                    }
+                    .to_string()
+                )
+            ],
+        )
     );
-    println!("更新包:{}", m.url);
+    println!("{}", t_with("更新包:{p1}", &[("p1", m.url.clone())]));
     Ok(())
 }
 
@@ -1619,12 +1713,27 @@ pub fn cli_check() -> Result<(), String> {
 pub fn cli_download() -> Result<(), String> {
     let cfg = load_config();
     if cfg.url.is_empty() {
-        return Err("UpdateURL 已置空,无法下载".into());
+        return Err(t("UpdateURL 已置空,无法下载").into());
     }
     let m = fetch_manifest(&cfg)?;
-    println!("清单:{}", cfg.url);
-    println!("服务端版本:{}  运行中的映像:v{}", m.version, CURRENT_VERSION);
-    println!("更新包:{} (声明 {} 字节)", m.url, m.size);
+    println!("{}", t_with("清单:{p1}", &[("p1", cfg.url.clone())]));
+    println!(
+        "{}",
+        t_with(
+            "服务端版本:{p1}  运行中的映像:v{ver}",
+            &[
+                ("p1", m.version.clone()),
+                ("ver", CURRENT_VERSION.to_string())
+            ]
+        )
+    );
+    println!(
+        "{}",
+        t_with(
+            "更新包:{p1} (声明 {p2} 字节)",
+            &[("p1", m.url.clone()), ("p2", m.size.to_string())]
+        )
+    );
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
     let (_cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1633,9 +1742,16 @@ pub fn cli_download() -> Result<(), String> {
     while let Ok(ev) = ev_rx.try_recv() {
         if let Event::Downloading { pct, done, total } = ev {
             last = if total > 0 {
-                format!("进度 {pct}% ({done}/{total} 字节)")
+                t_with(
+                    "进度 {pct}% ({done}/{total} 字节)",
+                    &[
+                        ("pct", pct.to_string()),
+                        ("done", done.to_string()),
+                        ("total", total.to_string()),
+                    ],
+                )
             } else {
-                format!("已收 {done} 字节")
+                t_with("已收 {done} 字节", &[("done", done.to_string())])
             };
         }
     }
@@ -1645,10 +1761,20 @@ pub fn cli_download() -> Result<(), String> {
     match out {
         DownloadOutcome::Done(p) => {
             let size = std::fs::metadata(&p.path).map(|x| x.len()).unwrap_or(0);
-            println!("下载并校验完成:v{} -> {} ({size} 字节)", p.version, p.path.display());
+            println!(
+                "{}",
+                t_with(
+                    "下载并校验完成:v{p1} -> {p2} ({size} 字节)",
+                    &[
+                        ("p1", p.version.clone()),
+                        ("p2", p.path.display().to_string()),
+                        ("size", size.to_string())
+                    ]
+                )
+            );
             Ok(())
         }
-        DownloadOutcome::Preempted(_) => Err("下载被中断".into()),
+        DownloadOutcome::Preempted(_) => Err(t("下载被中断").into()),
         DownloadOutcome::Failed(e) => Err(e),
     }
 }
@@ -1667,7 +1793,10 @@ pub fn effective_version(st: &State) -> String {
 #[derive(Debug)]
 enum Cmd {
     /// 命令自带配置快照:用户刚改过 maliang.ini 时,不必重启也能用上新地址/代理。
-    Check { manual: bool, cfg: Box<Config> },
+    Check {
+        manual: bool,
+        cfg: Box<Config>,
+    },
     Download(Box<Manifest>, Box<Config>),
     Apply(Box<Config>),
     Skip(String),
@@ -1702,22 +1831,35 @@ pub enum Phase {
 impl Phase {
     pub fn label(&self) -> String {
         match self {
-            Phase::Idle => "尚未检查".into(),
-            Phase::Checking => "正在检查更新地址…".into(),
-            Phase::UpToDate(v) => format!("已是最新版本 v{v}"),
-            Phase::Found(m) => format!("发现新版本 v{}", m.version),
+            Phase::Idle => t("尚未检查").into(),
+            Phase::Checking => t("正在检查更新地址…").into(),
+            Phase::UpToDate(v) => t_with("已是最新版本 v{v}", &[("v", v.to_string())]),
+            Phase::Found(m) => t_with("发现新版本 v{p1}", &[("p1", (m.version).to_string())]),
             Phase::Downloading { pct, done, total } => {
                 let mb = |n: u64| format!("{:.1} MB", n as f64 / 1_048_576.0);
                 if *total > 0 {
-                    format!("正在后台下载… {pct}%  ({}/{})", mb(*done), mb(*total))
+                    t_with(
+                        "正在后台下载… {pct}%  ({p1}/{p2})",
+                        &[
+                            ("pct", pct.to_string()),
+                            ("p1", (mb(*done)).to_string()),
+                            ("p2", (mb(*total)).to_string()),
+                        ],
+                    )
                 } else {
-                    format!("正在后台下载… 已收到 {}", mb(*done))
+                    t_with(
+                        "正在后台下载… 已收到 {p1}",
+                        &[("p1", (mb(*done)).to_string())],
+                    )
                 }
             }
-            Phase::Ready(p) => format!("v{} 已下载,可安装", p.version),
-            Phase::Applying => "正在安装更新(会先停止索引服务)…".into(),
-            Phase::Applied(v) => format!("v{} 已安装,重启程序后生效", v.version),
-            Phase::Failed(e) => format!("失败:{e}"),
+            Phase::Ready(p) => t_with("v{p1} 已下载,可安装", &[("p1", (p.version).to_string())]),
+            Phase::Applying => t("正在安装更新(会先停止索引服务)…").into(),
+            Phase::Applied(v) => t_with(
+                "v{p1} 已安装,重启程序后生效",
+                &[("p1", (v.version).to_string())],
+            ),
+            Phase::Failed(e) => t_with("失败:{e}", &[("e", e.to_string())]),
         }
     }
 
@@ -1731,9 +1873,18 @@ impl Phase {
     /// 状态栏上的一句提示;有可安装/可下载的版本时给个可点的入口。
     pub fn status_hint(&self) -> Option<String> {
         match self {
-            Phase::Found(m) => Some(format!("发现新版本 v{}", m.version)),
-            Phase::Ready(p) => Some(format!("更新 v{} 已就绪", p.version)),
-            Phase::Applied(v) => Some(format!("v{} 已安装,重启生效", v.version)),
+            Phase::Found(m) => Some(t_with(
+                "发现新版本 v{p1}",
+                &[("p1", (m.version).to_string())],
+            )),
+            Phase::Ready(p) => Some(t_with(
+                "更新 v{p1} 已就绪",
+                &[("p1", (p.version).to_string())],
+            )),
+            Phase::Applied(v) => Some(t_with(
+                "v{p1} 已安装,重启生效",
+                &[("p1", (v.version).to_string())],
+            )),
             _ => None,
         }
     }
@@ -1780,16 +1931,25 @@ impl Updater {
                         warning: warning.clone(),
                     };
                     phase = Phase::Applied(out);
-                    notice = Some(format!(
-                        "更新 v{v} 已安装,重新启动程序后即可使用新版本{}",
-                        warning.map(|w| format!("。注意:{w}")).unwrap_or_default()
+                    notice = Some(t_with(
+                        "更新 v{v} 已安装,重新启动程序后即可使用新版本{p1}",
+                        &[
+                            ("v", v.to_string()),
+                            (
+                                "p1",
+                                (warning
+                                    .map(|w| t_with("。注意:{w}", &[("w", w.to_string())]))
+                                    .unwrap_or_default())
+                                .to_string(),
+                            ),
+                        ],
                     ));
                     win_open = true;
                 }
                 Some("err") => {
                     let msg = kv.get("message").cloned().unwrap_or_default();
                     phase = Phase::Failed(msg.clone());
-                    notice = Some(format!("上次安装未完成:{msg}"));
+                    notice = Some(t_with("上次安装未完成:{msg}", &[("msg", msg.to_string())]));
                 }
                 // pending = 用户取消了 UAC 或 helper 超时还没回来,不当成失败吓人。
                 _ => {}
@@ -1884,15 +2044,21 @@ impl Updater {
                 self.phase = Phase::Found((*m).clone());
                 // 自动下载开着时这还不是终态,继续要重绘。
                 self.inflight = self.cfg.auto_download;
-                self.notice = Some(format!(
-                    "发现新版本 v{}(当前 v{})。{}",
-                    m.version,
-                    CURRENT_VERSION,
-                    if self.cfg.auto_download {
-                        "已在后台开始下载,完成后会再提示一次。"
-                    } else {
-                        "点「下载更新」可在后台取回安装包。"
-                    }
+                self.notice = Some(t_with(
+                    "发现新版本 v{p1}(当前 v{p2})。{p3}",
+                    &[
+                        ("p1", (m.version).to_string()),
+                        ("p2", (CURRENT_VERSION).to_string()),
+                        (
+                            "p3",
+                            (if self.cfg.auto_download {
+                                t("已在后台开始下载,完成后会再提示一次。")
+                            } else {
+                                t("点「下载更新」可在后台取回安装包。")
+                            })
+                            .to_string(),
+                        ),
+                    ],
                 ));
                 self.win_open = true;
             }
@@ -1905,10 +2071,7 @@ impl Updater {
                     return;
                 }
                 self.phase = Phase::Ready(*p.clone());
-                self.notice = Some(format!(
-                    "v{} 已下载完成。点「安装更新」即可写入程序文件;安装时会先停止索引服务,完成后自动恢复,本次会话不受影响,重启后生效。",
-                    p.version
-                ));
+                self.notice = Some(t_with("v{p1} 已下载完成。点「安装更新」即可写入程序文件;安装时会先停止索引服务,完成后自动恢复,本次会话不受影响,重启后生效。", &[("p1", (p.version).to_string())]));
                 // 下载完成也是一次明确的提示:自动检查时窗口可能已经被关掉了。
                 self.win_open = true;
             }
@@ -1916,12 +2079,18 @@ impl Updater {
             Event::Applied(out) => {
                 self.phase = Phase::Applied(out.clone());
                 self.inflight = false;
-                self.notice = Some(format!(
-                    "v{} 已安装,请重新启动程序以使用新版本{}",
-                    out.version,
-                    out.warning
-                        .map(|w| format!("。注意:{w}"))
-                        .unwrap_or_default()
+                self.notice = Some(t_with(
+                    "v{p1} 已安装,请重新启动程序以使用新版本{p2}",
+                    &[
+                        ("p1", (out.version).to_string()),
+                        (
+                            "p2",
+                            (out.warning
+                                .map(|w| t_with("。注意:{w}", &[("w", w.to_string())]))
+                                .unwrap_or_default())
+                            .to_string(),
+                        ),
+                    ],
                 ));
                 self.win_open = true;
             }
@@ -1946,9 +2115,7 @@ impl Updater {
         self.inflight = true;
         self.notice = None;
         let cfg = self.cfg_snapshot();
-        let _ = self
-            .cmd
-            .send(Cmd::Download(Box::new(m.clone()), cfg));
+        let _ = self.cmd.send(Cmd::Download(Box::new(m.clone()), cfg));
     }
 
     pub fn apply(&mut self) {
@@ -1964,7 +2131,10 @@ impl Updater {
         self.inflight = false;
         let _ = self.cmd.send(Cmd::Skip(version.to_string()));
         self.phase = Phase::Idle;
-        self.notice = Some(format!("已跳过 v{version},以后不再提示这个版本"));
+        self.notice = Some(t_with(
+            "已跳过 v{version},以后不再提示这个版本",
+            &[("version", version.to_string())],
+        ));
     }
 
     pub fn stop(&self) {
@@ -2164,8 +2334,7 @@ mod tests {
                         let mut hdrs = BTreeMap::new();
                         loop {
                             let mut l = String::new();
-                            if reader.read_line(&mut l).unwrap_or(0) == 0
-                                || l.trim_end().is_empty()
+                            if reader.read_line(&mut l).unwrap_or(0) == 0 || l.trim_end().is_empty()
                             {
                                 break;
                             }
@@ -2263,7 +2432,10 @@ mod tests {
         let (cfg, url) = test_cfg(&root, server.port, 64 * 1024);
         let m = fetch_manifest_with(&direct_agent(), &cfg).unwrap();
         assert_eq!(m.version, "0.9.0");
-        assert_eq!(m.url, format!("http://127.0.0.1:{}/maliang.exe?x=1", server.port));
+        assert_eq!(
+            m.url,
+            format!("http://127.0.0.1:{}/maliang.exe?x=1", server.port)
+        );
         assert_eq!(m.notes, "第一行\n第二行");
         assert!(is_newer(&m.version, CURRENT_VERSION));
 
@@ -2279,10 +2451,9 @@ mod tests {
         assert_eq!(p.version, "0.9.0");
         // 200KB / 64KB = 4 段,进度事件里应该能看到 100%。
         let evs: Vec<Event> = ev_rx.try_iter().collect();
-        assert!(evs.iter().any(|e| matches!(
-            e,
-            Event::Downloading { pct: 100, .. }
-        )));
+        assert!(evs
+            .iter()
+            .any(|e| matches!(e, Event::Downloading { pct: 100, .. })));
         assert!(range_log.lock().unwrap().len() >= 4, "应当分成多段请求");
         let st = load_state_at(&state_path_at(&root));
         assert_eq!(st.pending_version, "0.9.0");
@@ -2322,7 +2493,10 @@ mod tests {
         let root = test_root("resume");
         let (cfg, _url) = test_cfg(&root, server.port, 64 * 1024);
         let m = parse_manifest(
-            &format!("Version=0.9.1\nURL=maliang.exe\nSize={}\nSha256={sha}\n", package.len()),
+            &format!(
+                "Version=0.9.1\nURL=maliang.exe\nSize={}\nSha256={sha}\n",
+                package.len()
+            ),
             &cfg.url,
         )
         .unwrap();
@@ -2361,11 +2535,16 @@ mod tests {
         let package = fake_pe(host_machine(), &vec![9u8; 90_000]);
         let sha = to_hex(&hmac_sha256::Hash::hash(&package));
         let pkg = package.clone();
-        let server = serve(Box::new(move |_idx, _line, _hdrs| (200, vec![], pkg.clone())));
+        let server = serve(Box::new(move |_idx, _line, _hdrs| {
+            (200, vec![], pkg.clone())
+        }));
         let root = test_root("no-range");
         let (cfg, _url) = test_cfg(&root, server.port, 32 * 1024);
         let m = parse_manifest(
-            &format!("Version=0.9.2\nURL=pkg.exe\nSize={}\nSha256={sha}\n", package.len()),
+            &format!(
+                "Version=0.9.2\nURL=pkg.exe\nSize={}\nSha256={sha}\n",
+                package.len()
+            ),
             &cfg.url,
         )
         .unwrap();
@@ -2386,10 +2565,7 @@ mod tests {
         let root = test_root("cancel");
         let (cfg, _url) = test_cfg(&root, 1, 64 * 1024);
         let m = parse_manifest(
-            &format!(
-                "Version=0.9.3\nURL=pkg.exe\nSha256={}\n",
-                "a".repeat(64)
-            ),
+            &format!("Version=0.9.3\nURL=pkg.exe\nSha256={}\n", "a".repeat(64)),
             &cfg.url,
         )
         .unwrap();
@@ -2441,10 +2617,7 @@ mod tests {
         // 模型下载同样带出厂默认目录,清掉本机配置不会丢地址。
         assert_eq!(c.model_url, crate::db::DEFAULT_MODEL_URL);
         // 配置里明确留空 = 用户主动停用;与「根本没写这个键」区分开。
-        let off = Config::from_kv(
-            &parse_kv("UpdateURL=\nModelURL=\n"),
-            PathBuf::from("x.ini"),
-        );
+        let off = Config::from_kv(&parse_kv("UpdateURL=\nModelURL=\n"), PathBuf::from("x.ini"));
         assert!(off.url.is_empty());
         assert!(off.model_url.is_empty());
         let c = Config::from_kv(
@@ -2498,8 +2671,11 @@ mod tests {
         assert!(resolve_url("example.com/x", "m.exe").is_err());
         // CDN 签名清单:取目录时不能把 ?token 当路径的一部分。
         assert_eq!(
-            resolve_url("https://example.com/releases/latest.ini?token=abc&x=1", "m.exe")
-                .unwrap(),
+            resolve_url(
+                "https://example.com/releases/latest.ini?token=abc&x=1",
+                "m.exe"
+            )
+            .unwrap(),
             "https://example.com/releases/m.exe"
         );
         // 相对路径里的 .. 要收掉,查询串要原样留着。
@@ -2517,7 +2693,10 @@ mod tests {
     #[test]
     fn manifest_parsing_validates_fields() {
         let text = "[update]\nVersion=0.3.0\nURL=maliang-0.3.exe\nSize=1234\nSha256=AB\nNotes=修复\\n若干问题\n";
-        assert!(parse_manifest(text, "https://a/b.ini").is_err(), "短哈希要拒绝");
+        assert!(
+            parse_manifest(text, "https://a/b.ini").is_err(),
+            "短哈希要拒绝"
+        );
         let text = "Version=0.3.0\nURL=./maliang-0.3.exe\nSize=1234\nNotes=修复\\n若干问题\n";
         let m = parse_manifest(text, "https://a/b.ini").unwrap();
         assert_eq!(m.version, "0.3.0");

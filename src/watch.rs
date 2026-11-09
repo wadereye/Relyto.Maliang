@@ -31,7 +31,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use walkdir::WalkDir;
 
-
 /// 目录快照:排序后的 (路径, mtime_ms, size) 列表,只含**可索引**的媒体文件
 /// (图片 + RAW + 视频 —— 判定统一走 `crate::scan::is_indexable`,
 /// 避免此处与事件路径收录范围不一致)。
@@ -68,9 +67,7 @@ pub fn snapshot(root: &Path, excl: &crate::scan::Exclusions) -> Vec<(String, i64
 fn prune(e: &walkdir::DirEntry, excl: &crate::scan::Exclusions) -> bool {
     e.depth() > 0
         && e.file_type().is_dir()
-        && e.file_name()
-            .to_str()
-            .is_some_and(|n| excl.excludes_dir(n))
+        && e.file_name().to_str().is_some_and(|n| excl.excludes_dir(n))
 }
 
 /// 快照差异 → (新增数, 修改数, 变化的文件路径)。
@@ -85,10 +82,8 @@ pub fn diff(
     old: &[(String, i64, u64)],
     new: &[(String, i64, u64)],
 ) -> (usize, usize, Vec<PathBuf>) {
-    let old_m: HashMap<&str, (i64, u64)> = old
-        .iter()
-        .map(|(p, m, s)| (p.as_str(), (*m, *s)))
-        .collect();
+    let old_m: HashMap<&str, (i64, u64)> =
+        old.iter().map(|(p, m, s)| (p.as_str(), (*m, *s))).collect();
     let (mut added, mut modified) = (0usize, 0usize);
     let mut paths = Vec::new();
     for (p, m, s) in new {
@@ -121,8 +116,8 @@ impl Mode {
     /// 供 UI 展示当前监听模式。
     pub fn label(self) -> &'static str {
         match self {
-            Mode::Event => "事件驱动",
-            Mode::Poll => "轮询(降级)",
+            Mode::Event => crate::i18n::t("事件驱动"),
+            Mode::Poll => crate::i18n::t("轮询(降级)"),
         }
     }
 }
@@ -217,12 +212,21 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                         if n == 0 && removed == 0 && renamed.is_empty() {
                             continue;
                         }
-                        let mut msg = format!("监听:{n} 张照片变更,已增量入库(事件驱动)");
+                        let mut msg = crate::i18n::t_with(
+                            "监听:{n} 张照片变更,已增量入库(事件驱动)",
+                            &[("n", n.to_string())],
+                        );
                         if removed > 0 {
-                            msg.push_str(&format!(";{removed} 个已删除文件移出图库"));
+                            msg.push_str(&crate::i18n::t_with(
+                                ";{removed} 个已删除文件移出图库",
+                                &[("removed", removed.to_string())],
+                            ));
                         }
                         if !renamed.is_empty() {
-                            msg.push_str(&format!(";{} 个改名已原位更新", renamed.len()));
+                            msg.push_str(&crate::i18n::t_with(
+                                ";{p1} 个改名已原位更新",
+                                &[("p1", renamed.len().to_string())],
+                            ));
                         }
                         let _ = tx.send(msg);
                         last_poll = std::time::Instant::now();
@@ -242,8 +246,9 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                         }
                         let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
                         if ndirs > 0 {
-                            let _ = tx.send(format!(
-                                "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)"
+                            let _ = tx.send(crate::i18n::t_with(
+                                "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)",
+                                &[("added", added.to_string()), ("modified", modified.to_string()), ("ndirs", ndirs.to_string())],
                             ));
                         }
                     }
@@ -270,8 +275,9 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                 let roots = store.list_watched();
                 let (added, modified, ndirs) = poll_once(&store, &roots, &mut base);
                 if ndirs > 0 {
-                    let _ = tx.send(format!(
-                        "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)"
+                    let _ = tx.send(crate::i18n::t_with(
+                        "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)",
+                        &[("added", added.to_string()), ("modified", modified.to_string()), ("ndirs", ndirs.to_string())],
                     ));
                 }
             }
@@ -306,7 +312,8 @@ fn sync_plan(watched: &[PathBuf], roots: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathB
 ///
 /// 只取"事件的父目录",不再往上走到根 —— 上层目录里的其它文件没变,
 /// 重扫会被"未变快速路径"跳过,但仍要走目录树,浪费 IO。
-fn affected_dirs(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {    let mut out: Vec<PathBuf> = Vec::new();
+fn affected_dirs(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
     for p in paths {
         // 事件本身可能是目录(新建文件夹)→ 用它自己;否则用父目录。
         let dir = if p.is_dir() {
@@ -449,14 +456,13 @@ fn drop_and_purge(r: anyhow::Result<Vec<(i64, String)>>) -> usize {
 /// 返回**需要重扫的目录**:目录改名走「旧前缀摘行 + 新子树重录」
 /// (行的路径串全变,原位更新不划算);目标路径已有行的覆盖式改名
 /// 同样交给重扫。只处理监听根之内的事件。
-fn apply_renames(
-    store: &Store,
-    renames: &[(PathBuf, PathBuf)],
-    roots: &[PathBuf],
-) -> Vec<PathBuf> {
+fn apply_renames(store: &Store, renames: &[(PathBuf, PathBuf)], roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut rescan: Vec<PathBuf> = Vec::new();
     for (from, to) in renames {
-        if !roots.iter().any(|r| from.starts_with(r) && to.starts_with(r)) {
+        if !roots
+            .iter()
+            .any(|r| from.starts_with(r) && to.starts_with(r))
+        {
             continue;
         }
         if Path::new(to).is_dir() {
@@ -575,7 +581,9 @@ mod tests {
         assert_eq!(paths.len(), 2, "新增 + 修改各一条");
         assert!(paths.iter().any(|p| p == &a), "被改的那张要在里面");
         assert!(
-            paths.iter().any(|p| p.file_name().is_some_and(|n| n == "c.webp")),
+            paths
+                .iter()
+                .any(|p| p.file_name().is_some_and(|n| n == "c.webp")),
             "新增的那张要在里面"
         );
 
@@ -623,7 +631,7 @@ mod tests {
         let paths = vec![
             PathBuf::from("C:\\pics\\sub\\a.jpg"),
             PathBuf::from("C:\\pics\\sub\\a.jpg"), // 重复
-            PathBuf::from("C:\\other\\b.jpg"),      // 根之外,应被过滤
+            PathBuf::from("C:\\other\\b.jpg"),     // 根之外,应被过滤
         ];
         let dirs = affected_dirs(&paths, &roots);
         assert_eq!(dirs.len(), 1, "重复路径应去重,根外应过滤");
@@ -671,8 +679,8 @@ mod tests {
         let outside = std::env::temp_dir().join("outside-root.jpg");
         let items = vec![
             gone.clone(),
-            kept.clone(),   // 仍存在 → 必须跳过
-            outside,        // 根之外 → 必须跳过
+            kept.clone(), // 仍存在 → 必须跳过
+            outside,      // 根之外 → 必须跳过
         ];
         assert_eq!(drop_removed(&store, &items, &[root.clone()]), 1);
 
@@ -685,7 +693,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(kept_n, 1, "仍存在的文件不能被移出图库");
-        let all_n: i64 = c.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0)).unwrap();
+        let all_n: i64 = c
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(all_n, 1, "只有确已消失的文件被删除");
         drop(c);
         let _ = std::fs::remove_dir_all(&root);
@@ -719,11 +729,13 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match fsw.recv_batch(Duration::from_millis(500)) {
                 Ok(batch) => {
-                    if batch.iter().any(|e| matches!(e,
-                        FsEvent::Renamed { from, to }
-                        if from.file_name().map(|n| n == "x.jpg").unwrap_or(false)
-                            && to.file_name().map(|n| n == "y.jpg").unwrap_or(false)
-                    )) {
+                    if batch.iter().any(|e| {
+                        matches!(e,
+                            FsEvent::Renamed { from, to }
+                            if from.file_name().map(|n| n == "x.jpg").unwrap_or(false)
+                                && to.file_name().map(|n| n == "y.jpg").unwrap_or(false)
+                        )
+                    }) {
                         seen_rename = true;
                         break;
                     }
@@ -738,10 +750,12 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match fsw.recv_batch(Duration::from_millis(500)) {
                 Ok(batch) => {
-                    if batch.iter().any(|e| matches!(e,
-                        FsEvent::Removed(p)
-                        if p.file_name().map(|n| n == "y.jpg").unwrap_or(false)
-                    )) {
+                    if batch.iter().any(|e| {
+                        matches!(e,
+                            FsEvent::Removed(p)
+                            if p.file_name().map(|n| n == "y.jpg").unwrap_or(false)
+                        )
+                    }) {
                         seen_remove = true;
                         break;
                     }

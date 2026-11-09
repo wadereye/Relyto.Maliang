@@ -11,6 +11,7 @@
 //! 非 Windows 平台全部退化为无操作 / 返回 None,保证跨平台可编译。
 #![allow(dead_code)]
 
+use crate::i18n::{t, t_with};
 use std::path::Path;
 
 /// 卷类型(与 Win32 `GetDriveTypeA` 返回值一致)。
@@ -348,10 +349,10 @@ pub fn known_dirs() -> Vec<std::path::PathBuf> {
 /// 覆盖不到全盘,故路径给 `None`,由调用方给出明确说明而不是假装能跳。
 pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     vec![
-        ("桌面", known_path(FOLDERID::Desktop)),
-        ("我的文档", known_path(FOLDERID::Documents)),
-        ("我的图片", known_path(FOLDERID::Pictures)),
-        ("我的电脑", None),
+        (t("桌面"), known_path(FOLDERID::Desktop)),
+        (t("我的文档"), known_path(FOLDERID::Documents)),
+        (t("我的图片"), known_path(FOLDERID::Pictures)),
+        (t("我的电脑"), None),
     ]
 }
 
@@ -361,10 +362,10 @@ pub fn shell_shortcuts() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
 /// 这类没有落点的入口,点一下就能定位到图库里的对应目录。
 pub fn common_places() -> Vec<(&'static str, Option<std::path::PathBuf>)> {
     vec![
-        ("我的文档", known_path(FOLDERID::Documents)),
-        ("桌面", known_path(FOLDERID::Desktop)),
-        ("我的图片", known_path(FOLDERID::Pictures)),
-        ("我的视频", known_path(FOLDERID::Videos)),
+        (t("我的文档"), known_path(FOLDERID::Documents)),
+        (t("桌面"), known_path(FOLDERID::Desktop)),
+        (t("我的图片"), known_path(FOLDERID::Pictures)),
+        (t("我的视频"), known_path(FOLDERID::Videos)),
     ]
 }
 
@@ -558,9 +559,9 @@ fn shell_execute_elevated(
     unsafe { ShellExecuteExW(&mut sei) }.map_err(|e| {
         // 1223 = ERROR_CANCELLED,用户在 UAC 上点了"否"。
         if e.code() == HRESULT::from_win32(1223) {
-            "管理员授权被取消".to_string()
+            t("管理员授权被取消").to_string()
         } else {
-            format!("提权启动失败: {e}")
+            t_with("提权启动失败: {e}", &[("e", e.to_string())])
         }
     })?;
     let h = sei.hProcess;
@@ -580,9 +581,9 @@ fn shell_execute_elevated(
             }
             if !got {
                 return Err(if waited == 0 {
-                    "提权进程退出码读取失败".to_string()
+                    t("提权进程退出码读取失败").to_string()
                 } else {
-                    "提权进程超时未结束".to_string()
+                    t("提权进程超时未结束").to_string()
                 });
             }
             Some(exit)
@@ -605,13 +606,14 @@ fn shell_execute_elevated(
 pub fn launch_elevated(params: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| t_with("取自身路径失败: {e}", &[("e", e.to_string())]))?;
         shell_execute_elevated(&exe.to_string_lossy(), params, None).map(|_| ())
     }
     #[cfg(not(windows))]
     {
         let _ = params;
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -624,13 +626,14 @@ pub fn launch_elevated(params: &str) -> Result<(), String> {
 pub fn launch_update_helper(params: &str) -> Result<Option<u32>, String> {
     #[cfg(windows)]
     {
-        let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+        let exe = std::env::current_exe()
+            .map_err(|e| t_with("取自身路径失败: {e}", &[("e", e.to_string())]))?;
         shell_execute_elevated(&exe.to_string_lossy(), params, Some(300_000))
     }
     #[cfg(not(windows))]
     {
         let _ = params;
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -682,12 +685,13 @@ pub fn service_state() -> ServiceState {
         let name = to_wide(crate::service::SERVICE_NAME);
         // SAFETY: 前两个参数传 null 是 SCM 约定(本机 + 默认数据库);
         // name 是 NUL 结尾宽串,存活到调用结束。
-        let scm = match unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+        let scm =
+            match unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) } {
+                Ok(h) => ScHandle(h),
+                Err(_) => return ServiceState::NotInstalled,
+            };
+        let svc = match unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) }
         {
-            Ok(h) => ScHandle(h),
-            Err(_) => return ServiceState::NotInstalled,
-        };
-        let svc = match unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) } {
             Ok(h) => ScHandle(h),
             Err(e) => {
                 return if e.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) {
@@ -773,7 +777,12 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
                     SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE,
                 )
             }
-            .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+            .map_err(|e| {
+                t_with(
+                    "打开服务控制管理器失败(需要管理员): {e}",
+                    &[("e", e.to_string())],
+                )
+            })?,
         );
 
         // SAFETY: 已存在 → 拿全权限句柄改配置;不存在 → 走 CreateServiceW。
@@ -799,7 +808,7 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
                         PCWSTR(display.as_ptr()),
                     )
                 }
-                .map_err(|e| format!("更新服务配置失败: {e}"))?;
+                .map_err(|e| t_with("更新服务配置失败: {e}", &[("e", e.to_string())]))?;
                 h
             }
             None => {
@@ -822,7 +831,7 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
                         PCWSTR::null(),
                     )
                 }
-                .map_err(|e| format!("注册服务失败(需要管理员): {e}"))?;
+                .map_err(|e| t_with("注册服务失败(需要管理员): {e}", &[("e", e.to_string())]))?;
                 ScHandle(h)
             }
         };
@@ -840,14 +849,14 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
                 Some(&d as *const SERVICE_DESCRIPTIONW as *const std::ffi::c_void),
             )
         }
-        .map_err(|e| format!("写服务描述失败: {e}"))?;
+        .map_err(|e| t_with("写服务描述失败: {e}", &[("e", e.to_string())]))?;
 
         // SAFETY: 不带参数启动(--service 已写在二进制路径里)。
         let started = match unsafe { StartServiceW(svc.0, None) } {
             Ok(()) => Ok(()),
             // 已在跑就是成功:重复安装不该报错。
             Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => Ok(()),
-            Err(e) => Err(format!("服务已注册但启动失败: {e}")),
+            Err(e) => Err(t_with("服务已注册但启动失败: {e}", &[("e", e.to_string())])),
         };
         if started.is_ok() {
             // 常驻服务上线后,旧版那条定时扫描若还留着就会和它并发写同一份
@@ -859,7 +868,7 @@ pub fn service_install(exe: &Path) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = exe;
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -915,8 +924,14 @@ pub fn service_stop() -> Result<(), String> {
         let name = to_wide(crate::service::SERVICE_NAME);
         // SAFETY: null = 本机 + 默认数据库。
         let scm = ScHandle(
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(
+                |e| {
+                    t_with(
+                        "打开服务控制管理器失败(需要管理员): {e}",
+                        &[("e", e.to_string())],
+                    )
+                },
+            )?,
         );
         // SAFETY: name 是 NUL 结尾宽串;停服务要 STOP + QUERY_STATUS 两个权限。
         let svc = match unsafe {
@@ -933,12 +948,12 @@ pub fn service_stop() -> Result<(), String> {
         if stop_and_wait(&svc) {
             Ok(())
         } else {
-            Err("索引服务 10 秒内没停下来(可能正卡在磁盘读上),稍后再点一次".into())
+            Err(t("索引服务 10 秒内没停下来(可能正卡在磁盘读上),稍后再点一次").into())
         }
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -957,24 +972,30 @@ pub fn service_start() -> Result<(), String> {
         let name = to_wide(crate::service::SERVICE_NAME);
         // SAFETY: null = 本机 + 默认数据库。
         let scm = ScHandle(
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(
+                |e| {
+                    t_with(
+                        "打开服务控制管理器失败(需要管理员): {e}",
+                        &[("e", e.to_string())],
+                    )
+                },
+            )?,
         );
         // SAFETY: name 是 NUL 结尾宽串。
         let svc = unsafe { OpenServiceW(scm.0, PCWSTR(name.as_ptr()), SERVICE_START) }
-            .map_err(|_| "索引服务尚未安装,请先点「安装索引服务…」")?;
+            .map_err(|_| t("索引服务尚未安装,请先点「安装索引服务…」"))?;
         let svc = ScHandle(svc);
         // SAFETY: 不带参数启动(--service 已写在二进制路径里)。
         match unsafe { StartServiceW(svc.0, None) } {
             Ok(()) => Ok(()),
             // 已经在跑(比如开机自动起来了)就是成功:重复点不该报错。
             Err(e) if e.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => Ok(()),
-            Err(e) => Err(format!("启动索引服务失败: {e}")),
+            Err(e) => Err(t_with("启动索引服务失败: {e}", &[("e", e.to_string())])),
         }
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -998,8 +1019,14 @@ pub fn service_uninstall() -> Result<(), String> {
         let name = to_wide(crate::service::SERVICE_NAME);
         // SAFETY: null = 本机 + 默认数据库。
         let scm = ScHandle(
-            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
-                .map_err(|e| format!("打开服务控制管理器失败(需要管理员): {e}"))?,
+            unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }.map_err(
+                |e| {
+                    t_with(
+                        "打开服务控制管理器失败(需要管理员): {e}",
+                        &[("e", e.to_string())],
+                    )
+                },
+            )?,
         );
         // SAFETY: name 是 NUL 结尾宽串;要停、要查、要删,所以三个权限都拿。
         let svc = match unsafe {
@@ -1015,11 +1042,12 @@ pub fn service_uninstall() -> Result<(), String> {
         };
         let _ = stop_and_wait(&svc);
         // SAFETY: 删注册。
-        unsafe { DeleteService(svc.0) }.map_err(|e| format!("删除服务失败: {e}"))
+        unsafe { DeleteService(svc.0) }
+            .map_err(|e| t_with("删除服务失败: {e}", &[("e", e.to_string())]))
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -1032,7 +1060,7 @@ pub fn service_install_elevated() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -1044,7 +1072,7 @@ pub fn service_uninstall_elevated() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -1056,7 +1084,7 @@ pub fn service_stop_elevated() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -1068,7 +1096,7 @@ pub fn service_start_elevated() -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
-        Err("仅支持 Windows".into())
+        Err(t("仅支持 Windows").into())
     }
 }
 
@@ -1076,11 +1104,15 @@ pub fn service_start_elevated() -> Result<(), String> {
 /// 这里只有退出码可用(release 是 GUI 子系统,stdout 无处可去,不指望它)。
 #[cfg(windows)]
 fn elevated_self(flag: &str) -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| t_with("取自身路径失败: {e}", &[("e", e.to_string())]))?;
     match shell_execute_elevated(&exe.to_string_lossy(), flag, Some(120_000))? {
         Some(0) => Ok(()),
-        Some(code) => Err(format!("提权子进程退出码 {code}(详见数据目录 index-service.log)")),
-        None => Err("提权子进程未返回结果".to_string()),
+        Some(code) => Err(t_with(
+            "提权子进程退出码 {code}(详见数据目录 index-service.log)",
+            &[("code", code.to_string())],
+        )),
+        None => Err(t("提权子进程未返回结果").to_string()),
     }
 }
 
@@ -1240,7 +1272,7 @@ unsafe fn shell_context_menu_inner(wide: &[u16]) -> bool {
     use windows::core::{PCSTR, PCWSTR};
     use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::Shell::{
-        BHID_SFUIObject, CMF_NORMAL, IContextMenu, SHCreateItemFromParsingName,
+        BHID_SFUIObject, IContextMenu, SHCreateItemFromParsingName, CMF_NORMAL,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreatePopupMenu, DestroyMenu, GetCursorPos, GetForegroundWindow, TrackPopupMenuEx,
@@ -1266,7 +1298,10 @@ unsafe fn shell_context_menu_inner(wide: &[u16]) -> bool {
     // 命令号区间 [1, 0x7FFF]:TrackPopupMenuEx(TPM_RETURNCMD) 返回选中号,
     // InvokeCommand 的整数动词 = 选中号 - idcmdfirst。
     let first_cmd: u32 = 1;
-    if menu.QueryContextMenu(hmenu, 0, first_cmd, 0x7FFF, CMF_NORMAL).is_err() {
+    if menu
+        .QueryContextMenu(hmenu, 0, first_cmd, 0x7FFF, CMF_NORMAL)
+        .is_err()
+    {
         let _ = DestroyMenu(hmenu);
         return false;
     }
@@ -1337,9 +1372,9 @@ pub struct InstanceGuard;
 pub fn acquire_single_instance() -> Option<InstanceGuard> {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, CloseHandle, GetLastError};
-        use windows::Win32::System::Threading::CreateMutexW;
         use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS};
+        use windows::Win32::System::Threading::CreateMutexW;
 
         let name = to_wide(SINGLE_INSTANCE_MUTEX);
         // SAFETY: 名字是 NUL 结尾的 UTF-16 串;句柄属性为空 = 默认安全描述符。
@@ -1348,14 +1383,18 @@ pub fn acquire_single_instance() -> Option<InstanceGuard> {
                 // CreateMutexW 语义:互斥体已存在时照样返回有效句柄,
                 // 靠 GetLastError == ERROR_ALREADY_EXISTS 区分「新建」和「已有人」。
                 if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-                    unsafe { let _ = CloseHandle(h); }
+                    unsafe {
+                        let _ = CloseHandle(h);
+                    }
                     None
                 } else {
                     Some(InstanceGuard { _handle: h })
                 }
             }
             // 打不开命名互斥体(极端受限环境)就放行,别把程序挡死在门外。
-            Err(_) => Some(InstanceGuard { _handle: windows::Win32::Foundation::HANDLE::default() }),
+            Err(_) => Some(InstanceGuard {
+                _handle: windows::Win32::Foundation::HANDLE::default(),
+            }),
         }
     }
     #[cfg(not(windows))]
@@ -1369,11 +1408,11 @@ pub fn acquire_single_instance() -> Option<InstanceGuard> {
 pub fn activate_running_instance() {
     #[cfg(windows)]
     {
+        use windows::core::PCWSTR;
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
             FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE,
         };
-        use windows::core::PCWSTR;
 
         let title = to_wide(MAIN_WINDOW_TITLE);
         // SAFETY: 类名为空指针、窗口名是 NUL 结尾 UTF-16,二者只读。
@@ -1393,12 +1432,14 @@ pub fn activate_running_instance() {
 pub fn alert_already_running() {
     #[cfg(windows)]
     {
+        use windows::core::PCWSTR;
         use windows::Win32::UI::WindowsAndMessaging::{
             MessageBoxW, MB_ICONINFORMATION, MB_OK, MB_SETFOREGROUND,
         };
-        use windows::core::PCWSTR;
-        let text = to_wide("马良已经在运行了,同一会话只允许一个进程。\n已为你切换到已打开的窗口。");
-        let title = to_wide("马良");
+        let text = to_wide(t(
+            "马良已经在运行了,同一会话只允许一个进程。\n已为你切换到已打开的窗口。",
+        ));
+        let title = to_wide(t("马良"));
         // SAFETY: 文本/标题均为 NUL 结尾 UTF-16;无父窗口。
         unsafe {
             let _ = MessageBoxW(
@@ -1448,7 +1489,10 @@ mod tests {
         assert_eq!(SERVICE_DELETE, 0x0001_0000);
         // 与 crate 导出的同类访问权不重叠,避免"或"上去其实没拿到删除权。
         use windows::Win32::System::Services::{SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STOP};
-        assert_eq!(SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_DELETE, 0x0001_0024);
+        assert_eq!(
+            SERVICE_STOP | SERVICE_QUERY_STATUS | SERVICE_DELETE,
+            0x0001_0024
+        );
         assert_ne!(SERVICE_DELETE, SERVICE_START);
         // 「停止索引服务…」只要停 + 查两项:少一项 SCM 直接拒绝,
         // 多要删除权就等于把「停止」偷偷做成「卸载」。

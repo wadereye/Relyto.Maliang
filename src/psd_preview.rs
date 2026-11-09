@@ -81,7 +81,14 @@ fn parse_header(b: &[u8]) -> Result<Header> {
     let width = be32(b, 18).ok_or_else(|| anyhow!("头被截断"))?;
     let depth = be16(b, 22).ok_or_else(|| anyhow!("头被截断"))?;
     let mode = be16(b, 24).ok_or_else(|| anyhow!("头被截断"))?;
-    let h = Header { version, channels, width, height, depth, mode };
+    let h = Header {
+        version,
+        channels,
+        width,
+        height,
+        depth,
+        mode,
+    };
     validate(&h)?;
     Ok(h)
 }
@@ -164,7 +171,9 @@ pub fn decode(p: &Path) -> Option<DynamicImage> {
 }
 
 fn decode_inner(p: &Path) -> Result<DynamicImage> {
-    let size = std::fs::metadata(p).map_err(|e| anyhow!("读文件失败: {e}"))?.len();
+    let size = std::fs::metadata(p)
+        .map_err(|e| anyhow!("读文件失败: {e}"))?
+        .len();
     if size > MAX_FILE {
         return Err(anyhow!("文件超过只读预览上限"));
     }
@@ -191,13 +200,20 @@ fn take_section<'a>(b: &'a [u8], off: &mut usize, unit: usize) -> Result<&'a [u8
     let len64 = len_at(b, *off, unit).ok_or_else(|| anyhow!("段长度被截断"))?;
     let len = usize::try_from(len64).map_err(|_| anyhow!("段长度溢出"))?;
     let start = off.checked_add(unit).ok_or_else(|| anyhow!("段游标溢出"))?;
-    let end = start.checked_add(len).ok_or_else(|| anyhow!("段游标溢出"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow!("段游标溢出"))?;
     let data = b.get(start..end).ok_or_else(|| anyhow!("段数据被截断"))?;
     *off = end;
     Ok(data)
 }
 
-fn decode_layout(b: &[u8], h: &Header, data_unit: usize, layer_unit: usize) -> Result<DynamicImage> {
+fn decode_layout(
+    b: &[u8],
+    h: &Header,
+    data_unit: usize,
+    layer_unit: usize,
+) -> Result<DynamicImage> {
     let mut off = 26usize;
     let palette = take_section(b, &mut off, data_unit)?;
     let _resources = take_section(b, &mut off, data_unit)?;
@@ -235,7 +251,10 @@ fn decode_plane(
             if payload.len() != expected && payload.len() != expected + 1 {
                 return Err(anyhow!("未压缩数据长度不符"));
             }
-            Ok(payload.get(..expected).ok_or_else(|| anyhow!("未压缩数据不足"))?.to_vec())
+            Ok(payload
+                .get(..expected)
+                .ok_or_else(|| anyhow!("未压缩数据不足"))?
+                .to_vec())
         }
         1 => decode_rle(payload, h, expected, row_bytes, rows),
         2 => decode_zip(payload, expected, false, h, row_bytes, rows),
@@ -253,7 +272,9 @@ fn packbits_row(src: &[u8], row_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
         i += 1;
         if n >= 0 {
             let cnt = n as usize + 1;
-            let seg = src.get(i..i.saturating_add(cnt)).ok_or_else(|| anyhow!("PackBits 段被截断"))?;
+            let seg = src
+                .get(i..i.saturating_add(cnt))
+                .ok_or_else(|| anyhow!("PackBits 段被截断"))?;
             i = i.saturating_add(cnt);
             if out.len().saturating_sub(start).saturating_add(cnt) > row_bytes {
                 return Err(anyhow!("PackBits 行超长"));
@@ -278,11 +299,21 @@ fn packbits_row(src: &[u8], row_bytes: usize, out: &mut Vec<u8>) -> Result<()> {
     Err(anyhow!("PackBits 行未填满"))
 }
 
-fn decode_rle(payload: &[u8], h: &Header, expected: usize, row_bytes: usize, rows: usize) -> Result<Vec<u8>> {
+fn decode_rle(
+    payload: &[u8],
+    h: &Header,
+    expected: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> Result<Vec<u8>> {
     // 计数表:每行一个,PSD 用 u16、PSB 用 u32。
     let unit = if h.version == 2 { 4usize } else { 2usize };
-    let table_bytes = rows.checked_mul(unit).ok_or_else(|| anyhow!("计数表溢出"))?;
-    let table = payload.get(..table_bytes).ok_or_else(|| anyhow!("计数表被截断"))?;
+    let table_bytes = rows
+        .checked_mul(unit)
+        .ok_or_else(|| anyhow!("计数表溢出"))?;
+    let table = payload
+        .get(..table_bytes)
+        .ok_or_else(|| anyhow!("计数表被截断"))?;
     let mut pos = table_bytes;
     let mut out = Vec::with_capacity(expected);
     for i in 0..rows {
@@ -292,7 +323,9 @@ fn decode_rle(payload: &[u8], h: &Header, expected: usize, row_bytes: usize, row
         }
         .ok_or_else(|| anyhow!("计数项被截断"))?;
         let end = pos.checked_add(n).ok_or_else(|| anyhow!("行游标溢出"))?;
-        let seg = payload.get(pos..end).ok_or_else(|| anyhow!("行数据被截断"))?;
+        let seg = payload
+            .get(pos..end)
+            .ok_or_else(|| anyhow!("行数据被截断"))?;
         pos = end;
         packbits_row(seg, row_bytes, &mut out)?;
     }
@@ -363,8 +396,12 @@ struct PlaneView<'a> {
 
 impl<'a> PlaneView<'a> {
     fn plane(&self, i: usize) -> Result<&'a [u8]> {
-        let a = i.checked_mul(self.plane_len).ok_or_else(|| anyhow!("平面游标溢出"))?;
-        let b = a.checked_add(self.plane_len).ok_or_else(|| anyhow!("平面游标溢出"))?;
+        let a = i
+            .checked_mul(self.plane_len)
+            .ok_or_else(|| anyhow!("平面游标溢出"))?;
+        let b = a
+            .checked_add(self.plane_len)
+            .ok_or_else(|| anyhow!("平面游标溢出"))?;
         self.planes.get(a..b).ok_or_else(|| anyhow!("平面数据不足"))
     }
 
@@ -384,13 +421,15 @@ impl<'a> PlaneView<'a> {
             8 => f32::from(*b.get(i).ok_or_else(|| anyhow!("采样越界"))?) / 255.0,
             16 => {
                 let j = i.checked_mul(2).ok_or_else(|| anyhow!("采样游标溢出"))?;
-                let s = b.get(j..j.checked_add(2).ok_or_else(|| anyhow!("采样游标溢出"))?)
+                let s = b
+                    .get(j..j.checked_add(2).ok_or_else(|| anyhow!("采样游标溢出"))?)
                     .ok_or_else(|| anyhow!("采样越界"))?;
                 f32::from(u16::from_be_bytes([s[0], s[1]])) / 65535.0
             }
             32 => {
                 let j = i.checked_mul(4).ok_or_else(|| anyhow!("采样游标溢出"))?;
-                let s = b.get(j..j.checked_add(4).ok_or_else(|| anyhow!("采样游标溢出"))?)
+                let s = b
+                    .get(j..j.checked_add(4).ok_or_else(|| anyhow!("采样游标溢出"))?)
                     .ok_or_else(|| anyhow!("采样越界"))?;
                 f32::from_be_bytes([s[0], s[1], s[2], s[3]]).clamp(0.0, 1.0)
             }
@@ -470,14 +509,22 @@ fn lab_to_rgb(l: f32, a: f32, b: f32) -> [f32; 3] {
     let fz = fy - b / 200.0;
     let inv = |t: f32| -> f32 {
         let t3 = t * t * t;
-        if t3 > 0.008856 { t3 } else { (t - 16.0 / 116.0) / 7.787 }
+        if t3 > 0.008856 {
+            t3
+        } else {
+            (t - 16.0 / 116.0) / 7.787
+        }
     };
     let x = 0.9505 * inv(fx);
     let y = inv(fy);
     let z = 1.089 * inv(fz);
     let gamma = |v: f32| -> f32 {
         let v = v.clamp(0.0, 1.0);
-        if v <= 0.0031308 { 12.92 * v } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+        if v <= 0.0031308 {
+            12.92 * v
+        } else {
+            1.055 * v.powf(1.0 / 2.4) - 0.055
+        }
     };
     [
         gamma(3.2406 * x - 1.5372 * y - 0.4986 * z),
@@ -529,7 +576,12 @@ struct LayerRec {
     flags: u8,
 }
 
-fn decode_layers_layout(b: &[u8], h: &Header, data_unit: usize, layer_unit: usize) -> Result<DynamicImage> {
+fn decode_layers_layout(
+    b: &[u8],
+    h: &Header,
+    data_unit: usize,
+    layer_unit: usize,
+) -> Result<DynamicImage> {
     let mut off = 26usize;
     let palette = take_section(b, &mut off, data_unit)?;
     let _resources = take_section(b, &mut off, data_unit)?;
@@ -628,7 +680,9 @@ fn composite_layers(sec: &[u8], h: &Header, palette: &[u8]) -> Result<DynamicIma
             let comp = be16(sec, off).ok_or_else(|| anyhow!("通道压缩标记被截断"))?;
             off += 2;
             let data_len = ch.len.saturating_sub(2);
-            let end = off.checked_add(data_len).ok_or_else(|| anyhow!("通道数据溢出"))?;
+            let end = off
+                .checked_add(data_len)
+                .ok_or_else(|| anyhow!("通道数据溢出"))?;
             let seg = sec.get(off..end).ok_or_else(|| anyhow!("通道数据被截断"))?;
             off = end;
             let plane = decode_plane(seg, comp, h, expected, row, rec.h as usize)?;
@@ -730,7 +784,11 @@ fn composite_layers(sec: &[u8], h: &Header, palette: &[u8]) -> Result<DynamicIma
                         } else {
                             0.0
                         };
-                        [(1.0 - cc) * (1.0 - kk), (1.0 - mm) * (1.0 - kk), (1.0 - yy) * (1.0 - kk)]
+                        [
+                            (1.0 - cc) * (1.0 - kk),
+                            (1.0 - mm) * (1.0 - kk),
+                            (1.0 - yy) * (1.0 - kk),
+                        ]
                     }
                     9 => lab_to_rgb(rgb[0], rgb[1], rgb[2]),
                     _ => rgb,
@@ -902,7 +960,10 @@ mod tests {
         // CMYK 全零墨量 = 白;第 5 通道是 alpha。
         let cmyk = wrap(header(1, 1, 5, 4, 1), 0, &[0, 0, 0, 0, 255], &[]);
         let p = write_tmp("cmyk", &cmyk);
-        assert_eq!(decode(&p).unwrap().to_rgba8().get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(
+            decode(&p).unwrap().to_rgba8().get_pixel(0, 0).0,
+            [255, 255, 255, 255]
+        );
         let _ = std::fs::remove_file(p);
 
         // 16 位 RGB:0x0000 / 0x8000 / 0xFFFF → 0 / 128 / 255 附近。
@@ -926,7 +987,10 @@ mod tests {
     #[test]
     fn lab_conversion_is_bounded_and_neutral_gray_stays_gray() {
         let [r, g, b] = lab_to_rgb(0.5, 128.0 / 255.0, 128.0 / 255.0);
-        assert!((r - g).abs() < 0.02 && (g - b).abs() < 0.02, "中性灰不该偏色");
+        assert!(
+            (r - g).abs() < 0.02 && (g - b).abs() < 0.02,
+            "中性灰不该偏色"
+        );
         for v in [r, g, b] {
             assert!((0.0..=1.0).contains(&v));
         }

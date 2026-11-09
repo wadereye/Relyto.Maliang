@@ -16,6 +16,7 @@
 //! 3. 刻录只用 IMAPI2。
 
 use crate::effects::FilterStack;
+use crate::i18n::{t, t_with};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -52,14 +53,14 @@ impl ShareSize {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            ShareSize::Px160 => "160 像素(缩略图)",
-            ShareSize::Px320 => "320 像素(网页小图)",
-            ShareSize::Px480 => "480 像素(小图)",
-            ShareSize::Px640 => "640 像素(普通)",
-            ShareSize::Px800 => "800 像素(博客/网页)",
-            ShareSize::Px1024 => "1024 像素(推荐)",
-            ShareSize::Px1200 => "1200 像素(大图)",
-            ShareSize::Px1600 => "1600 像素(打印/分享)",
+            ShareSize::Px160 => t("160 像素(缩略图)"),
+            ShareSize::Px320 => t("320 像素(网页小图)"),
+            ShareSize::Px480 => t("480 像素(小图)"),
+            ShareSize::Px640 => t("640 像素(普通)"),
+            ShareSize::Px800 => t("800 像素(博客/网页)"),
+            ShareSize::Px1024 => t("1024 像素(推荐)"),
+            ShareSize::Px1200 => t("1200 像素(大图)"),
+            ShareSize::Px1600 => t("1600 像素(打印/分享)"),
         }
     }
 
@@ -103,13 +104,19 @@ pub fn stage_jpegs(
     dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     if items.is_empty() {
-        return Err(anyhow!("没有可分享的照片"));
+        return Err(anyhow!(t("没有可分享的照片")));
     }
     let _ = std::fs::remove_dir_all(dir);
-    std::fs::create_dir_all(dir).with_context(|| format!("创建暂存目录失败: {}", dir.display()))?;
+    std::fs::create_dir_all(dir).with_context(|| {
+        t_with(
+            "创建暂存目录失败: {p1}",
+            &[("p1", (dir.display()).to_string())],
+        )
+    })?;
     let mut out = Vec::with_capacity(items.len());
     for (i, (src, stack)) in items.iter().enumerate() {
-        let img = image::open(src).with_context(|| format!("解码失败: {}", src.display()))?;
+        let img = image::open(src)
+            .with_context(|| t_with("解码失败: {p1}", &[("p1", (src.display()).to_string())]))?;
         // 与预览同一坐标空间:先按 EXIF 方向摆正再套效果栈(含几何类效果)。
         let img = crate::thumbs::apply_exif_rotation(img, crate::exif::read_orientation(src));
         let mut rgba = img.to_rgba8();
@@ -241,23 +248,29 @@ mod win {
     /// 用 Unicode 导出 `MAPISendMailW`(中文路径不丢字)。
     pub fn send_email(subject: &str, files: &[PathBuf]) -> Result<()> {
         if files.is_empty() {
-            return Err(anyhow!("没有附件"));
+            return Err(anyhow!(t("没有附件")));
         }
         unsafe {
             // mapi32.dll 句柄不 FreeLibrary,进程退出由系统回收。
             let lib = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("MAPI32.DLL"))
-                .map_err(|e| anyhow!("加载 mapi32.dll 失败: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "{}",
+                        t_with("加载 mapi32.dll 失败: {e}", &[("e", e.to_string())])
+                    )
+                })?;
             let proc = windows::Win32::System::LibraryLoader::GetProcAddress(
                 lib,
                 PCSTR::from_raw(b"MAPISendMailW\0".as_ptr()),
             );
             let Some(proc) = proc else {
-                return Err(anyhow!("mapi32.dll 无 MAPISendMailW(系统过旧)"));
+                return Err(anyhow!(t("mapi32.dll 无 MAPISendMailW(系统过旧)")));
             };
             let send: SendMailWFn = std::mem::transmute(proc);
 
             // 字符串缓冲必须活到调用结束
-            let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+            let wide =
+                |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
             let mut subject_buf = wide(subject);
             let mut path_bufs: Vec<Vec<u16>> =
                 files.iter().map(|f| wide(&f.to_string_lossy())).collect();
@@ -291,7 +304,13 @@ mod win {
             let hr = send(0, 0, &mut msg, 9, 0);
             // SUCCESS_SUCCESS = 0
             if hr != 0 {
-                return Err(anyhow!("MAPISendMailW 返回 0x{hr:x}(用户取消或邮件客户端失败)"));
+                return Err(anyhow!(
+                    "{}",
+                    t_with(
+                        "MAPISendMailW 返回 0x{hr}(用户取消或邮件客户端失败)",
+                        &[("hr", format!("{hr:x}", hr = hr))]
+                    )
+                ));
             }
             Ok(())
         }
@@ -307,50 +326,78 @@ mod win {
             let _guard = CoUninitGuard { do_uninit: init };
 
             let master: IDiscMaster2 = CoCreateInstance(&MsftDiscMaster2, None, CLSCTX_ALL)
-                .map_err(|e| anyhow!("无法连接 IMAPI2: {e}"))?;
-            let count = master
-                .Count()
-                .map_err(|e| anyhow!("IMAPI2 枚举光驱失败: {e}"))?;
+                .map_err(|e| {
+                    anyhow!(
+                        "{}",
+                        t_with("无法连接 IMAPI2: {e}", &[("e", e.to_string())])
+                    )
+                })?;
+            let count = master.Count().map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("IMAPI2 枚举光驱失败: {e}", &[("e", e.to_string())])
+                )
+            })?;
             if count < 1 {
-                return Err(anyhow!("没有检测到光驱"));
+                return Err(anyhow!(t("没有检测到光驱")));
             }
-            let id = master
-                .get_Item(0)
-                .map_err(|e| anyhow!("读取光驱标识失败: {e}"))?;
+            let id = master.get_Item(0).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("读取光驱标识失败: {e}", &[("e", e.to_string())])
+                )
+            })?;
             let recorder: IDiscRecorder2 = CoCreateInstance(&MsftDiscRecorder2, None, CLSCTX_ALL)?;
-            recorder
-                .InitializeDiscRecorder(&id)
-                .map_err(|e| anyhow!("初始化光驱失败: {e}"))?;
+            recorder.InitializeDiscRecorder(&id).map_err(|e| {
+                anyhow!("{}", t_with("初始化光驱失败: {e}", &[("e", e.to_string())]))
+            })?;
 
-            let image: IFileSystemImage =
-                CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_ALL)?;
-            image
-                .ChooseImageDefaults(&recorder)
-                .map_err(|e| anyhow!("选择镜像默认值失败: {e}"))?;
+            let image: IFileSystemImage = CoCreateInstance(&MsftFileSystemImage, None, CLSCTX_ALL)?;
+            image.ChooseImageDefaults(&recorder).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("选择镜像默认值失败: {e}", &[("e", e.to_string())])
+                )
+            })?;
             image
                 .SetVolumeName(&BSTR::from(label))
-                .map_err(|e| anyhow!("设置卷标失败: {e}"))?;
+                .map_err(|e| anyhow!("{}", t_with("设置卷标失败: {e}", &[("e", e.to_string())])))?;
             image
                 .Root()
-                .map_err(|e| anyhow!("取根目录失败: {e}"))?
-                .AddTree(&BSTR::from(staging.as_os_str().to_string_lossy().as_ref()), VARIANT_BOOL(0))
-                .map_err(|e| anyhow!("添加文件失败: {e}"))?;
+                .map_err(|e| anyhow!("{}", t_with("取根目录失败: {e}", &[("e", e.to_string())])))?
+                .AddTree(
+                    &BSTR::from(staging.as_os_str().to_string_lossy().as_ref()),
+                    VARIANT_BOOL(0),
+                )
+                .map_err(|e| anyhow!("{}", t_with("添加文件失败: {e}", &[("e", e.to_string())])))?;
             let result = image
                 .CreateResultImage()
-                .map_err(|e| anyhow!("构建镜像失败: {e}"))?;
+                .map_err(|e| anyhow!("{}", t_with("构建镜像失败: {e}", &[("e", e.to_string())])))?;
             let stream = result
                 .ImageStream()
-                .map_err(|e| anyhow!("取镜像流失败: {e}"))?;
+                .map_err(|e| anyhow!("{}", t_with("取镜像流失败: {e}", &[("e", e.to_string())])))?;
 
             let fmt: IDiscFormat2Data = CoCreateInstance(&MsftDiscFormat2Data, None, CLSCTX_ALL)?;
             fmt.SetRecorder(&recorder)
-                .map_err(|e| anyhow!("绑定光驱失败: {e}"))?;
-            fmt.SetClientName(&BSTR::from(client))
-                .map_err(|e| anyhow!("设置客户端名失败: {e}"))?;
-            fmt.SetForceMediaToBeClosed(VARIANT_BOOL(1))
-                .map_err(|e| anyhow!("设置关闭介质失败: {e}"))?;
-            fmt.Write(&stream)
-                .map_err(|e| anyhow!("刻录失败(检查空盘/光驱状态): {e}"))?;
+                .map_err(|e| anyhow!("{}", t_with("绑定光驱失败: {e}", &[("e", e.to_string())])))?;
+            fmt.SetClientName(&BSTR::from(client)).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("设置客户端名失败: {e}", &[("e", e.to_string())])
+                )
+            })?;
+            fmt.SetForceMediaToBeClosed(VARIANT_BOOL(1)).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("设置关闭介质失败: {e}", &[("e", e.to_string())])
+                )
+            })?;
+            fmt.Write(&stream).map_err(|e| {
+                anyhow!(
+                    "{}",
+                    t_with("刻录失败(检查空盘/光驱状态): {e}", &[("e", e.to_string())])
+                )
+            })?;
             Ok(())
         }
     }
@@ -372,12 +419,12 @@ pub use win::{burn_folder, send_email};
 
 #[cfg(not(windows))]
 pub fn send_email(_subject: &str, _files: &[PathBuf]) -> Result<()> {
-    Err(anyhow!("邮件发送仅支持 Windows(Simple MAPI)"))
+    Err(anyhow!(t("邮件发送仅支持 Windows(Simple MAPI)")))
 }
 
 #[cfg(not(windows))]
 pub fn burn_folder(_staging: &Path, _label: &str, _client: &str) -> Result<()> {
-    Err(anyhow!("刻录仅支持 Windows(IMAPI2)"))
+    Err(anyhow!(t("刻录仅支持 Windows(IMAPI2)")))
 }
 
 #[cfg(test)]
@@ -405,7 +452,8 @@ mod tests {
     #[test]
     fn stage_jpegs_resizes_and_names() {
         let dir = std::env::temp_dir().join(format!("maliang-share-{}", std::process::id()));
-        let src_dir = std::env::temp_dir().join(format!("maliang-share-src-{}", std::process::id()));
+        let src_dir =
+            std::env::temp_dir().join(format!("maliang-share-src-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&src_dir);
         std::fs::create_dir_all(&src_dir).unwrap();
@@ -413,20 +461,38 @@ mod tests {
         let img = image::RgbImage::from_pixel(2000, 1000, image::Rgb([120, 120, 120]));
         let src = src_dir.join("照片 A.jpg");
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(Vec::new()), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(Vec::new()),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         let mut buf: Vec<u8> = Vec::new();
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2000, 1000, image::Rgb([120, 120, 120])))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
-            .unwrap();
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            2000,
+            1000,
+            image::Rgb([120, 120, 120]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut buf),
+            image::ImageFormat::Jpeg,
+        )
+        .unwrap();
         std::fs::write(&src, &buf).unwrap();
 
         let items = vec![(src.clone(), FilterStack::new())];
         let files = stage_jpegs(&items, ShareSize::Px1600.px(), &dir).unwrap();
         assert_eq!(files.len(), 1);
-        assert!(files[0].file_name().unwrap().to_string_lossy().ends_with("-照片 A.jpg"));
+        assert!(files[0]
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with("-照片 A.jpg"));
         let got = image::open(&files[0]).unwrap();
-        assert_eq!((got.width(), got.height()), (1600, 800), "最长边应缩到 1600");
+        assert_eq!(
+            (got.width(), got.height()),
+            (1600, 800),
+            "最长边应缩到 1600"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&src_dir);
     }
@@ -440,7 +506,10 @@ mod tests {
         std::fs::create_dir_all(&src_dir).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3])))
-            .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Jpeg)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
             .unwrap();
         let src = src_dir.join("x.jpg");
         std::fs::write(&src, &buf).unwrap();
@@ -448,7 +517,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         let manifest = std::fs::read_to_string(dir.join("manifest.txt")).unwrap();
         assert!(manifest.contains("-x.jpg"), "清单应列出暂存文件");
-        assert!(!dir.join("autorun.inf").exists(), "无盘上播放器,不写 autorun.inf");
+        assert!(
+            !dir.join("autorun.inf").exists(),
+            "无盘上播放器,不写 autorun.inf"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&src_dir);
     }

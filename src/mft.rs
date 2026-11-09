@@ -470,7 +470,10 @@ pub fn read_journal(
     #[cfg(windows)]
     {
         let h = open_volume(letter)?;
-        let mut stats = ReadStats { next_usn: start_usn, ..Default::default() };
+        let mut stats = ReadStats {
+            next_usn: start_usn,
+            ..Default::default()
+        };
         let mut buf = vec![0u8; USN_BUF_SIZE];
         let mut name: Vec<u16> = Vec::with_capacity(1024);
         let mut usn = start_usn;
@@ -745,10 +748,10 @@ mod imp {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, GetLogicalDrives, OPEN_EXISTING,
+        CreateFileW, GetLogicalDrives, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::Win32::System::IO::DeviceIoControl;
     use windows::Win32::System::Ioctl::{FSCTL_QUERY_USN_JOURNAL, USN_JOURNAL_DATA_V0};
+    use windows::Win32::System::IO::DeviceIoControl;
 
     /// 单次 ioctl 输出缓冲 1MB:大幅减少系统调用次数,
     /// 又不会在内存紧张的机器上碰 ERROR_INVALID_USER_BUFFER。
@@ -780,7 +783,10 @@ mod imp {
             }
             let letter = (b'A' + i as u8) as char;
             let root = PathBuf::from(format!("{letter}:\\"));
-            if crate::win::drive_type(&root).map(|t| t.scannable()).unwrap_or(false) {
+            if crate::win::drive_type(&root)
+                .map(|t| t.scannable())
+                .unwrap_or(false)
+            {
                 out.push(letter);
             }
         }
@@ -837,9 +843,7 @@ mod imp {
     /// 卷几何。打开卷这一步与 USN 枚举同权限(未提权 → ERROR_ACCESS_DENIED),
     /// 所以调用方拿到失败时可以复用 [`classify_open`] 的结论。
     pub(super) fn volume_geometry(letter: char) -> Result<VolumeGeometry> {
-        use windows::Win32::System::Ioctl::{
-            FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER,
-        };
+        use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_VOLUME_DATA, NTFS_VOLUME_DATA_BUFFER};
         let v = open_volume(letter)?;
         let mut d = NTFS_VOLUME_DATA_BUFFER::default();
         let mut ret = 0u32;
@@ -876,20 +880,18 @@ mod imp {
 }
 
 #[cfg(windows)]
-use imp::{
-    open_volume, query_journal, scannable_letters, FILE_ATTRIBUTE_DIRECTORY, USN_BUF_SIZE,
-};
+use imp::{open_volume, query_journal, scannable_letters, FILE_ATTRIBUTE_DIRECTORY, USN_BUF_SIZE};
 
 #[cfg(windows)]
 use windows::core::HRESULT;
 #[cfg(windows)]
 use windows::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_JOURNAL_ENTRY_DELETED};
 #[cfg(windows)]
-use windows::Win32::System::IO::DeviceIoControl;
-#[cfg(windows)]
 use windows::Win32::System::Ioctl::{
     FSCTL_ENUM_USN_DATA, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0, READ_USN_JOURNAL_DATA_V0,
 };
+#[cfg(windows)]
+use windows::Win32::System::IO::DeviceIoControl;
 
 #[cfg(test)]
 mod tests {
@@ -903,17 +905,19 @@ mod tests {
         b[4..6].copy_from_slice(&0u16.to_le_bytes()); // MinorVersion
         b[8..16].copy_from_slice(&0x0000_0000_0010_0234u64.to_le_bytes()); // FRN
         b[16..24].copy_from_slice(&0x0000_0000_0000_0005u64.to_le_bytes()); // 父 = 卷根
-        // 134382240000000000 = 2026-11-04T00:00:00Z 的 FILETIME 刻度(示例量级)。
+                                                                            // 134382240000000000 = 2026-11-04T00:00:00Z 的 FILETIME 刻度(示例量级)。
         b[24..32].copy_from_slice(&0x01DB_5F48_9A34_0000u64.to_le_bytes()); // Usn
         b[32..40].copy_from_slice(&134_382_240_000_000_000u64.to_le_bytes()); // TimeStamp
         b[40..44].copy_from_slice(&0x8000_2000u32.to_le_bytes()); // CLOSE|RENAME_NEW_NAME
         b[52..56].copy_from_slice(&0x20u32.to_le_bytes()); // ARCHIVE
         b[56..58].copy_from_slice(&4u16.to_le_bytes()); // FileNameLength
         b[58..60].copy_from_slice(&60u16.to_le_bytes()); // FileNameOffset
-        b[60..64].copy_from_slice(&"AB"
-            .encode_utf16()
-            .flat_map(|u| u.to_le_bytes())
-            .collect::<Vec<u8>>());
+        b[60..64].copy_from_slice(
+            &"AB"
+                .encode_utf16()
+                .flat_map(|u| u.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        );
         b
     }
 
@@ -931,7 +935,10 @@ mod tests {
         assert_eq!(r.usn, 0x01DB_5F48_9A34_0000);
         assert_eq!(r.timestamp, 134_382_240_000_000_000);
         assert_eq!(
-            crate::rec::filetime_to_system(r.timestamp).map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_secs()),
+            crate::rec::filetime_to_system(r.timestamp).map(|t| t
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()),
             Some(1_793_750_400),
             "TimeStamp 必须能换回 2026-11-04T00:00:00Z"
         );
@@ -1003,9 +1010,18 @@ mod tests {
         }
         let g = volume_geometry('C').expect("Usn 卷必然能取到几何");
         let pow2 = |v: u32| v != 0 && v.is_power_of_two();
-        assert!(pow2(g.bytes_per_sector) && g.bytes_per_sector >= 512, "{g:?}");
-        assert!(pow2(g.bytes_per_cluster) && g.bytes_per_cluster >= g.bytes_per_sector, "{g:?}");
-        assert!(pow2(g.bytes_per_file_record) && g.bytes_per_file_record >= 512, "{g:?}");
+        assert!(
+            pow2(g.bytes_per_sector) && g.bytes_per_sector >= 512,
+            "{g:?}"
+        );
+        assert!(
+            pow2(g.bytes_per_cluster) && g.bytes_per_cluster >= g.bytes_per_sector,
+            "{g:?}"
+        );
+        assert!(
+            pow2(g.bytes_per_file_record) && g.bytes_per_file_record >= 512,
+            "{g:?}"
+        );
         assert!(g.mft_valid_data_length >= 1 << 20, "{g:?}");
         assert!(g.mft_start_lcn > 0, "{g:?}");
         // 记录数上限必须与 diag 报的量级一致(C: ≈ 100 万条),且与折算后的记录尺寸自洽。
@@ -1048,7 +1064,10 @@ mod tests {
             Support::NeedsAdmin,
             "查 journal 被拒也是提权问题,不能吞成 NoJournal"
         );
-        assert_eq!(classify_journal(Some(ERR_JOURNAL_ENTRY_DELETED)), Support::NoJournal);
+        assert_eq!(
+            classify_journal(Some(ERR_JOURNAL_ENTRY_DELETED)),
+            Support::NoJournal
+        );
         assert_eq!(classify_journal(None), Support::NoJournal);
     }
 
@@ -1092,7 +1111,12 @@ mod tests {
             last_error: code,
         };
         assert_eq!(
-            mk(Support::NoJournal, Some(ERR_JOURNAL_NOT_ACTIVE), Some("NTFS")).fault_text(),
+            mk(
+                Support::NoJournal,
+                Some(ERR_JOURNAL_NOT_ACTIVE),
+                Some("NTFS")
+            )
+            .fault_text(),
             "USN 日志未激活"
         );
         assert_eq!(
@@ -1119,12 +1143,16 @@ mod tests {
     #[test]
     fn win32_code_reads_facility_seven_only() {
         use windows::core::HRESULT;
-        let e = anyhow::Error::new(windows::core::Error::from_hresult(HRESULT::from_win32(1179)))
-            .context("外层包装也要能挖到");
+        let e = anyhow::Error::new(windows::core::Error::from_hresult(HRESULT::from_win32(
+            1179,
+        )))
+        .context("外层包装也要能挖到");
         assert_eq!(win32_code(&e), Some(1179));
         assert_eq!(win32_code(&e), Some(ERR_JOURNAL_NOT_ACTIVE));
         // 非 Win32 facility(NTSTATUS 直传)不许被当成 Win32 码解释。
-        let n = anyhow::Error::new(windows::core::Error::from_hresult(HRESULT(0xC000_0001u32 as i32)));
+        let n = anyhow::Error::new(windows::core::Error::from_hresult(HRESULT(
+            0xC000_0001u32 as i32,
+        )));
         assert_eq!(win32_code(&n), None);
         // 没有 windows::core::Error 的错误链 → None。
         assert_eq!(win32_code(&anyhow!("纯文本错误")), None);

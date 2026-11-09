@@ -228,7 +228,7 @@ fn read_marker_text(dir: &Path) -> Option<String> {
 ///
 /// 缓存落点与扫描排除每帧/每文件都要问一次路径,必须走这里,
 /// 不能让「查一下目录在哪」顺手把目录建出来。
-fn data_dir_loc() -> PathBuf {
+pub fn data_dir_loc() -> PathBuf {
     if let Some(v) = std::env::var_os("MALIANG_DATA_DIR") {
         if !v.is_empty() {
             return PathBuf::from(v);
@@ -255,7 +255,10 @@ pub fn sync_machine_marker() -> std::io::Result<PathBuf> {
     std::fs::create_dir_all(marker.parent().unwrap())?;
     // 机器级文件只由本函数写(不含 [update] 节),整份重写安全。
     // 旧 data.location 留着不删:服务可能还是按旧文件名读的旧版。
-    std::fs::write(&marker, format!("[location]\ndata_dir={}\n", data_dir().display()))?;
+    std::fs::write(
+        &marker,
+        format!("[location]\ndata_dir={}\n", data_dir().display()),
+    )?;
     Ok(marker)
 }
 
@@ -277,7 +280,10 @@ pub fn set_data_dir(dir: Option<&Path>) -> std::io::Result<()> {
     // 旧 marker 还在(未迁移)时以它为底本,顺手完成到新文件名的搬迁。
     // 旧文件留着不删:可能还有按旧名读配置的旧版程序在跑。
     let existing = read_marker_text(&default_data_dir()).unwrap_or_default();
-    std::fs::write(&marker, rewrite_marker_text(&existing, data_line, pending_line))?;
+    std::fs::write(
+        &marker,
+        rewrite_marker_text(&existing, data_line, pending_line),
+    )?;
     Ok(())
 }
 
@@ -301,7 +307,10 @@ fn rewrite_marker_text(
     let insert_at = match kept.iter().position(|l| l.trim() == "[location]") {
         Some(i) => i + 1,
         None => {
-            if kept.iter().all(|l| l.trim().is_empty() || l.trim_start().starts_with('#')) {
+            if kept
+                .iter()
+                .all(|l| l.trim().is_empty() || l.trim_start().starts_with('#'))
+            {
                 kept.insert(0, "[location]".into());
                 1
             } else {
@@ -346,7 +355,8 @@ pub fn migrate_pending_data() {
         let _ = std::fs::create_dir_all(&target);
         if copy_missing_recursive(&from, &target) {
             remove_tree_best_effort(&from);
-            let kept = rewrite_marker_text(&text, Some(format!("data_dir={}", target.display())), None);
+            let kept =
+                rewrite_marker_text(&text, Some(format!("data_dir={}", target.display())), None);
             let _ = std::fs::write(&marker_path, kept);
         }
     } else {
@@ -725,8 +735,7 @@ fn copy_cache_missing(src: &Path, dst: &Path, moved: &mut usize, failed: &mut bo
 const CACHE_TIER_DIRS: [&str; 4] = ["thumbs", "smallthumbs", "bigthumbs", "previews"];
 
 /// 启动后台缓存搬迁状态:0 = 未开始/无需搬,1 = 进行中,2 = 完成,3 = 部分失败。
-static CACHE_MIGRATION_STATE: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
+static CACHE_MIGRATION_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 static CACHE_MIGRATION_MOVED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
@@ -948,6 +957,118 @@ CREATE TABLE IF NOT EXISTS bad_media (
     reason TEXT NOT NULL,
     since  INTEGER NOT NULL             -- Unix 毫秒
 );
+-- AI 待办:一个 (阶段, 照片) 一行,重复入队无副作用。
+CREATE TABLE IF NOT EXISTS ai_jobs (
+    stage       TEXT    NOT NULL,
+    photo_id    INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    priority    INTEGER NOT NULL,
+    enqueued_ts INTEGER NOT NULL,
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (stage, photo_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_pick
+    ON ai_jobs(stage, priority, enqueued_ts, photo_id);
+-- AI 完成台账:model_ver 不一致即视为未完成。
+CREATE TABLE IF NOT EXISTS ai_state (
+    photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    stage     TEXT    NOT NULL,
+    model_ver TEXT    NOT NULL,
+    done_ts   INTEGER NOT NULL,
+    PRIMARY KEY (photo_id, stage)
+) WITHOUT ROWID;
+-- AI 失败隔离:达到阈值后移出队列,不再反复重试坏图。
+CREATE TABLE IF NOT EXISTS ai_failed (
+    photo_id INTEGER NOT NULL,
+    stage    TEXT    NOT NULL,
+    err      TEXT    NOT NULL,
+    attempts INTEGER NOT NULL,
+    ts       INTEGER NOT NULL,
+    PRIMARY KEY (photo_id, stage)
+);
+-- AI 优先级:目录前缀最长匹配。
+CREATE TABLE IF NOT EXISTS ai_priority_rules (
+    prefix TEXT PRIMARY KEY,
+    prio   INTEGER NOT NULL
+);
+-- AI 模型槽位清单。
+CREATE TABLE IF NOT EXISTS ai_models (
+    slot         TEXT PRIMARY KEY,
+    file         TEXT NOT NULL,
+    version      TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    url          TEXT,
+    sha256       TEXT,
+    bytes        INTEGER NOT NULL,
+    license      TEXT NOT NULL,
+    dim          INTEGER,
+    input_name   TEXT,
+    installed_ts INTEGER NOT NULL
+);
+-- 语义向量:photo_id 主键,浮点数组存 BLOB(精确余弦检索,免外部扩展)。
+CREATE TABLE IF NOT EXISTS clips_vec (
+    photo_id  INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    ver       TEXT    NOT NULL,
+    dim       INTEGER NOT NULL,
+    embedding BLOB    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_clips_vec_ver ON clips_vec(ver);
+-- 自动标签词表:一份词表同时承载标签与分类(层级路径 node)。
+CREATE TABLE IF NOT EXISTS tag_labels (
+    id        INTEGER PRIMARY KEY,
+    node      TEXT NOT NULL,
+    name_zh   TEXT NOT NULL,
+    name_en   TEXT NOT NULL,
+    prompt_en TEXT NOT NULL,
+    parent    INTEGER,
+    builtin   INTEGER NOT NULL,
+    ver       TEXT NOT NULL
+);
+-- 自动标签结果:只按当前 model_ver 读取。
+CREATE TABLE IF NOT EXISTS auto_tags (
+    photo_id  INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+    label_id  INTEGER NOT NULL,
+    score     REAL    NOT NULL,
+    model_ver TEXT    NOT NULL,
+    PRIMARY KEY (photo_id, label_id, model_ver)
+);
+CREATE INDEX IF NOT EXISTS idx_auto_tags_ver ON auto_tags(model_ver, label_id);
+-- OCR 原文与检索用分词文本。
+CREATE TABLE IF NOT EXISTS ocr_docs (
+    photo_id   INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    text       TEXT    NOT NULL,
+    seg        TEXT    NOT NULL,
+    line_count INTEGER NOT NULL,
+    char_count INTEGER NOT NULL,
+    model_ver  TEXT    NOT NULL,
+    done_ts    INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS ocr_fts USING fts5(
+    seg,
+    content='ocr_docs',
+    content_rowid='photo_id',
+    tokenize="unicode61 remove_diacritics 0"
+);
+-- OCR 行框:只对文字类照片写入,最多前 200 行。
+CREATE TABLE IF NOT EXISTS ocr_boxes (
+    photo_id INTEGER NOT NULL,
+    line_no  INTEGER NOT NULL,
+    x0 INTEGER, y0 INTEGER, x1 INTEGER, y1 INTEGER,
+    conf REAL,
+    PRIMARY KEY (photo_id, line_no)
+);
+-- 查询词典:中文词 → 英文 prompt 片段(人工优先级高于机器翻译)。
+CREATE TABLE IF NOT EXISTS ai_dict (
+    term_zh TEXT PRIMARY KEY,
+    term_en TEXT NOT NULL
+);
+-- 人脸约束(M5):must = 同一人,never = 不同人;审核后供聚类使用。
+CREATE TABLE IF NOT EXISTS face_constraints (
+    a_face INTEGER NOT NULL,
+    b_face INTEGER NOT NULL,
+    kind   TEXT    NOT NULL,   -- 'must' | 'never'
+    ts     INTEGER NOT NULL,
+    PRIMARY KEY (a_face, b_face)
+);
 "#;
 
 /// 一条 L1 → L2 的结构行(全盘元数据入库,**不打开文件**)。
@@ -1022,7 +1143,10 @@ pub const SRC_VIEW: &str = "visible";
 
 /// `state` 是否属于纳入组(的第三个条件)。
 pub fn intent_included(state: &str) -> bool {
-    matches!(state, INTENT_DEFAULT_ROOT | INTENT_IMPORTED | INTENT_CLICKED)
+    matches!(
+        state,
+        INTENT_DEFAULT_ROOT | INTENT_IMPORTED | INTENT_CLICKED
+    )
 }
 
 /// 目录意图账本的一行。
@@ -1320,8 +1444,26 @@ pub fn frn64_of(letter: char, frn: u64) -> i64 {
 impl Store {
     pub fn open() -> Result<Arc<Store>> {
         let path = data_dir().join("index.db");
-        let conn = Connection::open(&path)?;
-        Ok(Self::from_conn(conn)?.with_file(path))
+        // 服务进程可能在 checkpoint/截断 WAL,首次打开偶发 SQLITE_IOERR;短重试避免启动即崩。
+        let mut last: Option<anyhow::Error> = None;
+        for _ in 0..4 {
+            match Connection::open(&path) {
+                Ok(conn) => match Self::from_conn(conn) {
+                    Ok(s) => return Ok(s.with_file(path)),
+                    Err(e) => {
+                        last = Some(e);
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                    }
+                },
+                Err(e) => {
+                    last = Some(e.into());
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        }
+        Err(last
+            .expect("重试循环至少执行一次")
+            .context(format!("库文件 {}", path.display())))
     }
 
     /// 文件库补记路径(只读连接池按它开新连接);内存库不调用。
@@ -1332,15 +1474,23 @@ impl Store {
 
     /// 对既有连接执行建表 + 旧库迁移(测试可注入模拟旧库)。
     pub fn from_conn(conn: Connection) -> Result<Store> {
+        use anyhow::Context;
+        // 单独执行 WAL 切换:库尾 WAL 需要恢复/截断时失败点都在这里,带上上下文便于定位。
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .context("开启 WAL 日志模式")?;
         conn.execute_batch(SCHEMA)?;
         // 旧库迁移:按需补列(列已存在时静默)
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN dhash INTEGER;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN baked INTEGER;");
-        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN star INTEGER NOT NULL DEFAULT 0;");
-        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN xmp_imported INTEGER NOT NULL DEFAULT 0;");
+        let _ =
+            conn.execute_batch("ALTER TABLE photos ADD COLUMN star INTEGER NOT NULL DEFAULT 0;");
+        let _ = conn.execute_batch(
+            "ALTER TABLE photos ADD COLUMN xmp_imported INTEGER NOT NULL DEFAULT 0;",
+        );
         let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN score REAL;");
         let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN quality REAL;");
-        let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;");
+        let _ =
+            conn.execute_batch("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;");
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lat REAL;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lon REAL;");
@@ -1349,14 +1499,14 @@ impl Store {
         // 效果栈列(`filters` 列)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN filters TEXT;");
         // 视频标记列(NOT NULL 带默认值,旧行自动 0=图片)。
-        let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;");
+        let _ =
+            conn.execute_batch("ALTER TABLE photos ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;");
         // 相机型号池化列 + 池表。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN cam_id INTEGER;");
         // 缩略图生成失败计数(防 worker 对坏文件无限重试,已知问题见
         // thumbs.rs::backfill_tier 注释):失败满 3 次不再进回填队列。
-        let _ = conn.execute_batch(
-            "ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;",
-        );
+        let _ = conn
+            .execute_batch("ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;");
         // P3-ui:标题(缩略图说明;幻灯片/属性面板显示)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN caption TEXT;");
         // 派生作用域两列:rich_state 是 L3 门控的唯一开关(0 未纳入 / 1 待派生 /
@@ -1412,9 +1562,8 @@ impl Store {
         // "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"。
         // 历史行/非 NTFS 行的 frn64 是 NULL,而 SQLite 的唯一索引允许多个 NULL,
         // 所以它们照样共存,仍按 path 身份走。
-        let _ = conn.execute_batch(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_frn64 ON photos(frn64);",
-        );
+        let _ = conn
+            .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_frn64 ON photos(frn64);");
         // 写连接兜底等待:与异步写批/其它同步写撞车时排队而不是报 BUSY。
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
         let store = Store {
@@ -1439,10 +1588,9 @@ impl Store {
         // 一次性清掉永远不该进库的历史行(自家缓存、回收站、系统目录…)。
         // 行数留给启动任务:有删除才值得跑一次缩略图缓存 GC。
         let purged = store.purge_hard_excluded_once().unwrap_or(0);
-        store.hard_purged.store(
-            purged,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        store
+            .hard_purged
+            .store(purged, std::sync::atomic::Ordering::Relaxed);
         Ok(store)
     }
 
@@ -1604,7 +1752,10 @@ impl Store {
         for r in default_roots() {
             let _ = self.upsert_watched(&r);
         }
-        let _ = self.set_setting("initial_scope", if complete { "complete" } else { "limited" });
+        let _ = self.set_setting(
+            "initial_scope",
+            if complete { "complete" } else { "limited" },
+        );
         let _ = self.set_setting("scan_initialized", "1");
         scope_roots
     }
@@ -1719,7 +1870,11 @@ impl Store {
                 Err(_) => return Vec::new(),
             };
             st.query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)? as usize))
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)? as usize,
+                ))
             })
             .ok()
             .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -1821,9 +1976,9 @@ impl Store {
     /// 相簿成员(按 pos 序),返回照片 id 列表。
     pub fn album_photo_ids(&self, album_id: i64) -> Vec<i64> {
         self.read(move |conn| {
-            let mut st = match conn.prepare(
-                "SELECT photo_id FROM album_photos WHERE album_id=?1 ORDER BY pos",
-            ) {
+            let mut st = match conn
+                .prepare("SELECT photo_id FROM album_photos WHERE album_id=?1 ORDER BY pos")
+            {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
@@ -1884,11 +2039,11 @@ impl Store {
     /// 读出全部待扫根(按入队先后),`(root, scope)`。
     pub fn pending_scans(&self) -> Vec<(String, String)> {
         self.read(|conn| {
-            let mut st = match conn.prepare("SELECT root, scope FROM scan_queue ORDER BY enqueued_ts, id")
-            {
-                Ok(s) => s,
-                Err(_) => return Vec::new(),
-            };
+            let mut st =
+                match conn.prepare("SELECT root, scope FROM scan_queue ORDER BY enqueued_ts, id") {
+                    Ok(s) => s,
+                    Err(_) => return Vec::new(),
+                };
             st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
                 .map(|rows| rows.filter_map(|x| x.ok()).collect())
                 .unwrap_or_default()
@@ -1899,7 +2054,10 @@ impl Store {
     pub fn dequeue_scan(&self, root: &str) -> Result<()> {
         let root = root.to_string();
         self.write(move |conn| {
-            let _ = conn.execute("DELETE FROM scan_queue WHERE root=?1", rusqlite::params![root]);
+            let _ = conn.execute(
+                "DELETE FROM scan_queue WHERE root=?1",
+                rusqlite::params![root],
+            );
         });
         Ok(())
     }
@@ -2001,10 +2159,7 @@ impl Store {
             };
             let rows = st.query_map([], |r| r.get::<_, String>(0));
             match rows {
-                Ok(rows) => rows
-                    .filter_map(|r| r.ok())
-                    .map(PathBuf::from)
-                    .collect(),
+                Ok(rows) => rows.filter_map(|r| r.ok()).map(PathBuf::from).collect(),
                 Err(_) => Vec::new(),
             }
         })
@@ -2030,6 +2185,18 @@ impl Store {
         let mut st_clips_cn = tx.prepare_cached("DELETE FROM clips_cn WHERE photo_id=?1")?;
         let mut st_tiers = tx.prepare_cached("DELETE FROM thumb_tiers WHERE photo_id=?1")?;
         let mut st_album = tx.prepare_cached("DELETE FROM album_photos WHERE photo_id=?1")?;
+        let mut st_jobs = tx.prepare_cached("DELETE FROM ai_jobs WHERE photo_id=?1")?;
+        let mut st_state = tx.prepare_cached("DELETE FROM ai_state WHERE photo_id=?1")?;
+        let mut st_failed = tx.prepare_cached("DELETE FROM ai_failed WHERE photo_id=?1")?;
+        let mut st_auto = tx.prepare_cached("DELETE FROM auto_tags WHERE photo_id=?1")?;
+        let mut st_vec = tx.prepare_cached("DELETE FROM clips_vec WHERE photo_id=?1")?;
+        let mut st_ocr_seg =
+            tx.prepare_cached("SELECT seg FROM ocr_docs WHERE photo_id=?1")?;
+        let mut st_fts = tx.prepare_cached(
+            "INSERT INTO ocr_fts(ocr_fts, rowid, seg) VALUES('delete', ?1, ?2)",
+        )?;
+        let mut st_docs = tx.prepare_cached("DELETE FROM ocr_docs WHERE photo_id=?1")?;
+        let mut st_boxes = tx.prepare_cached("DELETE FROM ocr_boxes WHERE photo_id=?1")?;
         let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
         let mut st_log = tx.prepare_cached(
             "INSERT INTO changes(ts,path,action,photo_id) VALUES(?1,?2,'removed',?3)",
@@ -2042,6 +2209,17 @@ impl Store {
             st_clips_cn.execute(rusqlite::params![id])?;
             st_tiers.execute(rusqlite::params![id])?;
             st_album.execute(rusqlite::params![id])?;
+            // FTS 是外部内容表,删正文前要按原分词发一次 delete。
+            if let Ok(seg) = st_ocr_seg.query_row(rusqlite::params![id], |r| r.get::<_, String>(0)) {
+                let _ = st_fts.execute(rusqlite::params![id, seg]);
+            }
+            st_jobs.execute(rusqlite::params![id])?;
+            st_state.execute(rusqlite::params![id])?;
+            st_failed.execute(rusqlite::params![id])?;
+            st_auto.execute(rusqlite::params![id])?;
+            st_vec.execute(rusqlite::params![id])?;
+            st_docs.execute(rusqlite::params![id])?;
+            st_boxes.execute(rusqlite::params![id])?;
             st_photos.execute(rusqlite::params![id])?;
             st_log.execute(rusqlite::params![ts, path, id])?;
         }
@@ -2212,9 +2390,9 @@ impl Store {
     /// 读取最近的变更记录(倒序)。
     pub fn recent_changes(&self, limit: usize) -> Vec<(i64, String, String)> {
         self.read(move |conn| {
-            let mut st = match conn.prepare(
-                "SELECT ts, path, action FROM changes ORDER BY ts DESC, id DESC LIMIT ?1",
-            ) {
+            let mut st = match conn
+                .prepare("SELECT ts, path, action FROM changes ORDER BY ts DESC, id DESC LIMIT ?1")
+            {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
@@ -2424,6 +2602,12 @@ impl Store {
                         st.execute(rusqlite::params![id])?;
                     }
                 }
+                // FTS 是外部内容表,删正文前要按原分词发一次 delete。
+                let _ = tx.execute_batch(
+                    "INSERT INTO ocr_fts(ocr_fts, rowid, seg)
+                       SELECT 'delete', d.photo_id, d.seg FROM ocr_docs d
+                        WHERE d.photo_id IN (SELECT id FROM purge_ids);",
+                );
                 tx.execute_batch(
                     "DELETE FROM photo_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
                      DELETE FROM face_templates WHERE face_id IN
@@ -2433,6 +2617,13 @@ impl Store {
                      DELETE FROM clips_cn      WHERE photo_id IN (SELECT id FROM purge_ids);
                      DELETE FROM thumb_tiers   WHERE photo_id IN (SELECT id FROM purge_ids);
                      DELETE FROM album_photos  WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM ai_jobs       WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM ai_state      WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM ai_failed     WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM auto_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM clips_vec     WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM ocr_docs      WHERE photo_id IN (SELECT id FROM purge_ids);
+                     DELETE FROM ocr_boxes     WHERE photo_id IN (SELECT id FROM purge_ids);
                      DELETE FROM photos        WHERE id IN (SELECT id FROM purge_ids);",
                 )?;
                 let n = part.len();
@@ -2476,11 +2667,7 @@ impl Store {
     /// 冲突分支**只升不降**:门说在作用域内才可能把 0 抬到 1,已派生(2)与
     /// 坏文件(3)由 [`Store::invalidate_dir`] / [`Store::mark_bad_media`] 管;
     /// 文件变了(mtime 不同)则退回 1 重派生,与 `thumb_ok` 的重置同一口径。
-    pub fn ingest_l1_rows(
-        &self,
-        rows: &[L1Row],
-        gate: Option<&ScopeGate>,
-    ) -> Result<L1Ingest> {
+    pub fn ingest_l1_rows(&self, rows: &[L1Row], gate: Option<&ScopeGate>) -> Result<L1Ingest> {
         if rows.is_empty() {
             return Ok(L1Ingest::default());
         }
@@ -2633,10 +2820,12 @@ impl Store {
             }
         }
         // ② 每个唯一值一次事务性驻留
-        let uniq: Vec<(String, String)> =
-            uniq.into_iter().map(|(p, v)| (p.to_string(), v.to_string())).collect();
-        let db_ids: std::collections::HashMap<(String, String), i64> =
-            self.write(|conn| -> Result<std::collections::HashMap<(String, String), i64>> {
+        let uniq: Vec<(String, String)> = uniq
+            .into_iter()
+            .map(|(p, v)| (p.to_string(), v.to_string()))
+            .collect();
+        let db_ids: std::collections::HashMap<(String, String), i64> = self.write(
+            |conn| -> Result<std::collections::HashMap<(String, String), i64>> {
                 let tx = conn.unchecked_transaction()?;
                 let mut db_ids: std::collections::HashMap<(String, String), i64> =
                     std::collections::HashMap::new();
@@ -2646,7 +2835,8 @@ impl Store {
                 }
                 tx.commit()?;
                 Ok(db_ids)
-            })?;
+            },
+        )?;
         // ③ 展开回原始顺序
         let mut out = Vec::with_capacity(items.len());
         for (p, v) in items {
@@ -2698,9 +2888,9 @@ impl Store {
     /// 返回被迁移的行数。
     pub fn backfill_cam_pool(&self) -> Result<usize> {
         let pending: Vec<(i64, String)> = self.read(|conn| {
-            let mut st = match conn
-                .prepare("SELECT id, cam FROM photos WHERE cam_id IS NULL AND cam IS NOT NULL AND cam<>''")
-            {
+            let mut st = match conn.prepare(
+                "SELECT id, cam FROM photos WHERE cam_id IS NULL AND cam IS NOT NULL AND cam<>''",
+            ) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
@@ -2778,7 +2968,11 @@ impl Store {
             )?;
             let rows = st
                 .query_map(rusqlite::params![crate::timeline::CAM_POOL], |r| {
-                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?))
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
                 })?
                 .filter_map(|x| x.ok())
                 .collect();
@@ -2792,29 +2986,34 @@ impl Store {
     /// (字符串入池只对当前行数组里的值入池)。
     pub fn live_pool_ids(&self) -> Result<std::collections::HashMap<String, crate::pool::HashSet>> {
         self.read(|conn| {
-            let mut st = conn.prepare(
-                "SELECT DISTINCT cam_id FROM photos WHERE cam_id IS NOT NULL",
-            )?;
+            let mut st =
+                conn.prepare("SELECT DISTINCT cam_id FROM photos WHERE cam_id IS NOT NULL")?;
             let ids: Vec<i64> = st
                 .query_map([], |r| r.get::<_, i64>(0))?
                 .filter_map(|x| x.ok())
                 .collect();
             let mut out = std::collections::HashMap::new();
-            out.insert(crate::timeline::CAM_POOL.to_string(), ids.into_iter().collect());
+            out.insert(
+                crate::timeline::CAM_POOL.to_string(),
+                ids.into_iter().collect(),
+            );
             Ok(out)
         })
     }
 
     /// 把当前 `string_pool` 整表读进内存池(供 UI 预估 / 诊断)。
     pub fn load_pool_set(&self) -> Result<crate::pool::PoolSet> {
-        let rows: Vec<(String, i64, String)> = self.read(|conn| -> Result<Vec<(String, i64, String)>> {
-            let mut st = conn.prepare("SELECT pool, value_id, value FROM string_pool ORDER BY pool, value_id")?;
-            let rows: Vec<(String, i64, String)> = st
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .filter_map(|x| x.ok())
-                .collect();
-            Ok(rows)
-        })?;
+        let rows: Vec<(String, i64, String)> =
+            self.read(|conn| -> Result<Vec<(String, i64, String)>> {
+                let mut st = conn.prepare(
+                    "SELECT pool, value_id, value FROM string_pool ORDER BY pool, value_id",
+                )?;
+                let rows: Vec<(String, i64, String)> = st
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                Ok(rows)
+            })?;
         let mut set = crate::pool::PoolSet::new();
         for (pool, id, val) in &rows {
             let got = set.intern(pool, val);
@@ -2840,41 +3039,42 @@ impl Store {
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
 
-        // 存活集:仍被 photos 引用的 id,按升序(保证新编号可复现)
-        let live: Vec<i64> = {
-            let mut st = tx.prepare(
-                "SELECT DISTINCT cam_id FROM photos WHERE cam_id IS NOT NULL ORDER BY cam_id",
-            )?;
-            let rows: Vec<i64> = st
-                .query_map([], |r| r.get::<_, i64>(0))?
-                .filter_map(|x| x.ok())
-                .collect();
-            rows
-        };
-        // 全量池条目,按旧 id 升序
-        let all: Vec<(i64, String)> = {
-            let mut st =
-                tx.prepare("SELECT value_id, value FROM string_pool WHERE pool=?1 ORDER BY value_id")?;
-            let rows: Vec<(i64, String)> = st
-                .query_map(rusqlite::params![pool], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .filter_map(|x| x.ok())
-                .collect();
-            rows
-        };
-        // 内存池先算重映射 —— 这是实际路径:
-        // 内存池被重写(整池序列化),
-        // 再整体落盘。SQL 侧只是这个结果的持久化。
-        let mut mem = crate::pool::ColumnPool::new();
-        for (_, v) in &all {
-            mem.intern(v);
-        }
-        if mem.is_empty() {
-            // 池本来就是空的:无需重建(对齐池序列化的 do-while,count=0 时不进循环)
-            return Ok((0, 0));
-        }
-        let live_set: crate::pool::HashSet = live.iter().copied().collect();
-        let remap = mem.vacuum(&live_set);
-        let orphan_total = all.len().saturating_sub(remap.len());
+            // 存活集:仍被 photos 引用的 id,按升序(保证新编号可复现)
+            let live: Vec<i64> = {
+                let mut st = tx.prepare(
+                    "SELECT DISTINCT cam_id FROM photos WHERE cam_id IS NOT NULL ORDER BY cam_id",
+                )?;
+                let rows: Vec<i64> = st
+                    .query_map([], |r| r.get::<_, i64>(0))?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                rows
+            };
+            // 全量池条目,按旧 id 升序
+            let all: Vec<(i64, String)> = {
+                let mut st = tx.prepare(
+                    "SELECT value_id, value FROM string_pool WHERE pool=?1 ORDER BY value_id",
+                )?;
+                let rows: Vec<(i64, String)> = st
+                    .query_map(rusqlite::params![pool], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                rows
+            };
+            // 内存池先算重映射 —— 这是实际路径:
+            // 内存池被重写(整池序列化),
+            // 再整体落盘。SQL 侧只是这个结果的持久化。
+            let mut mem = crate::pool::ColumnPool::new();
+            for (_, v) in &all {
+                mem.intern(v);
+            }
+            if mem.is_empty() {
+                // 池本来就是空的:无需重建(对齐池序列化的 do-while,count=0 时不进循环)
+                return Ok((0, 0));
+            }
+            let live_set: crate::pool::HashSet = live.iter().copied().collect();
+            let remap = mem.vacuum(&live_set);
+            let orphan_total = all.len().saturating_sub(remap.len());
 
             // 业务表引用(旧号 → 新号)。先全部改完再换池,避免中途态。
             let mut updated = 0usize;
@@ -2885,10 +3085,10 @@ impl Store {
                 }
             }
 
-        // 换池:新内容写临时表,再整体切换(边删边插会撞主键)
-        tx.execute_batch("DROP TABLE IF EXISTS string_pool_new;")?;
-        tx.execute_batch(
-            "CREATE TABLE string_pool_new (
+            // 换池:新内容写临时表,再整体切换(边删边插会撞主键)
+            tx.execute_batch("DROP TABLE IF EXISTS string_pool_new;")?;
+            tx.execute_batch(
+                "CREATE TABLE string_pool_new (
                  pool    TEXT    NOT NULL,
                  value_id INTEGER NOT NULL,
                  value   TEXT    NOT NULL,
@@ -2911,10 +3111,10 @@ impl Store {
             tx.execute_batch(
                 "INSERT INTO string_pool(pool, value_id, value)
              SELECT pool, value_id, value FROM string_pool_new;",
-        )?;
-        tx.execute_batch("DROP TABLE string_pool_new;")?;
-        tx.commit()?;
-        Ok((orphan_total, updated))
+            )?;
+            tx.execute_batch("DROP TABLE string_pool_new;")?;
+            tx.commit()?;
+            Ok((orphan_total, updated))
         })
     }
 
@@ -3112,8 +3312,7 @@ impl Store {
             .unwrap_or_default()
         });
         let excl = crate::scan::Exclusions::from_store(self);
-        cand
-            .into_iter()
+        cand.into_iter()
             .filter(|(_, _, parent)| excl.exclude_layer_dir(Path::new(parent)).is_none())
             .take(limit)
             .map(|(id, path, _)| (id, path))
@@ -3228,7 +3427,10 @@ impl Store {
             .map(|(_, _, d)| {
                 (
                     crate::timeline::CAM_POOL.to_string(),
-                    d.and_then(|d| d.cam.as_deref()).unwrap_or_default().trim().to_string(),
+                    d.and_then(|d| d.cam.as_deref())
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string(),
                 )
             })
             .collect();
@@ -3391,7 +3593,10 @@ impl Store {
     pub fn clear_needs_refresh(&self) -> Result<usize> {
         self.write(|conn| {
             Ok(conn
-                .execute("UPDATE dir_intent SET needs_refresh=0 WHERE needs_refresh<>0", [])
+                .execute(
+                    "UPDATE dir_intent SET needs_refresh=0 WHERE needs_refresh<>0",
+                    [],
+                )
                 .unwrap_or(0))
         })
     }
@@ -3405,7 +3610,10 @@ impl Store {
     pub fn mark_all_dirs_needs_refresh(&self) -> Result<usize> {
         self.write(|conn| {
             Ok(conn
-                .execute("UPDATE dir_intent SET needs_refresh=1 WHERE needs_refresh=0", [])
+                .execute(
+                    "UPDATE dir_intent SET needs_refresh=1 WHERE needs_refresh=0",
+                    [],
+                )
                 .unwrap_or(0))
         })
     }
@@ -3587,11 +3795,9 @@ impl Store {
     /// 路径与父目录由调用方自带(命中本来就是全路径),不必回查。
     pub fn photo_brief_by_id(&self, id: i64) -> Option<(i64, i64)> {
         self.read(|conn| {
-            conn.query_row(
-                "SELECT star, kind FROM photos WHERE id=?1",
-                [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            conn.query_row("SELECT star, kind FROM photos WHERE id=?1", [id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .ok()
         })
     }
@@ -3797,7 +4003,9 @@ pub fn fnv1a64(s: &str) -> u64 {
 
 /// LIKE 通配符转义(\、%、_ 在路径名里出现时避免被当作模式符)。
 fn like_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 /// 目录子树匹配用的两条 LIKE 模式:(直属该目录, 该目录子树)。
@@ -3882,10 +4090,7 @@ mod tests {
     fn parse_location_reads_both_lines_and_ignores_junk() {
         let (d, p) = parse_location("data_dir=D:\\mliang\npending_from=C:\\Users\\x\\AppData\n");
         assert_eq!(d, Some(PathBuf::from("D:\\mliang")));
-        assert_eq!(
-            p,
-            Some(PathBuf::from("C:\\Users\\x\\AppData"))
-        );
+        assert_eq!(p, Some(PathBuf::from("C:\\Users\\x\\AppData")));
         let (d, p) = parse_location("data_dir=\n垃圾行\ndata_dir=E:\\only\n");
         assert_eq!(d, Some(PathBuf::from("E:\\only")), "空行忽略,最后一行生效");
         assert_eq!(p, None);
@@ -3911,7 +4116,10 @@ mod tests {
         std::fs::write(dst.join("index.db"), b"OLD").unwrap();
         assert!(copy_missing_recursive(&src, &dst));
         assert_eq!(std::fs::read(dst.join("index.db")).unwrap(), b"OLD");
-        assert_eq!(std::fs::read(dst.join("sub").join("nameindex.bin")).unwrap(), b"BBB");
+        assert_eq!(
+            std::fs::read(dst.join("sub").join("nameindex.bin")).unwrap(),
+            b"BBB"
+        );
         assert!(!dst.join("maliang.ini").exists(), "统一配置不随迁");
         assert!(!dst.join("data.location").exists(), "旧 marker 不随迁");
         assert!(!dst.join("mft_report.txt").exists());
@@ -3991,7 +4199,10 @@ mod tests {
         let (moved, ok) = relocate_tier_caches(&from, &to);
         assert_eq!(moved, 2, "只搬两档: {moved}");
         assert!(ok);
-        assert_eq!(std::fs::read(to.join("thumbs").join("1.jpg")).unwrap(), b"A");
+        assert_eq!(
+            std::fs::read(to.join("thumbs").join("1.jpg")).unwrap(),
+            b"A"
+        );
         assert_eq!(
             std::fs::read(to.join("smallthumbs").join("2.jpg")).unwrap(),
             b"B"
@@ -4179,7 +4390,10 @@ mod tests {
         assert!(!got.contains_key("D:/Pictures/nope.jpg"));
         // b.jpg 没问就不回:结果只覆盖请求里的路径。
         assert!(!got.contains_key("D:/Pictures/b.jpg"));
-        assert_eq!(store.rich_states_by_paths(&q(&["D:/Pictures/b.jpg"]))["D:/Pictures/b.jpg"], RICH_DONE);
+        assert_eq!(
+            store.rich_states_by_paths(&q(&["D:/Pictures/b.jpg"]))["D:/Pictures/b.jpg"],
+            RICH_DONE
+        );
         assert!(store.rich_states_by_paths(&[]).is_empty());
     }
 
@@ -4278,10 +4492,7 @@ mod tests {
     fn default_roots_are_shell_dirs_never_drive_roots() {
         for p in default_roots() {
             assert!(p.exists(), "默认根不存在:{p:?}");
-            assert!(
-                p.parent().is_some(),
-                "默认根不允许是盘根/卷根:{p:?}"
-            );
+            assert!(p.parent().is_some(), "默认根不允许是盘根/卷根:{p:?}");
         }
     }
 
@@ -4296,12 +4507,18 @@ mod tests {
         assert_eq!(roots, default_roots(), "首扫根应等于落账的作用域根");
         assert!(!store.watched_stats().is_empty());
         assert!(store.scope_initialized());
-        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("limited"));
+        assert_eq!(
+            store.get_setting("initial_scope").as_deref(),
+            Some("limited")
+        );
         let gate = ScopeGate::load(&store);
         assert!(!gate.is_empty(), "落账后门不该再是空的");
         // 第二次调用是空操作(已初始化)。
         assert!(store.apply_initial_scope(true).is_empty());
-        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("limited"));
+        assert_eq!(
+            store.get_setting("initial_scope").as_deref(),
+            Some("limited")
+        );
     }
 
     /// 全盘档:每个可扫卷根各落一条意图,靠最长前缀命中覆盖卷内任意子目录;
@@ -4310,7 +4527,10 @@ mod tests {
     fn initial_scope_complete_ledgers_volume_roots_only() {
         let store = Store::open_mem().unwrap();
         let roots = store.apply_initial_scope(true);
-        assert_eq!(store.get_setting("initial_scope").as_deref(), Some("complete"));
+        assert_eq!(
+            store.get_setting("initial_scope").as_deref(),
+            Some("complete")
+        );
         for r in &roots {
             let s = r.to_string_lossy().into_owned();
             assert_eq!(
@@ -4384,7 +4604,10 @@ mod tests {
     #[test]
     fn adoptable_dir_splits_hard_and_soft_excludes_posix() {
         let store = Store::open_mem().unwrap();
-        assert!(store.adoptable_dir("/home/me/Photos/coco", false), "普通照片目录该放行");
+        assert!(
+            store.adoptable_dir("/home/me/Photos/coco", false),
+            "普通照片目录该放行"
+        );
         assert!(!store.adoptable_dir("", true), "空路径不是一条目录");
 
         // 硬排除:点开头目录 / 同名目录 / 我们的系统目录 —— deliberate 也救不回来。
@@ -4397,7 +4620,10 @@ mod tests {
             "/home/me/Pictures/Originals",
         ] {
             assert!(!store.adoptable_dir(d, false), "{d} 属于硬排除");
-            assert!(!store.adoptable_dir(d, true), "{d} 是硬排除,明确点名也不放行");
+            assert!(
+                !store.adoptable_dir(d, true),
+                "{d} 是硬排除,明确点名也不放行"
+            );
         }
         let own = cache_dir_loc().join("thumbs").join("a.jpg");
         assert!(
@@ -4442,7 +4668,11 @@ mod tests {
             .set_dir_intent(&DirIntent::new("/", INTENT_IMPORTED, SRC_INITIAL_DIALOG))
             .unwrap();
         let map = ScopeMap::load(&store);
-        assert_eq!(map.state_of("/srv/photos"), Some(INTENT_IMPORTED), "POSIX 根该被命中");
+        assert_eq!(
+            map.state_of("/srv/photos"),
+            Some(INTENT_IMPORTED),
+            "POSIX 根该被命中"
+        );
         let (eq, sub) = dir_like("/home/me/Pictures");
         assert_eq!(eq, "/home/me/Pictures");
         assert_eq!(sub, "/home/me/Pictures/%");
@@ -4504,58 +4734,58 @@ mod tests {
             "打过标记不再重跑"
         );
 
-    /// 同一条清库规则在 POSIX 路径上的对偶:回收站那行的分隔符是 `/`。
-    #[cfg(not(windows))]
-    #[test]
-    fn purge_hard_excluded_drops_own_cache_and_recycle_bin_rows_posix() {
-        let store = Store::open_mem().unwrap();
-        let loc = cache_dir_loc();
-        let own = loc.join("thumbs").join("a.jpg");
-        {
-            let c = store.test_conn();
-            c.execute(
-                "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
+        /// 同一条清库规则在 POSIX 路径上的对偶:回收站那行的分隔符是 `/`。
+        #[cfg(not(windows))]
+        #[test]
+        fn purge_hard_excluded_drops_own_cache_and_recycle_bin_rows_posix() {
+            let store = Store::open_mem().unwrap();
+            let loc = cache_dir_loc();
+            let own = loc.join("thumbs").join("a.jpg");
+            {
+                let c = store.test_conn();
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size,rich_state) VALUES
                  (1,?1,?2,0,0,0),
                  (2,'/mnt/win/$RECYCLE.BIN/S-1/$R9X.jpg','/mnt/win/$RECYCLE.BIN/S-1',0,0,0),
                  (3,'/home/me/pics/b.jpg','/home/me/pics',0,0,2)",
-                rusqlite::params![own.to_string_lossy(), loc.join("thumbs").to_string_lossy()],
-            )
-            .unwrap();
-            c.execute("INSERT INTO tags(id,name) VALUES(7,'t')", [])
-                .unwrap();
-            c.execute(
-                "INSERT INTO photo_tags(photo_id,tag_id) VALUES(1,7),(3,7)",
-                [],
-            )
-            .unwrap();
-        }
-        store.set_setting("hard_excluded_purged", "stale").unwrap();
-        let n = store.purge_hard_excluded_once().unwrap();
-        assert_eq!(n, 2, "自家 thumbs 与回收站那两行该被清掉");
-        let left: Vec<i64> = store.read(|conn| {
-            let mut st = conn.prepare("SELECT id FROM photos ORDER BY id").unwrap();
-            st.query_map([], |r| r.get(0))
-                .unwrap()
-                .filter_map(|r| r.ok())
-                .collect()
-        });
-        assert_eq!(left, vec![3], "只留没被硬排除的那行");
-        let orphan: i64 = store
-            .read(|conn| {
-                conn.query_row(
-                    "SELECT COUNT(*) FROM photo_tags WHERE photo_id=1",
-                    [],
-                    |r| r.get(0),
+                    rusqlite::params![own.to_string_lossy(), loc.join("thumbs").to_string_lossy()],
                 )
-            })
-            .unwrap();
-        assert_eq!(orphan, 0, "被删照片的标签关联要跟着走");
-        assert_eq!(
-            store.purge_hard_excluded_once().unwrap(),
-            0,
-            "已经打过标记就不再重扫",
-        );
-    }
+                .unwrap();
+                c.execute("INSERT INTO tags(id,name) VALUES(7,'t')", [])
+                    .unwrap();
+                c.execute(
+                    "INSERT INTO photo_tags(photo_id,tag_id) VALUES(1,7),(3,7)",
+                    [],
+                )
+                .unwrap();
+            }
+            store.set_setting("hard_excluded_purged", "stale").unwrap();
+            let n = store.purge_hard_excluded_once().unwrap();
+            assert_eq!(n, 2, "自家 thumbs 与回收站那两行该被清掉");
+            let left: Vec<i64> = store.read(|conn| {
+                let mut st = conn.prepare("SELECT id FROM photos ORDER BY id").unwrap();
+                st.query_map([], |r| r.get(0))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect()
+            });
+            assert_eq!(left, vec![3], "只留没被硬排除的那行");
+            let orphan: i64 = store
+                .read(|conn| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM photo_tags WHERE photo_id=1",
+                        [],
+                        |r| r.get(0),
+                    )
+                })
+                .unwrap();
+            assert_eq!(orphan, 0, "被删照片的标签关联要跟着走");
+            assert_eq!(
+                store.purge_hard_excluded_once().unwrap(),
+                0,
+                "已经打过标记就不再重扫",
+            );
+        }
     }
 
     /// 双向对账:撤出作用域的目录要退回占位,新纳入的目录要放出去派生。
@@ -4675,8 +4905,11 @@ mod tests {
                 [],
             )
             .unwrap();
-            c.execute("INSERT INTO bad_media(path,reason,since) VALUES('/p/bad.jpg','x',0)", [])
-                .unwrap();
+            c.execute(
+                "INSERT INTO bad_media(path,reason,since) VALUES('/p/bad.jpg','x',0)",
+                [],
+            )
+            .unwrap();
         }
         assert_eq!(store.promote_photos(&[1, 4]).unwrap(), 1, "坏文件不复活");
         // 台账说已生成、但磁盘缓存没了的行,按张放行要一并退回待派生。
@@ -4840,11 +5073,16 @@ mod tests {
             .unwrap();
         }
         let stats = store.watched_stats();
-        assert_eq!(stats, vec![("/data/pics".to_string(), 2)], "应含子文件夹,不含 /other");
+        assert_eq!(
+            stats,
+            vec![("/data/pics".to_string(), 2)],
+            "应含子文件夹,不含 /other"
+        );
         store.remove_watched(Path::new("/data/pics")).unwrap();
         assert!(store.watched_stats().is_empty());
         // 索引不受影响
-        let n: i64 = store.test_conn()
+        let n: i64 = store
+            .test_conn()
             .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 3);
@@ -4874,7 +5112,11 @@ mod tests {
     fn mark_missing_clears_related_rows() {
         let store = Store::open_mem().unwrap();
         let keep = format!("{}/keep.jpg", std::env::temp_dir().display());
-        let gone = format!("{}/definitely-not-here-{}.jpg", std::env::temp_dir().display(), std::process::id());
+        let gone = format!(
+            "{}/definitely-not-here-{}.jpg",
+            std::env::temp_dir().display(),
+            std::process::id()
+        );
         std::fs::write(&keep, b"x").unwrap();
         {
             let c = store.test_conn();
@@ -4889,7 +5131,11 @@ mod tests {
             )
             .unwrap();
             let gone_id: i64 = c
-                .query_row("SELECT id FROM photos WHERE path=?1", rusqlite::params![gone], |r| r.get(0))
+                .query_row(
+                    "SELECT id FROM photos WHERE path=?1",
+                    rusqlite::params![gone],
+                    |r| r.get(0),
+                )
                 .unwrap();
             // 给"已缺失"那张挂上全部关联行
             c.execute(
@@ -4926,12 +5172,80 @@ mod tests {
             ("clips", "photo_id"),
             ("photo_tags", "photo_id"),
         ] {
-            let q = format!("SELECT COUNT(*) FROM {tbl} WHERE {col} IN (SELECT id FROM photos WHERE path=?1)");
-            let n: i64 = c.query_row(&q, rusqlite::params![gone], |r| r.get(0)).unwrap();
+            let q = format!(
+                "SELECT COUNT(*) FROM {tbl} WHERE {col} IN (SELECT id FROM photos WHERE path=?1)"
+            );
+            let n: i64 = c
+                .query_row(&q, rusqlite::params![gone], |r| r.get(0))
+                .unwrap();
             assert_eq!(n, 0, "{tbl} 应为空");
         }
-        let n_photos: i64 = c.query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0)).unwrap();
+        let n_photos: i64 = c
+            .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n_photos, 1, "存在的照片必须保留");
+    }
+
+    /// 删照片时 AI 队列/台账/标签/向量/OCR 与全文索引一并清,避免 id 复用串图。
+    #[test]
+    fn delete_photo_clears_ai_rows_and_fts() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute_batch(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(42,'C:/gone.jpg','C:/',0,0);
+                 INSERT INTO ai_jobs(stage,photo_id,priority,enqueued_ts,attempts) VALUES('clip',42,6,0,0);
+                 INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES(42,'clip','v1',0);
+                 INSERT INTO ai_failed(photo_id,stage,err,attempts,ts) VALUES(42,'clip','e',3,0);
+                 INSERT INTO clips_vec(photo_id,ver,dim,embedding) VALUES(42,'v1',1,X'00');
+                 INSERT INTO tag_labels(id,node,name_zh,name_en,prompt_en,builtin,ver)
+                     VALUES(1,'人物','合影','group','a group',1,'v1');
+                 INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(42,1,0.9,'v1');
+                 INSERT INTO ocr_docs(photo_id,text,seg,line_count,char_count,model_ver,done_ts)
+                     VALUES(42,'发票','发 票',1,2,'v1',0);
+                 INSERT INTO ocr_fts(rowid,seg) VALUES(42,'发 票');
+                 INSERT INTO ocr_boxes(photo_id,line_no) VALUES(42,0);",
+            )
+            .unwrap();
+        }
+        {
+            let c = store.test_conn();
+            let tx = c.unchecked_transaction().unwrap();
+            Store::delete_photo_rows(&tx, &[(42, "C:/gone.jpg".into())]).unwrap();
+            tx.commit().unwrap();
+        }
+        let c = store.test_conn();
+        let ai_tables = [
+            "ai_jobs", "ai_state", "ai_failed", "clips_vec", "auto_tags", "ocr_docs",
+            "ocr_boxes",
+        ];
+        for tbl in ai_tables {
+            let q = format!("SELECT COUNT(*) FROM {tbl} WHERE photo_id=42");
+            let n: i64 = c.query_row(&q, [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{tbl} 应随照片一起删除");
+        }
+        let fts: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM ocr_fts WHERE ocr_fts MATCH '发 票'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 0, "OCR 全文索引不该留下已删照片");
+        let labels: i64 = c
+            .query_row("SELECT COUNT(*) FROM tag_labels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(labels, 1, "标签词表是全局数据,不能跟着照片删");
+        c.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(42,'C:/new.jpg','C:/',0,0)",
+            [],
+        )
+        .unwrap();
+        for tbl in ai_tables {
+            let q = format!("SELECT COUNT(*) FROM {tbl} WHERE photo_id=42");
+            let n: i64 = c.query_row(&q, [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "{tbl} 不该被复用 id 的新照片继承");
+        }
     }
 
     /// 监听线程的精确对账:只删给定且确实不存在的路径,仍存在的跳过。
@@ -4972,7 +5286,8 @@ mod tests {
                 rusqlite::params![gone_id],
             )
             .unwrap();
-            c.execute("INSERT INTO albums(name,ts) VALUES('a',0)", []).unwrap();
+            c.execute("INSERT INTO albums(name,ts) VALUES('a',0)", [])
+                .unwrap();
             let album_id = c.last_insert_rowid();
             c.execute(
                 "INSERT INTO album_photos(album_id,photo_id,pos) VALUES(?1,?2,0)",
@@ -5206,7 +5521,11 @@ mod tests {
             .into_iter()
             .map(|(id, _)| id)
             .collect();
-        assert_eq!(ids, vec![2, 3, 1], "可见的拿完了,不足一批用全库补齐且不重复");
+        assert_eq!(
+            ids,
+            vec![2, 3, 1],
+            "可见的拿完了,不足一批用全库补齐且不重复"
+        );
     }
 
     #[test]
@@ -5319,7 +5638,9 @@ mod tests {
         // 业务表引用已同步
         let conn = store.test_conn();
         let ids: Vec<i64> = {
-            let mut st = conn.prepare("SELECT cam_id FROM photos ORDER BY id").unwrap();
+            let mut st = conn
+                .prepare("SELECT cam_id FROM photos ORDER BY id")
+                .unwrap();
             let v = st
                 .query_map([], |r| r.get::<_, i64>(0))
                 .unwrap()
@@ -5466,7 +5787,8 @@ mod tests {
     #[test]
     fn new_db_has_star_column() {
         let store = Store::open_mem().unwrap();
-        let cols: Vec<String> = store.test_conn()
+        let cols: Vec<String> = store
+            .test_conn()
             .prepare("PRAGMA table_info(photos)")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(1))
@@ -5474,12 +5796,16 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(cols.contains(&"star".to_string()), "photos 列: {cols:?}");
-        assert!(cols.contains(&"xmp_imported".to_string()), "photos 列: {cols:?}");
+        assert!(
+            cols.contains(&"xmp_imported".to_string()),
+            "photos 列: {cols:?}"
+        );
         assert!(cols.contains(&"dhash".to_string()), "photos 列: {cols:?}");
         assert!(cols.contains(&"baked".to_string()), "photos 列: {cols:?}");
         assert!(cols.contains(&"lat".to_string()), "photos 列: {cols:?}");
         assert!(cols.contains(&"lon".to_string()), "photos 列: {cols:?}");
-        let tcols: Vec<String> = store.test_conn()
+        let tcols: Vec<String> = store
+            .test_conn()
             .prepare("PRAGMA table_info(tags)")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(1))
@@ -5487,15 +5813,22 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert!(tcols.contains(&"color".to_string()), "tags 列: {tcols:?}");
-        let fcols: Vec<String> = store.test_conn()
+        let fcols: Vec<String> = store
+            .test_conn()
             .prepare("PRAGMA table_info(faces)")
             .unwrap()
             .query_map([], |r| r.get::<_, String>(1))
             .unwrap()
             .filter_map(|r| r.ok())
             .collect();
-        assert!(fcols.contains(&"quality".to_string()), "faces 列: {fcols:?}");
-        assert!(fcols.contains(&"ignored".to_string()), "faces 列: {fcols:?}");
+        assert!(
+            fcols.contains(&"quality".to_string()),
+            "faces 列: {fcols:?}"
+        );
+        assert!(
+            fcols.contains(&"ignored".to_string()),
+            "faces 列: {fcols:?}"
+        );
     }
 
     // ===== uid64 =====
@@ -5532,13 +5865,15 @@ mod tests {
         assert_eq!(store.backfill_uid64().unwrap(), 0);
 
         // 按标识查询。
-        let uid: i64 = store.test_conn()
+        let uid: i64 = store
+            .test_conn()
             .query_row("SELECT uid64 FROM photos WHERE path='/x/a.jpg'", [], |r| {
                 r.get(0)
             })
             .unwrap();
         let id = store.photo_by_uid64(uid as u64).expect("应能按 uid64 查到");
-        let path: String = store.test_conn()
+        let path: String = store
+            .test_conn()
             .query_row("SELECT path FROM photos WHERE id=?1", [id], |r| r.get(0))
             .unwrap();
         assert_eq!(path, "/x/a.jpg");
@@ -5612,11 +5947,13 @@ mod tests {
         assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
         // 派生完成是 thumb_ok 与 rich_state 一起落定(mark_derived 一条语句):
         // 只改 thumb_ok 却还停在排队态,属于要重做的行,仍会出队。
-        store.test_conn()
+        store
+            .test_conn()
             .execute("UPDATE photos SET thumb_ok=1 WHERE id=?1", [pid])
             .unwrap();
         assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
-        store.test_conn()
+        store
+            .test_conn()
             .execute("UPDATE photos SET rich_state=2 WHERE id=?1", [pid])
             .unwrap();
         assert!(store.missing_tier(TIER_NORMAL, &[], 10).is_empty());
@@ -5656,17 +5993,35 @@ mod tests {
     #[test]
     fn l1_ingest_inserts_then_updates_same_identity() {
         let store = Store::open_mem().unwrap();
-        let c = store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
-        assert_eq!(c, L1Ingest { inserted: 1, updated: 0 });
+        let c = store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None)
+            .unwrap();
+        assert_eq!(
+            c,
+            L1Ingest {
+                inserted: 1,
+                updated: 0
+            }
+        );
         let id: i64 = store
             .test_conn()
-            .query_row("SELECT id FROM photos WHERE path=?1", [r"C:\pics\a.jpg"], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM photos WHERE path=?1",
+                [r"C:\pics\a.jpg"],
+                |r| r.get(0),
+            )
             .unwrap();
         // 同 FRN 改名 + 变大 → 命中同一行,身份与外部引用都不换。
         let c = store
             .ingest_l1_rows(&[row('C', 0x100, r"C:\albums\b.jpg", 2000, 8192)], None)
             .unwrap();
-        assert_eq!(c, L1Ingest { inserted: 0, updated: 1 });
+        assert_eq!(
+            c,
+            L1Ingest {
+                inserted: 0,
+                updated: 1
+            }
+        );
         let conn = store.test_conn();
         let (n, path, size, mtime): (i64, String, i64, i64) = conn
             .query_row(
@@ -5679,7 +6034,11 @@ mod tests {
         assert_eq!(path, r"C:\albums\b.jpg");
         assert_eq!((size, mtime), (8192, 2000));
         let same_id: i64 = conn
-            .query_row("SELECT id FROM photos WHERE path=?1", [r"C:\albums\b.jpg"], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM photos WHERE path=?1",
+                [r"C:\albums\b.jpg"],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(same_id, id, "行 id 不变 → 星标/标签/说明都还在");
     }
@@ -5687,12 +6046,17 @@ mod tests {
     #[test]
     fn l1_ingest_rename_keeps_uid64_and_stars() {
         let store = Store::open_mem().unwrap();
-        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
+        store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None)
+            .unwrap();
         let uid_before: i64 = store
             .test_conn()
             .query_row("SELECT uid64 FROM photos", [], |r| r.get(0))
             .unwrap();
-        store.test_conn().execute("UPDATE photos SET star=5", []).unwrap();
+        store
+            .test_conn()
+            .execute("UPDATE photos SET star=5", [])
+            .unwrap();
         store
             .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\renamed.jpg", 1000, 4096)], None)
             .unwrap();
@@ -5709,21 +6073,23 @@ mod tests {
     #[test]
     fn l1_ingest_mtime_change_keeps_old_thumb_and_requeues() {
         let store = Store::open_mem().unwrap();
-        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None).unwrap();
+        store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 1000, 4096)], None)
+            .unwrap();
         store
             .test_conn()
             .execute("UPDATE photos SET thumb_ok=1, dhash=123, rich_state=2", [])
             .unwrap();
         // 内容变了(mtime 前进)→ 只重新排队。旧缩略图继续显示、旧 dhash
         // 让重复分组不散,等后台重派生完成时一次性覆盖。
-        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 2000, 5000)], None).unwrap();
+        store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a.jpg", 2000, 5000)], None)
+            .unwrap();
         let (thumb, dhash, rich): (i64, Option<i64>, i32) = store
             .test_conn()
-            .query_row(
-                "SELECT thumb_ok, dhash, rich_state FROM photos",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            .query_row("SELECT thumb_ok, dhash, rich_state FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
         assert_eq!((thumb, dhash), (1, Some(123)));
         assert_eq!(rich, RICH_PENDING, "内容变了要重新排队");
@@ -5732,14 +6098,14 @@ mod tests {
             .test_conn()
             .execute("UPDATE photos SET thumb_ok=1, dhash=999, rich_state=2", [])
             .unwrap();
-        store.ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a2.jpg", 2000, 5000)], None).unwrap();
+        store
+            .ingest_l1_rows(&[row('C', 0x100, r"C:\pics\a2.jpg", 2000, 5000)], None)
+            .unwrap();
         let (thumb, dhash, rich): (i64, Option<i64>, i32) = store
             .test_conn()
-            .query_row(
-                "SELECT thumb_ok, dhash, rich_state FROM photos",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+            .query_row("SELECT thumb_ok, dhash, rich_state FROM photos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
             .unwrap();
         assert_eq!((thumb, dhash, rich), (1, Some(999), RICH_DONE));
     }
@@ -5758,7 +6124,13 @@ mod tests {
         let c = store
             .ingest_l1_rows(&[row('C', 0x200, r"C:\pics\slot.jpg", 10, 20)], None)
             .unwrap();
-        assert_eq!(c, L1Ingest { inserted: 1, updated: 0 });
+        assert_eq!(
+            c,
+            L1Ingest {
+                inserted: 1,
+                updated: 0
+            }
+        );
         let n: i64 = store
             .test_conn()
             .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))

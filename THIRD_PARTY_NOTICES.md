@@ -51,6 +51,13 @@ SOFTWARE.
 | `clip_vision.onnx` | 图像编码器(ONNX 导出) | [openai/CLIP](https://github.com/openai/CLIP),MIT |
 | `clip_text.onnx` | 文本编码器(ONNX 导出) | [openai/CLIP](https://github.com/openai/CLIP),MIT |
 | `clip_merges.txt` | BPE 合并表(随 CLIP 模型一同发布) | [openai/CLIP](https://github.com/openai/CLIP),MIT |
+| `clip_vision/…/vision.onnx` | MobileCLIP2-S2 图像编码器 | [apple/ml-mobileclip](https://github.com/apple/ml-mobileclip),许可以官方仓库与模型卡为准 |
+| `clip_text/…/text.onnx` + `merges.txt` | MobileCLIP2-S2 文本编码器与分词表 | 同上 |
+| `mt_zh_en/…/encoder.onnx`、`decoder.onnx`、`vocab.txt` | Opus-MT 中→英翻译 | [Helsinki-NLP/opus-mt-zh-en](https://huggingface.co/Helsinki-NLP/opus-mt-zh-en),CC-BY-4.0 |
+| `ocr_det/…/det.onnx` | PP-OCRv4 文字检测 | [PaddlePaddle/PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR),Apache-2.0 |
+| `ocr_cls/…/cls.onnx` | PP-OCR 文字方向分类 | 同上 |
+| `ocr_rec/…/rec.onnx`、`ppocr_keys_v1.txt` | PP-OCRv4 文字识别与字典 | 同上 |
+| `llm_parse/…/model.onnx` | 可选查询解析模型 | 由用户自行获取,许可以所选模型发布为准 |
 
 上述资源的权利归各自权利人所有,其许可条款以其发布渠道为准。
 各模型的具体获取方式(含 AdaFace 权重转 ONNX 步骤)见
@@ -121,6 +128,40 @@ SOFTWARE.
   manual-downloading models*(仅限非商用研究用途,涵盖其发布的全部模型包)。
 * **涉及范围**:保留为可选方案(选项 > 常规 可切换),权重由用户自行获取、
   自担许可义务,不在本仓库分发,本项目也从不分发其权重、从不代其下载。
+
+### MobileCLIP2(默认语义编码器)
+
+* **作品**:MobileCLIP2-S2 视觉/文本双编码器(ONNX 导出)
+* **来源**:https://github.com/apple/ml-mobileclip;官方权重
+  `mobileclip2_s2.pt`(https://huggingface.co/apple/MobileCLIP2-S2)经
+  `reparameterize_model` 后导出为 `vision.onnx` / `text.onnx`
+* **许可**:以官方仓库与 HuggingFace 模型卡发布为准;权重不在本仓库分发,
+  由应用在运行时从 ModelURL(内置默认地址)下载。
+* **涉及范围**:`src/clip.rs` 的推理与预处理(短边 256、居中裁剪、0~1 缩放,
+  不做均值方差归一化)按公开输入签名实现,未复制其训练代码。
+
+### Opus-MT(中文查询翻译)
+
+* **作品**:Helsinki-NLP Opus-MT zh→en 翻译模型(encoder/decoder 与词表)
+* **来源**:https://huggingface.co/Helsinki-NLP/opus-mt-zh-en
+* **许可**:CC-BY-4.0,使用时保留归属与许可声明;权重由用户或应用在运行时获取,
+  本项目不在仓库中分发。
+* **涉及范围**:`src/ai_text.rs` 的 `MtTranslator` 为独立实现的贪心解码器,
+  未复制上游代码;分词仅做词表最长匹配。
+
+### PP-OCRv4(文字识别)
+
+* **作品**:PaddleOCR PP-OCRv4 检测/方向/识别模型与 `ppocr_keys_v1.txt` 字典
+* **来源**:https://github.com/PaddlePaddle/PaddleOCR;ONNX 权重取自 RapidOCR 镜像
+  https://www.modelscope.cn/models/RapidAI/RapidOCR
+* **许可**:Apache License 2.0;权重由用户或应用在运行时获取,不在本仓库分发。
+* **涉及范围**:`src/ai.rs` 的 OCR 前处理、裁剪与解码按公开模型输入输出实现。
+
+### 可选查询解析模型
+
+* **作品**:0.5~0.6B instruct 模型(仅 M5 可选能力使用)
+* **来源与许可**:由用户自行选择并获取,以所选模型的发布条款为准。
+* **涉及范围**:本项目只调用其 ONNX 推理接口并解析 JSON 输出,不分发权重。
 
 ---
 

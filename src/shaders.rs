@@ -87,7 +87,15 @@ pub fn hexcells(img: &mut RgbaImage, cell: f32) {
 }
 
 /// 块状波纹(RippleBlocks):按横纵正弦/余弦位移对整幅图做波纹扰动。
-pub fn ripple_blocks(img: &mut RgbaImage, ax: f32, ay: f32, bx: f32, by: f32, ph_x: f32, ph_y: f32) {
+pub fn ripple_blocks(
+    img: &mut RgbaImage,
+    ax: f32,
+    ay: f32,
+    bx: f32,
+    by: f32,
+    ph_x: f32,
+    ph_y: f32,
+) {
     let (w, h) = img.dimensions();
     let src = img.clone();
     let bx = clamp_grid(bx);
@@ -145,11 +153,17 @@ pub fn crystallize(img: &mut RgbaImage, cell: f32) {
             let (px, py) = (fx - 2400.0, fy + 100.0);
             let i = ((py * -0.309 + px * 0.951) / cell).floor() + 0.5;
             let j = ((px * 0.309 + py * 0.951) / cell).floor() + 0.5;
-            let one = (i * cell * 0.951 + j * cell * 0.309 + 2400.0, i * cell * -0.309 + j * cell * 0.951 - 100.0);
+            let one = (
+                i * cell * 0.951 + j * cell * 0.309 + 2400.0,
+                i * cell * -0.309 + j * cell * 0.951 - 100.0,
+            );
             let (px, py) = (fx + 100.0, fy - 2400.0);
             let i = ((py * -0.5 + px * 0.866) / cell).floor() + 0.5;
             let j = ((px * 0.5 + py * 0.866) / cell).floor() + 0.5;
-            let two = (i * cell * 0.866 + j * cell * 0.5 - 100.0, i * cell * -0.5 + j * cell * 0.866 + 2400.0);
+            let two = (
+                i * cell * 0.866 + j * cell * 0.5 - 100.0,
+                i * cell * -0.5 + j * cell * 0.866 + 2400.0,
+            );
             let d1 = (one.0 - fx) * (one.0 - fx) + (one.1 - fy) * (one.1 - fy);
             let d2 = (two.0 - fx) * (two.0 - fx) + (two.1 - fy) * (two.1 - fy);
             let (mut bx, mut by) = if d1 <= d2 { one } else { two };
@@ -407,7 +421,11 @@ mod tests {
         circle_splash(&mut img, 0.5, 0.5, 4.0);
         // 圆心(半径内)与圆周上的像素保持原样
         assert_eq!(img.get_pixel(8, 8).0, src.get_pixel(8, 8).0, "圆内应原样");
-        assert_eq!(img.get_pixel(8, 12).0, src.get_pixel(8, 12).0, "圆周本身原样");
+        assert_eq!(
+            img.get_pixel(8, 12).0,
+            src.get_pixel(8, 12).0,
+            "圆周本身原样"
+        );
         assert_eq!(
             img.get_pixel(8, 0).0,
             src.get_pixel(8, 4).0,
@@ -471,8 +489,16 @@ mod tests {
             );
         }
         // 线下方保持原样
-        assert_eq!(img.get_pixel(3, 12).0, src.get_pixel(3, 12).0, "另一侧应原样");
-        assert_eq!(img.get_pixel(3, 8).0, src.get_pixel(3, 8).0, "折叠线本身不变");
+        assert_eq!(
+            img.get_pixel(3, 12).0,
+            src.get_pixel(3, 12).0,
+            "另一侧应原样"
+        );
+        assert_eq!(
+            img.get_pixel(3, 8).0,
+            src.get_pixel(3, 8).0,
+            "折叠线本身不变"
+        );
     }
 
     #[test]
@@ -481,12 +507,20 @@ mod tests {
         // 90..180:线右侧的列塌到线上
         let mut img = src.clone();
         waterfall(&mut img, 0.5, 0.5, 120.0);
-        assert_eq!(img.get_pixel(15, 2).0, src.get_pixel(8, 2).0, "右侧应塌到线上");
+        assert_eq!(
+            img.get_pixel(15, 2).0,
+            src.get_pixel(8, 2).0,
+            "右侧应塌到线上"
+        );
         assert_eq!(img.get_pixel(2, 15).0, src.get_pixel(2, 15).0, "左侧应原样");
         // 270:线左侧的列塌到线上
         let mut img = src.clone();
         waterfall(&mut img, 0.5, 0.5, 270.0);
-        assert_eq!(img.get_pixel(0, 2).0, src.get_pixel(8, 2).0, "左侧应塌到线上");
+        assert_eq!(
+            img.get_pixel(0, 2).0,
+            src.get_pixel(8, 2).0,
+            "左侧应塌到线上"
+        );
         assert_eq!(img.get_pixel(15, 2).0, src.get_pixel(15, 2).0, "右侧应原样");
         // 出界恒等
         for bad in [-1.0, 271.0] {
