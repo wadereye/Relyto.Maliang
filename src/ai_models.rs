@@ -16,7 +16,7 @@ pub struct SlotSpec {
     pub key: &'static str,
     pub label: &'static str,
     pub license: &'static str,
-    /// 权重许可不允许代分发时只能手动导入。
+    /// 无可验证直链或许可不允许代分发时只能手动导入。
     pub manual: bool,
     /// 版本目录内必须齐备的文件名,首个是主文件。
     pub files: &'static [&'static str],
@@ -50,7 +50,7 @@ pub const SLOTS: [SlotSpec; 8] = [
         key: "mt_zh_en",
         label: "Opus-MT 中→英",
         license: "CC-BY-4.0",
-        manual: false,
+        manual: true,
         files: &["encoder.onnx", "decoder.onnx", "vocab.txt"],
         legacy: &["mt_encoder.onnx", "mt_decoder.onnx", "mt_vocab.txt"],
         stage: None,
@@ -86,7 +86,7 @@ pub const SLOTS: [SlotSpec; 8] = [
         key: "llm_parse",
         label: "查询解析(可选)",
         license: "Apache-2.0",
-        manual: false,
+        manual: true,
         files: &["model.onnx"],
         legacy: &[],
         stage: None,
@@ -95,7 +95,7 @@ pub const SLOTS: [SlotSpec; 8] = [
         key: "face_det",
         label: "人脸检测 / 识别",
         license: "Apache-2.0",
-        manual: false,
+        manual: true,
         files: &["face_det.onnx", "face_rec_sface.onnx"],
         legacy: &["face_det.onnx", "face_rec_sface.onnx"],
         stage: None,
@@ -172,6 +172,23 @@ pub const ASSETS: &[AssetSlot] = &[
             bytes: 585532,
             sha256: "e47acedf663230f8863ff1ab0e64dd2d82b838fceb5957146dab185a89d6215c",
         }],
+    },
+    AssetSlot {
+        slot: "face_det",
+        assets: &[
+            ModelAsset {
+                file: "face_det.onnx",
+                url: "",
+                bytes: 16923827,
+                sha256: "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+            },
+            ModelAsset {
+                file: "face_rec_sface.onnx",
+                url: "",
+                bytes: 38696353,
+                sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+            },
+        ],
     },
     AssetSlot {
         slot: "ocr_rec",
@@ -455,7 +472,9 @@ pub fn resolve(store: &Store, slot: &str) -> Option<Resolved> {
 /// 槽位某文件的实际路径(按槽位约定顺序)。
 pub fn file_path(store: &Store, slot: &str, file: &str) -> Option<PathBuf> {
     let r = resolve(store, slot)?;
-    Some(r.dir.join(file))
+    let p = r.dir.join(file);
+    // 旧平铺模型没有新文件名,不校验存在会让 legacy 误判为新链路就绪。
+    p.is_file().then_some(p)
 }
 
 /// 槽位版本签名;未安装时为 "none"。
@@ -494,7 +513,11 @@ pub fn stage_signature(store: &Store, stage: Stage) -> Option<String> {
 pub fn stage_ready(store: &Store, stage: Stage) -> bool {
     match stage {
         Stage::Clip => {
-            resolve(store, "clip_vision").is_some() && resolve(store, "clip_text").is_some()
+            // 只认新链路的产物文件名,旧平铺模型不算就绪。
+            file_path(store, "clip_vision", "vision.onnx").is_some()
+                && file_path(store, "clip_text", "text.onnx").is_some()
+                && (file_path(store, "clip_text", "merges.txt").is_some()
+                    || file_path(store, "clip_text", "clip_merges.txt").is_some())
         }
         Stage::Tags => stage_ready(store, Stage::Clip) && crate::ai_tags::label_count(store) > 0,
         Stage::Ocr => resolve(store, "ocr_det").is_some() && resolve(store, "ocr_rec").is_some(),
@@ -1307,6 +1330,22 @@ mod tests {
         );
         assert_eq!(custom[0].url, "https://example.com/det.onnx");
         assert!(custom[0].sha256.is_empty());
+    }
+
+    #[test]
+    fn manual_slots_match_download_capability() {
+        use crate::models::SourcePref;
+        for key in ["mt_zh_en", "llm_parse", "face_det"] {
+            assert!(spec(key).unwrap().manual, "{key} 应标为手动放置");
+            assert!(
+                plans_for_pref(key, "v1", "", SourcePref::Official).is_empty(),
+                "{key} 不应有官方直链"
+            );
+        }
+        assert!(asset("face_det", "face_det.onnx").is_some());
+        assert!(asset("face_det", "face_rec_sface.onnx").is_some());
+        assert!(asset("mt_zh_en", "encoder.onnx").is_none());
+        assert!(asset("llm_parse", "model.onnx").is_none());
     }
 
     #[test]

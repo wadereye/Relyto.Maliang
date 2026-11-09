@@ -343,6 +343,10 @@ pub struct App {
     /// 标签视图:重命名待编辑项(原名, 输入框)与删除待确认项。
     tag_rename: Option<(String, String)>,
     tag_delete: Option<String>,
+    /// 批量加标签弹窗(打开状态、输入、目标照片)。
+    tag_batch_open: bool,
+    tag_batch_input: String,
+    tag_batch_ids: Vec<i64>,
     /// AI 后台索引是否启用(设置页/工具栏开关同步)。
     #[cfg(feature = "ai")]
     ai_enabled: bool,
@@ -2376,6 +2380,9 @@ impl App {
             sel_tag: None,
             tag_rename: None,
             tag_delete: None,
+            tag_batch_open: false,
+            tag_batch_input: String::new(),
+            tag_batch_ids: Vec::new(),
             #[cfg(feature = "ai")]
             ai_enabled: false,
             #[cfg(feature = "ai")]
@@ -5550,7 +5557,7 @@ impl App {
             return;
         }
         let store = self.store.clone();
-        if crate::ai_models::stage_ready(&store, crate::ai_queue::Stage::Clip) {
+        if crate::clip::natural_ready(&store) {
             self.status = t("已把全库排入语义索引队列(后台分批完成)").into();
             std::thread::spawn(move || {
                 let _ = crate::ai_queue::enqueue_all_for(&store, crate::ai_queue::Stage::Clip);
@@ -5566,7 +5573,7 @@ impl App {
         );
         std::thread::spawn(move || {
             let res = crate::clip::scan_batch_lang(&store, lang, 200).map_err(|e| e.to_string());
-            let _ = tx.send(res.map_err(|e| e.to_string()));
+            let _ = tx.send(res);
         });
     }
 
@@ -5579,11 +5586,9 @@ impl App {
             return;
         }
         let store = self.store.clone();
-        let clip_ver = crate::ai_queue::stage_version(&store, crate::ai_queue::Stage::Clip);
-        let natural = crate::ai_models::stage_ready(&store, crate::ai_queue::Stage::Clip)
-            && crate::ai_search::count(&store, &clip_ver) > 0;
+        let natural = crate::clip::natural_ready(&store);
         let lang = crate::clip::Lang::detect(&query);
-        if !natural && crate::clip::clip_count_lang(&self.store, lang) == 0 {
+        if !natural && crate::clip::clip_count_lang(&store, lang) == 0 {
             self.status = t_with(
                 "{p1}模型还没有语义索引 — 请先在下方选择「{p2}」模型并点「语义索引」",
                 &[
@@ -5607,45 +5612,46 @@ impl App {
             )
         };
         std::thread::spawn(move || {
-            let res: Result<(Vec<(i64, f32)>, bool), String> = if natural {
-                let parsed = crate::ai_parse::heuristic(&query);
-                let window = crate::ai_parse::date_window(
-                    &parsed,
-                    chrono::Local::now().date_naive(),
-                );
-                let text = if parsed.text.is_empty() {
-                    query.clone()
-                } else {
-                    parsed.text.clone()
-                };
-                let near = parsed.near;
-                match crate::clip::search_natural(&store, &text, 200) {
-                    Ok(mut hits) => {
-                        if let Some(cat) = parsed.category {
-                            let tag_ver = crate::ai_queue::stage_version(
-                                &store,
-                                crate::ai_queue::Stage::Tags,
-                            );
-                            let allowed: std::collections::HashSet<i64> =
-                                crate::ai_tags::category_ids(&store, &cat, &tag_ver, usize::MAX)
+            let parsed = crate::ai_parse::parse_query(&query, None);
+            let window = crate::ai_parse::date_window(&parsed, chrono::Local::now().date_naive());
+            let text = if parsed.text.is_empty() {
+                query.clone()
+            } else {
+                parsed.text.clone()
+            };
+            let res: Result<(Vec<(i64, f32)>, bool), String> =
+                match crate::clip::search_best(&store, &text, 200) {
+                    Ok((mut hits, used_natural)) => {
+                        // 分类与时间过滤只在新链路上生效,旧模型没有对应数据。
+                        if used_natural {
+                            if let Some(cat) = parsed.category.as_deref() {
+                                let tag_ver = crate::ai_queue::stage_version(
+                                    &store,
+                                    crate::ai_queue::Stage::Tags,
+                                );
+                                let allowed: std::collections::HashSet<i64> =
+                                    crate::ai_tags::category_ids(
+                                        &store,
+                                        cat,
+                                        &tag_ver,
+                                        usize::MAX,
+                                    )
                                     .into_iter()
                                     .collect();
-                            hits.retain(|(id, _)| allowed.contains(id));
+                                hits.retain(|(id, _)| allowed.contains(id));
+                            }
+                            if let Some((start, end)) = window {
+                                let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+                                let allowed = crate::ai_search::ids_in_date_window(
+                                    &store, &ids, &start, &end,
+                                );
+                                hits.retain(|(id, _)| allowed.contains(id));
+                            }
                         }
-                        if let Some((start, end)) = window {
-                            let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
-                            let allowed = crate::ai_search::ids_in_date_window(
-                                &store, &ids, &start, &end,
-                            );
-                            hits.retain(|(id, _)| allowed.contains(id));
-                        }
-                        Ok((hits, near))
+                        Ok((hits, used_natural && parsed.near))
                     }
                     Err(e) => Err(e),
-                }
-            } else {
-                crate::clip::search_lang(&store, lang, &query, 200).map(|hits| (hits, false))
-            };
+                };
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
     }
@@ -7193,6 +7199,61 @@ impl App {
         self.show_props = props_open && self.show_props;
     }
 
+    /// 批量加标签弹窗(右键菜单触发,预览视图与图库视图都要画)。
+    fn tag_batch_window(&mut self, ctx: &egui::Context) {
+        if !self.tag_batch_open {
+            return;
+        }
+        let mut open = true;
+        let mut apply = false;
+        let mut cancel = false;
+        let n = self.tag_batch_ids.len();
+        egui::Window::new(t("批量加标签"))
+            .open(&mut open)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label(t_with(
+                    "将给选中的 {p1} 张照片加标签",
+                    &[("p1", n.to_string())],
+                ));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.tag_batch_input).hint_text(t("标签名")),
+                );
+                let can = n > 0 && !self.tag_batch_input.trim().is_empty();
+                ui.horizontal(|ui| {
+                    apply = ui
+                        .add_enabled(can, egui::Button::new(t("添加")))
+                        .clicked();
+                    cancel = ui.button(t("取消")).clicked();
+                });
+            });
+        if cancel || !open {
+            self.tag_batch_open = false;
+            return;
+        }
+        if !apply {
+            return;
+        }
+        let name = self.tag_batch_input.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let ids = self.tag_batch_ids.clone();
+        let mut ok = 0usize;
+        for id in ids {
+            if timeline::add_tag(&self.store, id, &name).is_ok() {
+                let star = self.star_of(id);
+                self.sync_sidecars(id, star);
+                ok += 1;
+            }
+        }
+        self.tags = timeline::all_tags(&self.store).unwrap_or_default();
+        self.status = t_with("已给 {p1} 张照片加标签", &[("p1", ok.to_string())]).into();
+        self.tag_batch_open = false;
+        self.tag_batch_input.clear();
+        self.tag_batch_ids.clear();
+    }
+
     /// 标题编辑(失焦或回车即保存)。
     /// 单图预览与右栏抽屉「属性」页共用同一份 caption_edit 草稿。
     fn caption_editor(&mut self, ui: &mut egui::Ui, id: i64) {
@@ -7214,6 +7275,25 @@ impl App {
                     let _ = self.store.set_caption(id, cap);
                     self.fx_msg = t("标题已保存").into();
                 }
+            }
+        }
+        #[cfg(feature = "ai")]
+        self.caption_ai_button(ui, id);
+    }
+
+    /// 用已有识别结果重建标题(不覆盖手填标题的自动刷新)。
+    #[cfg(feature = "ai")]
+    fn caption_ai_button(&mut self, ui: &mut egui::Ui, id: i64) {
+        if ui.button(t("用 AI 数据生成描述")).clicked() {
+            let ver = crate::ai_queue::stage_version(
+                &self.store,
+                crate::ai_queue::Stage::Tags,
+            );
+            if crate::ai_caption::generate(&self.store, id, &ver, true) {
+                self.caption_edit = Some((id, self.store.get_caption(id)));
+                self.fx_msg = t("描述已生成").into();
+            } else {
+                self.fx_msg = t("暂无可生成描述的数据").into();
             }
         }
     }
@@ -8140,6 +8220,23 @@ impl App {
                     }
                     if row.manual {
                         ui.weak(t("需自行获取"));
+                        ui.small(t("本槽位没有可验证的官方直链,请用「导入文件」或「导入目录」放置模型。"));
+                        if row.key == "llm_parse" {
+                            ui.small(t("当前使用规则解析查询,该槽位模型暂不参与推理。"));
+                        }
+                        if let Some(spec) = crate::ai_models::spec(&row.key) {
+                            ui.small(t_with(
+                                "需要文件: {p1}",
+                                &[("p1", spec.files.join(", "))],
+                            ));
+                            for f in spec.files {
+                                if let Some(a) = crate::ai_models::asset(&row.key, f) {
+                                    if !a.sha256.is_empty() {
+                                        ui.small(format!("{} · {}", f, &a.sha256[..16]));
+                                    }
+                                }
+                            }
+                        }
                     }
                     // 自定义主文件直链;留空则按上面的全局下载源自动选择。
                     let url_key = format!("ai_url:{}", row.key);
@@ -8157,7 +8254,10 @@ impl App {
                             let _ = self.store.set_setting(&url_key, &url);
                         }
                         if ui
-                            .add_enabled(!phase.working(), egui::Button::new(t("下载")))
+                            .add_enabled(
+                                !phase.working() && (!row.manual || !url.trim().is_empty()),
+                                egui::Button::new(t("下载")),
+                            )
                             .clicked()
                         {
                             self.start_ai_slot_download(&row.key, &row.label, &url, pref);
@@ -9994,6 +10094,16 @@ impl App {
             show_in_explorer(&t.path);
             ui.close();
         }
+        if ui.button(crate::i18n::t("批量加标签…")).clicked() {
+            self.tag_batch_ids = if t.selected && !self.sel.is_empty() {
+                self.sel.iter().copied().collect()
+            } else {
+                vec![t.id]
+            };
+            self.tag_batch_input.clear();
+            self.tag_batch_open = true;
+            ui.close();
+        }
         // 加入相簿(相簿不移动文件;已加入的打勾,点击移除)。
         ui.menu_button(crate::i18n::t("加入相簿…"), |ui| {
             let albums = self.store.albums();
@@ -11411,6 +11521,7 @@ impl eframe::App for App {
             if self.show_options {
                 self.options_ui(ctx);
             }
+            self.tag_batch_window(ctx);
             // 编辑视图提前返回,通用提示窗仍要画(否则后台消息会一直憋到回图库)。
             self.update_window(ctx);
             self.update_confirm_window(ctx);
@@ -12484,6 +12595,43 @@ impl eframe::App for App {
                                     "共 {p1} 个(右键设颜色/重命名/删除)",
                                     &[("p1", (self.tags.len()).to_string())],
                                 ));
+                                let groups: Vec<String> = {
+                                    let mut g: Vec<String> = self
+                                        .tags
+                                        .iter()
+                                        .filter_map(|x| {
+                                            x.name.split_once('/').map(|(p, _)| p.to_string())
+                                        })
+                                        .collect();
+                                    g.sort();
+                                    g.dedup();
+                                    g
+                                };
+                                if !groups.is_empty() {
+                                    ui.label(t("标签分组"));
+                                    for g in groups {
+                                        if ui
+                                            .selectable_label(
+                                                self.sel_tag.as_deref() == Some(g.as_str()),
+                                                g.as_str(),
+                                            )
+                                            .clicked()
+                                        {
+                                            if self.sel_tag.as_deref() == Some(g.as_str()) {
+                                                self.sel_tag = None;
+                                            } else {
+                                                self.sel_tag = Some(g.clone());
+                                            }
+                                            #[cfg(feature = "ai")]
+                                            {
+                                                self.sel_category = None;
+                                                self.ai_query.clear();
+                                                self.ai_query_hits.clear();
+                                            }
+                                        }
+                                    }
+                                    ui.separator();
+                                }
                                 if self.tag_rename.is_some() {
                                     let old = self.tag_rename.as_ref().unwrap().0.clone();
                                     let mut confirm = false;
@@ -12835,7 +12983,8 @@ impl eframe::App for App {
                                 &[("p1", (models.join("、")).to_string())],
                             ));
                         }
-                        let indexed = crate::clip::clip_count_lang(&self.store, self.clip_lang);
+                        let natural = crate::clip::natural_ready(&self.store);
+                        let indexed = crate::clip::progress(&self.store, self.clip_lang);
                         let total_zh =
                             crate::clip::clip_count_lang(&self.store, crate::clip::Lang::Zh);
                         let total_en =
@@ -12843,16 +12992,27 @@ impl eframe::App for App {
                         ui.label(t_with(
                             "已索引({p1}){indexed} / {p2} 张",
                             &[
-                                ("p1", (self.clip_lang.label()).to_string()),
+                                (
+                                    "p1",
+                                    if natural {
+                                        t("语义向量").to_string()
+                                    } else {
+                                        self.clip_lang.label().to_string()
+                                    },
+                                ),
                                 ("indexed", indexed.to_string()),
                                 ("p2", (self.rows.len()).to_string()),
                             ],
                         ));
                         if indexed < self.rows.len() {
-                            ui.label(t_with(
-                                "点 工具 > 语义索引 补嵌(当前{p1}模型,较慢)",
-                                &[("p1", (self.clip_lang.label()).to_string())],
-                            ));
+                            if natural {
+                                ui.label(t("语义索引正在后台补建,稍后再试。"));
+                            } else {
+                                ui.label(t_with(
+                                    "点 工具 > 语义索引 补嵌(当前{p1}模型,较慢)",
+                                    &[("p1", (self.clip_lang.label()).to_string())],
+                                ));
+                            }
                         }
                         if total_en + total_zh > 0 {
                             ui.label(t_with(
@@ -13242,7 +13402,11 @@ impl eframe::App for App {
                         {
                             if self.clip_results.is_empty() {
                                 ui.heading(t("语义搜索"));
-                                ui.label(t("左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");首次使用请先 工具 > 语义索引。"));
+                                if crate::clip::natural_ready(&self.store) {
+                                    ui.label(t("左侧输入关键词或一句话,支持中英文、标签与图中文字。"));
+                                } else {
+                                    ui.label(t("左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");首次使用请先 工具 > 语义索引。"));
+                                }
                             } else {
                                 let q = self.input_query.trim().to_string();
                                 ui.heading(t_with("语义结果 {p1} 张(查询:{q})", &[("p1", (self.clip_results.len()).to_string()), ("q", q.to_string())]));
@@ -13706,6 +13870,7 @@ impl eframe::App for App {
         if self.show_options {
             self.options_ui(ctx);
         }
+        self.tag_batch_window(ctx);
 
         // 按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。
         if self.show_uid_lookup {

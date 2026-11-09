@@ -241,6 +241,7 @@ fn execute_tags(store: &Store, runner: &mut Runner, photo_id: i64, tag_ver: &str
     if let Err(e) = crate::ai_tags::save(store, photo_id, tag_ver, &scores) {
         return Outcome::Fail(e);
     }
+    let _ = crate::ai_caption::generate(store, photo_id, tag_ver, false);
     if crate::ai_ocr::should_auto(store, photo_id, tag_ver) {
         let _ = ai_queue::enqueue(store, Stage::Ocr, photo_id, ai_queue::P_DEFAULT);
     }
@@ -317,6 +318,7 @@ fn execute_ocr(
     if let Err(e) = crate::ai_ocr::save(store, photo_id, &text, &boxes, ver) {
         return Outcome::Fail(e);
     }
+    let _ = crate::ai_caption::generate(store, photo_id, &tag_ver, false);
     Outcome::Ok
 }
 

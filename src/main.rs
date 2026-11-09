@@ -83,6 +83,9 @@ mod ai_parse;
 #[cfg(feature = "ai")]
 mod ai_review;
 
+#[cfg(feature = "ai")]
+mod ai_caption;
+
 use crate::i18n::{t, t_with};
 use eframe::egui;
 use std::sync::Arc;

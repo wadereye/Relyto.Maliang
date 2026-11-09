@@ -4,7 +4,7 @@ use crate::db::Store;
 use anyhow::Result;
 use rusqlite::params;
 
-/// 向量落库(同版本覆盖,保留各版本以便回滚)。
+/// 向量落库(按照片主键覆盖,换版本时逐张重算)。
 pub fn save_vec(store: &Store, photo_id: i64, ver: &str, emb: &[f32]) -> Result<(), String> {
     store.write(|conn| -> Result<(), String> {
         conn.execute(

@@ -1509,6 +1509,8 @@ impl Store {
             .execute_batch("ALTER TABLE photos ADD COLUMN thumb_fail INTEGER NOT NULL DEFAULT 0;");
         // P3-ui:标题(缩略图说明;幻灯片/属性面板显示)。
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN caption TEXT;");
+        let _ = conn
+            .execute_batch("ALTER TABLE photos ADD COLUMN caption_auto INTEGER NOT NULL DEFAULT 0;");
         // 派生作用域两列:rich_state 是 L3 门控的唯一开关(0 未纳入 / 1 待派生 /
         // 2 已派生 / 3 坏文件),ext 让小写扩展名判定不必再逐条切字符串。
         // 旧库不带这两列,靠 ALTER 补;带默认值的 NOT NULL 列,旧行自动落 0。
@@ -1853,6 +1855,11 @@ impl Store {
             let _ = conn.execute(
                 "UPDATE photos SET caption=?2 WHERE id=?1",
                 rusqlite::params![id, cap],
+            );
+            // 手改过的标题不再被后台描述刷新覆盖;旧库缺列时静默忽略。
+            let _ = conn.execute(
+                "UPDATE photos SET caption_auto=0 WHERE id=?1",
+                rusqlite::params![id],
             );
         });
         Ok(())

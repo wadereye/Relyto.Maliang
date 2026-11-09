@@ -876,6 +876,35 @@ pub fn search_natural(store: &Store, query: &str, limit: usize) -> Result<Vec<(i
         .collect())
 }
 
+/// 新链路是否可用(只认新版产物文件)。
+pub fn natural_ready(store: &Store) -> bool {
+    crate::ai_models::stage_ready(store, crate::ai_queue::Stage::Clip)
+}
+
+/// 统一检索入口:两条链路的嵌入空间不同,只选一条,不混排。
+pub fn search_best(
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<(Vec<(i64, f32)>, bool), String> {
+    if natural_ready(store) {
+        search_natural(store, query, limit).map(|hits| (hits, true))
+    } else {
+        let lang = Lang::detect(query);
+        search_lang(store, lang, query, limit).map(|hits| (hits, false))
+    }
+}
+
+/// 当前生效链路的已索引张数。
+pub fn progress(store: &Store, lang: Lang) -> usize {
+    if natural_ready(store) {
+        let ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Clip);
+        crate::ai_search::count(store, &ver)
+    } else {
+        clip_count_lang(store, lang)
+    }
+}
+
 /// 中文查询模板(模型输入,不随界面语言变化)。
 pub fn zh_query_template(query: &str) -> String {
     if query.contains("照片") {

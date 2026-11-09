@@ -593,7 +593,8 @@ pub fn rename_tag(store: &Store, old: &str, new: &str) -> Result<Vec<i64>> {
     }
     let ids = photos_by_tag(store, old)?;
     store.write(|conn| -> Result<()> {
-        let dup: bool = conn.query_row(
+        let tx = conn.transaction()?;
+        let dup: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM tags WHERE name=?1)",
             rusqlite::params![new],
             |r| r.get(0),
@@ -601,13 +602,20 @@ pub fn rename_tag(store: &Store, old: &str, new: &str) -> Result<Vec<i64>> {
         if dup {
             anyhow::bail!("名称已存在");
         }
-        let n = conn.execute(
+        // 子路径随父名一起改,否则分组会断链。
+        tx.execute(
+            "UPDATE tags SET name = ?1 || substr(name, length(?2)+1)
+              WHERE substr(name, 1, length(?2)) = ?2",
+            rusqlite::params![format!("{new}/"), format!("{old}/")],
+        )?;
+        let n = tx.execute(
             "UPDATE tags SET name=?1 WHERE name=?2",
             rusqlite::params![new, old],
         )?;
         if n == 0 {
             anyhow::bail!("标签不存在");
         }
+        tx.commit()?;
         Ok(())
     })?;
     Ok(ids)
@@ -701,15 +709,17 @@ pub fn set_tag_color(store: &Store, name: &str, color: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// 某标签下的照片 id 列表(按 id 升序)。
+/// 某标签(含 `父/子` 前缀子树)下的照片 id 列表,按 id 升序。
 pub fn photos_by_tag(store: &Store, tag: &str) -> Result<Vec<i64>> {
     store.read(|conn| -> Result<Vec<i64>> {
+        let prefix = format!("{tag}/");
         let mut st = conn.prepare(
-            "SELECT pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
-             WHERE t.name=?1 ORDER BY pt.photo_id",
+            "SELECT DISTINCT pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+              WHERE t.name=?1 OR substr(t.name, 1, length(?2)) = ?2
+              ORDER BY pt.photo_id",
         )?;
         let rows: Vec<i64> = st
-            .query_map([tag], |r| r.get(0))?
+            .query_map(rusqlite::params![tag, prefix], |r| r.get(0))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -723,6 +733,19 @@ pub fn remove_photos(store: &Store, ids: &[i64]) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
             let mut st_tags = tx.prepare_cached("DELETE FROM photo_tags WHERE photo_id=?1")?;
+            let mut st_album = tx.prepare_cached("DELETE FROM album_photos WHERE photo_id=?1")?;
+            let mut st_jobs = tx.prepare_cached("DELETE FROM ai_jobs WHERE photo_id=?1")?;
+            let mut st_state = tx.prepare_cached("DELETE FROM ai_state WHERE photo_id=?1")?;
+            let mut st_failed = tx.prepare_cached("DELETE FROM ai_failed WHERE photo_id=?1")?;
+            let mut st_auto = tx.prepare_cached("DELETE FROM auto_tags WHERE photo_id=?1")?;
+            let mut st_vec = tx.prepare_cached("DELETE FROM clips_vec WHERE photo_id=?1")?;
+            let mut st_ocr_seg =
+                tx.prepare_cached("SELECT seg FROM ocr_docs WHERE photo_id=?1")?;
+            let mut st_fts = tx.prepare_cached(
+                "INSERT INTO ocr_fts(ocr_fts, rowid, seg) VALUES('delete', ?1, ?2)",
+            )?;
+            let mut st_docs = tx.prepare_cached("DELETE FROM ocr_docs WHERE photo_id=?1")?;
+            let mut st_boxes = tx.prepare_cached("DELETE FROM ocr_boxes WHERE photo_id=?1")?;
             let mut st_ft = tx.prepare_cached(
                 "DELETE FROM face_templates WHERE face_id IN
                  (SELECT id FROM faces WHERE photo_id=?1)",
@@ -732,7 +755,21 @@ pub fn remove_photos(store: &Store, ids: &[i64]) -> Result<()> {
             let mut st_clips_cn = tx.prepare_cached("DELETE FROM clips_cn WHERE photo_id=?1")?;
             let mut st_photos = tx.prepare_cached("DELETE FROM photos WHERE id=?1")?;
             for id in ids {
+                // FTS 是外部内容表,删正文前要按原分词发一次 delete。
+                if let Ok(seg) =
+                    st_ocr_seg.query_row(rusqlite::params![id], |r| r.get::<_, String>(0))
+                {
+                    let _ = st_fts.execute(rusqlite::params![id, seg]);
+                }
                 st_tags.execute(rusqlite::params![id])?;
+                st_album.execute(rusqlite::params![id])?;
+                st_jobs.execute(rusqlite::params![id])?;
+                st_state.execute(rusqlite::params![id])?;
+                st_failed.execute(rusqlite::params![id])?;
+                st_auto.execute(rusqlite::params![id])?;
+                st_vec.execute(rusqlite::params![id])?;
+                st_docs.execute(rusqlite::params![id])?;
+                st_boxes.execute(rusqlite::params![id])?;
                 st_clips.execute(rusqlite::params![id])?;
                 st_clips_cn.execute(rusqlite::params![id])?;
                 st_ft.execute(rusqlite::params![id])?;
@@ -884,6 +921,44 @@ mod tests {
         assert_eq!(tags_of(&store, a).unwrap(), vec!["dog".to_string()]);
     }
 
+    /// 虚拟两级标签:父名命中整棵子树,改父名时子路径一起改。
+    #[test]
+    fn tag_tree_prefix_queries_and_rename_cascade() {
+        let store = Store::open_mem().unwrap();
+        let a = one_photo(&store);
+        let extra = |path: &str| -> i64 {
+            store
+                .test_conn()
+                .execute(
+                    "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'.',0,0)",
+                    rusqlite::params![path],
+                )
+                .unwrap();
+            store.test_conn().last_insert_rowid()
+        };
+        let b = extra("b.jpg");
+        let c = extra("c.jpg");
+        add_tag(&store, a, "人物").unwrap();
+        add_tag(&store, b, "人物/自拍").unwrap();
+        add_tag(&store, c, "人物/合影").unwrap();
+        assert_eq!(photos_by_tag(&store, "人物").unwrap().len(), 3);
+        assert_eq!(photos_by_tag(&store, "人物/自拍").unwrap(), vec![b]);
+        rename_tag(&store, "人物", "人像").unwrap();
+        let names: Vec<String> = all_tags(&store)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.name)
+            .collect();
+        assert!(names.contains(&"人像".to_string()));
+        assert!(names.contains(&"人像/自拍".to_string()));
+        assert!(names.contains(&"人像/合影".to_string()));
+        assert!(names.iter().all(|n| !n.starts_with("人物")));
+        assert_eq!(photos_by_tag(&store, "人像").unwrap().len(), 3);
+        delete_tag(&store, "人像").unwrap();
+        assert_eq!(tags_of(&store, a).unwrap(), Vec::<String>::new());
+        assert_eq!(tags_of(&store, b).unwrap(), vec!["人像/自拍".to_string()]);
+    }
+
     /// P0 固化:star 列读写链路(load_all SELECT / set_star UPDATE)。
     #[test]
     fn star_set_and_read_back() {
@@ -957,12 +1032,39 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
-        remove_photos(&store, &[id]).unwrap();
-        let n2: i64 = store
+        store
             .test_conn()
-            .query_row("SELECT COUNT(*) FROM clips", [], |r| r.get(0))
+            .execute_batch(&format!(
+                "INSERT INTO ai_jobs(stage,photo_id,priority,enqueued_ts,attempts)
+                   VALUES('clip',{id},6,0,0);
+                 INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES({id},'clip','v1',0);
+                 INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES({id},1,0.9,'v1');
+                 INSERT INTO clips_vec(photo_id,ver,dim,embedding)
+                   VALUES({id},'v1',2,X'0000803f00000000');
+                 INSERT INTO ocr_docs(photo_id,text,seg,line_count,char_count,model_ver,done_ts)
+                   VALUES({id},'发票','发票',1,2,'v1',0);
+                 INSERT INTO ocr_fts(rowid,seg) VALUES({id},'发票');
+                 INSERT INTO albums(id,name,ts) VALUES(1,'a',0);
+                 INSERT INTO album_photos(album_id,photo_id) VALUES(1,{id});"
+            ))
             .unwrap();
-        assert_eq!(n2, 0, "clips 行应随照片索引一并删除");
+        remove_photos(&store, &[id]).unwrap();
+        for sql in [
+            "SELECT COUNT(*) FROM clips",
+            "SELECT COUNT(*) FROM ai_jobs",
+            "SELECT COUNT(*) FROM ai_state",
+            "SELECT COUNT(*) FROM auto_tags",
+            "SELECT COUNT(*) FROM clips_vec",
+            "SELECT COUNT(*) FROM ocr_docs",
+            "SELECT COUNT(*) FROM ocr_fts",
+            "SELECT COUNT(*) FROM album_photos",
+        ] {
+            let left: i64 = store
+                .test_conn()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(left, 0, "{sql} 应随照片索引一并清空");
+        }
     }
 
     /// GPS 点查询(有/无坐标过滤)。

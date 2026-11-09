@@ -106,6 +106,13 @@ pub fn date_window(p: &Parsed, today: chrono::NaiveDate) -> Option<(String, Stri
     Some((a.to_string(), b.to_string()))
 }
 
+/// 解析查询:优先采用模型输出,缺失或解析失败时走规则兜底。
+pub fn parse_query(query: &str, model_output: Option<&str>) -> Parsed {
+    model_output
+        .and_then(parse_model_output)
+        .unwrap_or_else(|| heuristic(query))
+}
+
 /// 从文本里抽"YYYY年M月"或"YYYY-MM"。
 fn find_year_month(s: &str) -> Option<(i32, u32)> {
     let chars: Vec<char> = s.chars().collect();
@@ -228,6 +235,22 @@ mod tests {
         assert_eq!(date_window(&both, today), Some(("2026-11-08".into(), "2026-11-09".into())));
         let disjoint = Parsed { year: 2024, month: 2, day_offset: Some(0), ..Parsed::default() };
         assert_eq!(date_window(&disjoint, today), Some(("2026-11-09".into(), "2026-11-09".into())));
+    }
+
+    #[test]
+    fn parse_query_prefers_model_output_and_falls_back() {
+        let p = parse_query(
+            "昨天的猫",
+            Some(r#"{"text":"cat","category":"动物","day_offset":-1}"#),
+        );
+        assert_eq!(p.text, "cat");
+        assert_eq!(p.category.as_deref(), Some("动物"));
+        assert_eq!(p.day_offset, Some(-1));
+        for out in [None, Some("not json")] {
+            let f = parse_query("昨天的猫", out);
+            assert_eq!(f.day_offset, Some(-1));
+            assert_eq!(f.category.as_deref(), Some("动物"));
+        }
     }
 
     #[test]
