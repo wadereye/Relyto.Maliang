@@ -16,6 +16,65 @@ pub fn save_vec(store: &Store, photo_id: i64, ver: &str, emb: &[f32]) -> Result<
     })
 }
 
+/// 只保留拍摄/修改日期落在 [start,end) 的照片 id(日期串按 YYYY-MM-DD 比较)。
+pub fn ids_in_date_window(
+    store: &Store,
+    ids: &[i64],
+    start: &str,
+    end: &str,
+) -> std::collections::HashSet<i64> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    if ids.is_empty() || start >= end {
+        return out;
+    }
+    let sql = format!(
+        "SELECT id, taken_utc, mtime FROM photos WHERE id IN ({})",
+        vec!["?"; ids.len()].join(",")
+    );
+    store.read(|conn| {
+        let Ok(mut st) = conn.prepare(&sql) else {
+            return;
+        };
+        let Ok(rows) = st.query_map(rusqlite::params_from_iter(ids.iter().copied()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        for (id, taken, mtime) in rows.flatten() {
+            let Some(date) = taken
+                .as_deref()
+                .filter(|s| s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-')
+                .map(|s| s[..10].to_string())
+                .or_else(|| mtime_date(mtime))
+            else {
+                continue;
+            };
+            if date.as_str() >= start && date.as_str() < end {
+                out.insert(id);
+            }
+        }
+    });
+    out
+}
+
+/// 把历史库里可能是秒/毫秒/微秒的 mtime 换成本地日期串。
+fn mtime_date(v: i64) -> Option<String> {
+    let secs = if v >= 100_000_000_000_000 {
+        v / 1_000_000
+    } else if v >= 100_000_000_000 {
+        v / 1_000
+    } else {
+        v
+    };
+    let dt = chrono::DateTime::from_timestamp(secs, 0)?;
+    Some(dt.with_timezone(&chrono::Local).date_naive().to_string())
+}
+
 /// 向量转小端字节。
 pub fn f32_to_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
@@ -221,5 +280,40 @@ mod tests {
         let hits = hybrid(&store, "v1", "v1", "合影", None, 10);
         assert!(hits.contains(&11), "标签命中应进入融合结果");
         assert!(hits.contains(&12), "图中文字命中应进入融合结果");
+    }
+
+    #[test]
+    fn date_window_filters_by_taken_and_falls_back_to_mtime() {
+        use chrono::TimeZone;
+        let store = Store::open_mem().unwrap();
+        let put = |id: i64, taken: Option<&str>, mtime: i64| {
+            store
+                .write(|conn| {
+                    conn.execute(
+                        "INSERT INTO photos(id, path, parent, mtime, size, taken_utc)
+                         VALUES(?1, ?2, 'C:\\', ?3, 0, ?4)",
+                        params![id, format!("C:\\p{id}.jpg"), mtime, taken],
+                    )
+                })
+                .unwrap();
+        };
+        let secs = chrono::Local
+            .with_ymd_and_hms(2026, 11, 9, 12, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        put(1, Some("2026-11-09T10:00:00"), 0);
+        put(2, Some("2024-05-01T10:00:00"), 0);
+        put(3, None, secs);
+        put(4, None, secs * 1000);
+        put(5, None, 0);
+        let ids = [1, 2, 3, 4, 5];
+        let got = ids_in_date_window(&store, &ids, "2026-11-09", "2026-11-10");
+        assert!(got.contains(&1), "拍摄日期命中");
+        assert!(!got.contains(&2), "窗口外的拍摄日期排除");
+        assert!(got.contains(&3), "无拍摄时间时回落 mtime 秒");
+        assert!(got.contains(&4), "mtime 毫秒口径也要归一");
+        assert!(!got.contains(&5), "1970 年不应落进窗口");
+        assert!(ids_in_date_window(&store, &ids, "2026-11-09", "2026-11-09").is_empty());
     }
 }

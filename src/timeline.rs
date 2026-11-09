@@ -585,6 +585,50 @@ pub fn remove_tag(store: &Store, id: i64, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// 全库重命名标签,返回受影响的照片 id 供调用方同步 sidecar。
+pub fn rename_tag(store: &Store, old: &str, new: &str) -> Result<Vec<i64>> {
+    let new = new.trim();
+    if new.is_empty() || new == old {
+        anyhow::bail!("名称无效");
+    }
+    let ids = photos_by_tag(store, old)?;
+    store.write(|conn| -> Result<()> {
+        let dup: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tags WHERE name=?1)",
+            rusqlite::params![new],
+            |r| r.get(0),
+        )?;
+        if dup {
+            anyhow::bail!("名称已存在");
+        }
+        let n = conn.execute(
+            "UPDATE tags SET name=?1 WHERE name=?2",
+            rusqlite::params![new, old],
+        )?;
+        if n == 0 {
+            anyhow::bail!("标签不存在");
+        }
+        Ok(())
+    })?;
+    Ok(ids)
+}
+
+/// 全库删除标签(先清关联再删标签行),返回受影响的照片 id。
+pub fn delete_tag(store: &Store, name: &str) -> Result<Vec<i64>> {
+    let ids = photos_by_tag(store, name)?;
+    store.write(|conn| -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM photo_tags WHERE tag_id IN (SELECT id FROM tags WHERE name=?1)",
+            rusqlite::params![name],
+        )?;
+        tx.execute("DELETE FROM tags WHERE name=?1", rusqlite::params![name])?;
+        tx.commit()?;
+        Ok(())
+    })?;
+    Ok(ids)
+}
+
 /// 某目录下**已入库**的照片路径集合。
 /// 导入页用它把"已经在图库里"的行标出来 —— 列目录读的是文件系统,
 /// 不查库就分不清"新照片"和"早就索引过的"。
@@ -805,6 +849,39 @@ mod tests {
         assert_eq!(tags[0].count, 1);
         assert_eq!(photos_by_tag(&store, "cat").unwrap(), vec![id]);
         assert!(photos_by_tag(&store, "missing").unwrap().is_empty());
+    }
+
+    /// 全库重命名/删除标签:关联不丢、旧名不残留、重名被拒。
+    #[test]
+    fn tag_rename_and_delete_keep_relations() {
+        let store = Store::open_mem().unwrap();
+        let a = one_photo(&store);
+        let b = {
+            store
+                .test_conn()
+                .execute(
+                    "INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)",
+                    [],
+                )
+                .unwrap();
+            store.test_conn().last_insert_rowid()
+        };
+        add_tag(&store, a, "cat").unwrap();
+        add_tag(&store, b, "cat").unwrap();
+        add_tag(&store, a, "dog").unwrap();
+        assert!(rename_tag(&store, "cat", "dog").is_err(), "重名必须拒绝");
+        assert!(rename_tag(&store, "cat", "  ").is_err(), "空名必须拒绝");
+        let ids = rename_tag(&store, "cat", "feline").unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a) && ids.contains(&b));
+        assert!(photos_by_tag(&store, "cat").unwrap().is_empty());
+        assert_eq!(photos_by_tag(&store, "feline").unwrap().len(), 2);
+        assert_eq!(tags_of(&store, a).unwrap(), vec!["dog".to_string(), "feline".to_string()]);
+        let gone = delete_tag(&store, "feline").unwrap();
+        assert_eq!(gone.len(), 2);
+        assert!(all_tags(&store).unwrap().iter().all(|t| t.name != "feline"));
+        assert_eq!(tags_of(&store, b).unwrap(), Vec::<String>::new());
+        assert_eq!(tags_of(&store, a).unwrap(), vec!["dog".to_string()]);
     }
 
     /// P0 固化:star 列读写链路(load_all SELECT / set_star UPDATE)。

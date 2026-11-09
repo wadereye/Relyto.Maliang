@@ -448,6 +448,9 @@ pub struct AiSched {
 impl AiSched {
     /// 启动三阶段 worker;`enabled=false` 时先停在暂停态。
     pub fn spawn(store: Arc<Store>, enabled: bool) -> Self {
+        // 服务进程只维护名字索引,不加载模型也不起 worker。
+        let service = crate::db::service_mode();
+        let enabled = enabled && !service;
         let _ = ai_queue::seed_priority_rules(&store);
         let _ = crate::ai_tags::seed_labels(&store);
         let gate = Arc::new(Gate::new(!enabled));
@@ -457,7 +460,8 @@ impl AiSched {
         let sem = Arc::new(Semaphore::new(permits));
         let mut handles = Vec::new();
         let mut releases = Vec::new();
-        for stage in Stage::ALL {
+        let stages: &[Stage] = if service { &[] } else { &Stage::ALL };
+        for &stage in stages {
             let st = store.clone();
             let g = gate.clone();
             let q = quit.clone();

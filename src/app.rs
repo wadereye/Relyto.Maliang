@@ -340,6 +340,9 @@ pub struct App {
     thumb_tier: crate::thumbs::Tier,
     tags: Vec<timeline::TagInfo>,
     sel_tag: Option<String>,
+    /// 标签视图:重命名待编辑项(原名, 输入框)与删除待确认项。
+    tag_rename: Option<(String, String)>,
+    tag_delete: Option<String>,
     /// AI 后台索引是否启用(设置页/工具栏开关同步)。
     #[cfg(feature = "ai")]
     ai_enabled: bool,
@@ -655,7 +658,7 @@ pub struct App {
     #[cfg(feature = "ai")]
     clip_index_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
     #[cfg(feature = "ai")]
-    clip_search_rx: Option<mpsc::Receiver<Result<Vec<(i64, f32)>, String>>>,
+    clip_search_rx: Option<mpsc::Receiver<Result<(Vec<(i64, f32)>, bool), String>>>,
     #[cfg(feature = "ai")]
     clip_results: Vec<(i64, f32)>,
     /// 语义索引语言(英文/中文 CLIP 双模型;搜索按查询语言自动匹配)。
@@ -2371,6 +2374,8 @@ impl App {
             thumb_tier: crate::thumbs::Tier::Normal,
             tags: Vec::new(),
             sel_tag: None,
+            tag_rename: None,
+            tag_delete: None,
             #[cfg(feature = "ai")]
             ai_enabled: false,
             #[cfg(feature = "ai")]
@@ -5602,13 +5607,18 @@ impl App {
             )
         };
         std::thread::spawn(move || {
-            let res = if natural {
+            let res: Result<(Vec<(i64, f32)>, bool), String> = if natural {
                 let parsed = crate::ai_parse::heuristic(&query);
+                let window = crate::ai_parse::date_window(
+                    &parsed,
+                    chrono::Local::now().date_naive(),
+                );
                 let text = if parsed.text.is_empty() {
                     query.clone()
                 } else {
                     parsed.text.clone()
                 };
+                let near = parsed.near;
                 match crate::clip::search_natural(&store, &text, 200) {
                     Ok(mut hits) => {
                         if let Some(cat) = parsed.category {
@@ -5622,12 +5632,19 @@ impl App {
                                     .collect();
                             hits.retain(|(id, _)| allowed.contains(id));
                         }
-                        Ok(hits)
+                        if let Some((start, end)) = window {
+                            let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+                            let allowed = crate::ai_search::ids_in_date_window(
+                                &store, &ids, &start, &end,
+                            );
+                            hits.retain(|(id, _)| allowed.contains(id));
+                        }
+                        Ok((hits, near))
                     }
                     Err(e) => Err(e),
                 }
             } else {
-                crate::clip::search_lang(&store, lang, &query, 200)
+                crate::clip::search_lang(&store, lang, &query, 200).map(|hits| (hits, false))
             };
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
@@ -11249,10 +11266,17 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.clip_search_rx = None;
                 match res {
-                    Ok(hits) => {
+                    Ok((hits, near)) => {
                         let n = hits.len();
                         self.clip_results = hits;
                         self.status = t_with("语义搜索完成:{n} 个结果", &[("n", n.to_string())]);
+                        if near {
+                            self.status = format!(
+                                "{} · {}",
+                                self.status,
+                                t("地点条件暂不参与筛选")
+                            );
+                        }
                     }
                     Err(e) => self.status = t_with("语义搜索失败: {e}", &[("e", e.to_string())]),
                 }
@@ -12457,9 +12481,96 @@ impl eframe::App for App {
                                     ui.separator();
                                 }
                                 ui.label(t_with(
-                                    "共 {p1} 个(右键设颜色)",
+                                    "共 {p1} 个(右键设颜色/重命名/删除)",
                                     &[("p1", (self.tags.len()).to_string())],
                                 ));
+                                if self.tag_rename.is_some() {
+                                    let old = self.tag_rename.as_ref().unwrap().0.clone();
+                                    let mut confirm = false;
+                                    let mut cancel = false;
+                                    ui.horizontal(|ui| {
+                                        ui.label(t_with(
+                                            "重命名 «{p1}»",
+                                            &[("p1", old.clone())],
+                                        ));
+                                        if let Some((_, input)) = self.tag_rename.as_mut() {
+                                            ui.add(
+                                                egui::TextEdit::singleline(input)
+                                                    .hint_text(t("新标签名")),
+                                            );
+                                        }
+                                        confirm = ui.button(t("重命名")).clicked();
+                                        cancel = ui.button(t("取消")).clicked();
+                                    });
+                                    if cancel {
+                                        self.tag_rename = None;
+                                    } else if confirm {
+                                        let new = self
+                                            .tag_rename
+                                            .as_ref()
+                                            .map(|(_, s)| s.trim().to_string())
+                                            .unwrap_or_default();
+                                        match timeline::rename_tag(&self.store, &old, &new) {
+                                            Ok(ids) => {
+                                                if self.sel_tag.as_deref() == Some(old.as_str()) {
+                                                    self.sel_tag = Some(new.clone());
+                                                }
+                                                for id in ids {
+                                                    let star = self.star_of(id);
+                                                    self.sync_sidecars(id, star);
+                                                }
+                                                self.tags = timeline::all_tags(&self.store)
+                                                    .unwrap_or_default();
+                                                self.tag_rename = None;
+                                                self.status = t("标签已重命名").into();
+                                            }
+                                            Err(_) => {
+                                                self.status =
+                                                    t("重命名失败:名称为空或已存在").into();
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(name) = self.tag_delete.clone() {
+                                    let n = self
+                                        .tags
+                                        .iter()
+                                        .find(|x| x.name == name)
+                                        .map(|x| x.count)
+                                        .unwrap_or(0);
+                                    let mut confirm = false;
+                                    let mut cancel = false;
+                                    ui.horizontal(|ui| {
+                                        ui.label(t_with(
+                                            "确定删除标签 «{p1}»? 将同时从 {p2} 张照片上移除",
+                                            &[("p1", name.clone()), ("p2", n.to_string())],
+                                        ));
+                                        confirm = ui.button(t("删除")).clicked();
+                                        cancel = ui.button(t("取消")).clicked();
+                                    });
+                                    if cancel {
+                                        self.tag_delete = None;
+                                    } else if confirm {
+                                        match timeline::delete_tag(&self.store, &name) {
+                                            Ok(ids) => {
+                                                if self.sel_tag.as_deref() == Some(name.as_str()) {
+                                                    self.sel_tag = None;
+                                                }
+                                                for id in ids {
+                                                    let star = self.star_of(id);
+                                                    self.sync_sidecars(id, star);
+                                                }
+                                                self.tags = timeline::all_tags(&self.store)
+                                                    .unwrap_or_default();
+                                                self.tag_delete = None;
+                                                self.status = t("标签已删除").into();
+                                            }
+                                            Err(_) => {
+                                                self.status = t("删除标签失败").into();
+                                            }
+                                        }
+                                    }
+                                }
                                 for t in self.tags.clone() {
                                     ui.horizontal(|ui| {
                                         let (rect, _) = ui.allocate_exact_size(
@@ -12531,6 +12642,21 @@ impl eframe::App for App {
                                                 );
                                                 self.tags = timeline::all_tags(&self.store)
                                                     .unwrap_or_default();
+                                                ui.close();
+                                            }
+                                            ui.separator();
+                                            if ui
+                                                .button(crate::i18n::t("重命名标签"))
+                                                .clicked()
+                                            {
+                                                self.tag_rename =
+                                                    Some((t.name.clone(), t.name.clone()));
+                                                self.tag_delete = None;
+                                                ui.close();
+                                            }
+                                            if ui.button(crate::i18n::t("删除标签")).clicked() {
+                                                self.tag_delete = Some(t.name.clone());
+                                                self.tag_rename = None;
                                                 ui.close();
                                             }
                                         });

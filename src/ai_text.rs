@@ -331,11 +331,11 @@ impl MtTranslator {
         let enc = pick("encoder.onnx", "mt_encoder.onnx").ok_or("缺少 Opus-MT 编码器")?;
         let dec = pick("decoder.onnx", "mt_decoder.onnx").ok_or("缺少 Opus-MT 解码器")?;
         let vocab_path = pick("vocab.txt", "mt_vocab.txt").ok_or("缺少 Opus-MT 词表")?;
-        let encoder = Session::builder(env())
+        let encoder = Session::builder(env()?)
             .map_err(|e| format!("会话构建: {e}"))?
             .commit_from_file(&enc)
             .map_err(|e| format!("加载 Opus-MT 编码器: {e}"))?;
-        let decoder = Session::builder(env())
+        let decoder = Session::builder(env()?)
             .map_err(|e| format!("会话构建: {e}"))?
             .commit_from_file(&dec)
             .map_err(|e| format!("加载 Opus-MT 解码器: {e}"))?;

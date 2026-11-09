@@ -10,16 +10,18 @@ pub fn models_dir() -> Option<std::path::PathBuf> {
     Some(crate::db::data_dir().join("models"))
 }
 
-static ENV: OnceLock<Environment> = OnceLock::new();
+static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
 
-/// 进程级唯一 Environment(同进程只允许一个)。
-pub(crate) fn env() -> &'static Environment {
-    ENV.get_or_init(|| ort::init().build().expect("初始化 onnxruntime 失败"))
+/// 进程级唯一 Environment;运行库不可用时返回错误,不终止进程。
+pub(crate) fn env() -> Result<&'static Environment, String> {
+    ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string()))
+        .as_ref()
+        .map_err(|e| e.clone())
 }
 
 /// 用 onnxruntime 加载一个模型,返回输入输出名(连通性冒烟/导入校验用)。
 pub fn inspect(path: &std::path::Path) -> Result<(Vec<String>, Vec<String>), String> {
-    let session = Session::builder(env())
+    let session = Session::builder(env()?)
         .map_err(|e| format!("会话构建: {e}"))?
         .commit_from_file(path)
         .map_err(|e| format!("加载模型: {e}"))?;
@@ -38,7 +40,7 @@ pub fn inspect(path: &std::path::Path) -> Result<(Vec<String>, Vec<String>), Str
 
 /// 首个张量输出的最后一维(语义嵌入维度校验用)。
 pub fn output_dim(path: &std::path::Path) -> Option<i32> {
-    let session = Session::builder(env()).ok()?.commit_from_file(path).ok()?;
+    let session = Session::builder(env().ok()?).ok()?.commit_from_file(path).ok()?;
     for o in session.outputs() {
         if let ort::value::ValueType::Tensor { shape, .. } = o.dtype() {
             if let Some(&d) = shape.last() {
@@ -103,7 +105,7 @@ pub mod ocr {
     }
 
     fn open_session(p: &std::path::Path) -> Result<Session, String> {
-        Session::builder(env())
+        Session::builder(env()?)
             .map_err(|e| e.to_string())?
             .commit_from_file(p)
             .map_err(|e| e.to_string())
@@ -535,7 +537,7 @@ pub mod face {
     }
 
     fn open_session(p: &std::path::Path) -> Result<Session, String> {
-        Session::builder(env())
+        Session::builder(env()?)
             .map_err(|e| e.to_string())?
             .commit_from_file(p)
             .map_err(|e| e.to_string())

@@ -512,7 +512,7 @@ impl ClipVision {
         if !p.is_file() {
             return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
-        let vision = Session::builder(env())
+        let vision = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载 clip_vision: {e}", &[("e", e.to_string())]))?;
@@ -553,7 +553,7 @@ impl ClipText {
         if !p.is_file() {
             return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
-        let text = Session::builder(env())
+        let text = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载 clip_text: {e}", &[("e", e.to_string())]))?;
@@ -606,7 +606,7 @@ impl CnClipVision {
         if !p.is_file() {
             return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
-        let vision = Session::builder(env())
+        let vision = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载 cn_clip_visual: {e}", &[("e", e.to_string())]))?;
@@ -647,7 +647,7 @@ impl CnClipText {
         if !p.is_file() {
             return Err(t_with("缺模型 {p1}", &[("p1", (p.display()).to_string())]));
         }
-        let text = Session::builder(env())
+        let text = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载 cn_clip_text: {e}", &[("e", e.to_string())]))?;
@@ -988,7 +988,7 @@ impl MobileClipVision {
         let p = crate::ai_models::file_path(store, "clip_vision", "vision.onnx")
             .or_else(|| crate::ai_models::file_path(store, "clip_vision", "clip_vision.onnx"))
             .ok_or(t("缺少 MobileCLIP2 视觉模型"))?;
-        let vision = Session::builder(env())
+        let vision = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载视觉模型: {e}", &[("e", e.to_string())]))?;
@@ -1027,7 +1027,7 @@ impl MobileClipText {
             .filter(|m| m.is_file())
             .or_else(|| crate::ai_models::file_path(store, "clip_text", "clip_merges.txt"))
             .ok_or(t("缺少分词表 merges.txt"))?;
-        let text = Session::builder(env())
+        let text = Session::builder(env()?)
             .map_err(|e| t_with("会话构建: {e}", &[("e", e.to_string())]))?
             .commit_from_file(&p)
             .map_err(|e| t_with("加载文本模型: {e}", &[("e", e.to_string())]))?;

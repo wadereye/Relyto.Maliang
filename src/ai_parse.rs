@@ -78,6 +78,34 @@ pub fn heuristic(query: &str) -> Parsed {
     p
 }
 
+/// 把时间条件换算成日期串区间 [start,end);无时间条件返回 None。
+pub fn date_window(p: &Parsed, today: chrono::NaiveDate) -> Option<(String, String)> {
+    use chrono::{Duration, NaiveDate};
+    let mut win: Option<(NaiveDate, NaiveDate)> = None;
+    if p.year > 0 {
+        let m = p.month.clamp(1, 12);
+        let first = NaiveDate::from_ymd_opt(p.year, m, 1)?;
+        let next = if m == 12 {
+            NaiveDate::from_ymd_opt(p.year + 1, 1, 1)
+        } else {
+            NaiveDate::from_ymd_opt(p.year, m + 1, 1)
+        }?;
+        win = Some((first, next));
+    }
+    if let Some(off) = p.day_offset {
+        let d = today.checked_add_signed(Duration::days(off as i64))?;
+        let next = d.checked_add_signed(Duration::days(1))?;
+        win = Some(match win {
+            Some((a, b)) => (a.max(d), b.min(next)),
+            None => (d, next),
+        });
+    }
+    let (a, b) = win?;
+    // 交集为空时返回零宽区间,调用方不会命中任何照片。
+    let b = b.max(a);
+    Some((a.to_string(), b.to_string()))
+}
+
 /// 从文本里抽"YYYY年M月"或"YYYY-MM"。
 fn find_year_month(s: &str) -> Option<(i32, u32)> {
     let chars: Vec<char> = s.chars().collect();
@@ -182,6 +210,24 @@ mod tests {
         assert_eq!(p.category.as_deref(), Some("动物"));
         assert!(p.near);
         assert!(heuristic("").text.is_empty());
+    }
+
+    #[test]
+    fn date_window_covers_day_month_and_intersection() {
+        use chrono::NaiveDate;
+        let today = NaiveDate::from_ymd_opt(2026, 11, 9).unwrap();
+        let empty = date_window(&Parsed::default(), today);
+        assert_eq!(empty, None);
+        let t = Parsed { day_offset: Some(0), ..Parsed::default() };
+        assert_eq!(date_window(&t, today), Some(("2026-11-09".into(), "2026-11-10".into())));
+        let y = Parsed { day_offset: Some(-1), ..Parsed::default() };
+        assert_eq!(date_window(&y, today), Some(("2026-11-08".into(), "2026-11-09".into())));
+        let m = Parsed { year: 2024, month: 2, ..Parsed::default() };
+        assert_eq!(date_window(&m, today), Some(("2024-02-01".into(), "2024-03-01".into())));
+        let both = Parsed { year: 2026, month: 11, day_offset: Some(-1), ..Parsed::default() };
+        assert_eq!(date_window(&both, today), Some(("2026-11-08".into(), "2026-11-09".into())));
+        let disjoint = Parsed { year: 2024, month: 2, day_offset: Some(0), ..Parsed::default() };
+        assert_eq!(date_window(&disjoint, today), Some(("2026-11-09".into(), "2026-11-09".into())));
     }
 
     #[test]
