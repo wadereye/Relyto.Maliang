@@ -1095,6 +1095,229 @@ pub mod face {
         }
     }
 
+    /// 单个模型文件的只读诊断:路径、存在性、内容哈希与 ONNX 输入/输出签名。
+    #[derive(Debug, Clone)]
+    pub struct ModelDiag {
+        /// 角色标签(检测/识别)。
+        pub role: &'static str,
+        /// 方案要求的文件名。
+        pub file: &'static str,
+        /// 生效的绝对路径。
+        pub path: std::path::PathBuf,
+        /// 文件是否存在。
+        pub exists: bool,
+        /// 内容 SHA256 前 16 位;缺失或不可读时为对应标记。
+        pub sha16: String,
+        /// 输入签名 "名[形状]"。
+        pub inputs: Vec<String>,
+        /// 输出签名 "名[形状]"。
+        pub outputs: Vec<String>,
+        /// 补充说明:检测器类型、识别维度或错误原因。
+        pub note: String,
+        /// 是否与方案导出契约不符(含缺失、加载失败、类型不符)。
+        pub mismatch: bool,
+    }
+
+    /// 一个方案的检测+识别双文件诊断汇总。
+    #[derive(Debug, Clone)]
+    pub struct FaceDiag {
+        pub contract: &'static str,
+        pub det: ModelDiag,
+        pub rec: ModelDiag,
+    }
+
+    /// 检测器类型的展示标签。
+    fn detector_label(kind: Detector) -> &'static str {
+        match kind {
+            Detector::YuNet => "YuNet",
+            Detector::Scrfd => "SCRFD",
+        }
+    }
+
+    /// 从导出契约前缀解析预期的检测器类型标签("yunet12"→YuNet,"scrfd9"→SCRFD)。
+    pub fn contract_detector(contract: &str) -> Option<&'static str> {
+        match contract.split('/').next().unwrap_or("") {
+            "yunet12" => Some(detector_label(Detector::YuNet)),
+            "scrfd9" => Some(detector_label(Detector::Scrfd)),
+            _ => None,
+        }
+    }
+
+    fn shape_str(shape: &[i64]) -> String {
+        if shape.is_empty() {
+            "?".to_string()
+        } else {
+            shape.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("×")
+        }
+    }
+
+    fn dtype_shape(dt: &ValueType) -> Vec<i64> {
+        match dt {
+            ValueType::Tensor { shape, .. } => shape.to_vec(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// 构造诊断骨架:核对路径、存在性与内容哈希,不加载模型。
+    fn diag_base(
+        role: &'static str, file: &'static str, dir: Option<&std::path::Path>,
+    ) -> ModelDiag {
+        let path = dir
+            .map(|d| d.join(file))
+            .unwrap_or_else(|| std::path::PathBuf::from(file));
+        let exists = path.is_file();
+        let sha16 = if !exists {
+            "absent".to_string()
+        } else {
+            crate::ai_models::sha256_file(&path)
+                .map(|s| s[..16].to_string())
+                .unwrap_or_else(|_| "unreadable".to_string())
+        };
+        ModelDiag {
+            role, file, path, exists, sha16,
+            inputs: Vec::new(), outputs: Vec::new(), note: String::new(), mismatch: false,
+        }
+    }
+
+    /// 采集一个已存在模型会话的输入/输出签名(仅用于展示)。
+    fn fill_io(d: &mut ModelDiag, session: &Session) {
+        d.inputs = session
+            .inputs()
+            .iter()
+            .map(|i| format!("{}[{}]", i.name(), shape_str(&dtype_shape(i.dtype()))))
+            .collect();
+        d.outputs = session
+            .outputs()
+            .iter()
+            .map(|o| format!("{}[{}]", o.name(), shape_str(&dtype_shape(o.dtype()))))
+            .collect();
+    }
+
+    /// 诊断检测模型:按输出签名判定检测器类型,与契约预期类型对照。
+    fn diag_detector(file: &'static str, dir: Option<&std::path::Path>, contract: &str) -> ModelDiag {
+        let mut d = diag_base(crate::i18n::t("检测"), file, dir);
+        if !d.exists {
+            d.note = crate::i18n::t("文件缺失").to_string();
+            d.mismatch = true;
+            return d;
+        }
+        let session = match open_session(&d.path) {
+            Ok(s) => s,
+            Err(e) => {
+                d.note = crate::i18n::t_with("加载失败:{e}", &[("e", e)]);
+                d.mismatch = true;
+                return d;
+            }
+        };
+        fill_io(&mut d, &session);
+        let specs: Vec<(&str, &[i64])> = match session
+            .outputs()
+            .iter()
+            .map(|o| float_shape(o.dtype()).map(|s| (o.name(), s)))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                d.note = e;
+                d.mismatch = true;
+                return d;
+            }
+        };
+        let expected = contract_detector(contract);
+        match detector_signature(&specs) {
+            Ok((kind, _)) => {
+                let label = detector_label(kind);
+                d.note = crate::i18n::t_with("检测器:{p1}", &[("p1", label.to_string())]);
+                if expected.is_some_and(|e| e != label) {
+                    d.mismatch = true;
+                    d.note = crate::i18n::t_with(
+                        "检测器不符:实际 {p1},契约要求 {p2}",
+                        &[
+                            ("p1", label.to_string()),
+                            ("p2", expected.unwrap_or("?").to_string()),
+                        ],
+                    );
+                }
+            }
+            Err(e) => {
+                d.note = e;
+                d.mismatch = true;
+            }
+        }
+        d
+    }
+
+    /// 诊断识别模型:输入必须 112×112、单输出,维度须与方案要求一致。
+    fn diag_recognizer(file: &'static str, dir: Option<&std::path::Path>, emb_dim: usize) -> ModelDiag {
+        let mut d = diag_base(crate::i18n::t("识别"), file, dir);
+        if !d.exists {
+            d.note = crate::i18n::t("文件缺失").to_string();
+            d.mismatch = true;
+            return d;
+        }
+        let session = match open_session(&d.path) {
+            Ok(s) => s,
+            Err(e) => {
+                d.note = crate::i18n::t_with("加载失败:{e}", &[("e", e)]);
+                d.mismatch = true;
+                return d;
+            }
+        };
+        fill_io(&mut d, &session);
+        let (_name, size) = match session_input(&session) {
+            Ok(v) => v,
+            Err(e) => {
+                d.note = e;
+                d.mismatch = true;
+                return d;
+            }
+        };
+        if [size.width, size.height].iter().flatten().any(|v| *v != 112) {
+            d.note = crate::i18n::t("识别输入必须为 112×112").to_string();
+            d.mismatch = true;
+            return d;
+        }
+        let dim = session
+            .outputs()
+            .first()
+            .and_then(|o| dtype_shape(o.dtype()).last().copied())
+            .unwrap_or(-1);
+        if session.outputs().len() != 1 {
+            d.note = crate::i18n::t("识别模型必须只有一个输出").to_string();
+            d.mismatch = true;
+            return d;
+        }
+        if dim > 0 && dim as usize != emb_dim {
+            d.note = crate::i18n::t_with(
+                "维度不符:实际 {p1},方案要求 {p2}",
+                &[("p1", dim.to_string()), ("p2", emb_dim.to_string())],
+            );
+            d.mismatch = true;
+            return d;
+        }
+        d.note = crate::i18n::t_with(
+            "识别维度:{p1}(方案要求 {p2})",
+            &[
+                ("p1", if dim > 0 { dim.to_string() } else { crate::i18n::t("动态").to_string() }),
+                ("p2", emb_dim.to_string()),
+            ],
+        );
+        d
+    }
+
+    /// 对指定方案做只读诊断:核对生效模型路径、内容哈希与导出契约。
+    /// 逐文件独立采集,单个缺失/损坏不中断;结果只展示,不改写也不自动替换错放的模型。
+    pub fn diagnose(algo: FaceAlgo) -> FaceDiag {
+        let dir = models_dir();
+        let (det_f, rec_f) = algo.files();
+        let contract = algo.contract();
+        FaceDiag {
+            contract,
+            det: diag_detector(det_f, dir.as_deref(), contract),
+            rec: diag_recognizer(rec_f, dir.as_deref(), algo.emb_dim()),
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -1111,6 +1334,36 @@ pub mod face {
 
         fn as_refs<'a, N: AsRef<str>>(entries: &'a [(N, Vec<i64>)]) -> Vec<(&'a str, &'a [i64])> {
             entries.iter().map(|(n, s)| (n.as_ref(), s.as_slice())).collect()
+        }
+
+        #[test]
+        fn contract_detector_maps_known_prefixes() {
+            assert_eq!(contract_detector("yunet12/sface-rawrgb-112"), Some("YuNet"));
+            assert_eq!(contract_detector("yunet12/adaface-bgr-112"), Some("YuNet"));
+            assert_eq!(contract_detector("scrfd9/arcface-bgr-112"), Some("SCRFD"));
+            assert_eq!(contract_detector("unknown/x"), None);
+            assert_eq!(contract_detector(""), None);
+        }
+
+        #[test]
+        fn contract_detector_agrees_with_all_algos() {
+            for algo in [FaceAlgo::SFace, FaceAlgo::AdaFace, FaceAlgo::AntelopeV2] {
+                assert!(
+                    contract_detector(algo.contract()).is_some(),
+                    "{} 契约前缀无法解析检测器类型",
+                    algo.key()
+                );
+            }
+            // SFace/AdaFace 用 YuNet,antelopev2 用 SCRFD。
+            assert_eq!(contract_detector(FaceAlgo::SFace.contract()), Some("YuNet"));
+            assert_eq!(contract_detector(FaceAlgo::AntelopeV2.contract()), Some("SCRFD"));
+        }
+
+        #[test]
+        fn shape_str_renders_dims() {
+            assert_eq!(shape_str(&[]), "?");
+            assert_eq!(shape_str(&[1, 3, 112, 112]), "1×3×112×112");
+            assert_eq!(shape_str(&[-1, 512]), "-1×512");
         }
 
         #[test]

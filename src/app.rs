@@ -664,6 +664,9 @@ pub struct App {
     /// 模型下载复选框的勾选状态(已就位的文件每帧强制清掉)。
     #[cfg(feature = "ai")]
     model_pick: [bool; 3],
+    /// 「模型诊断」结果缓存:点一次算一次,按方案存,切方案即失效重算。
+    #[cfg(feature = "ai")]
+    face_diag: Option<(crate::ai::face::FaceAlgo, crate::ai::face::FaceDiag)>,
     #[cfg(feature = "ai")]
     input_rename: String,
     /// 右栏「人物」页正在改名的脸(face_id, 草稿名);失焦/回车即写回所属人物。
@@ -2554,6 +2557,8 @@ impl App {
             // 默认全勾:勾选框每帧会按「文件是否已在位」收敛。
             #[cfg(feature = "ai")]
             model_pick: [true; 3],
+            #[cfg(feature = "ai")]
+            face_diag: None,
             #[cfg(feature = "ai")]
             input_rename: String::new(),
             #[cfg(feature = "ai")]
@@ -5281,6 +5286,44 @@ impl App {
                 crate::update::open_config_file();
             }
         });
+        ui.separator();
+
+        // —— 模型诊断(只读:核对生效路径/哈希/契约,不改写也不替换错放文件) ——
+        ui.heading(egui::RichText::new(t("模型诊断")).size(14.0));
+        ui.small(t(
+            "按当前方案核对生效的模型文件:路径、内容哈希与导出契约。只读,不会改写或替换任何文件。",
+        ));
+        // 方案切换后旧诊断作废,免得展示的是上一个方案的结果。
+        if self.face_diag.as_ref().is_some_and(|(a, _)| *a != cur) {
+            self.face_diag = None;
+        }
+        if ui
+            .add_enabled(!working, egui::Button::new(t("诊断当前方案的模型")))
+            .clicked()
+        {
+            self.face_diag = Some((cur, crate::ai::face::diagnose(cur)));
+        }
+        if let Some((_, diag)) = &self.face_diag {
+            ui.small(t_with(
+                "方案:{p1} · 契约:{p2}",
+                &[("p1", cur.label().to_string()), ("p2", diag.contract.to_string())],
+            ));
+            for m in [&diag.det, &diag.rec] {
+                let head = if m.mismatch { "✗" } else { "✓" };
+                ui.small(format!("{head} {} · {}", m.role, m.file));
+                ui.small(format!("    {}:{}", t("路径"), m.path.display()));
+                ui.small(format!("    SHA256:{}", m.sha16));
+                if !m.note.is_empty() {
+                    ui.small(format!("    {}", m.note));
+                }
+                if !m.inputs.is_empty() {
+                    ui.small(format!("    {}:{}", t("输入"), m.inputs.join(", ")));
+                }
+                if !m.outputs.is_empty() {
+                    ui.small(format!("    {}:{}", t("输出"), m.outputs.join(", ")));
+                }
+            }
+        }
         ui.separator();
 
         // —— 下载源(全局单选 + 测速) ——
