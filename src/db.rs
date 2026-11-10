@@ -895,7 +895,6 @@ CREATE TABLE IF NOT EXISTS face_templates (
     vec BLOB NOT NULL,
     sig TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX IF NOT EXISTS idx_face_templates_sig ON face_templates(sig);
 CREATE TABLE IF NOT EXISTS clips (
     photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     dim INTEGER NOT NULL,
@@ -1528,6 +1527,10 @@ impl Store {
         let _ = conn.execute_batch(
             "ALTER TABLE face_templates ADD COLUMN sig TEXT NOT NULL DEFAULT '';
              UPDATE face_templates SET sig='unknown' WHERE sig='';",
+        );
+        // sig 是迁移列:索引必须排在上面的 ALTER 之后建;写进 SCHEMA 会因旧库无此列而先于 ALTER 失败。
+        let _ = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_face_templates_sig ON face_templates(sig);",
         );
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN parent_id INTEGER;");
@@ -5676,6 +5679,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, "Nikon D850");
+    }
+
+    #[test]
+    fn open_migrates_legacy_face_templates_without_sig_column() {
+        // 模拟早期版本的 index.db:face_templates 表已存在但没有 sig 列。
+        // sig 是迁移列,其索引必须排在 ALTER 之后建;若写进 SCHEMA,
+        // 建索引会先于 ALTER 执行,旧库因无此列直接 panic(启动即崩)。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE faces(
+                 id INTEGER PRIMARY KEY,
+                 photo_id INTEGER NOT NULL,
+                 cluster INTEGER
+             );
+             CREATE TABLE face_templates(
+                 face_id INTEGER PRIMARY KEY,
+                 dim INTEGER NOT NULL,
+                 vec BLOB NOT NULL
+             );
+             INSERT INTO faces(id,photo_id,cluster) VALUES(1,1,0);
+             INSERT INTO face_templates(face_id,dim,vec) VALUES(1,4,x'00000000');",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        let c = store.test_conn();
+        // 迁移列已补齐,且 sig 索引在 ALTER 之后建立
+        let n: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index'
+                 AND name='idx_face_templates_sig'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "sig 索引应在迁移后建立");
+        // 旧模板补上 sig 并回填为 unknown(不参与当前管线比对)
+        let sig: String = c
+            .query_row(
+                "SELECT sig FROM face_templates WHERE face_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sig, "unknown", "旧模板 sig 应回填为 unknown");
     }
 
     #[test]
