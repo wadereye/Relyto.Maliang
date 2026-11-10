@@ -662,7 +662,7 @@ pub struct App {
     #[cfg(feature = "ai")]
     clip_index_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
     #[cfg(feature = "ai")]
-    clip_search_rx: Option<mpsc::Receiver<Result<(Vec<(i64, f32)>, bool), String>>>,
+    clip_search_rx: Option<mpsc::Receiver<Result<(Vec<(i64, f32)>, Option<String>), String>>>,
     #[cfg(feature = "ai")]
     clip_results: Vec<(i64, f32)>,
     /// 语义索引语言(英文/中文 CLIP 双模型;搜索按查询语言自动匹配)。
@@ -1396,6 +1396,37 @@ const TAG_COLORS: [(&str, egui::Color32); 10] = [
     ("white", egui::Color32::from_rgb(228, 228, 228)),
     ("gray", egui::Color32::from_rgb(140, 140, 140)),
 ];
+
+/// 把标签全路径展开成层级行(深度, 末段名, 全路径, 照片数, 是否真实标签)。
+fn tag_tree_rows(tags: &[timeline::TagInfo]) -> Vec<(usize, String, String, usize, bool)> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, (usize, usize, bool)> = BTreeMap::new();
+    for t in tags {
+        let segs: Vec<&str> = t.name.split('/').collect();
+        let mut path = String::new();
+        for (i, seg) in segs.iter().enumerate() {
+            if !path.is_empty() {
+                path.push('/');
+            }
+            path.push_str(seg);
+            let last = i + 1 == segs.len();
+            map.entry(path.clone())
+                .and_modify(|e| {
+                    if last {
+                        e.1 = t.count;
+                        e.2 = true;
+                    }
+                })
+                .or_insert((i, if last { t.count } else { 0 }, last));
+        }
+    }
+    map.into_iter()
+        .map(|(path, (depth, count, real))| {
+            let label = path.rsplit('/').next().unwrap_or(path.as_str()).to_string();
+            (depth, label, path, count, real)
+        })
+        .collect()
+}
 
 /// 颜色键对应的显示名(存储仍用英文键)。
 fn tag_color_name(key: &str) -> &'static str {
@@ -5598,6 +5629,15 @@ impl App {
             );
             return;
         }
+        // 地点意图要有一张带定位的基准照片才能算距离,否则只提示不过滤。
+        let base_id = self.preview.or_else(|| {
+            if self.sel.len() == 1 {
+                self.sel.iter().next().copied()
+            } else {
+                None
+            }
+        });
+        let near_base = base_id.and_then(|id| crate::ai_search::photo_gps(&store, id));
         let (tx, rx) = mpsc::channel();
         self.clip_search_rx = Some(rx);
         self.status = if natural {
@@ -5619,7 +5659,7 @@ impl App {
             } else {
                 parsed.text.clone()
             };
-            let res: Result<(Vec<(i64, f32)>, bool), String> =
+            let res: Result<(Vec<(i64, f32)>, Option<String>), String> =
                 match crate::clip::search_best(&store, &text, 200) {
                     Ok((mut hits, used_natural)) => {
                         // 分类与时间过滤只在新链路上生效,旧模型没有对应数据。
@@ -5648,7 +5688,26 @@ impl App {
                                 hits.retain(|(id, _)| allowed.contains(id));
                             }
                         }
-                        Ok((hits, used_natural && parsed.near))
+                        let mut note: Option<String> = None;
+                        if parsed.near {
+                            let km = parsed
+                                .near_km
+                                .unwrap_or(crate::ai_parse::DEFAULT_NEAR_KM);
+                            if let Some((la, lo)) = near_base {
+                                let ids: Vec<i64> = hits.iter().map(|(id, _)| *id).collect();
+                                let allowed = crate::ai_search::ids_near_point(
+                                    &store, &ids, la, lo, km,
+                                );
+                                hits.retain(|(id, _)| allowed.contains(id));
+                                note = Some(t_with(
+                                    "已按基准照片周边 {p1} 公里筛选(仅含带定位的照片)",
+                                    &[("p1", km.to_string())],
+                                ));
+                            } else {
+                                note = Some(t("未指定基准照片,地点条件暂不参与筛选").to_string());
+                            }
+                        }
+                        Ok((hits, note))
                     }
                     Err(e) => Err(e),
                 };
@@ -7855,7 +7914,7 @@ impl App {
                     &[("p1", q), ("p2", (cells.len()).to_string())],
                 ));
                 if cells.is_empty() {
-                    ui.label(t("没有命中的照片;先启用 AI 索引可生成标签与文字索引。"));
+                    ui.label(t("没有命中的照片;先启用 AI 索引可生成标签、文字与描述索引。"));
                 }
                 self.photo_grid(ui, "tag-search-grid", &cells);
                 return;
@@ -11376,16 +11435,12 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.clip_search_rx = None;
                 match res {
-                    Ok((hits, near)) => {
+                    Ok((hits, note)) => {
                         let n = hits.len();
                         self.clip_results = hits;
                         self.status = t_with("语义搜索完成:{n} 个结果", &[("n", n.to_string())]);
-                        if near {
-                            self.status = format!(
-                                "{} · {}",
-                                self.status,
-                                t("地点条件暂不参与筛选")
-                            );
+                        if let Some(msg) = note {
+                            self.status = format!("{} · {}", self.status, msg);
                         }
                     }
                     Err(e) => self.status = t_with("语义搜索失败: {e}", &[("e", e.to_string())]),
@@ -12501,10 +12556,10 @@ impl eframe::App for App {
                             .show(ui, |ui| {
                                 #[cfg(feature = "ai")]
                                 {
-                                    ui.label(t("库内检索:标签或图中文字"));
+                                    ui.label(t("库内检索:标签、图中文字或描述"));
                                     let resp = ui.add(
                                         egui::TextEdit::singleline(&mut self.ai_query)
-                                            .hint_text(t("输入标签名 / 图中文字,即输即搜…"))
+                                            .hint_text(t("输入标签名 / 图中文字 / 描述,即输即搜…"))
                                             .desired_width(f32::INFINITY),
                                     );
                                     if resp.changed() {
@@ -12522,8 +12577,11 @@ impl eframe::App for App {
                                             );
                                             let ocr =
                                                 crate::ai_ocr::search(&self.store, &q, 200);
+                                            let cap = crate::ai_search::caption_search(
+                                                &self.store, &q, 200,
+                                            );
                                             self.ai_query_hits = crate::ai_search::fuse(
-                                                &[tags, ocr],
+                                                &[tags, ocr, cap],
                                                 60.0,
                                                 200,
                                             )
@@ -12595,32 +12653,30 @@ impl eframe::App for App {
                                     "共 {p1} 个(右键设颜色/重命名/删除)",
                                     &[("p1", (self.tags.len()).to_string())],
                                 ));
-                                let groups: Vec<String> = {
-                                    let mut g: Vec<String> = self
-                                        .tags
-                                        .iter()
-                                        .filter_map(|x| {
-                                            x.name.split_once('/').map(|(p, _)| p.to_string())
-                                        })
-                                        .collect();
-                                    g.sort();
-                                    g.dedup();
-                                    g
-                                };
-                                if !groups.is_empty() {
+                                let tree = tag_tree_rows(&self.tags);
+                                if tree.iter().any(|(d, ..)| *d > 0) {
                                     ui.label(t("标签分组"));
-                                    for g in groups {
+                                    for (depth, label, path, count, real) in tree {
+                                        let text = if real {
+                                            t_with(
+                                                "{p1}  ·  {p2} 张",
+                                                &[("p1", label), ("p2", count.to_string())],
+                                            )
+                                        } else {
+                                            label
+                                        };
+                                        let shown = format!("{}{}", "    ".repeat(depth), text);
                                         if ui
                                             .selectable_label(
-                                                self.sel_tag.as_deref() == Some(g.as_str()),
-                                                g.as_str(),
+                                                self.sel_tag.as_deref() == Some(path.as_str()),
+                                                shown,
                                             )
                                             .clicked()
                                         {
-                                            if self.sel_tag.as_deref() == Some(g.as_str()) {
+                                            if self.sel_tag.as_deref() == Some(path.as_str()) {
                                                 self.sel_tag = None;
                                             } else {
-                                                self.sel_tag = Some(g.clone());
+                                                self.sel_tag = Some(path.clone());
                                             }
                                             #[cfg(feature = "ai")]
                                             {
@@ -12690,7 +12746,7 @@ impl eframe::App for App {
                                     let mut cancel = false;
                                     ui.horizontal(|ui| {
                                         ui.label(t_with(
-                                            "确定删除标签 «{p1}»? 将同时从 {p2} 张照片上移除",
+                                            "确定删除标签 «{p1}»(含子标签)? 将同时从 {p2} 张照片上移除",
                                             &[("p1", name.clone()), ("p2", n.to_string())],
                                         ));
                                         confirm = ui.button(t("删除")).clicked();

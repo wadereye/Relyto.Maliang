@@ -385,6 +385,30 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // 命令行帮助:只读、不进 GUI、不碰数据库。
+        "--help" | "-h" => {
+            println!("{}", t("用法: maliang.exe [子命令]"));
+            println!("{}", t("可用子命令:"));
+            for (cmd, desc) in [
+                ("--version", t("打印版本号")),
+                ("--help / -h", t("显示本帮助")),
+                ("--check-update", t("检查更新")),
+                ("--download-update", t("下载更新包")),
+                ("--install-service", t("安装索引服务")),
+                ("--uninstall-service", t("卸载索引服务")),
+                ("--start-service", t("启动索引服务")),
+                ("--stop-service", t("停止索引服务")),
+                ("--service", t("以索引服务运行")),
+                ("--console", t("控制台模式运行")),
+                ("--mft-scan", t("扫描名字索引")),
+                ("--mft-check", t("校验名字索引")),
+                ("--export-assets [路径]", t("导出资源包")),
+                ("--import-assets <路径>", t("导入资源包")),
+            ] {
+                println!("  {cmd:<28} {desc}");
+            }
+            true
+        }
         // 打印版本号后退出。
         "--version" => {
             println!(
@@ -422,6 +446,8 @@ fn main() -> eframe::Result {
             | Some("--check-update")
             | Some("--download-update")
             | Some("--version")
+            | Some("--help")
+            | Some("-h")
     );
     // 统一配置迁移(旧 data.location / update.ini → maliang.ini)必须最先行:
     // 后续一切配置与数据目录解析都只认新文件。update-helper 子命令也要跑,

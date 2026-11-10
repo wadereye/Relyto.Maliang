@@ -567,6 +567,7 @@ pub fn add_tag(store: &Store, id: i64, name: &str) -> Result<()> {
              SELECT ?1, id FROM tags WHERE name=?2",
             rusqlite::params![id, name],
         )?;
+        conn.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
         Ok(())
     })?;
     Ok(())
@@ -615,22 +616,29 @@ pub fn rename_tag(store: &Store, old: &str, new: &str) -> Result<Vec<i64>> {
         if n == 0 {
             anyhow::bail!("标签不存在");
         }
+        tx.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
         tx.commit()?;
         Ok(())
     })?;
     Ok(ids)
 }
 
-/// 全库删除标签(先清关联再删标签行),返回受影响的照片 id。
+/// 全库删除标签及其子标签(先清关联再删标签行),返回受影响的照片 id。
 pub fn delete_tag(store: &Store, name: &str) -> Result<Vec<i64>> {
     let ids = photos_by_tag(store, name)?;
     store.write(|conn| -> Result<()> {
         let tx = conn.transaction()?;
+        let prefix = format!("{name}/");
+        let cond = "name=?1 OR substr(name,1,length(?2))=?2";
         tx.execute(
-            "DELETE FROM photo_tags WHERE tag_id IN (SELECT id FROM tags WHERE name=?1)",
-            rusqlite::params![name],
+            &format!("DELETE FROM photo_tags WHERE tag_id IN (SELECT id FROM tags WHERE {cond})"),
+            rusqlite::params![name, prefix],
         )?;
-        tx.execute("DELETE FROM tags WHERE name=?1", rusqlite::params![name])?;
+        tx.execute(
+            &format!("DELETE FROM tags WHERE {cond}"),
+            rusqlite::params![name, prefix],
+        )?;
+        tx.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
         tx.commit()?;
         Ok(())
     })?;
@@ -709,13 +717,19 @@ pub fn set_tag_color(store: &Store, name: &str, color: Option<&str>) -> Result<(
     Ok(())
 }
 
-/// 某标签(含 `父/子` 前缀子树)下的照片 id 列表,按 id 升序。
+/// 某标签及其整棵子树下的照片 id 列表,按 id 升序。
 pub fn photos_by_tag(store: &Store, tag: &str) -> Result<Vec<i64>> {
     store.read(|conn| -> Result<Vec<i64>> {
         let prefix = format!("{tag}/");
         let mut st = conn.prepare(
-            "SELECT DISTINCT pt.photo_id FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
-              WHERE t.name=?1 OR substr(t.name, 1, length(?2)) = ?2
+            "WITH RECURSIVE sub(id) AS (
+                SELECT id FROM tags WHERE name=?1
+                UNION
+                SELECT t.id FROM tags t JOIN sub s ON t.parent_id=s.id
+             )
+             SELECT DISTINCT pt.photo_id FROM photo_tags pt
+              WHERE pt.tag_id IN (SELECT id FROM sub)
+                 OR pt.tag_id IN (SELECT id FROM tags WHERE substr(name,1,length(?2))=?2)
               ORDER BY pt.photo_id",
         )?;
         let rows: Vec<i64> = st
@@ -956,7 +970,41 @@ mod tests {
         assert_eq!(photos_by_tag(&store, "人像").unwrap().len(), 3);
         delete_tag(&store, "人像").unwrap();
         assert_eq!(tags_of(&store, a).unwrap(), Vec::<String>::new());
-        assert_eq!(tags_of(&store, b).unwrap(), vec!["人像/自拍".to_string()]);
+        assert_eq!(tags_of(&store, b).unwrap(), Vec::<String>::new());
+        assert_eq!(tags_of(&store, c).unwrap(), Vec::<String>::new());
+        assert!(all_tags(&store).unwrap().iter().all(|t| !t.name.starts_with("人像")));
+    }
+
+    /// 真父子树:parent_id 挂最长祖先,递归查询命中整棵子树。
+    #[test]
+    fn tag_parent_chain_and_recursive_subtree() {
+        let store = Store::open_mem().unwrap();
+        let a = one_photo(&store);
+        let b = {
+            store.test_conn()
+                .execute("INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)", [])
+                .unwrap();
+            store.test_conn().last_insert_rowid()
+        };
+        add_tag(&store, a, "旅行").unwrap();
+        add_tag(&store, a, "旅行/2024").unwrap();
+        add_tag(&store, b, "旅行/2024/北京").unwrap();
+        let parent_id: Option<i64> = store.test_conn().query_row(
+            "SELECT parent_id FROM tags WHERE name='旅行/2024/北京'", [], |r| r.get(0),
+        ).unwrap();
+        let expect: i64 = store.test_conn().query_row(
+            "SELECT id FROM tags WHERE name='旅行/2024'", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(parent_id, Some(expect), "子节点应挂到最长已存在祖先");
+        assert_eq!(photos_by_tag(&store, "旅行").unwrap(), vec![a, b]);
+        assert_eq!(photos_by_tag(&store, "旅行/2024").unwrap(), vec![a, b]);
+        assert_eq!(photos_by_tag(&store, "旅行/2024/北京").unwrap(), vec![b]);
+        rename_tag(&store, "旅行/2024", "旅行/2025").unwrap();
+        let rebuilt: Option<i64> = store.test_conn().query_row(
+            "SELECT parent_id FROM tags WHERE name='旅行/2025/北京'", [], |r| r.get(0),
+        ).unwrap();
+        assert!(rebuilt.is_some(), "改名后父链要重算");
+        assert_eq!(photos_by_tag(&store, "旅行/2025").unwrap(), vec![a, b]);
     }
 
     /// P0 固化:star 列读写链路(load_all SELECT / set_star UPDATE)。

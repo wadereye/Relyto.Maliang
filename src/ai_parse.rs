@@ -1,5 +1,8 @@
 //! 复杂查询解析(M5,可选):时间/地点/分类/自由文本;模型不可用时走规则兜底。
 
+/// 未指定距离时「附近」的默认半径(公里)。
+pub const DEFAULT_NEAR_KM: f64 = 10.0;
+
 /// 解析后的查询结构。
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Parsed {
@@ -14,6 +17,8 @@ pub struct Parsed {
     pub month: u32,
     /// 是否包含"附近/旁边"这类地点意图。
     pub near: bool,
+    /// 地点意图自带的半径(公里);未写明则调用方用默认值。
+    pub near_km: Option<f64>,
 }
 
 /// 规则解析:识别时间词、分类词与地点意图,剩余文本作为自由查询。
@@ -70,6 +75,9 @@ pub fn heuristic(query: &str) -> Parsed {
             rest = rest.replace(word, " ");
         }
     }
+    if p.near {
+        p.near_km = take_radius_km(&mut rest);
+    }
     p.text = rest
         .replace("的", " ")
         .split_whitespace()
@@ -111,6 +119,49 @@ pub fn parse_query(query: &str, model_output: Option<&str>) -> Parsed {
     model_output
         .and_then(parse_model_output)
         .unwrap_or_else(|| heuristic(query))
+}
+
+/// 抽「5公里 / 500米 / 2km」并从自由文本里摘掉,返回公里数。
+fn take_radius_km(rest: &mut String) -> Option<f64> {
+    let chars: Vec<char> = rest.chars().collect();
+    for start in 0..chars.len() {
+        if !chars[start].is_ascii_digit() {
+            continue;
+        }
+        if start > 0 && chars[start - 1].is_ascii_digit() {
+            continue;
+        }
+        let mut end = start;
+        while end < chars.len() && (chars[end].is_ascii_digit() || chars[end] == '.') {
+            end += 1;
+        }
+        let Ok(num) = chars[start..end].iter().collect::<String>().parse::<f64>() else {
+            continue;
+        };
+        let mut u = end;
+        while u < chars.len() && chars[u].is_whitespace() {
+            u += 1;
+        }
+        let tail: String = chars[u..].iter().take(2).collect();
+        let low = tail.to_ascii_lowercase();
+        let (km, unit_len) = if low.starts_with("公里")
+            || low.starts_with("千米")
+            || low.starts_with("km")
+        {
+            (num, 2)
+        } else if low.starts_with('米') || low.starts_with('m') {
+            (num / 1000.0, 1)
+        } else {
+            continue;
+        };
+        if km <= 0.0 || km > 20_000.0 {
+            continue;
+        }
+        let removed: String = chars[start..u + unit_len].iter().collect();
+        *rest = rest.replacen(&removed, " ", 1);
+        return Some(km);
+    }
+    None
 }
 
 /// 从文本里抽"YYYY年M月"或"YYYY-MM"。
@@ -159,7 +210,8 @@ pub fn parse_model_output(s: &str) -> Option<Parsed> {
         p.month = n as u32;
     }
     p.near = json_bool(body, "near").unwrap_or(false);
-    if p.text.is_empty() && p.category.is_none() && p.day_offset.is_none() {
+    p.near_km = json_num(body, "near_km");
+    if p.text.is_empty() && p.category.is_none() && p.day_offset.is_none() && !p.near {
         None
     } else {
         Some(p)
@@ -216,7 +268,28 @@ mod tests {
         let p = heuristic("附近的猫");
         assert_eq!(p.category.as_deref(), Some("动物"));
         assert!(p.near);
+        assert_eq!(p.near_km, None);
         assert!(heuristic("").text.is_empty());
+    }
+
+    #[test]
+    fn parses_near_radius_units() {
+        let a = heuristic("附近5公里的猫");
+        assert!(a.near);
+        assert_eq!(a.near_km, Some(5.0));
+        assert!(!a.text.contains("公里"));
+        let b = heuristic("旁边 500 米 的发票");
+        assert_eq!(b.near_km, Some(0.5));
+        let c = heuristic("周围的 2km 猫");
+        assert_eq!(c.near_km, Some(2.0));
+        assert_eq!(take_radius_km(&mut "2024年5月".to_string()), None);
+    }
+
+    #[test]
+    fn model_output_with_only_near_is_valid() {
+        let p = parse_model_output(r#"{"near":true,"near_km":3.5}"#).unwrap();
+        assert!(p.near);
+        assert_eq!(p.near_km, Some(3.5));
     }
 
     #[test]

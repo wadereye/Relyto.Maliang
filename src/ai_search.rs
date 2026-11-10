@@ -62,6 +62,70 @@ pub fn ids_in_date_window(
     out
 }
 
+/// 球面距离(公里)。
+fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let r = 6371.0088_f64;
+    let (p1, p2) = (a.0.to_radians(), b.0.to_radians());
+    let dp = p2 - p1;
+    let dl = (b.1 - a.1).to_radians();
+    let h = (dp / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dl / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
+}
+
+/// 取一张照片的基准坐标(无定位返回 None)。
+pub fn photo_gps(store: &Store, photo_id: i64) -> Option<(f64, f64)> {
+    store.read(|conn| {
+        conn.query_row(
+            "SELECT lat, lon FROM photos WHERE id=?1",
+            params![photo_id],
+            |r| Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<f64>>(1)?)),
+        )
+        .ok()
+        .and_then(|(a, b)| a.zip(b))
+    })
+}
+
+/// 只保留距基准坐标不超过 km 的照片(无定位的行一律排除)。
+pub fn ids_near_point(
+    store: &Store,
+    ids: &[i64],
+    lat: f64,
+    lon: f64,
+    km: f64,
+) -> std::collections::HashSet<i64> {
+    use std::collections::HashSet;
+    let mut out = HashSet::new();
+    if ids.is_empty() || km <= 0.0 {
+        return out;
+    }
+    let sql = format!(
+        "SELECT id, lat, lon FROM photos WHERE id IN ({})",
+        vec!["?"; ids.len()].join(",")
+    );
+    store.read(|conn| {
+        let Ok(mut st) = conn.prepare(&sql) else {
+            return;
+        };
+        let Ok(rows) = st.query_map(rusqlite::params_from_iter(ids.iter().copied()), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<f64>>(1)?,
+                r.get::<_, Option<f64>>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        for (id, la, lo) in rows.flatten() {
+            if let (Some(a), Some(b)) = (la, lo) {
+                if haversine_km((lat, lon), (a, b)) <= km {
+                    out.insert(id);
+                }
+            }
+        }
+    });
+    out
+}
+
 /// 把历史库里可能是秒/毫秒/微秒的 mtime 换成本地日期串。
 fn mtime_date(v: i64) -> Option<String> {
     let secs = if v >= 100_000_000_000_000 {
@@ -171,6 +235,30 @@ pub fn tag_search(store: &Store, ver: &str, query: &str, limit: usize) -> Vec<(i
     })
 }
 
+/// 描述命中:标题子串匹配(不区分大小写,命中位置靠前的优先)。
+pub fn caption_search(store: &Store, query: &str, limit: usize) -> Vec<(i64, f32)> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    store.read(|conn| {
+        let mut out = Vec::new();
+        let Ok(mut st) = conn.prepare(
+            "SELECT id, instr(lower(COALESCE(caption,'')), ?1) AS pos FROM photos
+              WHERE instr(lower(COALESCE(caption,'')), ?1) > 0
+              ORDER BY pos, id LIMIT ?2",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = st.query_map(params![q, limit as i64], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as f32))
+        }) {
+            out.extend(rows.flatten());
+        }
+        out
+    })
+}
+
 /// Reciprocal Rank Fusion:多路结果按 1/(k+rank) 相加。
 pub fn fuse(lists: &[Vec<(i64, f32)>], k: f32, limit: usize) -> Vec<(i64, f32)> {
     use std::collections::HashMap;
@@ -186,7 +274,7 @@ pub fn fuse(lists: &[Vec<(i64, f32)>], k: f32, limit: usize) -> Vec<(i64, f32)> 
     out
 }
 
-/// 混合检索:向量(有则用)+ 标签 + OCR,三路融合。
+/// 混合检索:向量(有则用)+ 标签 + OCR + 描述,四路融合。
 pub fn hybrid(
     store: &Store,
     ver: &str,
@@ -201,6 +289,7 @@ pub fn hybrid(
     }
     lists.push(tag_search(store, tag_ver, query, limit * 2));
     lists.push(crate::ai_ocr::search(store, query, limit * 2));
+    lists.push(caption_search(store, query, limit * 2));
     fuse(&lists, 60.0, limit)
         .into_iter()
         .map(|(id, _)| id)
@@ -277,9 +366,56 @@ mod tests {
         crate::ai_tags::seed_labels(&store).unwrap();
         crate::ai_tags::save(&store, 11, "v1", &[(2, 0.8)]).unwrap();
         crate::ai_ocr::save(&store, 12, "合影 发票", &[], "v1").unwrap();
+        add_photo(&store, 13);
+        store.set_caption(13, "合影留念").unwrap();
         let hits = hybrid(&store, "v1", "v1", "合影", None, 10);
         assert!(hits.contains(&11), "标签命中应进入融合结果");
         assert!(hits.contains(&12), "图中文字命中应进入融合结果");
+        assert!(hits.contains(&13), "描述命中应进入融合结果");
+    }
+
+    #[test]
+    fn caption_search_matches_manual_text_without_wildcards() {
+        let store = Store::open_mem().unwrap();
+        add_photo(&store, 21);
+        add_photo(&store, 22);
+        store.set_caption(21, "身份证放在抽屉里").unwrap();
+        store.set_caption(22, "海边日落").unwrap();
+        let ids: Vec<i64> = caption_search(&store, "身份证", 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![21]);
+        assert!(caption_search(&store, "抽屉", 10)
+            .iter()
+            .any(|(id, _)| *id == 21));
+        assert!(caption_search(&store, "%", 10).is_empty(), "百分号不是通配符");
+        assert!(caption_search(&store, "  ", 10).is_empty(), "空词不查全库");
+    }
+
+    #[test]
+    fn near_point_filters_by_distance_and_requires_gps() {
+        let store = Store::open_mem().unwrap();
+        for id in [31, 32, 33] {
+            add_photo(&store, id);
+        }
+        store.write(|conn| {
+            conn.execute("UPDATE photos SET lat=39.9, lon=116.4 WHERE id=31", [])
+                .unwrap();
+            conn.execute("UPDATE photos SET lat=39.91, lon=116.41 WHERE id=32", [])
+                .unwrap();
+        });
+        let ids = [31, 32, 33];
+        let near = ids_near_point(&store, &ids, 39.9, 116.4, 5.0);
+        assert!(near.contains(&31));
+        assert!(near.contains(&32), "约 1.4 公里应落在 5 公里内");
+        assert!(!near.contains(&33), "无定位的照片不参与附近筛选");
+        let tight = ids_near_point(&store, &ids, 39.9, 116.4, 0.1);
+        assert!(tight.contains(&31));
+        assert!(!tight.contains(&32));
+        assert!(ids_near_point(&store, &[], 39.9, 116.4, 5.0).is_empty());
+        assert!(photo_gps(&store, 31).is_some());
+        assert_eq!(photo_gps(&store, 33), None);
     }
 
     #[test]

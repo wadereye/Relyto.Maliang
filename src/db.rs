@@ -798,6 +798,13 @@ pub fn auto_relocate_system_cache() -> (usize, bool) {
     (moved, ok)
 }
 
+/// 由标签全路径重算父层级(挂到最长的已存在祖先)。
+pub(crate) const REBUILD_TAG_PARENTS_SQL: &str =
+    "UPDATE tags SET parent_id = (
+       SELECT p.id FROM tags p
+        WHERE substr(tags.name, 1, length(p.name) + 1) = p.name || '/'
+        ORDER BY length(p.name) DESC LIMIT 1);";
+
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -859,7 +866,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pool_value ON string_pool(pool, value);
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY,
     name TEXT UNIQUE NOT NULL,
-    color TEXT
+    color TEXT,
+    parent_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS photo_tags (
     photo_id INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
@@ -1492,6 +1500,8 @@ impl Store {
         let _ =
             conn.execute_batch("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;");
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN parent_id INTEGER;");
+        let _ = conn.execute_batch(REBUILD_TAG_PARENTS_SQL);
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lat REAL;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lon REAL;");
         // uid64 持久唯一标识(64 位无符号整数列)。
@@ -2585,6 +2595,35 @@ impl Store {
         Ok(total)
     }
 
+    /// 事务内清掉 purge_ids 里的照片及全部引用行(不写变更日志)。
+    fn delete_purge_ids_tx(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+        // FTS 是外部内容表,删正文前要按原分词发一次 delete。
+        let _ = tx.execute_batch(
+            "INSERT INTO ocr_fts(ocr_fts, rowid, seg)
+               SELECT 'delete', d.photo_id, d.seg FROM ocr_docs d
+                WHERE d.photo_id IN (SELECT id FROM purge_ids);",
+        );
+        tx.execute_batch(
+            "DELETE FROM photo_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM face_templates WHERE face_id IN
+                 (SELECT id FROM faces WHERE photo_id IN (SELECT id FROM purge_ids));
+             DELETE FROM faces         WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM clips         WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM clips_cn      WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM thumb_tiers   WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM album_photos  WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM ai_jobs       WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM ai_state      WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM ai_failed     WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM auto_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM clips_vec     WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM ocr_docs      WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM ocr_boxes     WHERE photo_id IN (SELECT id FROM purge_ids);
+             DELETE FROM photos        WHERE id IN (SELECT id FROM purge_ids);",
+        )?;
+        Ok(())
+    }
+
     /// 按 id 批量删行,**不写变更日志**:清的是从未属于图库的行,往 `changes`
     /// 里灌十万条 `removed` 会把真正的用户删除记录冲掉。
     ///
@@ -2609,30 +2648,7 @@ impl Store {
                         st.execute(rusqlite::params![id])?;
                     }
                 }
-                // FTS 是外部内容表,删正文前要按原分词发一次 delete。
-                let _ = tx.execute_batch(
-                    "INSERT INTO ocr_fts(ocr_fts, rowid, seg)
-                       SELECT 'delete', d.photo_id, d.seg FROM ocr_docs d
-                        WHERE d.photo_id IN (SELECT id FROM purge_ids);",
-                );
-                tx.execute_batch(
-                    "DELETE FROM photo_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM face_templates WHERE face_id IN
-                         (SELECT id FROM faces WHERE photo_id IN (SELECT id FROM purge_ids));
-                     DELETE FROM faces         WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM clips         WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM clips_cn      WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM thumb_tiers   WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM album_photos  WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM ai_jobs       WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM ai_state      WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM ai_failed     WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM auto_tags     WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM clips_vec     WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM ocr_docs      WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM ocr_boxes     WHERE photo_id IN (SELECT id FROM purge_ids);
-                     DELETE FROM photos        WHERE id IN (SELECT id FROM purge_ids);",
-                )?;
+                Self::delete_purge_ids_tx(&tx)?;
                 let n = part.len();
                 tx.commit()?;
                 Ok::<usize, anyhow::Error>(n)
@@ -2697,16 +2713,33 @@ impl Store {
                      ELSE photos.rich_state
                    END",
             )?;
-            let mut purge = tx.prepare_cached(
-                "DELETE FROM photos WHERE path=:path AND (frn64 IS NULL OR frn64<>:frn64)",
+            let mut stale = tx.prepare_cached(
+                "SELECT id FROM photos WHERE path=:path AND (frn64 IS NULL OR frn64<>:frn64)",
             )?;
             let mut probe = tx.prepare_cached("SELECT 1 FROM photos WHERE frn64=:frn64")?;
             let mut out = L1Ingest::default();
             for r in &rows {
-                // 先摘陈旧占用,再 upsert;两条都在同一事务里,失败一起回滚。
-                purge.execute(rusqlite::named_params! {
-                    ":path": r.path, ":frn64": r.frn64,
-                })?;
+                // 先摘陈旧占用(连引用表一起),再 upsert;同事务,失败一起回滚。
+                let ids: Vec<i64> = stale
+                    .query_map(
+                        rusqlite::named_params! { ":path": r.path, ":frn64": r.frn64 },
+                        |row| row.get(0),
+                    )?
+                    .filter_map(|x| x.ok())
+                    .collect();
+                if !ids.is_empty() {
+                    tx.execute_batch(
+                        "CREATE TEMP TABLE IF NOT EXISTS purge_ids(id INTEGER PRIMARY KEY);
+                         DELETE FROM purge_ids;",
+                    )?;
+                    {
+                        let mut put = tx.prepare_cached("INSERT INTO purge_ids(id) VALUES(?1)")?;
+                        for id in &ids {
+                            put.execute(rusqlite::params![id])?;
+                        }
+                    }
+                    Self::delete_purge_ids_tx(&tx)?;
+                }
                 let existed = probe
                     .exists(rusqlite::named_params! { ":frn64": r.frn64 })
                     .unwrap_or(false);
@@ -2726,7 +2759,7 @@ impl Store {
                 }
             }
             drop(ins);
-            drop(purge);
+            drop(stale);
             drop(probe);
             tx.commit()?;
             Ok(out)
@@ -2742,12 +2775,22 @@ impl Store {
         let frn64s = frn64s.to_vec();
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
-            let mut st = tx.prepare_cached("DELETE FROM photos WHERE frn64=?1")?;
-            let mut n = 0usize;
-            for f in &frn64s {
-                n += st.execute(rusqlite::params![f])?;
+            tx.execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS purge_ids(id INTEGER PRIMARY KEY);
+                 DELETE FROM purge_ids;",
+            )?;
+            {
+                let mut put = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO purge_ids(id) SELECT id FROM photos WHERE frn64=?1",
+                )?;
+                for f in &frn64s {
+                    put.execute(rusqlite::params![f])?;
+                }
             }
-            drop(st);
+            let n: usize = tx.query_row("SELECT COUNT(*) FROM purge_ids", [], |r| r.get(0))?;
+            if n > 0 {
+                Self::delete_purge_ids_tx(&tx)?;
+            }
             tx.commit()?;
             Ok(n)
         })
@@ -6167,6 +6210,69 @@ mod tests {
             .unwrap();
         assert_eq!(left, r"C:\pics\b.jpg");
         assert_eq!(store.delete_l1_frn64(&[]).unwrap(), 0);
+    }
+
+    /// L1 同步删除不能只删主表:引用表与 FTS 幽灵行都要清。
+    #[test]
+    fn l1_purge_clears_reference_rows() {
+        let store = Store::open_mem().unwrap();
+        let seed = |frn: u64| {
+            store
+                .ingest_l1_rows(&[row('C', frn, r"C:\pics\slot.jpg", 1, 1)], None)
+                .unwrap();
+            store
+                .test_conn()
+                .query_row("SELECT id FROM photos WHERE path='C:\\pics\\slot.jpg'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let refs = |id: i64| {
+            store
+                .test_conn()
+                .execute_batch(&format!(
+                    "INSERT OR IGNORE INTO tags(name) VALUES('l1tag');
+                     INSERT OR IGNORE INTO photo_tags(photo_id,tag_id)
+                       SELECT {id}, id FROM tags WHERE name='l1tag';
+                     INSERT INTO ai_jobs(stage,photo_id,priority,enqueued_ts) VALUES('Clip',{id},1,0);
+                     INSERT INTO ocr_docs(photo_id,text,seg,line_count,char_count,model_ver,done_ts)
+                       VALUES({id},'发票','发票',1,2,'v1',0);
+                     INSERT INTO ocr_fts(rowid,seg) VALUES({id},'发票');"
+                ))
+                .unwrap();
+        };
+        let count = |sql: &str| -> i64 {
+            store
+                .test_conn()
+                .query_row(sql, [], |r| r.get(0))
+                .unwrap()
+        };
+        let first = seed(0x300);
+        refs(first);
+        assert_eq!(store.delete_l1_frn64(&[frn64_of('C', 0x300)]).unwrap(), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM photos"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM photo_tags"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM ai_jobs"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM ocr_docs"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ocr_fts WHERE ocr_fts MATCH '发票'"),
+            0,
+            "外部内容 FTS 不能留下幽灵行"
+        );
+        // 同 path 换 FRN 触发的陈旧占用清理,也要走同一份逐表清理。
+        let second = seed(0x301);
+        refs(second);
+        store
+            .ingest_l1_rows(&[row('C', 0x302, r"C:\pics\slot.jpg", 1, 1)], None)
+            .unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM photos"), 1);
+        assert_eq!(count("SELECT COUNT(*) FROM photo_tags"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM ai_jobs"), 0);
+        assert_eq!(count("SELECT COUNT(*) FROM ocr_docs"), 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM ocr_fts WHERE ocr_fts MATCH '发票'"),
+            0
+        );
     }
 
     #[test]
