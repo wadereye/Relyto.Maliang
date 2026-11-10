@@ -1463,8 +1463,142 @@ pub mod face {
             assert!((ada[8] - (10.0f32 - 127.5) / 127.5).abs() < 1e-6);
         }
 
+        /// 检测框几何/得分是否在合理范围(纯函数,catch 解码与坐标错位)。
+        fn det_is_sane(d: &Det, width: u32, height: u32) -> Result<(), String> {
+            if !(d.score > 0.0 && d.score <= 1.0) {
+                return Err(format!("得分越界: {}", d.score));
+            }
+            if [d.x0, d.y0, d.x1, d.y1].iter().any(|v| !v.is_finite()) {
+                return Err("框坐标非有限".to_string());
+            }
+            if d.x1 <= d.x0 || d.y1 <= d.y0 {
+                return Err(format!("框反向或零面积: [{}, {}, {}, {}]", d.x0, d.y0, d.x1, d.y1));
+            }
+            let mx = width as f32 * 0.1;
+            let my = height as f32 * 0.1;
+            if d.x0 < -mx || d.y0 < -my || d.x1 > width as f32 + mx || d.y1 > height as f32 + my {
+                return Err(format!("框超出图像范围: [{}, {}, {}, {}]", d.x0, d.y0, d.x1, d.y1));
+            }
+            if d.kps.iter().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+                return Err("关键点含非有限值".to_string());
+            }
+            let inside = |p: &(f32, f32)| {
+                p.0 >= d.x0 - mx && p.0 <= d.x1 + mx && p.1 >= d.y0 - my && p.1 <= d.y1 + my
+            };
+            let n = d.kps.iter().filter(|p| inside(p)).count();
+            if n < 3 {
+                return Err(format!("多数关键点落在框外({n}/5),疑似对齐或解码错位"));
+            }
+            Ok(())
+        }
+
+        /// 嵌入是有限值且单位 L2 范数(纯函数,catch 归一化与 NaN/Inf)。
+        fn emb_is_unit(v: &[f32]) -> bool {
+            v.iter().all(|x| x.is_finite())
+                && (v.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt() - 1.0).abs() < 1e-3
+        }
+
+        fn cos_sim(a: &[f32], b: &[f32]) -> Option<f64> {
+            if a.len() != b.len() || a.is_empty() {
+                return None;
+            }
+            let dot: f64 = a.iter().zip(b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let na: f64 = a.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            let nb: f64 = b.iter().map(|x| (*x as f64).powi(2)).sum::<f64>().sqrt();
+            if na == 0.0 || nb == 0.0 {
+                return None;
+            }
+            Some(dot / (na * nb))
+        }
+
+        fn iou(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> f64 {
+            let ix = (a.2.min(b.2) - a.0.max(b.0)).max(0.0) as f64;
+            let iy = (a.3.min(b.3) - a.1.max(b.1)).max(0.0) as f64;
+            let inter = ix * iy;
+            let ua = (a.2 - a.0).max(0.0) as f64 * (a.3 - a.1).max(0.0) as f64;
+            let ub = (b.2 - b.0).max(0.0) as f64 * (b.3 - b.1).max(0.0) as f64;
+            let union = ua + ub - inter;
+            if union > 0.0 {
+                inter / union
+            } else {
+                0.0
+            }
+        }
+
+        /// 读同目录 `<图>.maliang_ref.txt` 里的 OpenCV 参考:首词 `box`/`emb`,其后为浮点。
+        fn read_reference(
+            path: &std::path::Path,
+        ) -> Option<(Option<(f32, f32, f32, f32)>, Option<Vec<f32>>)> {
+            let text = std::fs::read_to_string(path).ok()?;
+            let mut boxv = None;
+            let mut emb = None;
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                match it.next() {
+                    Some("box") => {
+                        let n: Vec<f32> = it.filter_map(|s| s.parse().ok()).take(4).collect();
+                        if n.len() == 4 {
+                            boxv = Some((n[0], n[1], n[2], n[3]));
+                        }
+                    }
+                    Some("emb") => {
+                        emb = Some(it.filter_map(|s| s.parse::<f32>().ok()).collect());
+                    }
+                    _ => {}
+                }
+            }
+            Some((boxv, emb))
+        }
+
         #[test]
-        #[ignore = "需要真实人脸模型与标注照片，设置 MALIANG_FACE_TEST_IMAGE 后运行"]
+        fn det_is_sane_accepts_valid_box() {
+            let d = Det {
+                x0: 100., y0: 80., x1: 220., y1: 210., score: 0.9,
+                kps: [(130., 130.), (190., 130.), (160., 160.), (135., 185.), (185., 185.)],
+            };
+            assert!(det_is_sane(&d, 640, 480).is_ok());
+        }
+
+        #[test]
+        fn det_is_sane_rejects_bad_score_flip_and_offset() {
+            let base = Det {
+                x0: 100., y0: 80., x1: 220., y1: 210., score: 0.9,
+                kps: [(130., 130.), (190., 130.), (160., 160.), (135., 185.), (185., 185.)],
+            };
+            assert!(det_is_sane(&Det { score: 1.5, ..base.clone() }, 640, 480).is_err());
+            assert!(det_is_sane(&Det { x0: 220., x1: 100., ..base.clone() }, 640, 480).is_err());
+            let out_of_frame = Det {
+                x0: 2000., y0: 80., x1: 2100., y1: 210.,
+                kps: [(2030., 130.), (2050., 130.), (2040., 160.), (2035., 185.), (2050., 185.)],
+                ..base.clone()
+            };
+            assert!(det_is_sane(&out_of_frame, 640, 480).is_err());
+            let kps_off = Det {
+                kps: [(0., 0.), (5., 5.), (10., 10.), (15., 15.), (20., 20.)],
+                ..base.clone()
+            };
+            assert!(det_is_sane(&kps_off, 640, 480).is_err());
+        }
+
+        #[test]
+        fn emb_is_unit_rejects_nan_zero_and_offnorm() {
+            assert!(emb_is_unit(&[0.6, 0.8]));
+            assert!(!emb_is_unit(&[1.0, 1.0]));
+            assert!(!emb_is_unit(&[0.0, 0.0]));
+            assert!(!emb_is_unit(&[f32::NAN, 1.0]));
+        }
+
+        #[test]
+        fn cos_and_iou_reference_math() {
+            assert_eq!(cos_sim(&[1., 0.], &[1., 0.]), Some(1.0));
+            assert!(cos_sim(&[1., 0.], &[0., 1.]).unwrap().abs() < 1e-9);
+            assert_eq!(cos_sim(&[1., 0.], &[1., 0., 0.]), None);
+            assert!((iou((0., 0., 10., 10.), (0., 0., 10., 10.)) - 1.0).abs() < 1e-9);
+            assert!(iou((0., 0., 10., 10.), (20., 20., 30., 30.)).abs() < 1e-9);
+        }
+
+        #[test]
+        #[ignore = "需要真实人脸模型与测试照片,设置 MALIANG_FACE_TEST_IMAGE 后运行"]
         fn face_roundtrip_reference_models() {
             let fixture = std::path::PathBuf::from(
                 std::env::var("MALIANG_FACE_TEST_IMAGE")
@@ -1474,15 +1608,59 @@ pub mod face {
                 .expect("打开测试图片")
                 .decode()
                 .expect("解码测试图片");
-            for algo in [FaceAlgo::SFace, FaceAlgo::AdaFace] {
-                if !Faces::models_present(algo) {
-                    panic!("{algo:?} 模型未就位，不能把缺失模型当作通过");
-                }
-                let mut f = Faces::load(algo).unwrap_or_else(|e| panic!("加载模型失败: {e}"));
-                let out = f.analyze(&img).unwrap();
-                assert!(!out.is_empty(), "{algo:?} 未检测到人脸");
-                assert_eq!(out[0].emb.len(), algo.emb_dim());
+            let (w, h) = (img.width(), img.height());
+            // 可选参考对照:OpenCV(cv2.FaceDetectorYN + cv2.FaceRecognizerSF)在同图上
+            // 输出的框与向量,写进同目录 `<图>.maliang_ref.txt`(行首 `box`/`emb`)。
+            let reference = read_reference(&fixture.with_extension("maliang_ref.txt"));
+            fn best_face(out: &[Face]) -> &Face {
+                out.iter()
+                    .max_by(|a, b| a.det.score.partial_cmp(&b.det.score).unwrap())
+                    .expect("非空结果里应有最高分脸")
             }
+            let mut checked = 0usize;
+            for algo in [FaceAlgo::SFace, FaceAlgo::AdaFace] {
+                let present = Faces::models_present(algo);
+                if algo == FaceAlgo::SFace {
+                    assert!(present, "SFace 模型未就位(默认方案),不能把缺失当通过");
+                } else if !present {
+                    eprintln!("AdaFace 模型未就位,跳过(权重非商用,可自备)");
+                    continue;
+                }
+                let mut f = Faces::load(algo)
+                    .unwrap_or_else(|e| panic!("加载 {} 模型失败: {e}", algo.key()));
+                let out = f.analyze(&img).unwrap_or_else(|e| panic!("{} 分析失败: {e}", algo.key()));
+                assert!(!out.is_empty(), "{} 未检测到人脸,无法对照", algo.key());
+                let best = best_face(&out);
+                assert_eq!(best.emb.len(), algo.emb_dim());
+                assert!(emb_is_unit(&best.emb), "{} 嵌入非单位范数或含 NaN/Inf", algo.key());
+                det_is_sane(&best.det, w, h)
+                    .unwrap_or_else(|e| panic!("{} 检测框异常: {e}", algo.key()));
+                // 决定性:再跑一次向量应一致(排除跨照片共享缓冲污染)。
+                let again = f.analyze(&img).unwrap();
+                let best2 = best_face(&again);
+                let dc = cos_sim(&best.emb, &best2.emb).unwrap_or(-1.0);
+                assert!(dc > 0.999, "{} 两次分析向量不一致(cos={dc:.4}),疑缓冲未隔离", algo.key());
+                // 与 OpenCV 参考对照(仅 SFace,且 sidecar 存在时)。
+                if algo == FaceAlgo::SFace {
+                    if let Some((rbox, remb)) = &reference {
+                        if let Some(rb) = rbox {
+                            let v = iou(
+                                (best.det.x0, best.det.y0, best.det.x1, best.det.y1),
+                                *rb,
+                            );
+                            assert!(v > 0.5, "对照 OpenCV 检测框 IoU 过低 {v:.3}(我方与参考偏差过大)");
+                        }
+                        if let Some(re) = remb {
+                            let c = cos_sim(&best.emb, re).unwrap_or(-1.0);
+                            assert!(c > 0.9, "对照 OpenCV 识别向量 cos 过低 {c:.3}(对齐/通道/归一化不一致)");
+                        }
+                    } else {
+                        eprintln!("未找到参考件,跳过 OpenCV 对照(仅做了自洽与几何校验)");
+                    }
+                }
+                checked += 1;
+            }
+            assert!(checked > 0, "至少要有一个就位方案完成对照");
         }
     }
 }
