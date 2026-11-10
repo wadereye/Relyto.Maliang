@@ -76,13 +76,18 @@ const SCAN_FAILED: i64 = 3;
 static FACE_TASK_LOCK: Mutex<()> = Mutex::new(());
 
 fn face_task_guard() -> Result<MutexGuard<'static, ()>> {
-    match FACE_TASK_LOCK.try_lock() {
-        Ok(g) => Ok(g),
-        Err(std::sync::TryLockError::Poisoned(e)) => Ok(e.into_inner()),
+    #[cfg(not(test))]
+    let g = match FACE_TASK_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
             bail!("人脸扫描或重聚类正在进行,请先取消再操作")
         }
-    }
+    };
+    // 测试构建改为等待,并发用例不再互相打断。
+    #[cfg(test)]
+    let g = FACE_TASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(g)
 }
 
 /// 一条待提交的人脸结果(坐标已映射回未旋转原图)。
@@ -567,7 +572,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
         return Ok(0);
     }
     let dim = emb_dim(store);
-    let (mut clusters, mut members, mut photos, mut next_id) =
+    let (mut clusters, mut members, mut photos, cluster_pid, mut next_id) =
         store.read(|conn| -> Result<_> {
             let mut clusters: BTreeMap<i64, Vec<(Vec<f32>, f32)>> = BTreeMap::new();
             let mut members: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
@@ -591,6 +596,25 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 members.entry(cid).or_default().push(fid);
                 photos.entry(cid).or_default().push(photo_id);
             }
+            let mut cluster_pid: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
+            let mut st = conn.prepare(
+                "SELECT cluster, person_id, COUNT(*) FROM faces
+                 WHERE cluster IS NOT NULL AND person_id IS NOT NULL
+                 GROUP BY cluster, person_id",
+            )?;
+            let mut rows = st.query([])?;
+            while let Some(r) = rows.next()? {
+                let cid: i64 = r.get(0)?;
+                let pid: i64 = r.get(1)?;
+                let n: i64 = r.get(2)?;
+                let better = cluster_pid
+                    .get(&cid)
+                    .map(|(p, c)| n > *c || (n == *c && pid < *p))
+                    .unwrap_or(true);
+                if better {
+                    cluster_pid.insert(cid, (pid, n));
+                }
+            }
             let max_cluster: i64 = conn
                 .query_row(
                     "SELECT COALESCE(MAX(cluster),0) FROM faces WHERE cluster IS NOT NULL",
@@ -599,9 +623,18 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 )
                 .unwrap_or(0);
             let max_person: i64 = conn
+                .query_row("SELECT COALESCE(MAX(person_id),0) FROM faces", [], |r| r.get(0))
+                .unwrap_or(0);
+            let max_people: i64 = conn
                 .query_row("SELECT COALESCE(MAX(id),0) FROM people", [], |r| r.get(0))
                 .unwrap_or(0);
-            Ok((clusters, members, photos, max_cluster.max(max_person) + 1))
+            Ok((
+                clusters,
+                members,
+                photos,
+                cluster_pid,
+                max_cluster.max(max_person).max(max_people) + 1,
+            ))
         })?;
     let todo: Vec<(i64, i64, Vec<f32>, f32)> = store.read(|conn| -> Result<_> {
         let mut st = conn.prepare(
@@ -634,7 +667,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
         map.entry(*b).or_default().push(*a);
     }
     // 先在内存里定簇,再一次事务写回 —— 每脸一条 UPDATE 也锁一次写连接。
-    let mut updates: Vec<(i64, i64)> = Vec::with_capacity(todo.len());
+    let mut updates: Vec<(i64, i64, Option<i64>)> = Vec::with_capacity(todo.len());
     for (face_id, photo_id, v, q) in todo {
         // must 同伴已在某簇:直接归入(never 仍优先,不参与阈值判定)。
         let forced = must.get(&face_id).and_then(|ps| {
@@ -645,7 +678,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             })
         });
         if let Some(cid) = forced {
-            updates.push((face_id, cid));
+            updates.push((face_id, cid, cluster_pid.get(&cid).map(|(p, _)| *p)));
             clusters.get_mut(&cid).unwrap().push((v, q));
             members.get_mut(&cid).unwrap().push(face_id);
             photos.entry(cid).or_default().push(photo_id);
@@ -680,7 +713,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                     .map(|(_, c)| *c)
                     .fold(f32::NEG_INFINITY, f32::max);
                 if c - runner >= CLUSTER_MARGIN {
-                    updates.push((face_id, cid));
+                    updates.push((face_id, cid, cluster_pid.get(&cid).map(|(p, _)| *p)));
                     clusters.get_mut(&cid).unwrap().push((v, q));
                     members.get_mut(&cid).unwrap().push(face_id);
                     photos.entry(cid).or_default().push(photo_id);
@@ -689,7 +722,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             None => {
                 let next = next_id;
                 next_id += 1;
-                updates.push((face_id, next));
+                updates.push((face_id, next, None));
                 clusters.insert(next, vec![(v, q)]);
                 members.insert(next, vec![face_id]);
                 photos.insert(next, vec![photo_id]);
@@ -699,16 +732,19 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     store.write(|conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut st = tx.prepare_cached("UPDATE faces SET cluster=?1 WHERE id=?2")?;
-            for (face_id, cid) in &updates {
-                st.execute(params![cid, face_id])?;
+            let mut st = tx.prepare_cached(
+                "UPDATE faces SET cluster=?1,
+                 person_id=CASE WHEN person_id IS NULL THEN ?2 ELSE person_id END
+                 WHERE id=?3",
+            )?;
+            for (face_id, cid, pid) in &updates {
+                st.execute(params![cid, pid, face_id])?;
             }
         }
         tx.commit()?;
         Ok(())
     })?;
-    // 簇的默认名不写 people 表:people_overview 是 LEFT JOIN,name 为 NULL 时
-    // GUI 回退显示"簇 N";rename_cluster 才会写入 people(id=cluster, name)。
+    // 归入已有簇的新脸继承该簇身份;未命名身份不写名字表。
     Ok(clusters.len())
 }
 
@@ -728,19 +764,16 @@ fn must_between(must: &HashMap<i64, Vec<i64>>, a: &[i64], b: &[i64]) -> bool {
     })
 }
 
-/// 合并质心足够相近的簇(贪心聚类「只分不合」的补丁;质心级比较能修
-/// 人脸级阈值修不好的分裂)。已命名的簇互不合并 —— 命名即用户意图,
-/// 不越权改写;只有一方命名时名字跟到保留方(优先保留有名字的,
-/// 其次成员多的)。返回减少的簇数。
+/// 合并质心足够相近的簇;已命名人物所在的簇互不合并,只重排簇号。
 pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     let sig = effective_sig(store);
     if sig.is_empty() {
         return Ok(0);
     }
     let dim = emb_dim(store);
-    let (mut clusters, mut names, mut members, mut photos): (
+    let (mut clusters, named, mut members, mut photos): (
         HashMap<i64, Vec<(Vec<f32>, f32)>>,
-        HashMap<i64, String>,
+        HashSet<i64>,
         HashMap<i64, Vec<i64>>,
         HashMap<i64, Vec<i64>>,
     ) = store.read(|conn| -> Result<_> {
@@ -765,13 +798,16 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
             members.entry(cid).or_default().push(fid);
             photos.entry(cid).or_default().push(photo_id);
         }
-        let mut names: HashMap<i64, String> = HashMap::new();
-        let mut st = conn.prepare("SELECT id, name FROM people")?;
+        let mut named: HashSet<i64> = HashSet::new();
+        let mut st = conn.prepare(
+            "SELECT DISTINCT f.cluster FROM faces f JOIN people p ON p.id=f.person_id
+             WHERE f.cluster IS NOT NULL AND f.ignored=0",
+        )?;
         let mut rows = st.query([])?;
         while let Some(r) = rows.next()? {
-            names.insert(r.get(0)?, r.get(1)?);
+            named.insert(r.get::<_, i64>(0)?);
         }
-        Ok((acc, names, members, photos))
+        Ok((acc, named, members, photos))
     })?;
     if clusters.len() < 2 {
         return Ok(0);
@@ -809,7 +845,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
                 if never_between(&never, ia, ib) {
                     continue;
                 }
-                if !forced && names.contains_key(a) && names.contains_key(b) {
+                if !forced && named.contains(a) && named.contains(b) {
                     continue;
                 }
                 // 同图两簇默认不并,避免合照里的不同人被当成同一个人。
@@ -830,7 +866,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         }
         let Some((a, b, _)) = best else { break };
         // 保留方:有名字的一方优先,其次成员多的;平局取小号。
-        let (keep, drop) = match (names.contains_key(&a), names.contains_key(&b)) {
+        let (keep, drop) = match (named.contains(&a), named.contains(&b)) {
             (true, false) => (a, b),
             (false, true) => (b, a),
             _ => {
@@ -850,16 +886,13 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         if let Some(ps) = photos.remove(&drop) {
             photos.get_mut(&keep).unwrap().extend(ps);
         }
-        if let Some(n) = names.remove(&drop) {
-            names.entry(keep).or_insert(n);
-        }
         merges.push((drop, keep));
     }
     if merges.is_empty() {
         return Ok(0);
     }
     let merged = merges.len();
-    // 一次事务落库:被并簇的人脸改归属、名字行清掉,保留方写入最终名。
+    // 一次事务落库:只重排簇号,人物档案与身份列一律不动。
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
@@ -867,17 +900,6 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
             for (drop, keep) in &merges {
                 st.execute(params![keep, drop])?;
             }
-            let mut del = tx.prepare_cached("DELETE FROM people WHERE id=?1")?;
-            for (drop, _) in &merges {
-                del.execute(params![drop])?;
-            }
-        }
-        for (cid, name) in &names {
-            conn.execute(
-                "INSERT INTO people(id,name) VALUES(?1,?2)
-                 ON CONFLICT(id) DO UPDATE SET name=excluded.name",
-                params![cid, name],
-            )?;
         }
         tx.commit()?;
         Ok(())
@@ -887,31 +909,51 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
 
 #[derive(Clone)]
 pub struct PeopleRow {
+    /// 代表簇号(忽略与审核入口)。
     pub cluster: i64,
+    /// 稳定身份(未归属 = None)。
+    pub person_id: Option<i64>,
+    /// 该组涉及的簇号。
+    pub clusters: Vec<i64>,
     pub person: Option<String>,
     pub count: usize,
-    /// 簇内平均人脸质量(0..1;低质量簇值得人工复核)。
+    /// 组内平均人脸质量(0..1;低质量组值得人工复核)。
     pub quality: f32,
 }
 
-/// 簇列表(忽略的人脸不计入;按人数升序,与 GUI 显示一致)。
+/// 人物列表:已归属按身份合并,未归属按簇分列(忽略的脸不计入)。
 pub fn people_overview(store: &Store) -> Vec<PeopleRow> {
     store.read(|conn| {
         let mut st = match conn.prepare(
-            "SELECT f.cluster, p.name, COUNT(*), AVG(COALESCE(f.quality,0.5))
-             FROM faces f LEFT JOIN people p ON p.id = f.cluster
-             WHERE f.cluster IS NOT NULL AND f.ignored=0
-             GROUP BY f.cluster ORDER BY count(f.cluster)",
+            "SELECT g.cluster, g.pid, p.name, g.cnt, g.q, g.cs FROM
+              (SELECT MIN(cluster) AS cluster, person_id AS pid, COUNT(*) AS cnt,
+                      AVG(COALESCE(quality,0.5)) AS q,
+                      GROUP_CONCAT(DISTINCT cluster) AS cs
+               FROM faces WHERE cluster IS NOT NULL AND ignored=0 AND person_id IS NOT NULL
+               GROUP BY person_id
+               UNION ALL
+               SELECT cluster AS cluster, NULL AS pid, COUNT(*) AS cnt,
+                      AVG(COALESCE(quality,0.5)) AS q, CAST(cluster AS TEXT) AS cs
+               FROM faces WHERE cluster IS NOT NULL AND ignored=0 AND person_id IS NULL
+               GROUP BY cluster) g
+             LEFT JOIN people p ON p.id = g.pid
+             ORDER BY g.cnt, g.cluster",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
         st.query_map([], |r| {
+            let cs: String = r.get(5)?;
             Ok(PeopleRow {
                 cluster: r.get::<_, i64>(0)?,
-                person: r.get(1)?,
-                count: r.get::<_, i64>(2)? as usize,
-                quality: r.get::<_, f64>(3)? as f32,
+                person_id: r.get(1)?,
+                person: r.get(2)?,
+                count: r.get::<_, i64>(3)? as usize,
+                quality: r.get::<_, f64>(4)? as f32,
+                clusters: cs
+                    .split(',')
+                    .filter_map(|s| s.parse::<i64>().ok())
+                    .collect(),
             })
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
@@ -974,6 +1016,44 @@ pub fn faces_for_cluster(
     })
 }
 
+/// 稳定身份下的全部人脸(可跨簇;min_quality 过滤低质量脸)。
+pub fn faces_for_person(
+    store: &Store,
+    person_id: i64,
+    include_ignored: bool,
+    min_quality: f32,
+) -> Vec<FaceHit> {
+    store.read(|conn| {
+        let mut st = match conn.prepare(
+            "SELECT f.id, f.photo_id, p.path, f.x1, f.y1, f.x2, f.y2, COALESCE(f.quality,0.5)
+             FROM faces f JOIN photos p ON p.id = f.photo_id
+             WHERE f.person_id = ?1 AND (?2=1 OR f.ignored=0)
+               AND COALESCE(f.quality,0.5) >= ?3
+             ORDER BY p.path",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        st.query_map(
+            params![person_id, include_ignored as i32, min_quality as f64],
+            |r| {
+                Ok(FaceHit {
+                    face_id: r.get(0)?,
+                    photo_id: r.get(1)?,
+                    photo_path: r.get(2)?,
+                    x1: r.get::<_, f64>(3)? as f32,
+                    y1: r.get::<_, f64>(4)? as f32,
+                    x2: r.get::<_, f64>(5)? as f32,
+                    y2: r.get::<_, f64>(6)? as f32,
+                    quality: r.get::<_, f64>(7)? as f32,
+                })
+            },
+        )
+        .map(|rows| rows.filter_map(|r| r.ok()).collect())
+        .unwrap_or_default()
+    })
+}
+
 /// 单张照片的全部人脸(预览窗叠框用;坐标 = 未旋转原图像素)。
 pub fn faces_for_photo(store: &Store, photo_id: i64) -> Vec<FaceHit> {
     store.read(|conn| {
@@ -1009,6 +1089,8 @@ pub struct SimilarFace {
     pub photo_id: i64,
     pub photo_path: String,
     pub cluster: Option<i64>,
+    /// 稳定身份(未归属 = None)。
+    pub person_id: Option<i64>,
     pub person: Option<String>,
     #[allow(dead_code)]
     pub ignored: bool,
@@ -1048,18 +1130,18 @@ pub fn similar_faces(
                 return Ok(Vec::new());
             }
             let mut st = conn.prepare(
-                "SELECT f.id, f.photo_id, p.path, f.cluster, pe.name, f.ignored,
+                "SELECT f.id, f.photo_id, p.path, f.cluster, f.person_id, pe.name, f.ignored,
                         COALESCE(f.quality,0.5), t.vec, f.x1, f.y1, f.x2, f.y2
                  FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?4
                  JOIN photos p ON p.id=f.photo_id
-                 LEFT JOIN people pe ON pe.id=f.cluster
+                 LEFT JOIN people pe ON pe.id=f.person_id
                  WHERE f.id<>?2 AND (?3=1 OR f.ignored=0)",
             )?;
             let mut rows = st.query(params![dim, face_id, include_ignored as i32, sig])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? {
-                let vec = blob_to_vec(&r.get::<_, Vec<u8>>(7)?);
+                let vec = blob_to_vec(&r.get::<_, Vec<u8>>(8)?);
                 if vec.len() != query.len() {
                     continue;
                 }
@@ -1072,14 +1154,15 @@ pub fn similar_faces(
                     photo_id: r.get(1)?,
                     photo_path: r.get(2)?,
                     cluster: r.get(3)?,
-                    person: r.get(4)?,
-                    ignored: r.get::<_, i64>(5)? != 0,
-                    quality: r.get::<_, f64>(6)? as f32,
+                    person_id: r.get(4)?,
+                    person: r.get(5)?,
+                    ignored: r.get::<_, i64>(6)? != 0,
+                    quality: r.get::<_, f64>(7)? as f32,
                     rect: (
-                        r.get::<_, f64>(8)? as f32,
                         r.get::<_, f64>(9)? as f32,
                         r.get::<_, f64>(10)? as f32,
                         r.get::<_, f64>(11)? as f32,
+                        r.get::<_, f64>(12)? as f32,
                     ),
                     score,
                 });
@@ -1096,12 +1179,14 @@ pub fn similar_faces(
         .unwrap_or_default()
 }
 
-/// 一张照片的人脸 + 归属(右栏人物面板用)。
+/// 一张照片的人脸 + 身份(右栏人物面板用)。
 pub struct PhotoFace {
     pub face_id: i64,
     /// 所属簇;未聚类 = None。
     pub cluster: Option<i64>,
-    /// 簇的姓名(未命名 = None)。
+    /// 稳定身份;未归属 = None。
+    pub person_id: Option<i64>,
+    /// 人物姓名(未命名 = None)。
     pub person: Option<String>,
     pub ignored: bool,
     pub quality: f32,
@@ -1109,13 +1194,13 @@ pub struct PhotoFace {
     pub rect: (f32, f32, f32, f32),
 }
 
-/// 单张照片的人脸清单,连簇号与姓名(左连接 people,未命名照样返回)。
+/// 单张照片的人脸清单,连簇号、身份与姓名(未命名照样返回)。
 pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
     store.read(|conn| {
         let mut st = match conn.prepare(
-            "SELECT f.id, f.cluster, p.name, f.ignored, COALESCE(f.quality,0.5),
+            "SELECT f.id, f.cluster, f.person_id, p.name, f.ignored, COALESCE(f.quality,0.5),
                     f.x1, f.y1, f.x2, f.y2
-             FROM faces f LEFT JOIN people p ON p.id = f.cluster
+             FROM faces f LEFT JOIN people p ON p.id = f.person_id
              WHERE f.photo_id = ?1 ORDER BY f.id",
         ) {
             Ok(s) => s,
@@ -1125,14 +1210,15 @@ pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
             Ok(PhotoFace {
                 face_id: r.get(0)?,
                 cluster: r.get(1)?,
-                person: r.get(2)?,
-                ignored: r.get::<_, i64>(3)? != 0,
-                quality: r.get::<_, f64>(4)? as f32,
+                person_id: r.get(2)?,
+                person: r.get(3)?,
+                ignored: r.get::<_, i64>(4)? != 0,
+                quality: r.get::<_, f64>(5)? as f32,
                 rect: (
-                    r.get::<_, f64>(5)? as f32,
                     r.get::<_, f64>(6)? as f32,
                     r.get::<_, f64>(7)? as f32,
                     r.get::<_, f64>(8)? as f32,
+                    r.get::<_, f64>(9)? as f32,
                 ),
             })
         })
@@ -1141,7 +1227,33 @@ pub fn photo_faces(store: &Store, photo_id: i64) -> Vec<PhotoFace> {
     })
 }
 
-pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
+/// 新发一个人物身份号,不撞已有身份与簇号。
+fn alloc_person_id(conn: &rusqlite::Connection) -> Result<i64> {
+    let a: i64 = conn.query_row("SELECT COALESCE(MAX(person_id),0) FROM faces", [], |r| {
+        r.get(0)
+    })?;
+    let b: i64 = conn.query_row("SELECT COALESCE(MAX(id),0) FROM people", [], |r| r.get(0))?;
+    let c: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(cluster),0) FROM faces WHERE cluster IS NOT NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(a.max(b).max(c) + 1)
+}
+
+/// 簇的代表身份(成员多数票;无票返回 None)。
+fn cluster_person(conn: &rusqlite::Connection, cluster: i64) -> Option<i64> {
+    conn.query_row(
+        "SELECT person_id FROM faces WHERE cluster=?1 AND person_id IS NOT NULL
+         GROUP BY person_id ORDER BY COUNT(*) DESC, person_id ASC LIMIT 1",
+        params![cluster],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// 按稳定身份命名(名字全局唯一)。
+pub fn rename_person(store: &Store, person_id: i64, name: &str) -> Result<()> {
     let name = name.trim();
     if name.is_empty() {
         bail!("名字不能为空");
@@ -1158,15 +1270,53 @@ pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
             })
             .ok();
         if let Some(id) = holder {
-            if id != cluster {
+            if id != person_id {
                 bail!("已有人物使用该名字");
             }
         }
         tx.execute(
             "INSERT INTO people(id,name) VALUES(?1,?2)
              ON CONFLICT(id) DO UPDATE SET name=excluded.name",
-            params![cluster, name],
+            params![person_id, name],
         )?;
+        tx.commit()?;
+        Ok(())
+    })
+}
+
+/// 按簇命名:把簇号映射到稳定身份后再写名字(无身份簇先建档)。
+pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
+    let pid = store.read(|conn| cluster_person(conn, cluster));
+    if let Some(pid) = pid {
+        return rename_person(store, pid, name);
+    }
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("名字不能为空");
+    }
+    if name.chars().count() > 64 {
+        bail!("名字过长");
+    }
+    let name = name.to_string();
+    store.write(move |conn| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        let holder: Option<i64> = tx
+            .query_row("SELECT id FROM people WHERE name=?1", params![name], |r| {
+                r.get(0)
+            })
+            .ok();
+        if holder.is_some() {
+            bail!("已有人物使用该名字");
+        }
+        let pid = alloc_person_id(&tx)?;
+        let n = tx.execute(
+            "UPDATE faces SET person_id=?1 WHERE cluster=?2 AND person_id IS NULL",
+            params![pid, cluster],
+        )?;
+        if n == 0 {
+            bail!("该簇没有待归属的人脸");
+        }
+        tx.execute("INSERT INTO people(id,name) VALUES(?1,?2)", params![pid, name])?;
         tx.commit()?;
         Ok(())
     })
@@ -1186,8 +1336,8 @@ fn never_conflict(conn: &rusqlite::Connection, group: &[i64]) -> Result<bool> {
     Ok(false)
 }
 
-/// 人工把脸归入已有簇(忽略状态清除;never 冲突拒绝)。
-pub fn assign_faces(store: &Store, face_ids: &[i64], cluster: i64) -> Result<usize> {
+/// 人工把脸归入已有的人物(忽略状态清除;never 冲突拒绝)。
+pub fn assign_faces(store: &Store, face_ids: &[i64], person_id: i64) -> Result<usize> {
     if face_ids.is_empty() {
         return Ok(0);
     }
@@ -1198,17 +1348,17 @@ pub fn assign_faces(store: &Store, face_ids: &[i64], cluster: i64) -> Result<usi
     store.write(move |conn| -> Result<usize> {
         let tx = conn.unchecked_transaction()?;
         let exists: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM faces WHERE cluster=?1",
-            params![cluster],
+            "SELECT COUNT(*) FROM faces WHERE person_id=?1",
+            params![person_id],
             |r| r.get(0),
         )?;
         if exists == 0 {
-            bail!("目标簇不存在,请先刷新人物列表");
+            bail!("目标人物不存在,请先刷新人物列表");
         }
         let mut group: Vec<i64> = Vec::new();
         {
-            let mut st = tx.prepare("SELECT id FROM faces WHERE cluster=?1")?;
-            let mut rows = st.query(params![cluster])?;
+            let mut st = tx.prepare("SELECT id FROM faces WHERE person_id=?1")?;
+            let mut rows = st.query(params![person_id])?;
             while let Some(r) = rows.next()? {
                 group.push(r.get(0)?);
             }
@@ -1217,11 +1367,21 @@ pub fn assign_faces(store: &Store, face_ids: &[i64], cluster: i64) -> Result<usi
         if never_conflict(&tx, &group)? {
             bail!("所选人脸与目标人物存在「不同人」约束,请先移除冲突约束");
         }
+        let cluster: Option<i64> = tx
+            .query_row(
+                "SELECT cluster FROM faces WHERE person_id=?1 AND cluster IS NOT NULL
+                 GROUP BY cluster ORDER BY COUNT(*) DESC, cluster ASC LIMIT 1",
+                params![person_id],
+                |r| r.get(0),
+            )
+            .ok();
         let mut n = 0usize;
         {
-            let mut st = tx.prepare("UPDATE faces SET cluster=?1, ignored=0 WHERE id=?2")?;
+            let mut st = tx.prepare(
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0 WHERE id=?3",
+            )?;
             for id in &ids {
-                n += st.execute(params![cluster, id])?;
+                n += st.execute(params![person_id, cluster, id])?;
             }
         }
         tx.commit()?;
@@ -1229,7 +1389,86 @@ pub fn assign_faces(store: &Store, face_ids: &[i64], cluster: i64) -> Result<usi
     })
 }
 
-/// 人工把脸移出簇,回到未归入状态。
+/// 把待命名的一组脸并入目标人物(不新建同名档案,never 冲突拒绝)。
+pub fn merge_into_person(
+    store: &Store,
+    cluster: i64,
+    person_id: Option<i64>,
+    target: i64,
+) -> Result<usize> {
+    let _g = face_task_guard()?;
+    store.write(move |conn| -> Result<usize> {
+        let tx = conn.unchecked_transaction()?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM people WHERE id=?1",
+            params![target],
+            |r| r.get(0),
+        )?;
+        if exists == 0 {
+            bail!("目标人物不存在,请先刷新人物列表");
+        }
+        if let Some(pid) = person_id {
+            let named: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM people WHERE id=?1",
+                params![pid],
+                |r| r.get(0),
+            )?;
+            if named > 0 {
+                bail!("该组已有独立档案,请改用重命名或移出");
+            }
+        }
+        let target_cluster: Option<i64> = tx
+            .query_row(
+                "SELECT cluster FROM faces WHERE person_id=?1 AND cluster IS NOT NULL
+                 GROUP BY cluster ORDER BY COUNT(*) DESC, cluster ASC LIMIT 1",
+                params![target],
+                |r| r.get(0),
+            )
+            .ok();
+        let mut group: Vec<i64> = Vec::new();
+        {
+            let mut st = tx.prepare("SELECT id FROM faces WHERE person_id=?1")?;
+            let mut rows = st.query(params![target])?;
+            while let Some(r) = rows.next()? {
+                group.push(r.get(0)?);
+            }
+        }
+        {
+            let sql = if person_id.is_some() {
+                "SELECT id FROM faces WHERE person_id=?1"
+            } else {
+                "SELECT id FROM faces WHERE cluster=?1 AND person_id IS NULL"
+            };
+            let mut st = tx.prepare(sql)?;
+            let mut rows = st.query(params![person_id.unwrap_or(cluster)])?;
+            while let Some(r) = rows.next()? {
+                group.push(r.get(0)?);
+            }
+        }
+        if never_conflict(&tx, &group)? {
+            bail!("所选人脸与目标人物存在「不同人」约束,请先移除冲突约束");
+        }
+        let n = match person_id {
+            Some(pid) => tx.execute(
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0
+                 WHERE person_id=?3",
+                params![target, target_cluster, pid],
+            )?,
+            None => tx.execute(
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0
+                 WHERE cluster=?3 AND person_id IS NULL",
+                params![target, target_cluster, cluster],
+            )?,
+        };
+        if n == 0 {
+            bail!("没有待并入的人脸");
+        }
+        tx.commit()?;
+        Ok(n)
+    })
+}
+
+/// 人工把脸移出人物,回到未归属状态。
 pub fn remove_faces(store: &Store, face_ids: &[i64]) -> Result<usize> {
     if face_ids.is_empty() {
         return Ok(0);
@@ -1242,7 +1481,7 @@ pub fn remove_faces(store: &Store, face_ids: &[i64]) -> Result<usize> {
         let tx = conn.unchecked_transaction()?;
         let mut n = 0usize;
         {
-            let mut st = tx.prepare("UPDATE faces SET cluster=NULL WHERE id=?1")?;
+            let mut st = tx.prepare("UPDATE faces SET person_id=NULL, cluster=NULL WHERE id=?1")?;
             for id in &ids {
                 n += st.execute(params![id])?;
             }
@@ -1275,7 +1514,7 @@ pub fn set_ignored(store: &Store, face_ids: &[i64], ignored: bool) -> Result<usi
     })
 }
 
-/// 用所选人脸新建人物(簇号全局唯一;可选名字需未占用)。
+/// 用所选人脸新建人物(身份号全局唯一;可选名字需未占用)。
 pub fn create_person(store: &Store, face_ids: &[i64], name: Option<&str>) -> Result<i64> {
     if face_ids.is_empty() {
         bail!("请先选择人脸");
@@ -1308,26 +1547,20 @@ pub fn create_person(store: &Store, face_ids: &[i64], name: Option<&str>) -> Res
                 bail!("已有人物使用该名字");
             }
         }
-        let max_cluster: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(cluster),0) FROM faces WHERE cluster IS NOT NULL",
-            [],
-            |r| r.get(0),
-        )?;
-        let max_person: i64 = tx.query_row("SELECT COALESCE(MAX(id),0) FROM people", [], |r| {
-            r.get(0)
-        })?;
-        let cid = max_cluster.max(max_person) + 1;
+        let pid = alloc_person_id(&tx)?;
         if let Some(n) = &name {
-            tx.execute("INSERT INTO people(id,name) VALUES(?1,?2)", params![cid, n])?;
+            tx.execute("INSERT INTO people(id,name) VALUES(?1,?2)", params![pid, n])?;
         }
         {
-            let mut st = tx.prepare("UPDATE faces SET cluster=?1, ignored=0 WHERE id=?2")?;
+            let mut st = tx.prepare(
+                "UPDATE faces SET person_id=?1, cluster=?2, ignored=0 WHERE id=?3",
+            )?;
             for id in &ids {
-                st.execute(params![cid, id])?;
+                st.execute(params![pid, pid, id])?;
             }
         }
         tx.commit()?;
-        Ok(cid)
+        Ok(pid)
     })
 }
 
@@ -1584,7 +1817,6 @@ struct ReclusterGroup {
     sum: Vec<f32>,
     photos: Vec<i64>,
     faces: Vec<i64>,
-    anchor: Option<i64>,
 }
 
 fn group_add(g: &mut ReclusterGroup, v: &[f32], q: f32, photo: i64, face: i64) {
@@ -1612,8 +1844,7 @@ fn linked_faces(map: &HashMap<i64, Vec<i64>>, face: i64, others: &[i64]) -> bool
         .unwrap_or(false)
 }
 
-/// 全量重聚类:已命名簇作为固定锚点保留原簇号,其余脸按质量降序重分;
-/// 同图默认不并,never 优先;收尾再做质心级合并。返回新簇数。
+/// 全量重聚类:只按向量重排簇号,身份由成员旧 person_id 多数票继承。
 pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     let _guard = face_task_guard()?;
     let sig = effective_sig(store);
@@ -1621,11 +1852,12 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
         return Ok(0);
     }
     let dim = emb_dim(store);
-    // (face_id, 向量, 质量, 旧簇, photo_id)
-    let mut faces: Vec<(i64, Vec<f32>, f32, Option<i64>, i64)> =
+    // (face_id, 向量, 质量, 旧簇, 旧身份, photo_id)
+    let mut faces: Vec<(i64, Vec<f32>, f32, Option<i64>, Option<i64>, i64)> =
         store.read(|conn| -> Result<_> {
             let mut st = conn.prepare(
-                "SELECT f.id, t.vec, COALESCE(f.quality,0.5), f.cluster, f.photo_id FROM faces f
+                "SELECT f.id, t.vec, COALESCE(f.quality,0.5), f.cluster, f.person_id,
+                        f.photo_id FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
                  WHERE f.ignored=0",
             )?;
@@ -1636,34 +1868,31 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
                 let blob: Vec<u8> = r.get(1)?;
                 let q: f64 = r.get(2)?;
                 let old: Option<i64> = r.get(3)?;
-                let photo_id: i64 = r.get(4)?;
-                out.push((id, blob_to_vec(&blob), q as f32, old, photo_id));
+                let pid: Option<i64> = r.get(4)?;
+                let photo_id: i64 = r.get(5)?;
+                out.push((id, blob_to_vec(&blob), q as f32, old, pid, photo_id));
             }
             Ok(out)
         })?;
     if faces.is_empty() {
         return Ok(0);
     }
-    let (named, mut next_id): (HashMap<i64, String>, i64) =
-        store.read(|conn| -> Result<_> {
-            let mut named = HashMap::new();
-            let mut st = conn.prepare("SELECT id, name FROM people")?;
-            let mut rows = st.query([])?;
-            while let Some(r) = rows.next()? {
-                named.insert(r.get::<_, i64>(0)?, r.get::<_, String>(1)?);
-            }
-            let max_cluster: i64 = conn
-                .query_row(
-                    "SELECT COALESCE(MAX(cluster),0) FROM faces WHERE cluster IS NOT NULL",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            let max_person: i64 = conn
-                .query_row("SELECT COALESCE(MAX(id),0) FROM people", [], |r| r.get(0))
-                .unwrap_or(0);
-            Ok((named, max_cluster.max(max_person) + 1))
-        })?;
+    let mut next_id: i64 = store.read(|conn| -> Result<_> {
+        let max_cluster: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(cluster),0) FROM faces WHERE cluster IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let max_person: i64 = conn
+            .query_row("SELECT COALESCE(MAX(person_id),0) FROM faces", [], |r| r.get(0))
+            .unwrap_or(0);
+        let max_people: i64 = conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM people", [], |r| r.get(0))
+            .unwrap_or(0);
+        Ok(max_cluster.max(max_person).max(max_people) + 1)
+    })?;
     faces.sort_by(|a, b| {
         b.2.partial_cmp(&a.2)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1682,27 +1911,8 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     }
     let mut groups: Vec<ReclusterGroup> = Vec::new();
     let mut assign: HashMap<i64, usize> = HashMap::new();
-    // 已命名簇先按原簇号成组,重编号不会再把名字错配到别人身上。
-    for &(fid, ref v, q, old, photo) in &faces {
-        let Some(oc) = old.filter(|c| named.contains_key(c)) else {
-            continue;
-        };
-        let gi = match groups.iter().position(|g| g.anchor == Some(oc)) {
-            Some(gi) => gi,
-            None => {
-                groups.push(ReclusterGroup {
-                    sum: vec![0.0; dim as usize],
-                    photos: Vec::new(),
-                    faces: Vec::new(),
-                    anchor: Some(oc),
-                });
-                groups.len() - 1
-            }
-        };
-        group_add(&mut groups[gi], v, q, photo, fid);
-        assign.insert(fid, gi);
-    }
-    for &(fid, ref v, q, _, photo) in &faces {
+    // 所有脸一视同仁按质量降序贪心分组,身份不参与分组。
+    for &(fid, ref v, q, _, _, photo) in &faces {
         if assign.contains_key(&fid) {
             continue;
         }
@@ -1734,7 +1944,6 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
                     sum: vec![0.0; dim as usize],
                     photos: Vec::new(),
                     faces: Vec::new(),
-                    anchor: None,
                 });
                 let gi = groups.len() - 1;
                 group_add(&mut groups[gi], v, q, photo, fid);
@@ -1748,23 +1957,47 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
         let base: Vec<Vec<i64>> = groups.iter().map(|g| g.faces.clone()).collect();
         crate::ai_review::apply(&cons, &base)
     };
-    let old_of: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.3)).collect();
-    let mut used: std::collections::HashSet<i64> = std::collections::HashSet::new();
-    let mut writes: Vec<(i64, i64)> = Vec::with_capacity(faces.len());
+    let old_cluster: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.3)).collect();
+    let old_person: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.4)).collect();
+    // 每组按旧身份多数票选代表;平票取小号。
+    let mut votes: Vec<(Option<i64>, usize)> = Vec::with_capacity(final_groups.len());
     for g in &final_groups {
+        let mut tally: HashMap<i64, usize> = HashMap::new();
+        for fid in g {
+            if let Some(pid) = old_person.get(fid).copied().flatten() {
+                *tally.entry(pid).or_insert(0) += 1;
+            }
+        }
+        let pick = tally
+            .iter()
+            .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+            .map(|(p, n)| (*p, *n));
+        votes.push((pick.map(|(p, _)| p), pick.map(|(_, n)| n).unwrap_or(0)));
+    }
+    // 同一身份只给净票最多的组(簇分裂时身份随多数走)。
+    let mut winners: HashMap<i64, (usize, usize)> = HashMap::new();
+    for (gi, (pid, n)) in votes.iter().enumerate() {
+        if let Some(p) = pid {
+            let e = winners.entry(*p).or_insert((gi, *n));
+            if *n > e.1 || (*n == e.1 && gi < e.0) {
+                *e = (gi, *n);
+            }
+        }
+    }
+    let mut used: HashSet<i64> = HashSet::new();
+    let mut writes: Vec<(i64, i64, Option<i64>)> = Vec::with_capacity(faces.len());
+    for (gi, g) in final_groups.iter().enumerate() {
         if g.is_empty() {
             continue;
         }
-        // 组内命名簇取成员最多的旧簇号,保住档案名;其余簇从未用号段新发。
-        let mut anchors: HashMap<i64, usize> = HashMap::new();
+        // 簇号按旧簇号多数继承,已占用的号另发新号。
+        let mut cs: HashMap<i64, usize> = HashMap::new();
         for fid in g {
-            if let Some(oc) = old_of.get(fid).copied().flatten() {
-                if named.contains_key(&oc) {
-                    *anchors.entry(oc).or_insert(0) += 1;
-                }
+            if let Some(oc) = old_cluster.get(fid).copied().flatten() {
+                *cs.entry(oc).or_insert(0) += 1;
             }
         }
-        let pick = anchors
+        let pick = cs
             .iter()
             .max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
             .map(|(c, _)| *c);
@@ -1777,17 +2010,24 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
             }
         };
         used.insert(cid);
+        let mut pid = votes[gi].0;
+        if let Some(p) = pid {
+            if winners.get(&p).map(|w| w.0) != Some(gi) {
+                pid = None;
+            }
+        }
         for fid in g {
-            writes.push((*fid, cid));
+            writes.push((*fid, cid, pid));
         }
     }
     let count = used.len();
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut st = tx.prepare_cached("UPDATE faces SET cluster=?1 WHERE id=?2")?;
-            for (fid, cid) in &writes {
-                st.execute(params![cid, fid])?;
+            let mut st =
+                tx.prepare_cached("UPDATE faces SET cluster=?1, person_id=?2 WHERE id=?3")?;
+            for (fid, cid, pid) in &writes {
+                st.execute(params![cid, pid, fid])?;
             }
         }
         tx.commit()?;
@@ -1797,10 +2037,13 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     Ok(count.saturating_sub(merged))
 }
 
-/// 未命名簇的命名建议;只读,不写库。
+/// 未命名身份的命名建议;只读,不写库。
 #[derive(Clone, Debug)]
 pub struct Suggestion {
     pub cluster: i64,
+    pub person_id: Option<i64>,
+    /// 建议并入的已命名身份。
+    pub target_person_id: i64,
     pub name: String,
     pub score: f32,
     pub count: usize,
@@ -1814,13 +2057,13 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
     }
     let dim = emb_dim(store);
     store.read(|conn| {
-        // 已命名簇 -> (name, [(vec, quality)])
+        // 已命名人物 -> (name, [(vec, quality)])
         let mut named: HashMap<i64, (String, Vec<(Vec<f32>, f32)>)> = HashMap::new();
         {
             let mut st = match conn.prepare(
-                "SELECT f.cluster, p.name, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                "SELECT f.person_id, p.name, t.vec, COALESCE(f.quality,0.5) FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
-                 JOIN people p ON p.id=f.cluster
+                 JOIN people p ON p.id=f.person_id
                  WHERE f.ignored=0",
             ) {
                 Ok(s) => s,
@@ -1832,7 +2075,7 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             };
             loop {
                 let Ok(Some(r)) = rows.next() else { break };
-                let (Ok(cid), Ok(name), Ok(blob), Ok(q)) = (
+                let (Ok(pid), Ok(name), Ok(blob), Ok(q)) = (
                     r.get::<_, i64>(0),
                     r.get::<_, String>(1),
                     r.get::<_, Vec<u8>>(2),
@@ -1841,19 +2084,19 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                     continue;
                 };
                 named
-                    .entry(cid)
+                    .entry(pid)
                     .or_insert_with(|| (name, Vec::new()))
                     .1
                     .push((blob_to_vec(&blob), q as f32));
             }
         }
-        // 未命名簇 -> [(vec, quality)]
-        let mut unnamed: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
+        // 待命名组按(簇,身份)分开,避免把不同身份的脸混成一条建议。
+        let mut unnamed: HashMap<(i64, Option<i64>), Vec<(Vec<f32>, f32)>> = HashMap::new();
         {
             let mut st = match conn.prepare(
-                "SELECT f.cluster, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                "SELECT f.cluster, f.person_id, t.vec, COALESCE(f.quality,0.5) FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
-                 LEFT JOIN people p ON p.id=f.cluster
+                 LEFT JOIN people p ON p.id=f.person_id
                  WHERE p.id IS NULL AND f.cluster IS NOT NULL AND f.ignored=0",
             ) {
                 Ok(s) => s,
@@ -1865,23 +2108,23 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             };
             loop {
                 let Ok(Some(r)) = rows.next() else { break };
-                let (Ok(cid), Ok(blob), Ok(q)) = (
+                let (Ok(cid), Ok(pid), Ok(blob), Ok(q)) = (
                     r.get::<_, i64>(0),
-                    r.get::<_, Vec<u8>>(1),
-                    r.get::<_, f64>(2),
+                    r.get::<_, Option<i64>>(1),
+                    r.get::<_, Vec<u8>>(2),
+                    r.get::<_, f64>(3),
                 ) else {
                     continue;
                 };
                 unnamed
-                    .entry(cid)
+                    .entry((cid, pid))
                     .or_default()
                     .push((blob_to_vec(&blob), q as f32));
             }
         }
         let mut out: Vec<Suggestion> = unnamed
             .iter()
-            .filter_map(|(&cid, vs)| {
-                // probe:质量降序取前 2;低质量脸不参与。
+            .filter_map(|(&(cid, pid), vs)| {
                 let mut ranked = vs.clone();
                 ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let mut probes: Vec<&Vec<f32>> = ranked
@@ -1893,11 +2136,9 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                 if probes.is_empty() {
                     probes = ranked.iter().take(2).map(|(v, _)| v).collect();
                 }
-                // 按人物聚合:每个 probe 取对该人物代表模板的最优分,再求均值;
-                // 至少一个 probe 过阈值才算支持,要求与第二候选人拉开余量。
-                let mut scored: Vec<(String, f32)> = named
-                    .values()
-                    .filter_map(|(name, tpl)| {
+                let mut scored: Vec<(i64, String, f32)> = named
+                    .iter()
+                    .filter_map(|(&target_pid, (name, tpl))| {
                         let mut reps: Vec<&Vec<f32>> = tpl
                             .iter()
                             .filter(|(_, q)| *q >= SUGGEST_MIN_Q)
@@ -1921,24 +2162,29 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                             }
                             total += best;
                         }
-                        (support > 0)
-                            .then_some((name.clone(), total / probes.len() as f32))
+                        (support > 0).then_some((
+                            target_pid,
+                            name.clone(),
+                            total / probes.len() as f32,
+                        ))
                     })
                     .collect();
                 scored.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                let (name, score) = scored.first()?.clone();
+                let (target_pid, name, score) = scored.first()?.clone();
                 if score < thr {
                     return None;
                 }
                 if let Some(second) = scored.get(1) {
-                    if score - second.1 < SUGGEST_MARGIN {
+                    if score - second.2 < SUGGEST_MARGIN {
                         return None;
                     }
                 }
                 Some(Suggestion {
                     cluster: cid,
+                    person_id: pid,
+                    target_person_id: target_pid,
                     name,
                     score,
                     count: vs.len(),
@@ -1968,15 +2214,25 @@ mod tests {
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 直接插入一张带簇/质量的人脸(绕过模型,测聚类逻辑)。
-    /// 测试向量不足方案维度时零填充到位 —— 零填充不改余弦值,查询端的
-    /// t.dim 过滤才能命中。
+    /// 直接插入一张人脸(向量零填充到方案维度,身份默认随簇号)。
     fn insert_face(
         store: &Store,
         photo_id: i64,
         vec: &[f32],
         quality: f32,
         cluster: Option<i64>,
+    ) -> i64 {
+        insert_face_with(store, photo_id, vec, quality, cluster, cluster)
+    }
+
+    /// 直接插入一张人脸,簇号与身份可分别指定。
+    fn insert_face_with(
+        store: &Store,
+        photo_id: i64,
+        vec: &[f32],
+        quality: f32,
+        cluster: Option<i64>,
+        person_id: Option<i64>,
     ) -> i64 {
         let dim = emb_dim(store) as usize;
         let mut full = vec.to_vec();
@@ -1987,9 +2243,9 @@ mod tests {
         }
         let c = store.test_conn();
         c.execute(
-            "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored,cluster)
-             VALUES(?1,10,10,50,50,0.9,?2,0,?3)",
-            params![photo_id, quality as f64, cluster],
+            "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored,cluster,person_id)
+             VALUES(?1,10,10,50,50,0.9,?2,0,?3,?4)",
+            params![photo_id, quality as f64, cluster, person_id],
         )
         .unwrap();
         let fid = c.last_insert_rowid();
@@ -1999,6 +2255,27 @@ mod tests {
         )
         .unwrap();
         fid
+    }
+
+    /// 读取人物档案快照。
+    fn people_rows(store: &Store) -> Vec<(i64, String)> {
+        store.read(|conn| {
+            let mut st = conn.prepare("SELECT id,name FROM people ORDER BY id").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        })
+    }
+
+    /// 读取某张脸的当前身份。
+    fn person_of(store: &Store, fid: i64) -> Option<i64> {
+        store
+            .test_conn()
+            .query_row("SELECT person_id FROM faces WHERE id=?1", params![fid], |r| {
+                r.get(0)
+            })
+            .unwrap()
     }
 
     /// 测试用 save_face 包装:向量零填充到方案维度(不改余弦,过 t.dim 过滤)。
@@ -2100,6 +2377,8 @@ mod tests {
         );
         assert_eq!(sugs[0].name, "张三");
         assert_eq!(sugs[0].cluster, 2);
+        assert_eq!(sugs[0].person_id, Some(2), "建议应落在待命名身份所在簇");
+        assert_eq!(sugs[0].target_person_id, 1, "建议指向已命名的张三");
         assert!(sugs[0].score > 0.9, "score={}", sugs[0].score);
         assert_eq!(sugs[0].count, 1);
     }
@@ -2137,7 +2416,87 @@ mod tests {
         let sugs = face_suggestions(&store, 0.5);
         assert_eq!(sugs.len(), 1);
         assert_eq!(sugs[0].cluster, 3);
+        assert_eq!(sugs[0].person_id, Some(3));
+        assert_eq!(sugs[0].target_person_id, 1);
         assert_eq!(sugs[0].name, "甲");
+    }
+
+    /// 应用建议是把脸并入已有身份,不再新建同名档案。
+    #[test]
+    fn suggestion_apply_merges_into_existing_person() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let named = insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        rename_cluster(&store, 1, "张三").unwrap();
+        let other = insert_face(&store, 2, &[0.95, 0.31, 0.0], 1.0, Some(2));
+        let sugs = face_suggestions(&store, 0.55);
+        assert_eq!(sugs.len(), 1);
+        let s = &sugs[0];
+        assert_eq!(s.target_person_id, 1);
+        let n = merge_into_person(&store, s.cluster, s.person_id, s.target_person_id).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(person_of(&store, named), Some(1));
+        assert_eq!(person_of(&store, other), Some(1), "脸迁到目标身份");
+        assert_eq!(people_rows(&store), vec![(1, "张三".to_string())]);
+        assert_eq!(faces_for_person(&store, 1, false, 0.0).len(), 2);
+        assert!(face_suggestions(&store, 0.55).is_empty(), "并入后不再有建议");
+    }
+
+    /// 未归属组按簇并入,同簇已有身份的脸不被带走。
+    #[test]
+    fn merge_into_person_handles_unowned_group() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        insert_face_with(&store, 1, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        rename_person(&store, 11, "张三").unwrap();
+        let belonging = insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(2), Some(22));
+        let unowned = insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(2), None);
+        assert_eq!(merge_into_person(&store, 2, None, 11).unwrap(), 1);
+        assert_eq!(person_of(&store, unowned), Some(11));
+        assert_eq!(person_of(&store, belonging), Some(22));
+        assert_eq!(faces_for_person(&store, 11, false, 0.0).len(), 2);
+        assert!(merge_into_person(&store, 2, None, 999).is_err());
+    }
+
+    /// 并入受「不同人」约束保护,失败时身份不变。
+    #[test]
+    fn merge_into_person_respects_never_constraint() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let a = insert_face_with(&store, 1, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        rename_person(&store, 11, "张三").unwrap();
+        let b = insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(2), Some(22));
+        crate::ai_review::add(&store, a, b, crate::ai_review::Kind::Never).unwrap();
+        assert!(merge_into_person(&store, 2, Some(22), 11).is_err());
+        assert_eq!(person_of(&store, b), Some(22));
+    }
+
+    /// 人物列表按身份合并:跨簇同一身份一行,混合簇按身份分列。
+    #[test]
+    fn people_overview_groups_by_person_id() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg"]);
+        insert_face_with(&store, 1, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(2), Some(11));
+        insert_face_with(&store, 3, &[0.0, 1.0], 1.0, Some(2), Some(22));
+        insert_face_with(&store, 3, &[0.0, 1.0], 1.0, Some(2), None);
+        rename_person(&store, 11, "张三").unwrap();
+        let rows = people_overview(&store);
+        assert_eq!(rows.len(), 3, "两身份 + 一个未归属组");
+        let zhang = rows.iter().find(|r| r.person_id == Some(11)).unwrap();
+        assert_eq!(zhang.count, 2, "跨簇身份合成一行");
+        assert_eq!(zhang.person.as_deref(), Some("张三"));
+        assert_eq!(zhang.cluster, 1, "代表簇取最小号");
+        let mut cs = zhang.clusters.clone();
+        cs.sort_unstable();
+        assert_eq!(cs, vec![1, 2]);
+        assert_eq!(faces_for_person(&store, 11, false, 0.0).len(), 2);
+        let unowned = rows.iter().find(|r| r.person_id.is_none()).unwrap();
+        assert_eq!(unowned.count, 1);
+        assert_eq!(unowned.clusters, vec![2]);
     }
 
     /// 逐照片状态按签名隔离:当前签名成功/失败的项不再自动重跑,视频不进队列。
@@ -2213,7 +2572,7 @@ mod tests {
         }
     }
 
-    /// 全量重聚类:已命名簇作为锚点保留原簇号,新成员并入后名字仍对得上。
+    /// 全量重聚类:新簇按旧身份多数票继承,名字与身份不受簇号重排影响。
     #[test]
     fn recluster_all_rebuilds_and_keeps_names() {
         let _g = test_serial();
@@ -2229,12 +2588,15 @@ mod tests {
         drop(conn);
         // 张三(已命名)+ 一张同簇新脸(此前分在无名簇 2)应重聚为一簇;
         // 正交脸自成另一簇。
-        insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        let zhang = insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
         rename_cluster(&store, 1, "张三").unwrap();
+        let before = people_rows(&store);
         insert_face(&store, 2, &[0.9, 0.1, 0.0], 0.9, Some(2));
         insert_face(&store, 3, &[0.0, 1.0, 0.0], 0.9, Some(3));
         let n = recluster_all(&store, 0.6).unwrap();
         assert_eq!(n, 2, "cos≈0.99 的两张聚一簇,正交一张: {n}");
+        assert_eq!(person_of(&store, zhang), Some(1), "身份号不随簇号变化");
+        assert_eq!(people_rows(&store), before, "重聚类不得改动人物档案");
         let rows = people_overview(&store);
         assert_eq!(rows.len(), 2);
         let named = rows
@@ -2242,13 +2604,14 @@ mod tests {
             .find(|r| r.person.is_some())
             .expect("名字应保留");
         assert_eq!(named.person.as_deref(), Some("张三"));
+        assert_eq!(named.person_id, Some(1));
         assert_eq!(named.count, 2, "两张相似脸应同在新簇");
         assert!(rows.iter().all(|r| r.count >= 1));
     }
 
-    /// 重聚类不改已命名簇的簇号:名字与成员始终绑定。
+    /// 重聚类可任意重排簇号,但身份与姓名始终不变。
     #[test]
-    fn recluster_keeps_named_cluster_id_stable() {
+    fn recluster_keeps_person_id_regardless_of_cluster() {
         let _g = test_serial();
         let store = test_store();
         let conn = store.test_conn();
@@ -2264,27 +2627,91 @@ mod tests {
         let f1 = insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.5, Some(2));
         let _f2 = insert_face(&store, 2, &[1.0, 0.0, 0.0], 0.5, Some(2));
         rename_cluster(&store, 2, "张三").unwrap();
+        let before = people_rows(&store);
         // 两张正交脸质量更高,先占新簇 1、2。
         insert_face(&store, 3, &[0.0, 1.0, 0.0], 1.0, Some(1));
         insert_face(&store, 4, &[0.0, 0.0, 1.0], 1.0, Some(3));
         recluster_all(&store, 0.6).unwrap();
-        let c1: i64 = store
-            .read(|conn| -> anyhow::Result<i64> {
-                Ok(
-                    conn.query_row("SELECT cluster FROM faces WHERE id=?1", params![f1], |r| {
-                        r.get(0)
-                    })?,
-                )
-            })
-            .unwrap();
+        assert_eq!(person_of(&store, f1), Some(2), "身份号不随簇号变化");
+        assert_eq!(people_rows(&store), before, "人物档案原样保留");
         let rows = people_overview(&store);
         let named = rows
             .iter()
             .find(|r| r.person.is_some())
             .expect("名字应保留");
         assert_eq!(named.person.as_deref(), Some("张三"));
-        assert_eq!(named.cluster, c1, "名字必须落在张三那张脸所在的新簇");
+        assert_eq!(named.person_id, Some(2), "名字挂在稳定身份而非簇号上");
         assert_eq!(named.count, 2);
+    }
+
+    /// 簇号可以任意重排甚至复用,姓名始终绑定 person_id。
+    #[test]
+    fn recluster_preserves_person_name_and_id() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let f1 = insert_face_with(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(3), Some(11));
+        let f2 = insert_face_with(&store, 2, &[0.0, 1.0, 0.0], 1.0, Some(4), Some(22));
+        rename_person(&store, 11, "赵六").unwrap();
+        rename_person(&store, 22, "钱七").unwrap();
+        let before = people_rows(&store);
+        recluster_all(&store, 0.6).unwrap();
+        assert_eq!(people_rows(&store), before, "重聚类不动人物档案");
+        assert_eq!(person_of(&store, f1), Some(11));
+        assert_eq!(person_of(&store, f2), Some(22));
+        // 手工把所有簇号改成同一个,姓名仍随身份走。
+        store
+            .test_conn()
+            .execute("UPDATE faces SET cluster=100", [])
+            .unwrap();
+        let mut names: Vec<String> = photo_faces(&store, 1)
+            .into_iter()
+            .filter_map(|f| f.person)
+            .collect();
+        names.extend(photo_faces(&store, 2).into_iter().filter_map(|f| f.person));
+        assert_eq!(names, vec!["赵六".to_string(), "钱七".to_string()]);
+    }
+
+    /// 同一身份被拆成两个新簇时,身份只跟票数多的一组。
+    #[test]
+    fn recluster_split_identity_follows_majority() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        let x1 = insert_face_with(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(7), Some(7));
+        let x2 = insert_face_with(&store, 2, &[1.0, 0.0, 0.0], 1.0, Some(7), Some(7));
+        let x3 = insert_face_with(&store, 3, &[1.0, 0.0, 0.0], 1.0, Some(7), Some(7));
+        let y = insert_face_with(&store, 4, &[0.0, 1.0, 0.0], 1.0, Some(7), Some(7));
+        rename_person(&store, 7, "王五").unwrap();
+        let before = people_rows(&store);
+        recluster_all(&store, 0.6).unwrap();
+        assert_eq!(people_rows(&store), before, "名字不因分裂丢失");
+        let xs = [x1, x2, x3]
+            .iter()
+            .map(|f| person_of(&store, *f))
+            .collect::<Vec<_>>();
+        assert!(xs.iter().all(|p| *p == Some(7)), "多数派保留身份: {xs:?}");
+        assert_eq!(person_of(&store, y), None, "少数派回到未归属");
+        assert_eq!(photo_faces(&store, 1)[0].person.as_deref(), Some("王五"));
+    }
+
+    /// 同名冲突被拒;给还没有身份的簇命名时新建身份档案。
+    #[test]
+    fn rename_person_rejects_duplicate_and_names_unowned_cluster() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg"]);
+        insert_face(&store, 1, &[1.0, 0.0], 0.9, Some(1));
+        insert_face(&store, 2, &[0.0, 1.0], 0.9, Some(2));
+        let f3 = insert_face_with(&store, 3, &[0.7, 0.7], 0.9, Some(3), None);
+        rename_cluster(&store, 1, "张三").unwrap();
+        assert!(rename_person(&store, 2, "张三").is_err(), "同名应被拒绝");
+        assert!(rename_person(&store, 1, "  ").is_err(), "空名应被拒绝");
+        rename_cluster(&store, 3, "王五").unwrap();
+        let pid = person_of(&store, f3).expect("无身份簇应分配新身份");
+        assert!(pid > 3, "新身份号不撞已有簇号");
+        assert_eq!(photo_faces(&store, 3)[0].person.as_deref(), Some("王五"));
+        assert_eq!(person_of(&store, 1), Some(1), "别的簇不受影响");
+        assert!(rename_cluster(&store, 3, "张三").is_err(), "已有身份后仍拒绝同名");
     }
 
     /// never 约束:增量归簇、质心合并、全量重聚类三处都不得让两人同簇。
@@ -2523,11 +2950,19 @@ mod tests {
         for _ in 0..2 {
             insert_face(&store, 2, &[0.93, 0.36, 0.0], 1.0, Some(2));
         }
+        let before = people_rows(&store);
         let merged = merge_similar_clusters(&store, 0.6).unwrap();
         assert_eq!(merged, 1, "应并掉一簇");
+        assert_eq!(people_rows(&store), before, "并簇不得增删人物档案");
         let rows = people_overview(&store);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].count, 5, "两簇成员应合到一起");
+        assert_eq!(rows.len(), 2, "并簇只改簇号,两个身份仍各自成行");
+        assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), 5);
+        assert!(rows.iter().all(|r| r.clusters == vec![1]));
+        assert_eq!(
+            faces_for_cluster(&store, 1, false, 0.0).len(),
+            5,
+            "簇内成员已合并"
+        );
     }
 
     /// 已命名的簇互不合并 —— 命名即用户意图,哪怕质心再像也不越权。
@@ -2551,8 +2986,10 @@ mod tests {
         }
         rename_cluster(&store, 1, "张三").unwrap();
         rename_cluster(&store, 2, "李四").unwrap();
+        let before = people_rows(&store);
         let merged = merge_similar_clusters(&store, 0.6).unwrap();
         assert_eq!(merged, 0, "双方都有名字不应并");
+        assert_eq!(people_rows(&store), before, "两个已命名身份都保留");
         let rows = people_overview(&store);
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|r| r.person.as_deref() == Some("张三")));
@@ -2579,12 +3016,24 @@ mod tests {
             insert_face(&store, 2, &[0.93, 0.36, 0.0], 1.0, Some(2));
         }
         rename_cluster(&store, 2, "李四").unwrap();
+        let before = people_rows(&store);
         let merged = merge_similar_clusters(&store, 0.6).unwrap();
         assert_eq!(merged, 1);
+        assert_eq!(people_rows(&store), before, "并簇只改簇号");
         let rows = people_overview(&store);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].person.as_deref(), Some("李四"), "名字应保留");
-        assert_eq!(rows[0].count, 5);
+        assert_eq!(rows.len(), 2, "并簇不改身份,两行各留各的身份");
+        let named = rows
+            .iter()
+            .find(|r| r.person.is_some())
+            .expect("名字应保留");
+        assert_eq!(named.person.as_deref(), Some("李四"));
+        assert_eq!(named.person_id, Some(2));
+        assert_eq!(named.count, 2);
+        assert_eq!(
+            faces_for_cluster(&store, 2, false, 0.0).len(),
+            5,
+            "两个身份的脸已在同一簇"
+        );
     }
 
     /// 右栏人物面板的数据口:一 photo 多脸,带簇号、姓名与忽略态。
@@ -2606,14 +3055,17 @@ mod tests {
         ignore_cluster(&store, 2, true).unwrap();
 
         let faces = photo_faces(&store, 7);
-        assert_eq!(faces.len(), 3, "未聚类的脸也要返回");
+        assert_eq!(faces.len(), 3, "未归属的脸也要返回");
         assert_eq!(faces[0].person.as_deref(), Some("小明"));
         assert_eq!(faces[0].cluster, Some(1));
+        assert_eq!(faces[0].person_id, Some(1));
         assert!(!faces[0].ignored);
         assert_eq!(faces[0].rect, (10.0, 10.0, 50.0, 50.0));
         assert!(faces[1].ignored, "被忽略的簇要带着标记返回");
-        assert_eq!(faces[1].person, None, "没命名的簇不该被写成空串");
+        assert_eq!(faces[1].person, None, "没命名的身份不该被写成空串");
+        assert_eq!(faces[1].person_id, Some(2), "未命名身份也有稳定编号");
         assert_eq!(faces[2].cluster, None);
+        assert_eq!(faces[2].person_id, None, "未归属 = person_id IS NULL");
         assert!(photo_faces(&store, 999).is_empty(), "别的照片不该混进来");
     }
 
@@ -2699,7 +3151,9 @@ mod tests {
         insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
         insert_face(&store, 2, &[0.0, 1.0, 0.0], 1.0, Some(2));
         rename_cluster(&store, 1, "张三").unwrap();
+        assert_eq!(people_rows(&store), vec![(1, "张三".to_string())]);
         assert!(rename_cluster(&store, 2, "张三").is_err(), "同名应被拒绝");
+        assert!(rename_person(&store, 2, "张三").is_err(), "按身份命名同样拒绝同名");
         assert!(rename_cluster(&store, 2, "   ").is_err(), "空名应被拒绝");
         rename_cluster(&store, 2, "李四").unwrap();
         let names: Vec<String> = store
@@ -2710,6 +3164,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(names, vec!["张三".to_string(), "李四".to_string()]);
+        assert_eq!(person_of(&store, 1), Some(1));
+        assert_eq!(person_of(&store, 2), Some(2), "两个簇映射到不同身份");
     }
 
     /// 清除人脸数据在事务内连约束与扫描状态一起清掉。
@@ -2821,7 +3277,6 @@ mod tests {
             sum: vec![0.0, 0.0],
             photos: Vec::new(),
             faces: Vec::new(),
-            anchor: None,
         };
         group_add(&mut g, &[1.0, 0.0], 1.0, 1, 1);
         group_add(&mut g, &[0.0, 1.0], 0.05, 2, 2);
@@ -2851,6 +3306,7 @@ mod tests {
         let hits = similar_faces(&store, q, 0.5, 10, false);
         let ids: Vec<i64> = hits.iter().map(|h| h.face_id).collect();
         assert_eq!(ids, vec![near, mid], "按相似度降序且排除自身/低分");
+        assert!(hits.iter().all(|h| h.person_id.is_none()), "新脸未归属");
         assert!((hits[0].score - 1.0).abs() < 1e-5);
         assert!(!hits.iter().any(|h| h.face_id == far));
         assert_eq!(similar_faces(&store, q, 0.5, 1, false).len(), 1, "limit 生效");
@@ -2875,8 +3331,10 @@ mod tests {
         assert_eq!(faces_for_cluster(&store, 1, true, 0.0).len(), 1);
         crate::ai_review::remove(&store, a, b).unwrap();
         assert_eq!(assign_faces(&store, &[a], 2).unwrap(), 1);
+        assert_eq!(person_of(&store, a), Some(2), "加入此人物按身份落库");
         assert!(faces_for_cluster(&store, 1, true, 0.0).is_empty());
         assert_eq!(remove_faces(&store, &[a]).unwrap(), 1);
+        assert_eq!(person_of(&store, a), None, "移出人物后回到未归属");
         let left: Vec<i64> = faces_for_cluster(&store, 2, true, 0.0)
             .iter()
             .map(|f| f.face_id)
@@ -2885,15 +3343,20 @@ mod tests {
     }
 
     #[test]
-    fn create_person_allocates_unique_cluster_and_rejects_duplicate_name() {
+    fn create_person_allocates_stable_id_and_rejects_duplicate_name() {
         let _g = test_serial();
         let store = test_store();
         insert_photos(&store, &["a.jpg", "b.jpg"]);
         let a = insert_face(&store, 1, &[1.0, 0.0], 0.9, Some(5));
         rename_cluster(&store, 5, "张三").unwrap();
         let b = insert_face(&store, 2, &[0.0, 1.0], 0.9, None);
-        let cid = create_person(&store, &[b], Some("李四")).unwrap();
-        assert!(cid > 5, "新人物编号不得撞已有簇/档案");
+        let pid = create_person(&store, &[b], Some("李四")).unwrap();
+        assert!(pid > 5, "新身份号不得撞已有簇/档案");
+        assert_eq!(person_of(&store, b), Some(pid), "新建人物写入稳定身份");
+        assert_eq!(
+            people_rows(&store),
+            vec![(5, "张三".to_string()), (pid, "李四".to_string())]
+        );
         let names: Vec<String> = photo_faces(&store, 2)
             .into_iter()
             .filter_map(|f| f.person)

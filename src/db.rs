@@ -1594,7 +1594,8 @@ impl Store {
         // rich_state 是派生队列的取行条件,ext 是快查的过滤条件,都要走索引。
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_rich_state ON photos(rich_state);
-             CREATE INDEX IF NOT EXISTS idx_photos_ext ON photos(ext);",
+             CREATE INDEX IF NOT EXISTS idx_photos_ext ON photos(ext);
+             CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);",
         );
         // frn64 唯一索引 = L1 增量落库的 upsert 冲突靶。
         // **不能**做成 partial index:`ON CONFLICT(frn64)` 只认无 WHERE 的
@@ -1623,6 +1624,8 @@ impl Store {
         let _ = store.backfill_cam_pool();
         // 旧行补齐小写扩展名(ext IS NULL 的行;填完条件自然不再命中)。
         let _ = store.backfill_ext();
+        // 老库簇号即身份,一次性补齐人脸身份列。
+        let _ = store.backfill_person_ids_once();
         // 一次性把历史库的派生状态播种进 rich_state。
         let _ = store.seed_rich_state_once();
         // 一次性清掉永远不该进库的历史行(自家缓存、回收站、系统目录…)。
@@ -2542,6 +2545,22 @@ impl Store {
             }
             Ok(n)
         })
+    }
+
+    /// 老库簇号即身份,一次性回填人脸身份列;已移出人物的行不再被回写。
+    pub fn backfill_person_ids_once(&self) -> Result<usize> {
+        if self.get_setting("person_id_v1").is_some() {
+            return Ok(0);
+        }
+        let n = self.write(|conn| {
+            conn.execute(
+                "UPDATE faces SET person_id=cluster WHERE cluster IS NOT NULL AND person_id IS NULL",
+                [],
+            )
+            .unwrap_or(0)
+        });
+        let _ = self.set_setting("person_id_v1", "1");
+        Ok(n)
     }
 
     /// 一次性播种 `rich_state`:历史库没有作用域概念,凡是已经有普通档缩略图的行
@@ -5654,6 +5673,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, "Nikon D850");
+    }
+
+    #[test]
+    fn backfill_person_ids_once_migrates_legacy_rows() {
+        let store = Store::open_mem().unwrap();
+        // open_mem 已跑过回填;清掉库内标记与进程缓存,模拟尚未迁移的老库。
+        {
+            let c = store.test_conn();
+            c.execute("DELETE FROM settings WHERE k='person_id_v1'", [])
+                .unwrap();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO faces(photo_id,cluster,person_id) VALUES(1,7,NULL)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO faces(photo_id,cluster,person_id) VALUES(1,NULL,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        store.settings.lock().unwrap().remove("person_id_v1");
+        assert_eq!(store.backfill_person_ids_once().unwrap(), 1);
+        let c = store.test_conn();
+        let pid: Option<i64> = c
+            .query_row(
+                "SELECT person_id FROM faces WHERE cluster=7",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid, Some(7), "老库簇号应回填为身份");
+        // 门控生效后新行不再回填,避免把「移出人物」的 NULL 又写回去。
+        c.execute(
+            "INSERT INTO faces(photo_id,cluster,person_id) VALUES(1,9,NULL)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(store.backfill_person_ids_once().unwrap(), 0);
+        let pid: Option<i64> = c
+            .query_row(
+                "SELECT person_id FROM faces WHERE cluster=9",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pid, None);
     }
 
     #[test]
