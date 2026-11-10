@@ -3,6 +3,7 @@
 use crate::db::Store;
 use anyhow::Result;
 use rusqlite::params;
+use std::collections::HashMap;
 
 /// 一条标签定义。
 #[derive(Debug, Clone, PartialEq)]
@@ -300,15 +301,16 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// 灵敏度档位:top1 下限与 top2 领先幅度。
+/// 灵敏度档位:每条标签下限与同类兼容分差。
 const SENSITIVITY: [(f32, f32); 3] = [(0.22, 0.03), (0.26, 0.06), (0.30, 0.09)];
+const SELECTION_VERSION: &str = "category-multilabel-v2";
 
 /// 内置词表条目数。
 pub fn builtin_count() -> usize {
     BUILTIN.len()
 }
 
-/// 按灵敏度档位取 (top1 下限, margin)。
+/// 按灵敏度档位取 (标签下限, 同类分差)。
 pub fn thresholds(sensitivity: i32) -> (f32, f32) {
     SENSITIVITY[sensitivity.clamp(0, 2) as usize]
 }
@@ -377,13 +379,22 @@ pub fn label_count(store: &Store) -> usize {
     })
 }
 
-/// 词表版本(条数变化即触发标签阶段重建)。
+/// 词表版本包含有序内容与选择算法版本。
 pub fn vocab_version(store: &Store) -> String {
-    let n = label_count(store);
+    let mut bytes = SELECTION_VERSION.as_bytes().to_vec();
     let custom = store
         .get_setting("ai_labels_ver")
         .unwrap_or_else(|| "v1".into());
-    format!("{custom}:{n}")
+    bytes.extend_from_slice(&(custom.len() as u64).to_le_bytes());
+    bytes.extend_from_slice(custom.as_bytes());
+    for label in labels(store) {
+        bytes.extend_from_slice(&label.id.to_le_bytes());
+        for field in [&label.node, &label.zh, &label.en, &label.prompt] {
+            bytes.extend_from_slice(&(field.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(field.as_bytes());
+        }
+    }
+    crate::ai_models::sha256_bytes(&bytes)
 }
 
 /// 分类相簿:顶层节点与显示名。
@@ -406,20 +417,49 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
 }
 
-/// 打分并筛选:top1 过下限且领先 top2 达到 margin。
-pub fn select(scores: &mut Vec<(i64, f32)>, threshold: f32, margin: f32) -> Vec<(i64, f32)> {
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let Some(&(id, top)) = scores.first() else {
-        return Vec::new();
-    };
-    if top < threshold {
-        return Vec::new();
-    }
-    let second = scores.get(1).map(|s| s.1).unwrap_or(0.0);
-    if top - second < margin {
+/// 按绝对门槛筛选,同类最多两条兼容标签,全图最多六条。
+pub fn select(
+    scores: &[(i64, f32)],
+    labels: &[Label],
+    threshold: f32,
+    margin: f32,
+) -> Vec<(i64, f32)> {
+    if !threshold.is_finite() || !margin.is_finite() || margin < 0.0 {
         return Vec::new();
     }
-    vec![(id, top)]
+    let mut by_id = HashMap::new();
+    for label in labels {
+        by_id.entry(label.id).or_insert(label);
+    }
+    let mut candidates: Vec<(&Label, f32)> = scores
+        .iter()
+        .filter(|(_, score)| score.is_finite() && *score >= threshold)
+        .filter_map(|(id, score)| by_id.get(id).map(|label| (*label, *score)))
+        .collect();
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap().then_with(|| a.0.id.cmp(&b.0.id)));
+    let mut categories: HashMap<&str, (f32, usize)> = HashMap::new();
+    let mut selected: Vec<(&Label, f32)> = Vec::new();
+    for (label, score) in candidates {
+        let category = label.node.split('/').next().unwrap_or_default();
+        let (top, count) = categories.entry(category).or_insert((score, 0));
+        if *count >= 2 || *top - score > margin {
+            continue;
+        }
+        if selected.iter().any(|(prev, _)| {
+            prev.id == label.id
+                || prev.node == label.node
+                || prev.zh == label.zh
+                || prev.en == label.en
+        }) {
+            continue;
+        }
+        selected.push((label, score));
+        *count += 1;
+        if selected.len() == 6 {
+            break;
+        }
+    }
+    selected.into_iter().map(|(label, score)| (label.id, score)).collect()
 }
 
 /// 写某张照片的自动标签(同版本覆盖)。
@@ -545,22 +585,38 @@ mod tests {
         assert_eq!(label_count(&store), builtin_count());
     }
 
+    fn label(id: i64, node: &str, zh: &str, en: &str) -> Label {
+        Label {
+            id,
+            node: node.into(),
+            zh: zh.into(),
+            en: en.into(),
+            prompt: String::new(),
+        }
+    }
+
     #[test]
     fn select_requires_threshold_and_margin() {
-        let mut low = vec![(1, 0.20f32), (2, 0.10)];
+        let labels = vec![
+            label(1, "人物/合影", "合影", "group photo"),
+            label(2, "人物/自拍", "自拍", "selfie"),
+        ];
         assert!(
-            select(&mut low, 0.26, 0.06).is_empty(),
-            "top1 低于下限应丢弃"
+            select(&[(1, 0.20f32), (2, 0.10)], &labels, 0.26, 0.06).is_empty(),
+            "低于下限应丢弃"
         );
-        let mut close = vec![(1, 0.40f32), (2, 0.37)];
-        assert!(
-            select(&mut close, 0.26, 0.06).is_empty(),
-            "领先不足 margin 应丢弃"
-        );
-        let mut good = vec![(1, 0.45f32), (2, 0.20)];
-        let got = select(&mut good, 0.26, 0.06);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, 1);
+        let gap = select(&[(1, 0.40f32), (2, 0.20)], &labels, 0.26, 0.06);
+        assert_eq!(gap.len(), 1, "落后超过 margin 的同类标签应丢弃");
+        assert_eq!(gap[0].0, 1);
+        let close = select(&[(1, 0.40f32), (2, 0.37)], &labels, 0.26, 0.06);
+        assert_eq!(close.len(), 2, "margin 内的同类标签可同时命中");
+    }
+
+    #[test]
+    fn select_ignores_unknown_label_ids() {
+        let labels = vec![label(1, "动物/猫", "猫", "cat")];
+        let got = select(&[(1, 0.50f32), (99, 0.90)], &labels, 0.26, 0.06);
+        assert_eq!(got, vec![(1, 0.50)]);
     }
 
     #[test]

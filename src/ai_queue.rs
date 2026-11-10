@@ -61,16 +61,14 @@ fn norm(path: &str) -> String {
 
 /// 从连接读取优先级规则(目录前缀, 档位)。
 pub fn rules_from_conn(conn: &Connection) -> Vec<(String, i32)> {
-    let mut out = Vec::new();
-    let Ok(mut st) = conn.prepare("SELECT prefix, prio FROM ai_priority_rules") else {
-        return out;
-    };
-    if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?))) {
-        for row in rows.flatten() {
-            out.push(row);
-        }
-    }
-    out
+    try_rules_from_conn(conn).unwrap_or_default()
+}
+
+/// 读取目录优先级规则并传播数据库错误。
+fn try_rules_from_conn(conn: &Connection) -> Result<Vec<(String, i32)>> {
+    let mut st = conn.prepare("SELECT prefix, prio FROM ai_priority_rules")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// 按最长目录前缀取优先级,未命中返回默认档。
@@ -431,6 +429,72 @@ pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
     Ok(total)
 }
 
+/// 继续处理:只补当前版本缺失/过期的任务,保留有效完成项。
+pub fn continue_stage(store: &Store, stage: Stage) -> Result<usize> {
+    enqueue_all_for(store, stage)
+}
+
+/// 重试失败:把该阶段隔离的失败项放回队列并清零重试次数。
+pub fn retry_failed(store: &Store, stage: Stage) -> Result<usize> {
+    let ts = now_ms();
+    store.write(|conn| -> Result<usize> {
+        let tx = conn.transaction()?;
+        let n = {
+            let mut st = tx.prepare(
+                "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
+                 SELECT ?1, f.photo_id, ?2, ?3, 0
+                   FROM ai_failed f JOIN photos p ON p.id = f.photo_id
+                  WHERE f.stage = ?1
+                 ON CONFLICT(stage, photo_id)
+                 DO UPDATE SET attempts=0, enqueued_ts=excluded.enqueued_ts",
+            )?;
+            st.execute(params![stage.as_str(), P_DEFAULT, ts])?
+        };
+        tx.execute("DELETE FROM ai_failed WHERE stage=?1", [stage.as_str()])?;
+        tx.commit()?;
+        Ok(n)
+    })
+}
+
+/// 强制重建:清除本阶段的完成/失败状态与派生产物后重新入队,人工标注保留。
+pub fn rebuild_stage(store: &Store, stage: Stage) -> Result<usize> {
+    let clip_ver = stage_version(store, Stage::Clip);
+    let tags_ver = stage_version(store, Stage::Tags);
+    store.write(|conn| -> Result<()> {
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM ai_state WHERE stage=?1", [stage.as_str()])?;
+        tx.execute("DELETE FROM ai_jobs WHERE stage=?1", [stage.as_str()])?;
+        tx.execute("DELETE FROM ai_failed WHERE stage=?1", [stage.as_str()])?;
+        match stage {
+            Stage::Clip => {
+                tx.execute("DELETE FROM clips_vec WHERE ver=?1", [&clip_ver])?;
+                // 语义向量重建后,由它派生的自动标签与标题一起失效。
+                tx.execute("DELETE FROM ai_state WHERE stage='tags'", [])?;
+                tx.execute("DELETE FROM auto_tags WHERE model_ver=?1", [&tags_ver])?;
+                tx.execute(
+                    "UPDATE photos SET caption=NULL, caption_auto=0 WHERE caption_auto=1",
+                    [],
+                )?;
+            }
+            Stage::Tags => {
+                tx.execute("DELETE FROM auto_tags WHERE model_ver=?1", [&tags_ver])?;
+                tx.execute(
+                    "UPDATE photos SET caption=NULL, caption_auto=0 WHERE caption_auto=1",
+                    [],
+                )?;
+            }
+            Stage::Ocr => {
+                tx.execute("INSERT INTO ocr_fts(ocr_fts) VALUES('delete-all')", [])?;
+                tx.execute("DELETE FROM ocr_docs", [])?;
+                tx.execute("DELETE FROM ocr_boxes", [])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    })?;
+    enqueue_all_for(store, stage)
+}
+
 /// 该阶段当前生效的模型版本;未配置时用基准版本。
 pub fn stage_version(store: &Store, stage: Stage) -> String {
     crate::ai_models::stage_signature(store, stage)
@@ -606,6 +670,71 @@ mod tests {
         assert_eq!(n as i64, N);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs"), N);
         assert_eq!(batch.len(), 16);
+    }
+
+    #[test]
+    fn retry_failed_requeues_only_isolated_rows_with_zero_attempts() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        add_photo(&store, 2, r"C:\docs\b.jpg");
+        enqueue(&store, Stage::Clip, 1, 1).unwrap();
+        commit_batch(&store, Stage::Clip, "v0", &[1], &[]).unwrap();
+        enqueue(&store, Stage::Clip, 2, 1).unwrap();
+        commit_batch(&store, Stage::Clip, "v0", &[], &[(2, 3, "decode".into())]).unwrap();
+        assert_eq!(retry_failed(&store, Stage::Clip).unwrap(), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_failed"), 0);
+        let jobs: Vec<(i64, i32)> = store.read(|conn| {
+            let mut st = conn.prepare("SELECT photo_id, attempts FROM ai_jobs").unwrap();
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .flatten()
+                .collect()
+        });
+        assert_eq!(jobs, vec![(2, 0)], "已完成项不该被重试,失败项应清零次数");
+    }
+
+    #[test]
+    fn rebuild_stage_clears_derived_state_and_requeues() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        add_photo(&store, 2, r"C:\docs\b.jpg");
+        let ver = stage_version(&store, Stage::Tags);
+        commit_batch(&store, Stage::Tags, &ver, &[1, 2], &[]).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(1,1,0.9,?1)",
+                    params![ver],
+                )?;
+                conn.execute(
+                    "UPDATE photos SET caption='auto', caption_auto=1 WHERE id=1",
+                    [],
+                )
+            })
+            .unwrap();
+        let n = rebuild_stage(&store, Stage::Tags).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_state WHERE stage='tags'"), 0);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM auto_tags"), 0);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM photos WHERE caption_auto=1"),
+            0,
+            "自动标题应随标签重建失效"
+        );
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE stage='tags'"), 2);
+    }
+
+    #[test]
+    fn continue_stage_keeps_completed_items() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        add_photo(&store, 2, r"C:\docs\b.jpg");
+        let ver = stage_version(&store, Stage::Clip);
+        commit_batch(&store, Stage::Clip, &ver, &[1], &[]).unwrap();
+        continue_stage(&store, Stage::Clip).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_state WHERE stage='clip'"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE stage='clip'"), 1);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE photo_id=2"), 1);
     }
 
     #[test]

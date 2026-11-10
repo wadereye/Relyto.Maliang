@@ -891,8 +891,10 @@ CREATE TABLE IF NOT EXISTS people (
 CREATE TABLE IF NOT EXISTS face_templates (
     face_id INTEGER PRIMARY KEY REFERENCES faces(id) ON DELETE CASCADE,
     dim INTEGER NOT NULL,
-    vec BLOB NOT NULL
+    vec BLOB NOT NULL,
+    sig TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_face_templates_sig ON face_templates(sig);
 CREATE TABLE IF NOT EXISTS clips (
     photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
     dim INTEGER NOT NULL,
@@ -1077,6 +1079,27 @@ CREATE TABLE IF NOT EXISTS face_constraints (
     ts     INTEGER NOT NULL,
     PRIMARY KEY (a_face, b_face)
 );
+-- 人脸逐照片状态:0=待处理 1=处理中 2=成功(含无脸) 3=失败。
+CREATE TABLE IF NOT EXISTS face_scan (
+    photo_id INTEGER PRIMARY KEY REFERENCES photos(id) ON DELETE CASCADE,
+    sig TEXT NOT NULL,
+    state INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    face_count INTEGER NOT NULL DEFAULT 0,
+    mtime INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL DEFAULT 0,
+    ts INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_face_scan_state ON face_scan(sig, state);
+-- 删脸/删照片时同步清理模板、约束与扫描状态,避免留下悬空引用。
+CREATE TRIGGER IF NOT EXISTS trg_face_cleanup AFTER DELETE ON faces BEGIN
+    DELETE FROM face_templates WHERE face_id = OLD.id;
+    DELETE FROM face_constraints WHERE a_face = OLD.id OR b_face = OLD.id;
+END;
+CREATE TRIGGER IF NOT EXISTS trg_photo_scan_cleanup AFTER DELETE ON photos BEGIN
+    DELETE FROM face_scan WHERE photo_id = OLD.id;
+END;
 "#;
 
 /// 一条 L1 → L2 的结构行(全盘元数据入库,**不打开文件**)。
@@ -1499,6 +1522,11 @@ impl Store {
         let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN quality REAL;");
         let _ =
             conn.execute_batch("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;");
+        // 旧模板无签名,标为未知版本,不参与当前管线的比对与归档。
+        let _ = conn.execute_batch(
+            "ALTER TABLE face_templates ADD COLUMN sig TEXT NOT NULL DEFAULT '';
+             UPDATE face_templates SET sig='unknown' WHERE sig='';",
+        );
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN parent_id INTEGER;");
         let _ = conn.execute_batch(REBUILD_TAG_PARENTS_SQL);

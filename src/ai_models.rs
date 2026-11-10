@@ -503,7 +503,8 @@ pub fn stage_signature(store: &Store, stage: Stage) -> Option<String> {
         None
     } else if stage == Stage::Tags {
         let labels = crate::ai_tags::vocab_version(store);
-        Some(format!("{}|labels={labels}", parts.join(",")))
+        let sens = crate::ai_tags::sensitivity(store);
+        Some(format!("{}|labels={labels}|sens={sens}", parts.join(",")))
     } else {
         Some(parts.join(","))
     }
@@ -833,12 +834,27 @@ pub fn replace_model(
         activate(store, slot, version)?;
         return Ok(());
     };
+    let mut stages = vec![stage];
+    if stage == Stage::Clip {
+        // 标签由语义向量派生,换模型时必须一起停、释放会话并重排失败项。
+        stages.push(Stage::Tags);
+    }
     sched.pause();
-    sched.drain(stage);
-    sched.release(stage);
+    for s in &stages {
+        sched.drain(*s);
+    }
+    for s in &stages {
+        sched.release(*s);
+    }
     let out = activate(store, slot, version)
-        .and_then(|_| crate::ai_queue::enqueue_all_for(store, stage).map_err(|e| e.to_string()))
-        .map(|_| ());
+        .and_then(|_| {
+            for s in stages.iter().skip(1) {
+                crate::ai_queue::retry_failed(store, *s).map_err(|e| e.to_string())?;
+            }
+            crate::ai_queue::enqueue_all_for(store, stage)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
     sched.resume();
     out
 }

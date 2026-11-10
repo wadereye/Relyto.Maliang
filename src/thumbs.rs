@@ -428,6 +428,12 @@ pub fn load_for_preview(src: &Path, max_side: u32) -> Option<(image::DynamicImag
     decode_base(src, max_side).ok()
 }
 
+/// AI 用画面:按 EXIF 摆正、等比缩到 `max_side` 内,不带展示画布留白。
+pub fn load_for_ai(src: &Path, max_side: u32) -> Result<image::DynamicImage> {
+    let (img, orient) = decode_base(src, max_side)?;
+    Ok(apply_exif_rotation(downscale(img, max_side), orient))
+}
+
 /// 生成指定档位的缩略图;返回 dHash。
 ///
 /// dHash **只在中档(Normal)计算** —— 它是全图感知哈希,与显示档位无关,
@@ -1133,6 +1139,30 @@ mod tests {
         assert_eq!(cached.width(), Tier::Normal.size());
         assert_eq!(cached.height(), Tier::Normal.size());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AI 输入必须保留原始比例,不能读带浅灰留白的展示画布。
+    #[test]
+    fn load_for_ai_keeps_aspect_without_letterbox() {
+        let dir = std::env::temp_dir().join(format!("rk-thumbai-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("wide.jpg");
+        let mut img = image::RgbImage::new(800, 400);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([(x % 256) as u8, (y % 256) as u8, 32]);
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Jpeg,
+            )
+            .unwrap();
+        std::fs::write(&src, &buf).unwrap();
+
+        let ai = load_for_ai(&src, 512).expect("应解出 AI 输入");
+        assert_eq!((ai.width(), ai.height()), (512, 256), "应等比缩放而非补成正方形");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

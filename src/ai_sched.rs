@@ -35,35 +35,68 @@ pub struct StageStats {
 
 /// 暂停闸门:worker 在批边界等这里。
 struct Gate {
-    paused: Mutex<bool>,
+    state: Mutex<GateState>,
     cv: Condvar,
+}
+
+struct GateState {
+    paused: bool,
+    maintenance: bool,
+}
+
+struct Maintenance<'a>(&'a Gate);
+
+impl Drop for Maintenance<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().maintenance = false;
+        self.0.cv.notify_all();
+    }
 }
 
 impl Gate {
     fn new(paused: bool) -> Self {
         Gate {
-            paused: Mutex::new(paused),
+            state: Mutex::new(GateState { paused, maintenance: false }),
             cv: Condvar::new(),
         }
     }
 
+    /// 等到暂停和维护都结束。
     fn wait(&self) {
-        let mut p = self.paused.lock().unwrap();
-        while *p {
-            p = self.cv.wait(p).unwrap();
+        let mut state = self.state.lock().unwrap();
+        while state.paused || state.maintenance {
+            state = self.cv.wait(state).unwrap();
         }
+    }
+
+    fn enter(&self, busy: &Busy, quit: &AtomicBool) -> bool {
+        let mut state = self.state.lock().unwrap();
+        while (state.paused || state.maintenance) && !quit.load(Ordering::Relaxed) {
+            state = self.cv.wait(state).unwrap();
+        }
+        if quit.load(Ordering::Relaxed) {
+            return false;
+        }
+        busy.enter();
+        true
+    }
+
+    fn maintain(&self) -> Result<Maintenance<'_>, String> {
+        let mut state = self.state.lock().unwrap();
+        if state.maintenance {
+            return Err(crate::i18n::t("已有 AI 维护任务正在运行").into());
+        }
+        state.maintenance = true;
+        Ok(Maintenance(self))
     }
 
     fn set(&self, paused: bool) {
-        let mut p = self.paused.lock().unwrap();
-        *p = paused;
-        if !paused {
-            self.cv.notify_all();
-        }
+        self.state.lock().unwrap().paused = paused;
+        self.cv.notify_all();
     }
 
     fn is_paused(&self) -> bool {
-        *self.paused.lock().unwrap()
+        self.state.lock().unwrap().paused
     }
 }
 
@@ -91,7 +124,7 @@ impl Busy {
         self.cv.notify_all();
     }
 
-    fn wait_idle(&self, timeout: Duration) {
+    fn wait_idle(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut n = self.active.lock().unwrap();
         while *n > 0 {
@@ -102,6 +135,7 @@ impl Busy {
             let (guard, _) = self.cv.wait_timeout(n, left).unwrap();
             n = guard;
         }
+        *n == 0
     }
 }
 
@@ -147,7 +181,8 @@ struct Runner {
     vision: Option<crate::clip::MobileClipVision>,
     text: Option<crate::clip::MobileClipText>,
     ocr: Option<crate::ai::ocr::Ocr>,
-    label_vecs: Option<Vec<(i64, Vec<f32>)>>,
+    label_vecs: Option<(String, Vec<(i64, Vec<f32>)>)>,
+    model_sig: String,
 }
 
 impl Runner {
@@ -156,6 +191,14 @@ impl Runner {
         self.text = None;
         self.ocr = None;
         self.label_vecs = None;
+        self.model_sig.clear();
+    }
+
+    fn prepare(&mut self, signature: String) {
+        if self.model_sig != signature {
+            self.clear();
+            self.model_sig = signature;
+        }
     }
 
     fn vision(&mut self, store: &Store) -> Result<&mut crate::clip::MobileClipVision, String> {
@@ -179,9 +222,15 @@ impl Runner {
         Ok(self.ocr.as_mut().unwrap())
     }
 
-    /// 标签文本向量只算一次(词表版本变化时由版本签名触发重建)。
+    /// 标签文本向量按词表签名缓存;词表内容变化时重算。
     fn label_vectors(&mut self, store: &Store) -> Result<&Vec<(i64, Vec<f32>)>, String> {
-        if self.label_vecs.is_none() {
+        let ver = format!("{}|{}", self.model_sig, crate::ai_tags::vocab_version(store));
+        let stale = self
+            .label_vecs
+            .as_ref()
+            .map(|(v, _)| v != &ver)
+            .unwrap_or(true);
+        if stale {
             let labels = crate::ai_tags::labels(store);
             let mut out = Vec::with_capacity(labels.len());
             for l in labels {
@@ -189,24 +238,25 @@ impl Runner {
                 let v = t.embed_text(&l.prompt)?;
                 out.push((l.id, v));
             }
-            self.label_vecs = Some(out);
+            self.label_vecs = Some((ver, out));
         }
-        Ok(self.label_vecs.as_ref().unwrap())
+        Ok(&self.label_vecs.as_ref().unwrap().1)
     }
 }
 
-/// 取可用于推理的缩略图:普通档优先,缺档时退回其它已生成档位。
-fn clip_image(photo_id: i64) -> Option<image::DynamicImage> {
-    use crate::thumbs::Tier;
-    [Tier::Normal, Tier::Big, Tier::Preview, Tier::Small]
-        .into_iter()
-        .find_map(|t| crate::thumbs::load_cached_tier(t, photo_id))
+fn clip_image(store: &Store, photo_id: i64) -> Result<image::DynamicImage, String> {
+    let src = store.read(|conn| {
+        conn.query_row("SELECT path FROM photos WHERE id=?1", [photo_id], |r| {
+            r.get::<_, String>(0)
+        })
+    }).map_err(|e| e.to_string())?;
+    crate::thumbs::load_for_ai(std::path::Path::new(&src), 1024).map_err(|e| e.to_string())
 }
 
 fn execute_clip(store: &Store, runner: &mut Runner, photo_id: i64, ver: &str) -> Outcome {
-    let img = match clip_image(photo_id) {
-        Some(i) => i,
-        None => return Outcome::Skip("缺缩略图".into()),
+    let img = match clip_image(store, photo_id) {
+        Ok(i) => i,
+        Err(e) => return Outcome::Skip(e),
     };
     let emb = match runner.vision(store).and_then(|v| v.embed_image(&img)) {
         Ok(e) => e,
@@ -231,12 +281,13 @@ fn execute_tags(store: &Store, runner: &mut Runner, photo_id: i64, tag_ver: &str
             Ok(v) => v,
             Err(e) => return Outcome::Fail(e),
         };
-        let mut s: Vec<(i64, f32)> = labels
+        let s: Vec<(i64, f32)> = labels
             .iter()
             .filter(|(_, v)| v.len() == emb.len())
             .map(|(id, v)| (*id, crate::ai_tags::cosine(&emb, v)))
             .collect();
-        crate::ai_tags::select(&mut s, threshold, margin)
+        let catalog = crate::ai_tags::labels(store);
+        crate::ai_tags::select(&s, &catalog, threshold, margin)
     };
     if let Err(e) = crate::ai_tags::save(store, photo_id, tag_ver, &scores) {
         return Outcome::Fail(e);

@@ -639,6 +639,13 @@ pub struct App {
     face_hits: Vec<crate::faces::FaceHit>,
     #[cfg(feature = "ai")]
     face_sugs: Vec<crate::faces::Suggestion>,
+    /// 按脸检索结果;face_similar_for 记录查询脸,换脸后旧结果自动隐藏。
+    #[cfg(feature = "ai")]
+    face_similar: Vec<crate::faces::SimilarFace>,
+    #[cfg(feature = "ai")]
+    face_similar_for: Option<i64>,
+    #[cfg(feature = "ai")]
+    face_similar_thr: f32,
     /// 合并/拆分约束的目标簇(当前簇之外)。
     #[cfg(feature = "ai")]
     face_merge_target: Option<i64>,
@@ -2521,6 +2528,12 @@ impl App {
             sel_cluster: None,
             #[cfg(feature = "ai")]
             face_hits: Vec::new(),
+            #[cfg(feature = "ai")]
+            face_similar: Vec::new(),
+            #[cfg(feature = "ai")]
+            face_similar_for: None,
+            #[cfg(feature = "ai")]
+            face_similar_thr: 0.35,
             #[cfg(feature = "ai")]
             face_sugs: Vec::new(),
             #[cfg(feature = "ai")]
@@ -5204,7 +5217,7 @@ impl App {
                 ui.small(note);
             });
         }
-        ui.small(t("三个方案的模型文件可以都下好备着,但方案之间特征向量不通用:切换后需要重建(清除现有人脸数据并按新方案重扫,或暂留旧数据)。"));
+        ui.small(t("三个方案的模型文件可以都下好备着,但方案之间特征向量不通用:切换需确认清除现有人脸数据并按新方案重扫。"));
         ui.separator();
 
         // —— 模型文件(复选下载) ——
@@ -5563,20 +5576,15 @@ impl App {
         self.face_sugs = crate::faces::face_suggestions(&self.store, thr);
     }
 
-    /// 人脸算法版本检查(算法版本迁移):库中记录的版本+方案标识与当前
-    /// 不一致时弹窗,建议清除旧人脸数据重扫。
+    /// 人脸管线签名检查:存在非当前签名模板时请用户确认重建,不自动覆盖人工数据。
     #[cfg(feature = "ai")]
     fn check_face_algo_version(&mut self) {
-        let tag = crate::faces::algo_tag(&self.store);
-        match self.store.get_setting("face_algo_version") {
-            None => {
-                let _ = self.store.set_setting("face_algo_version", &tag);
-            }
-            Some(v) if v != tag => {
-                self.face_version_warn = true;
-            }
-            _ => {}
+        if crate::faces::pending_rebuild(&self.store) {
+            self.face_version_warn = true;
+            return;
         }
+        let tag = crate::faces::algo_tag(&self.store);
+        let _ = self.store.set_setting("face_algo_version", &tag);
     }
 
     /// 后台语义索引(M4b):CLIP 图像编码器嵌入一批未处理照片(较慢)。
@@ -7581,31 +7589,18 @@ impl App {
             ui.small(t("左栏「人物」里可以扫描图库并自动聚类。"));
             return;
         }
-        for f in faces {
-            let Some(cluster) = f.cluster else {
-                ui.small(t_with(
-                    "未归入人物的脸  · 质量 {p1}{p2}",
-                    &[
-                        ("p1", format!("{p1:.2}", p1 = (f.quality))),
-                        (
-                            "p2",
-                            if f.ignored {
-                                t("(已忽略)").to_string()
-                            } else {
-                                String::new()
-                            },
-                        ),
-                    ],
-                ));
-                continue;
-            };
+        for f in &faces {
             ui.separator();
             let named = f.person.clone().unwrap_or_default();
             ui.horizontal(|ui| {
-                if named.is_empty() {
-                    ui.strong(t_with("簇 {cluster}", &[("cluster", cluster.to_string())]));
+                if let Some(cluster) = f.cluster {
+                    if named.is_empty() {
+                        ui.strong(t_with("簇 {cluster}", &[("cluster", cluster.to_string())]));
+                    } else {
+                        ui.strong(named.as_str());
+                    }
                 } else {
-                    ui.strong(named.as_str());
+                    ui.strong(t("未归入人物的脸"));
                 }
                 ui.small(t_with(
                     "质量 {p1}",
@@ -7616,49 +7611,224 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
-                if ui.small_button(t("命名")).clicked() {
-                    self.face_name_draft = Some((f.face_id, named.clone()));
-                }
-                if ui.small_button(t("查看该人物")).clicked() {
-                    if self.face_people.is_empty() {
-                        self.refresh_people_and_suggestions();
+                if let Some(cluster) = f.cluster {
+                    if ui.small_button(t("命名")).clicked() {
+                        self.face_name_draft = Some((f.face_id, named.clone()));
                     }
-                    self.set_view(ViewKind::Faces);
-                    self.sel_cluster = Some(cluster);
-                    self.face_hits = crate::faces::faces_for_cluster(
-                        &self.store,
-                        cluster,
-                        self.face_show_ignored,
-                        if self.face_hide_low { 0.4 } else { 0.0 },
+                    if ui.small_button(t("查看该人物")).clicked() {
+                        if self.face_people.is_empty() {
+                            self.refresh_people_and_suggestions();
+                        }
+                        self.set_view(ViewKind::Faces);
+                        self.sel_cluster = Some(cluster);
+                        self.face_hits = crate::faces::faces_for_cluster(
+                            &self.store,
+                            cluster,
+                            self.face_show_ignored,
+                            if self.face_hide_low { 0.4 } else { 0.0 },
+                        );
+                    }
+                    if ui.small_button(t("移出人物")).clicked() {
+                        match crate::faces::remove_faces(&self.store, &[f.face_id]) {
+                            Ok(_) => {
+                                self.status = t("已移出,待下次聚类重新归入").into();
+                                self.refresh_people_and_suggestions();
+                            }
+                            Err(e) => {
+                                self.status =
+                                    t_with("操作失败: {e}", &[("e", e.to_string())]);
+                            }
+                        }
+                    }
+                }
+                if ui.small_button(t("找相似人脸")).clicked() {
+                    let thr = self.face_similar_thr;
+                    self.face_similar =
+                        crate::faces::similar_faces(&self.store, f.face_id, thr, 60, false);
+                    self.face_similar_for = Some(f.face_id);
+                    self.status = t_with(
+                        "已在全库找到 {n} 个相近人脸",
+                        &[("n", self.face_similar.len().to_string())],
                     );
                 }
                 if ui
                     .small_button(if f.ignored { t("恢复") } else { t("忽略") })
                     .clicked()
                 {
-                    let _ = crate::faces::ignore_cluster(&self.store, cluster, !f.ignored);
+                    match f.cluster {
+                        Some(cluster) => {
+                            let _ =
+                                crate::faces::ignore_cluster(&self.store, cluster, !f.ignored);
+                        }
+                        None => {
+                            let _ = crate::faces::set_ignored(
+                                &self.store,
+                                &[f.face_id],
+                                !f.ignored,
+                            );
+                        }
+                    }
                     self.face_show_ignored = true;
                     self.refresh_people_and_suggestions();
                 }
             });
-            if self.face_name_draft.as_ref().map(|(k, _)| *k) == Some(f.face_id) {
-                let mut commit: Option<String> = None;
-                if let Some((_, draft)) = &mut self.face_name_draft {
-                    let resp = ui.text_edit_singleline(draft);
-                    let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
-                    if resp.lost_focus() || enter {
-                        commit = Some(draft.clone());
+            if let Some(cluster) = f.cluster {
+                if self.face_name_draft.as_ref().map(|(k, _)| *k) == Some(f.face_id) {
+                    let mut commit: Option<String> = None;
+                    if let Some((_, draft)) = &mut self.face_name_draft {
+                        let resp = ui.text_edit_singleline(draft);
+                        let enter =
+                            ui.input(|i| i.key_pressed(egui::Key::Enter)) && resp.has_focus();
+                        if resp.lost_focus() || enter {
+                            commit = Some(draft.clone());
+                        }
                     }
-                }
-                if let Some(name) = commit {
-                    if !name.is_empty() {
-                        let _ = crate::faces::rename_cluster(&self.store, cluster, &name);
-                        self.refresh_people_and_suggestions();
-                        self.status = t_with("已命名:{name}", &[("name", name.to_string())]);
+                    if let Some(name) = commit {
+                        if !name.is_empty() {
+                            match crate::faces::rename_cluster(&self.store, cluster, &name) {
+                                Ok(()) => {
+                                    self.refresh_people_and_suggestions();
+                                    self.status =
+                                        t_with("已命名:{name}", &[("name", name.to_string())]);
+                                }
+                                Err(e) => {
+                                    self.status =
+                                        t_with("命名失败: {e}", &[("e", e.to_string())]);
+                                }
+                            }
+                        }
+                        self.face_name_draft = None;
                     }
-                    self.face_name_draft = None;
                 }
             }
+        }
+        self.drawer_similar_ui(ui, &faces);
+    }
+
+    /// 抽屉:按脸检索结果与归档、纠错操作。
+    #[cfg(feature = "ai")]
+    fn drawer_similar_ui(&mut self, ui: &mut egui::Ui, faces: &[crate::faces::PhotoFace]) {
+        let Some(qid) = self.face_similar_for else {
+            return;
+        };
+        let Some(qface) = faces.iter().find(|f| f.face_id == qid) else {
+            self.face_similar.clear();
+            self.face_similar_for = None;
+            return;
+        };
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(t_with(
+                "相似人脸({n})",
+                &[("n", self.face_similar.len().to_string())],
+            ));
+            if ui.small_button(t("清除")).clicked() {
+                self.face_similar.clear();
+                self.face_similar_for = None;
+            }
+        });
+        let mut thr = self.face_similar_thr;
+        if ui
+            .add(egui::Slider::new(&mut thr, 0.2..=0.8).text(t("相似度下限")))
+            .changed()
+        {
+            self.face_similar_thr = thr;
+            self.face_similar = crate::faces::similar_faces(&self.store, qid, thr, 60, false);
+        }
+        if qface.cluster.is_none() {
+            ui.small(t("当前脸还未归入人物;先命名再点「加入此人物」。"));
+        }
+        if self.face_similar.is_empty() {
+            ui.small(t("该阈值下没有相近人脸;可调低下限再试。"));
+            return;
+        }
+        let target = qface.cluster;
+        let mut act: Option<(usize, u8)> = None;
+        for (i, hit) in self.face_similar.iter().enumerate() {
+            ui.separator();
+            ui.horizontal(|ui| {
+                let file = std::path::Path::new(&hit.photo_path)
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| hit.photo_path.clone());
+                ui.strong(file);
+                match &hit.person {
+                    Some(name) => {
+                        ui.small(name.as_str());
+                    }
+                    None => match hit.cluster {
+                        Some(c) => {
+                            ui.small(t_with("簇 {cluster}", &[("cluster", c.to_string())]));
+                        }
+                        None => {
+                            ui.small(t("未归属"));
+                        }
+                    },
+                }
+            });
+            ui.small(t_with(
+                "相似度 {s} · 质量 {q}",
+                &[
+                    ("s", format!("{:.3}", hit.score)),
+                    ("q", format!("{:.2}", hit.quality)),
+                ],
+            ));
+            ui.horizontal(|ui| {
+                if target.is_some() && ui.small_button(t("加入此人物")).clicked() {
+                    act = Some((i, 0));
+                }
+                if ui.small_button(t("单独建人物")).clicked() {
+                    act = Some((i, 3));
+                }
+                if ui.small_button(t("不是同一人")).clicked() {
+                    act = Some((i, 1));
+                }
+                if ui.small_button(t("忽略")).clicked() {
+                    act = Some((i, 2));
+                }
+            });
+        }
+        if self.face_similar.len() >= 60 {
+            ui.small(t("只显示最相近的 60 个结果。"));
+        }
+        let Some((i, code)) = act else {
+            return;
+        };
+        let hit_id = self.face_similar[i].face_id;
+        let res = match code {
+            0 => target.map(|c| {
+                crate::faces::assign_faces(&self.store, &[hit_id], c)
+                    .map(|_| t("已加入此人物").to_string())
+            }),
+            1 => Some(
+                crate::ai_review::add(&self.store, qid, hit_id, crate::ai_review::Kind::Never)
+                    .map(|_| t("已标记为不同人").to_string()),
+            ),
+            3 => Some(
+                crate::faces::create_person(&self.store, &[hit_id], None)
+                    .map(|_| t("已新建人物(未命名)").to_string()),
+            ),
+            _ => Some(
+                crate::faces::set_ignored(&self.store, &[hit_id], true)
+                    .map(|_| t("已忽略该脸").to_string()),
+            ),
+        };
+        match res {
+            Some(Ok(msg)) => {
+                self.status = msg;
+                self.refresh_people_and_suggestions();
+                self.face_similar = crate::faces::similar_faces(
+                    &self.store,
+                    qid,
+                    self.face_similar_thr,
+                    60,
+                    false,
+                );
+            }
+            Some(Err(e)) => {
+                self.status = t_with("操作失败: {e}", &[("e", e.to_string())]);
+            }
+            None => {}
         }
     }
 
@@ -7982,6 +8152,35 @@ impl App {
         });
     }
 
+    /// 队列统计行的三个动作:继续处理 / 重试失败 / 强制重建。
+    #[cfg(feature = "ai")]
+    fn stage_action_ai(&mut self, stage: crate::ai_queue::Stage, kind: u8) {
+        if kind == 0 {
+            self.enqueue_stage_ai(stage);
+            return;
+        }
+        let store = self.store.clone();
+        self.status = if kind == 1 {
+            t_with(
+                "已重新安排 {p1} 的失败项",
+                &[("p1", (stage.label()).to_string())],
+            )
+        } else {
+            t_with(
+                "正在重建 {p1}:清除本阶段完成状态与派生产物后重新入队",
+                &[("p1", (stage.label()).to_string())],
+            )
+        };
+        std::thread::spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
+            let _ = if kind == 1 {
+                crate::ai_queue::retry_failed(&store, stage)
+            } else {
+                crate::ai_queue::rebuild_stage(&store, stage)
+            };
+        });
+    }
+
     /// 选项页「AI 行为」:基础开关、暂停恢复与队列统计。
     #[cfg(feature = "ai")]
     fn ai_options_ui(&mut self, ui: &mut egui::Ui) {
@@ -8044,8 +8243,7 @@ impl App {
                 for (i, name) in [t("宽松"), t("适中"), t("严格")].iter().enumerate() {
                     if ui.selectable_value(&mut sens, i as i32, *name).clicked() {
                         let _ = self.store.set_setting("ai_tag_sensitivity", &i.to_string());
-                        crate::ai_queue::enqueue_all_for(&self.store, crate::ai_queue::Stage::Tags)
-                            .ok();
+                        self.enqueue_stage_ai(crate::ai_queue::Stage::Tags);
                     }
                 }
             });
@@ -8066,17 +8264,7 @@ impl App {
                     }
                 });
         });
-        ui.horizontal(|ui| {
-            if ui.button(t("重建标签")).clicked() {
-                self.enqueue_stage_ai(crate::ai_queue::Stage::Tags);
-            }
-            if ui.button(t("重建语义")).clicked() {
-                self.enqueue_stage_ai(crate::ai_queue::Stage::Clip);
-            }
-            if ui.button(t("入队 OCR")).clicked() {
-                self.enqueue_stage_ai(crate::ai_queue::Stage::Ocr);
-            }
-        });
+        let tag_ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
         ui.small(t_with(
             "词表 {p1} 条 · 语义向量 {p2} 条 · OCR 文档 {p3} 篇 · 人脸约束 {p4} 条",
             &[
@@ -8093,7 +8281,6 @@ impl App {
                 ("p4", (crate::ai_review::all(&self.store).len()).to_string()),
             ],
         ));
-        let tag_ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
         let counts = crate::ai_tags::category_counts(&self.store, &tag_ver);
         ui.horizontal_wrapped(|ui| {
             for (name, n) in counts {
@@ -8115,20 +8302,37 @@ impl App {
             }
         }
         if let Some((_, rows)) = &self.ai_stats_cache {
-            for row in rows {
-                ui.small(t_with(
-                    "{p1}:待办 {p2} · 完成 {p3} · 失败 {p4}",
-                    &[
-                        ("p1", (row.stage.label()).to_string()),
-                        ("p2", (row.stats.pending).to_string()),
-                        ("p3", (row.stats.done).to_string()),
-                        ("p4", (row.stats.failed).to_string()),
-                    ],
-                ));
+            let rows = rows.clone();
+            let mut action: Option<(crate::ai_queue::Stage, u8)> = None;
+            for row in &rows {
+                ui.horizontal_wrapped(|ui| {
+                    ui.small(t_with(
+                        "{p1}:待办 {p2} · 完成 {p3} · 失败 {p4}",
+                        &[
+                            ("p1", (row.stage.label()).to_string()),
+                            ("p2", (row.stats.pending).to_string()),
+                            ("p3", (row.stats.done).to_string()),
+                            ("p4", (row.stats.failed).to_string()),
+                        ],
+                    ));
+                    if ui.small_button(t("继续处理")).clicked() {
+                        action = Some((row.stage, 0));
+                    }
+                    if ui.small_button(t("重试失败")).clicked() {
+                        action = Some((row.stage, 1));
+                    }
+                    if ui.small_button(t("强制重建")).clicked() {
+                        action = Some((row.stage, 2));
+                    }
+                });
+            }
+            if let Some((stage, kind)) = action {
+                self.stage_action_ai(stage, kind);
             }
         }
         ui.separator();
         ui.small(t("暂停/恢复在批边界生效;任务持久化在索引库,重启后继续。"));
+        ui.small(t("继续处理只补缺失/过期项;重试失败只重排隔离项;强制重建会清除本阶段完成状态与派生产物,人工标注保留。"));
     }
 
     /// 启用某槽位版本(带调度器的顺序化替换)。
@@ -12886,25 +13090,59 @@ impl eframe::App for App {
                             ],
                         ));
                         // 全量重聚类:增量聚类只增不改,分错的簇不会自己长好;
-                        // 把全部向量按质量降序重分一遍(已命名按质心最近迁移)。
-                        if ui.button(t("重新聚类")).clicked() {
-                            match crate::faces::recluster_all(
-                                &self.store,
-                                crate::faces::cluster_thr(&self.store),
-                            ) {
-                                Ok(n) => {
-                                    self.status =
-                                        t_with("重新聚类完成:共 {n} 簇", &[("n", n.to_string())]);
+                        // 已命名簇保留原簇号,其余向量按质量降序重分。
+                        let failed = crate::faces::failed_count(&self.store);
+                        ui.horizontal(|ui| {
+                            if ui.button(t("重新聚类")).clicked() {
+                                match crate::faces::recluster_all(
+                                    &self.store,
+                                    crate::faces::cluster_thr(&self.store),
+                                ) {
+                                    Ok(n) => {
+                                        self.status = t_with(
+                                            "重新聚类完成:共 {n} 簇",
+                                            &[("n", n.to_string())],
+                                        );
+                                    }
+                                    Err(e) => {
+                                        self.status = t_with(
+                                            "重新聚类失败: {e}",
+                                            &[("e", e.to_string())],
+                                        )
+                                    }
                                 }
-                                Err(e) => {
-                                    self.status =
-                                        t_with("重新聚类失败: {e}", &[("e", e.to_string())])
+                                self.refresh_people_and_suggestions();
+                                self.sel_cluster = None;
+                                self.face_hits.clear();
+                            }
+                            if failed > 0
+                                && ui
+                                    .button(t_with(
+                                        "重试失败 ({p1})",
+                                        &[("p1", failed.to_string())],
+                                    ))
+                                    .clicked()
+                            {
+                                match crate::faces::retry_failed(&self.store) {
+                                    Ok(n) => {
+                                        self.status = t_with(
+                                            "已重新排队 {n} 张失败照片",
+                                            &[("n", n.to_string())],
+                                        );
+                                        self.refresh_people_and_suggestions();
+                                        if n > 0 {
+                                            self.start_face_scan();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.status = t_with(
+                                            "重试失败: {e}",
+                                            &[("e", e.to_string())],
+                                        );
+                                    }
                                 }
                             }
-                            self.refresh_people_and_suggestions();
-                            self.sel_cluster = None;
-                            self.face_hits.clear();
-                        }
+                        });
                         // 命名建议(未命名簇按质心相似度推荐)
                         if !self.face_sugs.is_empty() {
                             ui.separator();
@@ -12921,11 +13159,24 @@ impl eframe::App for App {
                                         ],
                                     ));
                                     if ui.small_button(t("应用")).clicked() {
-                                        let _ = crate::faces::rename_cluster(
+                                        match crate::faces::rename_cluster(
                                             &self.store,
                                             s.cluster,
                                             &s.name,
-                                        );
+                                        ) {
+                                            Ok(()) => {
+                                                self.status = t_with(
+                                                    "已命名:{name}",
+                                                    &[("name", s.name.clone())],
+                                                );
+                                            }
+                                            Err(e) => {
+                                                self.status = t_with(
+                                                    "命名失败: {e}",
+                                                    &[("e", e.to_string())],
+                                                );
+                                            }
+                                        }
                                         self.refresh_people_and_suggestions();
                                     }
                                 });
@@ -13322,8 +13573,21 @@ impl eframe::App for App {
                                     {
                                         let name = std::mem::take(&mut self.input_rename);
                                         if !name.is_empty() {
-                                            let _ =
-                                                crate::faces::rename_cluster(&self.store, c, &name);
+                                            match crate::faces::rename_cluster(&self.store, c, &name)
+                                            {
+                                                Ok(()) => {
+                                                    self.status = t_with(
+                                                        "已命名:{name}",
+                                                        &[("name", name.clone())],
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    self.status = t_with(
+                                                        "命名失败: {e}",
+                                                        &[("e", e.to_string())],
+                                                    );
+                                                }
+                                            }
                                             self.refresh_people_and_suggestions();
                                         }
                                     }
@@ -14260,7 +14524,7 @@ impl eframe::App for App {
         #[cfg(feature = "ai")]
         if let Some(pend) = self.face_algo_pending {
             let mut open = true;
-            let mut decision: u8 = 0; // 1=切换并重建 2=切换暂留 3=取消
+            let mut decision: u8 = 0; // 1=切换并重建 3=取消
             egui::Window::new(t("切换人脸识别方案"))
                 .open(&mut open)
                 .collapsible(false)
@@ -14268,14 +14532,11 @@ impl eframe::App for App {
                 .default_width(480.0)
                 .show(ctx, |ui| {
                     ui.label(t_with("切换到「{p1}」后,现有的人脸特征向量与簇不通用,需要重建。", &[("p1", (pend.label()).to_string())]));
-                    ui.small(t("重建 = 清除全部人脸数据(含人物命名)并按新方案重新扫描;暂留 = 旧簇照旧显示,待下次扫描再慢慢换血。"));
+                    ui.small(t("确认后清除全部人脸数据(含人物命名)并按新方案重新扫描;取消则维持当前方案,不混用新旧结果。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button(t("切换并重建")).clicked() {
                             decision = 1;
-                        }
-                        if ui.button(t("切换,暂留旧数据")).clicked() {
-                            decision = 2;
                         }
                         if ui.button(t("取消")).clicked() {
                             decision = 3;
@@ -14286,34 +14547,31 @@ impl eframe::App for App {
                 self.face_algo_pending = None;
             }
             match decision {
-                1 => {
-                    let _ = crate::faces::wipe_faces(&self.store);
-                    let _ = self.store.set_setting("face_algo", pend.key());
-                    let tag = crate::faces::algo_tag(&self.store);
-                    let _ = self.store.set_setting("face_algo_version", &tag);
-                    self.refresh_people_and_suggestions();
-                    if crate::ai::face::Faces::models_present(pend) {
-                        self.start_face_scan();
-                        self.status = t_with(
-                            "已切换到 {p1},现有人脸数据已清除,正在按新方案重新扫描",
-                            &[("p1", (pend.label()).to_string())],
-                        );
-                    } else {
-                        self.status = t_with("已切换到 {p1},人脸数据已清除;模型未就位,请到 选项 > AI 模型 下载后再扫描", &[("p1", (pend.label()).to_string())]);
+                1 => match crate::faces::wipe_faces(&self.store) {
+                    Ok(()) => {
+                        let _ = self.store.set_setting("face_algo", pend.key());
+                        let tag = crate::faces::algo_tag(&self.store);
+                        let _ = self.store.set_setting("face_algo_version", &tag);
+                        self.refresh_people_and_suggestions();
+                        if crate::ai::face::Faces::models_present(pend) {
+                            self.start_face_scan();
+                            self.status = t_with(
+                                "已切换到 {p1},现有人脸数据已清除,正在按新方案重新扫描",
+                                &[("p1", (pend.label()).to_string())],
+                            );
+                        } else {
+                            self.status = t_with("已切换到 {p1},人脸数据已清除;模型未就位,请到 选项 > AI 模型 下载后再扫描", &[("p1", (pend.label()).to_string())]);
+                        }
                     }
-                }
-                2 => {
-                    let _ = self.store.set_setting("face_algo", pend.key());
-                    let tag = crate::faces::algo_tag(&self.store);
-                    let _ = self.store.set_setting("face_algo_version", &tag);
-                    self.refresh_people_and_suggestions();
-                    self.status = t_with("已切换到 {p1},旧的人脸数据保留;重新扫描后新旧结果可能混排,建议用「切换并重建」", &[("p1", (pend.label()).to_string())]);
-                }
+                    Err(e) => {
+                        self.status = t_with("切换失败: {p1}", &[("p1", e.to_string())]);
+                    }
+                },
                 _ => {}
             }
         }
 
-        // 人脸算法版本不一致:旧向量无法与新算法结果比较
+        // 人脸管线签名不一致:旧结果不参与比对,等用户确认重建。
         #[cfg(feature = "ai")]
         if self.face_version_warn {
             let mut open = self.face_version_warn;
@@ -14322,21 +14580,26 @@ impl eframe::App for App {
                 .collapsible(false)
                 .default_width(480.0)
                 .show(ctx, |ui| {
-                    ui.label(t("检测到人脸识别算法已升级(现有数据由旧版本生成),旧的人脸簇和特征向量无法与新算法的结果正确比较。"));
-                    ui.label(t("建议清除旧人脸数据并重新扫描;也可以暂时保留(新旧簇可能分开显示)。"));
+                    ui.label(t("人脸数据与当前管线不一致(权重或处理版本已变化),旧结果暂不参与检索、聚类和自动归档。"));
+                    ui.label(t("确认后清除全部人脸数据并按当前方案重新扫描;稍后处理则继续保持待重建,不会自动覆盖人工命名。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button(t("清除并重新扫描")).clicked() {
-                            let _ = crate::faces::wipe_faces(&self.store);
-                            let tag = crate::faces::algo_tag(&self.store);
-                            let _ = self.store.set_setting("face_algo_version", &tag);
-                            self.face_version_warn = false;
-                            self.start_face_scan();
+                            match crate::faces::wipe_faces(&self.store) {
+                                Ok(()) => {
+                                    let tag = crate::faces::algo_tag(&self.store);
+                                    let _ = self.store.set_setting("face_algo_version", &tag);
+                                    self.face_version_warn = false;
+                                    self.start_face_scan();
+                                }
+                                Err(e) => {
+                                    self.status = t_with("重建失败: {p1}", &[("p1", e.to_string())]);
+                                }
+                            }
                         }
-                        if ui.button(t("保留旧数据")).clicked() {
-                            let tag = crate::faces::algo_tag(&self.store);
-                            let _ = self.store.set_setting("face_algo_version", &tag);
+                        if ui.button(t("稍后处理")).clicked() {
                             self.face_version_warn = false;
+                            self.status = t("人脸数据保持待重建,暂不参与检索与归档;可在选项页确认清除后重新扫描").to_string();
                         }
                     });
                 });
