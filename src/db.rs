@@ -882,7 +882,8 @@ CREATE TABLE IF NOT EXISTS faces (
     cluster INTEGER,
     score REAL,
     quality REAL,
-    ignored INTEGER NOT NULL DEFAULT 0
+    ignored INTEGER NOT NULL DEFAULT 0,
+    assign_src TEXT
 );
 CREATE TABLE IF NOT EXISTS people (
     id INTEGER PRIMARY KEY,
@@ -1520,6 +1521,7 @@ impl Store {
         );
         let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN score REAL;");
         let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN quality REAL;");
+        let _ = conn.execute_batch("ALTER TABLE faces ADD COLUMN assign_src TEXT;");
         let _ =
             conn.execute_batch("ALTER TABLE faces ADD COLUMN ignored INTEGER NOT NULL DEFAULT 0;");
         // 旧模板无签名,标为未知版本,不参与当前管线的比对与归档。
@@ -2554,7 +2556,8 @@ impl Store {
         }
         let n = self.write(|conn| {
             conn.execute(
-                "UPDATE faces SET person_id=cluster WHERE cluster IS NOT NULL AND person_id IS NULL",
+                "UPDATE faces SET person_id=cluster, assign_src='auto'
+                 WHERE cluster IS NOT NULL AND person_id IS NULL",
                 [],
             )
             .unwrap_or(0)

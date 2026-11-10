@@ -39,8 +39,6 @@ pub fn suggestion_thr(store: &Store) -> f32 {
     current_algo(store).suggestion_thr()
 }
 
-/// 命名建议所需的最低人脸质量(低质量脸不作代表模板或 probe)。
-const SUGGEST_MIN_Q: f32 = 0.4;
 /// 建议相对第二候选人物需要的最低分数余量。
 const SUGGEST_MARGIN: f32 = 0.02;
 
@@ -59,6 +57,21 @@ pub const YOUNG_PENALTY: f32 = 0.1;
 /// 归簇余量:最高分与次高分之差小于该值 = 模棱两可,不当场归簇,
 /// 留在未分配等下批再判(重聚类是批处理,必须落位,无此规则)。
 pub const CLUSTER_MARGIN: f32 = 0.05;
+
+/// 代表模板预算:每组参与认领判定的高质量互异模板上限。
+const REP_BUDGET: usize = 8;
+/// 近重复判定的余弦:达到该值视为连拍/同帧重复,不重复计入代表集。
+const REP_DUP_COS: f32 = 0.95;
+/// 代表模板的同照片上限:一张照片的多张脸不得虚增支持数。
+const REP_MAX_PER_PHOTO: usize = 2;
+/// 代表模板的最低质量;人工确认的脸不受此门槛限制。
+const REP_MIN_Q: f32 = 0.4;
+/// 稳健聚合取相似度最高的前 N 个代表模板。
+const REP_AGG_TOP: usize = 3;
+/// 质心候选放宽量:质心只负责缩小候选,最终归属看代表模板。
+const CAND_SLACK: f32 = 0.15;
+/// 每张脸的质心候选上限(按质心余弦取前 K 再精算)。
+const CAND_K: usize = 8;
 
 /// 连续推理失败上限:达到即停,避免模型坏掉时把全库逐张标失败。
 const MAX_ANALYZE_FAILURES: usize = 5;
@@ -468,36 +481,6 @@ fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// 质量加权质心(mean + L2 归一化);低质量脸保底权重 0.05。
-fn mean_vec_weighted(vs: &[(Vec<f32>, f32)]) -> Option<Vec<f32>> {
-    if vs.is_empty() {
-        return None;
-    }
-    let mut m = vec![0.0f32; vs[0].0.len()];
-    let mut wsum = 0.0f32;
-    for (v, q) in vs {
-        let w = q.max(0.05);
-        for (a, b) in m.iter_mut().zip(v) {
-            *a += b * w;
-        }
-        wsum += w;
-    }
-    if wsum <= 0.0 {
-        return None;
-    }
-    for v in &mut m {
-        *v /= wsum;
-    }
-    let norm = m.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if norm <= 0.0 {
-        return None;
-    }
-    for v in &mut m {
-        *v /= norm;
-    }
-    Some(m)
-}
-
 fn cos(a: &[f32], b: &[f32]) -> f32 {
     let mut s = 0.0f32;
     for (x, y) in a.iter().zip(b) {
@@ -513,6 +496,174 @@ fn join_thr(base: f32, members: usize) -> f32 {
     } else {
         base
     }
+}
+
+/// 参与聚类/认领计算的一张脸(内存中的副本)。
+#[derive(Clone)]
+struct Member {
+    v: Vec<f32>,
+    q: f32,
+    photo: i64,
+    /// 归属来源为人工确认(assign_src='manual')。
+    manual: bool,
+}
+
+/// 内存计算中的簇状态:成员、代表模板集与质心增量和。
+#[derive(Clone)]
+struct ClusterMem {
+    members: Vec<Member>,
+    reps: Vec<Member>,
+    sum: Vec<f32>,
+    wsum: f32,
+}
+
+impl ClusterMem {
+    fn new(dim: usize) -> Self {
+        Self {
+            members: Vec::new(),
+            reps: Vec::new(),
+            sum: vec![0.0; dim],
+            wsum: 0.0,
+        }
+    }
+
+    fn centroid(&self) -> Option<Vec<f32>> {
+        sum_centroid(&self.sum, self.wsum)
+    }
+
+    fn add(&mut self, m: &Member, thr: f32) {
+        member_add(&mut self.sum, &mut self.wsum, &mut self.reps, m, thr);
+        self.members.push(m.clone());
+    }
+}
+
+/// 把一张脸并入簇的累计状态(质心增量和 + 代表模板尝试入围)。
+fn member_add(
+    sum: &mut [f32],
+    wsum: &mut f32,
+    reps: &mut Vec<Member>,
+    m: &Member,
+    thr: f32,
+) {
+    let w = m.q.max(0.05);
+    for (a, b) in sum.iter_mut().zip(&m.v) {
+        *a += b * w;
+    }
+    *wsum += w;
+    let _ = rep_try_add(reps, m, thr);
+}
+
+/// 增量和归一化质心;只用于缩小候选,不作为最终归属凭证。
+fn sum_centroid(sum: &[f32], wsum: f32) -> Option<Vec<f32>> {
+    if wsum <= 0.0 {
+        return None;
+    }
+    let mut m = sum.to_vec();
+    for v in &mut m {
+        *v /= wsum;
+    }
+    let norm = m.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if !norm.is_finite() || norm <= 0.0 {
+        return None;
+    }
+    for v in &mut m {
+        *v /= norm;
+    }
+    Some(m)
+}
+
+/// 尝试把一张脸加入代表模板集:预算、同照片上限、近重复去重、
+/// 自动归属脸须获已选人工模板支持(防自动模板自我强化)。
+fn rep_try_add(reps: &mut Vec<Member>, m: &Member, thr: f32) -> bool {
+    if reps.len() >= REP_BUDGET {
+        return false;
+    }
+    if reps.iter().filter(|r| r.photo == m.photo).count() >= REP_MAX_PER_PHOTO {
+        return false;
+    }
+    if reps.iter().any(|r| cos(&r.v, &m.v) >= REP_DUP_COS) {
+        return false;
+    }
+    if reps.iter().any(|r| r.manual)
+        && !m.manual
+        && !reps
+            .iter()
+            .any(|r| r.manual && cos(&r.v, &m.v) >= thr)
+    {
+        return false;
+    }
+    reps.push(m.clone());
+    true
+}
+
+/// 从全组成员选代表模板:人工确认优先、质量降序;低质量脸默认不入围,
+/// 全组都不达标时退回质量最高的一张(组不能没有代表)。
+fn rep_select(ms: &[Member], thr: f32) -> Vec<Member> {
+    let mut order: Vec<usize> = (0..ms.len()).collect();
+    order.sort_by(|&a, &b| {
+        ms[b]
+            .manual
+            .cmp(&ms[a].manual)
+            .then(
+                ms[b]
+                    .q
+                    .partial_cmp(&ms[a].q)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(a.cmp(&b))
+    });
+    let mut reps: Vec<Member> = Vec::new();
+    for &i in &order {
+        if !ms[i].manual && ms[i].q < REP_MIN_Q {
+            continue;
+        }
+        if rep_try_add(&mut reps, &ms[i], thr) && reps.len() >= REP_BUDGET {
+            break;
+        }
+    }
+    if reps.is_empty() {
+        if let Some(&i) = order.first() {
+            reps.push(ms[i].clone());
+        }
+    }
+    reps
+}
+
+/// 候选脸对代表模板集的打分:返回(达到 thr_eff 的支持数, 前 N 高相似度均值)。
+fn rep_claim(reps: &[Member], v: &[f32], thr_eff: f32) -> (usize, f32) {
+    if reps.is_empty() {
+        return (0, f32::MIN);
+    }
+    let mut sims: Vec<f32> = reps.iter().map(|r| cos(v, &r.v)).collect();
+    sims.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let support = sims.iter().filter(|s| **s >= thr_eff).count();
+    let top = sims.len().min(REP_AGG_TOP);
+    let agg = sims[..top].iter().sum::<f32>() / top as f32;
+    (support, agg)
+}
+
+/// 认领所需支持数:有人工锚点或仅单模板的组 1 票即可;
+/// 纯自动的多模板组必须 2 票,单张自动脸不能独自吸收更多人。
+fn required_support(reps: &[Member]) -> usize {
+    if reps.len() >= 2 && !reps.iter().any(|r| r.manual) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 两组代表模板是否双向支持:各自至少 min(2, 模板数) 张在对方找到匹配,
+/// 防单侧桥接脸把两组硬拉在一起。
+fn mutual_support(ra: &[Member], rb: &[Member], thr: f32) -> bool {
+    fn side(x: &[Member], y: &[Member], thr: f32) -> bool {
+        let need = x.len().min(2);
+        let got = x
+            .iter()
+            .filter(|m| y.iter().any(|n| cos(&m.v, &n.v) >= thr))
+            .count();
+        got >= need
+    }
+    !ra.is_empty() && !rb.is_empty() && side(ra, rb, thr) && side(rb, ra, thr)
 }
 
 /// 同图脸默认不能自动合并;人工 must 例外。
@@ -562,9 +713,9 @@ fn forced_by_must(
         .unwrap_or(false)
 }
 
-/// 增量聚类:未分配且未忽略的脸与各簇**质量加权质心**比余弦,
-/// 过该簇的成熟度阈值且与次高簇拉开足够余量才归簇;都不够格则新建簇,
-/// 模棱两可的留在未分配,下批随质心移动或合并结果再判。
+/// 增量聚类:质心只负责缩小候选,最终归属由**代表模板**的支持数与
+/// 聚合相似度决定;过该簇的成熟度阈值且与次高簇拉开足够余量才归簇,
+/// 都不够格则新建簇,模棱两可的留在未分配,下批随质心移动或合并结果再判。
 /// 同图两张脸默认不并(人工 must 例外);忽略的脸不参与也不成簇。
 pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     let sig = effective_sig(store);
@@ -574,11 +725,12 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     let dim = emb_dim(store);
     let (mut clusters, mut members, mut photos, cluster_pid, mut next_id) =
         store.read(|conn| -> Result<_> {
-            let mut clusters: BTreeMap<i64, Vec<(Vec<f32>, f32)>> = BTreeMap::new();
+            let mut clusters: BTreeMap<i64, ClusterMem> = BTreeMap::new();
             let mut members: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
             let mut photos: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
             let mut st = conn.prepare(
-                "SELECT f.id, f.cluster, f.photo_id, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                "SELECT f.id, f.cluster, f.photo_id, t.vec, COALESCE(f.quality,0.5),
+                        COALESCE(f.assign_src,'') FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
                  WHERE f.cluster IS NOT NULL AND f.ignored=0",
             )?;
@@ -589,12 +741,27 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 let photo_id: i64 = r.get(2)?;
                 let blob: Vec<u8> = r.get(3)?;
                 let q: f64 = r.get(4)?;
-                clusters
+                let src: String = r.get(5)?;
+                let m = Member {
+                    v: blob_to_vec(&blob),
+                    q: q as f32,
+                    photo: photo_id,
+                    manual: src == "manual",
+                };
+                let e = clusters
                     .entry(cid)
-                    .or_default()
-                    .push((blob_to_vec(&blob), q as f32));
+                    .or_insert_with(|| ClusterMem::new(dim as usize));
+                let w = m.q.max(0.05);
+                for (a, b) in e.sum.iter_mut().zip(&m.v) {
+                    *a += b * w;
+                }
+                e.wsum += w;
+                e.members.push(m);
                 members.entry(cid).or_default().push(fid);
                 photos.entry(cid).or_default().push(photo_id);
+            }
+            for cm in clusters.values_mut() {
+                cm.reps = rep_select(&cm.members, thr);
             }
             let mut cluster_pid: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
             let mut st = conn.prepare(
@@ -636,9 +803,10 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 max_cluster.max(max_person).max(max_people) + 1,
             ))
         })?;
-    let todo: Vec<(i64, i64, Vec<f32>, f32)> = store.read(|conn| -> Result<_> {
+    let todo: Vec<(i64, Member)> = store.read(|conn| -> Result<_> {
         let mut st = conn.prepare(
-            "SELECT f.id, f.photo_id, t.vec, COALESCE(f.quality,0.5) FROM faces f
+            "SELECT f.id, f.photo_id, t.vec, COALESCE(f.quality,0.5),
+                    COALESCE(f.assign_src,'') FROM faces f
              JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
              WHERE f.cluster IS NULL AND f.ignored=0
              ORDER BY COALESCE(f.quality,0.5) DESC, f.id",
@@ -650,7 +818,16 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             let photo_id: i64 = r.get(1)?;
             let blob: Vec<u8> = r.get(2)?;
             let q: f64 = r.get(3)?;
-            out.push((id, photo_id, blob_to_vec(&blob), q as f32));
+            let src: String = r.get(4)?;
+            out.push((
+                id,
+                Member {
+                    v: blob_to_vec(&blob),
+                    q: q as f32,
+                    photo: photo_id,
+                    manual: src == "manual",
+                },
+            ));
         }
         Ok(out)
     })?;
@@ -668,64 +845,72 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     }
     // 先在内存里定簇,再一次事务写回 —— 每脸一条 UPDATE 也锁一次写连接。
     let mut updates: Vec<(i64, i64, Option<i64>)> = Vec::with_capacity(todo.len());
-    for (face_id, photo_id, v, q) in todo {
+    for (face_id, m) in todo {
         // must 同伴已在某簇:直接归入(never 仍优先,不参与阈值判定)。
         let forced = must.get(&face_id).and_then(|ps| {
             members.iter().find_map(|(&cid, ms)| {
                 (!blocked_by_never(&members, &never, cid, face_id)
-                    && ms.iter().any(|m| ps.contains(m)))
+                    && ms.iter().any(|x| ps.contains(x)))
                 .then_some(cid)
             })
         });
         if let Some(cid) = forced {
             updates.push((face_id, cid, cluster_pid.get(&cid).map(|(p, _)| *p)));
-            clusters.get_mut(&cid).unwrap().push((v, q));
-            members.get_mut(&cid).unwrap().push(face_id);
-            photos.entry(cid).or_default().push(photo_id);
+            join_cluster(&mut clusters, &mut members, &mut photos, cid, &m, face_id, thr);
             continue;
         }
         // 各簇按余弦打分;同图不并,never 不并。
-        let mut scored: Vec<(i64, f32)> = Vec::new();
-        for (&cid, vs) in &clusters {
+        let mut cents: Vec<(i64, f32)> = Vec::new();
+        for (&cid, cm) in &clusters {
             if blocked_by_never(&members, &never, cid, face_id) {
                 continue;
             }
-            if shares_photo(&photos, cid, photo_id)
+            if shares_photo(&photos, cid, m.photo)
                 && !forced_by_must(&members, &must, cid, face_id)
             {
                 continue;
             }
-            if let Some(m) = mean_vec_weighted(vs) {
-                scored.push((cid, cos(&m, &v)));
+            if let Some(c) = cm.centroid() {
+                cents.push((cid, cos(&c, &m.v)));
             }
         }
+        cents.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        cents.truncate(CAND_K);
+        let mut scored: Vec<(i64, f32, bool)> = cents
+            .into_iter()
+            .filter(|(_, c)| *c >= thr - CAND_SLACK)
+            .map(|(cid, _)| {
+                let cm = &clusters[&cid];
+                let thr_eff = join_thr(thr, cm.members.len());
+                let (support, agg) = rep_claim(&cm.reps, &m.v, thr_eff);
+                (cid, agg, agg >= thr_eff && support >= required_support(&cm.reps))
+            })
+            .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let best = scored
-            .iter()
-            .copied()
-            .find(|(cid, c)| *c >= join_thr(thr, clusters[cid].len()));
-        match best {
-            Some((cid, c)) => {
+        match scored.iter().find(|(_, _, ok)| *ok) {
+            Some((cid, agg, _)) => {
                 // 次高簇只差一点 = 归属存疑,不当场归簇也不另开新簇。
                 let runner = scored
                     .iter()
-                    .filter(|(other, _)| *other != cid)
-                    .map(|(_, c)| *c)
+                    .filter(|(other, _, _)| other != cid)
+                    .map(|(_, a, _)| *a)
                     .fold(f32::NEG_INFINITY, f32::max);
-                if c - runner >= CLUSTER_MARGIN {
-                    updates.push((face_id, cid, cluster_pid.get(&cid).map(|(p, _)| *p)));
-                    clusters.get_mut(&cid).unwrap().push((v, q));
-                    members.get_mut(&cid).unwrap().push(face_id);
-                    photos.entry(cid).or_default().push(photo_id);
+                if *agg - runner >= CLUSTER_MARGIN {
+                    updates.push((face_id, *cid, cluster_pid.get(cid).map(|(p, _)| *p)));
+                    join_cluster(&mut clusters, &mut members, &mut photos, *cid, &m, face_id, thr);
                 }
             }
             None => {
                 let next = next_id;
                 next_id += 1;
                 updates.push((face_id, next, None));
-                clusters.insert(next, vec![(v, q)]);
+                clusters.insert(next, {
+                    let mut cm = ClusterMem::new(dim as usize);
+                    cm.add(&m, thr);
+                    cm
+                });
                 members.insert(next, vec![face_id]);
-                photos.insert(next, vec![photo_id]);
+                photos.insert(next, vec![m.photo]);
             }
         }
     }
@@ -734,7 +919,9 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
         {
             let mut st = tx.prepare_cached(
                 "UPDATE faces SET cluster=?1,
-                 person_id=CASE WHEN person_id IS NULL THEN ?2 ELSE person_id END
+                 person_id=CASE WHEN person_id IS NULL THEN ?2 ELSE person_id END,
+                 assign_src=CASE WHEN person_id IS NULL AND ?2 IS NOT NULL
+                                 THEN 'auto' ELSE assign_src END
                  WHERE id=?3",
             )?;
             for (face_id, cid, pid) in &updates {
@@ -746,6 +933,24 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     })?;
     // 归入已有簇的新脸继承该簇身份;未命名身份不写名字表。
     Ok(clusters.len())
+}
+
+/// 把一张脸并入簇的全部内存状态(成员、质心、代表模板、索引表)。
+#[allow(clippy::too_many_arguments)]
+fn join_cluster(
+    clusters: &mut BTreeMap<i64, ClusterMem>,
+    members: &mut BTreeMap<i64, Vec<i64>>,
+    photos: &mut BTreeMap<i64, Vec<i64>>,
+    cid: i64,
+    m: &Member,
+    fid: i64,
+    thr: f32,
+) {
+    if let Some(cm) = clusters.get_mut(&cid) {
+        cm.add(m, thr);
+    }
+    members.entry(cid).or_default().push(fid);
+    photos.entry(cid).or_default().push(m.photo);
 }
 
 /// 两簇之间是否存在 never 约束(任一对人脸)。
@@ -772,18 +977,19 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     }
     let dim = emb_dim(store);
     let (mut clusters, named, mut members, mut photos): (
-        HashMap<i64, Vec<(Vec<f32>, f32)>>,
+        HashMap<i64, ClusterMem>,
         HashSet<i64>,
         HashMap<i64, Vec<i64>>,
         HashMap<i64, Vec<i64>>,
     ) = store.read(|conn| -> Result<_> {
         let mut st = conn.prepare(
-            "SELECT f.id, f.cluster, f.photo_id, t.vec, COALESCE(f.quality,0.5) FROM faces f
+            "SELECT f.id, f.cluster, f.photo_id, t.vec, COALESCE(f.quality,0.5),
+                    COALESCE(f.assign_src,'') FROM faces f
              JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
              WHERE f.cluster IS NOT NULL AND f.ignored=0",
         )?;
         let mut rows = st.query(params![dim, sig])?;
-        let mut acc: HashMap<i64, Vec<(Vec<f32>, f32)>> = HashMap::new();
+        let mut acc: HashMap<i64, ClusterMem> = HashMap::new();
         let mut members: HashMap<i64, Vec<i64>> = HashMap::new();
         let mut photos: HashMap<i64, Vec<i64>> = HashMap::new();
         while let Some(r) = rows.next()? {
@@ -792,11 +998,25 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
             let photo_id: i64 = r.get(2)?;
             let blob: Vec<u8> = r.get(3)?;
             let q: f64 = r.get(4)?;
-            acc.entry(cid)
-                .or_default()
-                .push((blob_to_vec(&blob), q as f32));
+            let src: String = r.get(5)?;
+            let m = Member {
+                v: blob_to_vec(&blob),
+                q: q as f32,
+                photo: photo_id,
+                manual: src == "manual",
+            };
+            let e = acc.entry(cid).or_insert_with(|| ClusterMem::new(dim as usize));
+            let w = m.q.max(0.05);
+            for (a, b) in e.sum.iter_mut().zip(&m.v) {
+                *a += b * w;
+            }
+            e.wsum += w;
+            e.members.push(m);
             members.entry(cid).or_default().push(fid);
             photos.entry(cid).or_default().push(photo_id);
+        }
+        for cm in acc.values_mut() {
+            cm.reps = rep_select(&cm.members, thr);
         }
         let mut named: HashSet<i64> = HashSet::new();
         let mut st = conn.prepare(
@@ -830,7 +1050,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     loop {
         let cents: Vec<(i64, Vec<f32>)> = clusters
             .iter()
-            .filter_map(|(&cid, vs)| mean_vec_weighted(vs).map(|m| (cid, m)))
+            .filter_map(|(&cid, cm)| cm.centroid().map(|c| (cid, c)))
             .collect();
         let mut best: Option<(i64, i64, f32)> = None;
         for i in 0..cents.len() {
@@ -857,6 +1077,26 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
                     continue;
                 }
                 let c = cos(ma, mb);
+                if !forced {
+                    let (Some(ca), Some(cb)) = (clusters.get(a), clusters.get(b)) else {
+                        continue;
+                    };
+                    // 任一方成员过少时支撑弱,合并阈值同样收紧,防绕过年轻簇保护。
+                    let thr_eff = if ca.members.len() < CLUSTER_MATURE
+                        || cb.members.len() < CLUSTER_MATURE
+                    {
+                        thr + YOUNG_PENALTY
+                    } else {
+                        thr
+                    };
+                    if c < thr_eff {
+                        continue;
+                    }
+                    // 双向多点代表支持:只有单侧桥接脸相似时不合并。
+                    if !mutual_support(&ca.reps, &cb.reps, thr_eff) {
+                        continue;
+                    }
+                }
                 // must 对带 2.0 偏置,保证排在所有普通候选之前。
                 let sc = if forced { 2.0 + c } else { c };
                 if (forced || c >= thr) && best.map(|(_, _, bc)| sc > bc).unwrap_or(true) {
@@ -870,7 +1110,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
             (true, false) => (a, b),
             (false, true) => (b, a),
             _ => {
-                let (na, nb) = (clusters[&a].len(), clusters[&b].len());
+                let (na, nb) = (clusters[&a].members.len(), clusters[&b].members.len());
                 if na > nb || (na == nb && a < b) {
                     (a, b)
                 } else {
@@ -878,8 +1118,14 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
                 }
             }
         };
-        let moved = clusters.remove(&drop).unwrap();
-        clusters.get_mut(&keep).unwrap().extend(moved);
+        let mut moved = clusters.remove(&drop).unwrap();
+        let kept = clusters.get_mut(&keep).unwrap();
+        for (x, y) in kept.sum.iter_mut().zip(&moved.sum) {
+            *x += y;
+        }
+        kept.wsum += moved.wsum;
+        kept.members.append(&mut moved.members);
+        kept.reps = rep_select(&kept.members, thr);
         if let Some(ids) = members.remove(&drop) {
             members.get_mut(&keep).unwrap().extend(ids);
         }
@@ -1279,6 +1525,10 @@ pub fn rename_person(store: &Store, person_id: i64, name: &str) -> Result<()> {
              ON CONFLICT(id) DO UPDATE SET name=excluded.name",
             params![person_id, name],
         )?;
+        tx.execute(
+            "UPDATE faces SET assign_src='manual' WHERE person_id=?1",
+            params![person_id],
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -1310,7 +1560,7 @@ pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
         }
         let pid = alloc_person_id(&tx)?;
         let n = tx.execute(
-            "UPDATE faces SET person_id=?1 WHERE cluster=?2 AND person_id IS NULL",
+            "UPDATE faces SET person_id=?1, assign_src='manual' WHERE cluster=?2 AND person_id IS NULL",
             params![pid, cluster],
         )?;
         if n == 0 {
@@ -1378,7 +1628,8 @@ pub fn assign_faces(store: &Store, face_ids: &[i64], person_id: i64) -> Result<u
         let mut n = 0usize;
         {
             let mut st = tx.prepare(
-                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0 WHERE id=?3",
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0,
+                 assign_src='manual' WHERE id=?3",
             )?;
             for id in &ids {
                 n += st.execute(params![person_id, cluster, id])?;
@@ -1450,12 +1701,14 @@ pub fn merge_into_person(
         }
         let n = match person_id {
             Some(pid) => tx.execute(
-                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0,
+                 assign_src='manual'
                  WHERE person_id=?3",
                 params![target, target_cluster, pid],
             )?,
             None => tx.execute(
-                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0
+                "UPDATE faces SET person_id=?1, cluster=COALESCE(?2, cluster), ignored=0,
+                 assign_src='manual'
                  WHERE cluster=?3 AND person_id IS NULL",
                 params![target, target_cluster, cluster],
             )?,
@@ -1481,7 +1734,9 @@ pub fn remove_faces(store: &Store, face_ids: &[i64]) -> Result<usize> {
         let tx = conn.unchecked_transaction()?;
         let mut n = 0usize;
         {
-            let mut st = tx.prepare("UPDATE faces SET person_id=NULL, cluster=NULL WHERE id=?1")?;
+            let mut st = tx.prepare(
+                "UPDATE faces SET person_id=NULL, cluster=NULL, assign_src=NULL WHERE id=?1",
+            )?;
             for id in &ids {
                 n += st.execute(params![id])?;
             }
@@ -1553,7 +1808,8 @@ pub fn create_person(store: &Store, face_ids: &[i64], name: Option<&str>) -> Res
         }
         {
             let mut st = tx.prepare(
-                "UPDATE faces SET person_id=?1, cluster=?2, ignored=0 WHERE id=?3",
+                "UPDATE faces SET person_id=?1, cluster=?2, ignored=0,
+                 assign_src='manual' WHERE id=?3",
             )?;
             for id in &ids {
                 st.execute(params![pid, pid, id])?;
@@ -1815,27 +2071,18 @@ pub fn scan_all(
 /// 重聚类分组累加器(加权和 + 同图约束所需的照片集合)。
 struct ReclusterGroup {
     sum: Vec<f32>,
+    wsum: f32,
+    reps: Vec<Member>,
     photos: Vec<i64>,
     faces: Vec<i64>,
 }
 
-fn group_add(g: &mut ReclusterGroup, v: &[f32], q: f32, photo: i64, face: i64) {
-    let w = q.max(0.05);
-    for (a, b) in g.sum.iter_mut().zip(v) {
-        *a += b * w;
-    }
-    if !g.photos.contains(&photo) {
-        g.photos.push(photo);
+fn group_add(g: &mut ReclusterGroup, m: &Member, face: i64, thr: f32) {
+    member_add(&mut g.sum, &mut g.wsum, &mut g.reps, m, thr);
+    if !g.photos.contains(&m.photo) {
+        g.photos.push(m.photo);
     }
     g.faces.push(face);
-}
-
-fn group_centroid(g: &ReclusterGroup) -> Option<Vec<f32>> {
-    let norm = g.sum.iter().map(|v| v * v).sum::<f32>().sqrt();
-    if !norm.is_finite() || norm <= 0.0 {
-        return None;
-    }
-    Some(g.sum.iter().map(|v| v / norm).collect())
 }
 
 fn linked_faces(map: &HashMap<i64, Vec<i64>>, face: i64, others: &[i64]) -> bool {
@@ -1852,12 +2099,12 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
         return Ok(0);
     }
     let dim = emb_dim(store);
-    // (face_id, 向量, 质量, 旧簇, 旧身份, photo_id)
-    let mut faces: Vec<(i64, Vec<f32>, f32, Option<i64>, Option<i64>, i64)> =
+    // (face_id, 内存副本, 旧簇, 旧身份)
+    let mut faces: Vec<(i64, Member, Option<i64>, Option<i64>)> =
         store.read(|conn| -> Result<_> {
             let mut st = conn.prepare(
                 "SELECT f.id, t.vec, COALESCE(f.quality,0.5), f.cluster, f.person_id,
-                        f.photo_id FROM faces f
+                        f.photo_id, COALESCE(f.assign_src,'') FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
                  WHERE f.ignored=0",
             )?;
@@ -1870,7 +2117,18 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
                 let old: Option<i64> = r.get(3)?;
                 let pid: Option<i64> = r.get(4)?;
                 let photo_id: i64 = r.get(5)?;
-                out.push((id, blob_to_vec(&blob), q as f32, old, pid, photo_id));
+                let src: String = r.get(6)?;
+                out.push((
+                    id,
+                    Member {
+                        v: blob_to_vec(&blob),
+                        q: q as f32,
+                        photo: photo_id,
+                        manual: src == "manual",
+                    },
+                    old,
+                    pid,
+                ));
             }
             Ok(out)
         })?;
@@ -1894,7 +2152,9 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
         Ok(max_cluster.max(max_person).max(max_people) + 1)
     })?;
     faces.sort_by(|a, b| {
-        b.2.partial_cmp(&a.2)
+        b.1
+            .q
+            .partial_cmp(&a.1.q)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.0.cmp(&b.0))
     });
@@ -1912,41 +2172,57 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     let mut groups: Vec<ReclusterGroup> = Vec::new();
     let mut assign: HashMap<i64, usize> = HashMap::new();
     // 所有脸一视同仁按质量降序贪心分组,身份不参与分组。
-    for &(fid, ref v, q, _, _, photo) in &faces {
+    for (fid, m, _, _) in &faces {
+        let fid = *fid;
         if assign.contains_key(&fid) {
             continue;
         }
-        let mut scored: Vec<(usize, f32)> = Vec::new();
+        let mut cents: Vec<(usize, f32)> = Vec::new();
         for (gi, g) in groups.iter().enumerate() {
             if linked_faces(&never, fid, &g.faces) {
                 continue;
             }
-            let same_photo = g.photos.contains(&photo);
+            let same_photo = g.photos.contains(&m.photo);
             if same_photo && !linked_faces(&must, fid, &g.faces) {
                 continue;
             }
-            if let Some(c) = group_centroid(g) {
-                scored.push((gi, cos(&c, v)));
+            if let Some(c) = sum_centroid(&g.sum, g.wsum) {
+                cents.push((gi, cos(&c, &m.v)));
             }
         }
+        cents.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        cents.truncate(CAND_K);
+        let mut scored: Vec<(usize, f32, bool)> = cents
+            .into_iter()
+            .filter(|(_, c)| *c >= thr - CAND_SLACK)
+            .map(|(gi, _)| {
+                let g = &groups[gi];
+                let thr_eff = join_thr(thr, g.faces.len());
+                let (support, agg) = rep_claim(&g.reps, &m.v, thr_eff);
+                (
+                    gi,
+                    agg,
+                    agg >= thr_eff && support >= required_support(&g.reps),
+                )
+            })
+            .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let best = scored
-            .iter()
-            .copied()
-            .find(|(gi, c)| *c >= join_thr(thr, groups[*gi].faces.len()));
-        match best {
-            Some((gi, _)) => {
-                group_add(&mut groups[gi], v, q, photo, fid);
+        // 重聚类必须给每张脸落位:没有存疑搁置规则,取第一个合格组。
+        match scored.iter().find(|(_, _, ok)| *ok).map(|(gi, _, _)| *gi) {
+            Some(gi) => {
+                group_add(&mut groups[gi], m, fid, thr);
                 assign.insert(fid, gi);
             }
             None => {
                 groups.push(ReclusterGroup {
                     sum: vec![0.0; dim as usize],
+                    wsum: 0.0,
+                    reps: Vec::new(),
                     photos: Vec::new(),
                     faces: Vec::new(),
                 });
                 let gi = groups.len() - 1;
-                group_add(&mut groups[gi], v, q, photo, fid);
+                group_add(&mut groups[gi], m, fid, thr);
                 assign.insert(fid, gi);
             }
         }
@@ -1957,8 +2233,8 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
         let base: Vec<Vec<i64>> = groups.iter().map(|g| g.faces.clone()).collect();
         crate::ai_review::apply(&cons, &base)
     };
-    let old_cluster: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.3)).collect();
-    let old_person: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.4)).collect();
+    let old_cluster: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.2)).collect();
+    let old_person: HashMap<i64, Option<i64>> = faces.iter().map(|f| (f.0, f.3)).collect();
     // 每组按旧身份多数票选代表;平票取小号。
     let mut votes: Vec<(Option<i64>, usize)> = Vec::with_capacity(final_groups.len());
     for g in &final_groups {
@@ -2024,8 +2300,13 @@ pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut st =
-                tx.prepare_cached("UPDATE faces SET cluster=?1, person_id=?2 WHERE id=?3")?;
+            let mut st = tx.prepare_cached(
+                "UPDATE faces SET cluster=?1, person_id=?2,
+                 assign_src=CASE WHEN ?2 IS NULL THEN NULL
+                                 WHEN assign_src IS NULL THEN 'auto'
+                                 ELSE assign_src END
+                 WHERE id=?3",
+            )?;
             for (fid, cid, pid) in &writes {
                 st.execute(params![cid, pid, fid])?;
             }
@@ -2057,11 +2338,12 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
     }
     let dim = emb_dim(store);
     store.read(|conn| {
-        // 已命名人物 -> (name, [(vec, quality)])
-        let mut named: HashMap<i64, (String, Vec<(Vec<f32>, f32)>)> = HashMap::new();
+        // 已命名人物 -> (name, 成员列表)
+        let mut named: HashMap<i64, (String, Vec<Member>)> = HashMap::new();
         {
             let mut st = match conn.prepare(
-                "SELECT f.person_id, p.name, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                "SELECT f.person_id, p.name, t.vec, COALESCE(f.quality,0.5),
+                        f.photo_id, COALESCE(f.assign_src,'') FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
                  JOIN people p ON p.id=f.person_id
                  WHERE f.ignored=0",
@@ -2075,11 +2357,13 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             };
             loop {
                 let Ok(Some(r)) = rows.next() else { break };
-                let (Ok(pid), Ok(name), Ok(blob), Ok(q)) = (
+                let (Ok(pid), Ok(name), Ok(blob), Ok(q), Ok(photo_id), Ok(src)) = (
                     r.get::<_, i64>(0),
                     r.get::<_, String>(1),
                     r.get::<_, Vec<u8>>(2),
                     r.get::<_, f64>(3),
+                    r.get::<_, i64>(4),
+                    r.get::<_, String>(5),
                 ) else {
                     continue;
                 };
@@ -2087,14 +2371,20 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                     .entry(pid)
                     .or_insert_with(|| (name, Vec::new()))
                     .1
-                    .push((blob_to_vec(&blob), q as f32));
+                    .push(Member {
+                        v: blob_to_vec(&blob),
+                        q: q as f32,
+                        photo: photo_id,
+                        manual: src == "manual",
+                    });
             }
         }
         // 待命名组按(簇,身份)分开,避免把不同身份的脸混成一条建议。
-        let mut unnamed: HashMap<(i64, Option<i64>), Vec<(Vec<f32>, f32)>> = HashMap::new();
+        let mut unnamed: HashMap<(i64, Option<i64>), Vec<Member>> = HashMap::new();
         {
             let mut st = match conn.prepare(
-                "SELECT f.cluster, f.person_id, t.vec, COALESCE(f.quality,0.5) FROM faces f
+                "SELECT f.cluster, f.person_id, t.vec, COALESCE(f.quality,0.5),
+                        f.photo_id, COALESCE(f.assign_src,'') FROM faces f
                  JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
                  LEFT JOIN people p ON p.id=f.person_id
                  WHERE p.id IS NULL AND f.cluster IS NOT NULL AND f.ignored=0",
@@ -2108,45 +2398,39 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
             };
             loop {
                 let Ok(Some(r)) = rows.next() else { break };
-                let (Ok(cid), Ok(pid), Ok(blob), Ok(q)) = (
+                let (Ok(cid), Ok(pid), Ok(blob), Ok(q), Ok(photo_id), Ok(src)) = (
                     r.get::<_, i64>(0),
                     r.get::<_, Option<i64>>(1),
                     r.get::<_, Vec<u8>>(2),
                     r.get::<_, f64>(3),
+                    r.get::<_, i64>(4),
+                    r.get::<_, String>(5),
                 ) else {
                     continue;
                 };
                 unnamed
                     .entry((cid, pid))
                     .or_default()
-                    .push((blob_to_vec(&blob), q as f32));
+                    .push(Member {
+                        v: blob_to_vec(&blob),
+                        q: q as f32,
+                        photo: photo_id,
+                        manual: src == "manual",
+                    });
             }
         }
         let mut out: Vec<Suggestion> = unnamed
             .iter()
             .filter_map(|(&(cid, pid), vs)| {
-                let mut ranked = vs.clone();
-                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                let mut probes: Vec<&Vec<f32>> = ranked
-                    .iter()
-                    .filter(|(_, q)| *q >= SUGGEST_MIN_Q)
-                    .take(2)
-                    .map(|(v, _)| v)
-                    .collect();
+                // 双方都用代表模板集:低质量与近重复脸不再直接参与建议打分。
+                let probes: Vec<Member> = rep_select(vs, thr).into_iter().take(2).collect();
                 if probes.is_empty() {
-                    probes = ranked.iter().take(2).map(|(v, _)| v).collect();
+                    return None;
                 }
                 let mut scored: Vec<(i64, String, f32)> = named
                     .iter()
                     .filter_map(|(&target_pid, (name, tpl))| {
-                        let mut reps: Vec<&Vec<f32>> = tpl
-                            .iter()
-                            .filter(|(_, q)| *q >= SUGGEST_MIN_Q)
-                            .map(|(v, _)| v)
-                            .collect();
-                        if reps.is_empty() {
-                            reps = tpl.iter().map(|(v, _)| v).collect();
-                        }
+                        let reps = rep_select(tpl, thr);
                         if reps.is_empty() {
                             return None;
                         }
@@ -2155,8 +2439,8 @@ pub fn face_suggestions(store: &Store, thr: f32) -> Vec<Suggestion> {
                         for p in &probes {
                             let best = reps
                                 .iter()
-                                .map(|v| cos(p, v))
-                                .fold(f32::MIN, |a, b| a.max(b));
+                                .map(|r| cos(&p.v, &r.v))
+                                .fold(f32::MIN, f32::max);
                             if best >= thr {
                                 support += 1;
                             }
@@ -2273,6 +2557,26 @@ mod tests {
         store
             .test_conn()
             .query_row("SELECT person_id FROM faces WHERE id=?1", params![fid], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// 读取某张脸的当前簇号。
+    fn cluster_of(store: &Store, fid: i64) -> Option<i64> {
+        store
+            .test_conn()
+            .query_row("SELECT cluster FROM faces WHERE id=?1", params![fid], |r| {
+                r.get(0)
+            })
+            .unwrap()
+    }
+
+    /// 读取某张脸的归属来源(assign_src)。
+    fn assign_src_of(store: &Store, fid: i64) -> Option<String> {
+        store
+            .test_conn()
+            .query_row("SELECT assign_src FROM faces WHERE id=?1", params![fid], |r| {
                 r.get(0)
             })
             .unwrap()
@@ -3275,13 +3579,134 @@ mod tests {
     fn group_accumulation_weights_first_face() {
         let mut g = ReclusterGroup {
             sum: vec![0.0, 0.0],
+            wsum: 0.0,
+            reps: Vec::new(),
             photos: Vec::new(),
             faces: Vec::new(),
         };
-        group_add(&mut g, &[1.0, 0.0], 1.0, 1, 1);
-        group_add(&mut g, &[0.0, 1.0], 0.05, 2, 2);
-        let c = group_centroid(&g).unwrap();
+        let hi = Member {
+            v: vec![1.0, 0.0],
+            q: 1.0,
+            photo: 1,
+            manual: false,
+        };
+        let lo = Member {
+            v: vec![0.0, 1.0],
+            q: 0.05,
+            photo: 2,
+            manual: false,
+        };
+        group_add(&mut g, &hi, 1, 0.6);
+        group_add(&mut g, &lo, 2, 0.6);
+        let c = sum_centroid(&g.sum, g.wsum).unwrap();
         assert!(c[0] > 0.99, "质心应由高质量脸主导: {c:?}");
+    }
+
+    fn mem(v: &[f32], q: f32, photo: i64, manual: bool) -> Member {
+        Member {
+            v: v.to_vec(),
+            q,
+            photo,
+            manual,
+        }
+    }
+
+    /// 代表模板:近重复去重 + 低质量门控。
+    #[test]
+    fn rep_select_dedups_and_gates_quality() {
+        let ms = vec![
+            mem(&[1.0, 0.0], 0.9, 1, false),
+            mem(&[1.0, 0.0], 0.8, 2, false), // 与首张近重复(cos=1.0)→ 剔除
+            mem(&[0.0, 1.0], 0.1, 3, false), // 质量低于 REP_MIN_Q → 跳过
+            mem(&[0.6, 0.8], 0.7, 4, false), // 足够互异 → 入选
+        ];
+        let reps = rep_select(&ms, 0.5);
+        let photos: Vec<i64> = reps.iter().map(|r| r.photo).collect();
+        assert_eq!(reps.len(), 2, "近重复与低质量都不进代表集: {photos:?}");
+        assert!(photos.contains(&1) && photos.contains(&4));
+        assert!(!photos.contains(&2) && !photos.contains(&3));
+    }
+
+    /// 代表模板:人工锚点优先,未被人工锚点支持的自动脸不入围(防自我强化)。
+    #[test]
+    fn rep_select_manual_first_blocks_unsupported_auto() {
+        let ms = vec![
+            mem(&[1.0, 0.0], 0.9, 1, false), // 高质量自动脸,但与人工锚点正交
+            mem(&[0.0, 1.0], 0.3, 2, true),  // 低质量人工锚点(人工不受质量门槛限制)
+        ];
+        let reps = rep_select(&ms, 0.5);
+        assert_eq!(reps.len(), 1, "未被人工锚点支持的自动脸不得进代表集");
+        assert!(reps[0].manual && reps[0].photo == 2);
+    }
+
+    /// 代表模板:同照片上限,防一张照片多脸虚增支持数。
+    #[test]
+    fn rep_select_caps_per_photo() {
+        let ms = vec![
+            mem(&[1.0, 0.0, 0.0], 0.9, 1, false),
+            mem(&[0.0, 1.0, 0.0], 0.8, 1, false),
+            mem(&[0.0, 0.0, 1.0], 0.7, 1, false), // 同照片第三张 → 触顶
+        ];
+        let reps = rep_select(&ms, 0.5);
+        assert_eq!(reps.len(), REP_MAX_PER_PHOTO, "同照片最多贡献两张代表");
+        assert!(reps.iter().all(|r| r.photo == 1));
+    }
+
+    /// 纯自动多模板簇:桥接脸质心过关但只命中一张代表,支持数不足 → 不自动认领。
+    #[test]
+    fn auto_claim_needs_two_rep_support() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        // 成熟簇(3 成员、2 互异代表,无人工锚点 → 需 2 票支持)。
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        insert_face(&store, 2, &[0.0, 1.0, 0.0], 1.0, Some(1));
+        insert_face(&store, 3, &[1.0, 0.0, 0.0], 1.0, Some(1)); // 近重复,只占成员不进代表
+        // 桥接脸:偏向其中一个代表(cos≈0.95),对另一个仅 cos≈0.31。
+        let bridge = insert_face(&store, 4, &[0.95, 0.31, 0.0], 1.0, None);
+        assign_clusters(&store, 0.6).unwrap();
+        let bc = cluster_of(&store, bridge);
+        assert_ne!(bc, Some(1), "单代表支持不足以自动认领桥接脸");
+        assert!(bc.is_some(), "被拒的桥接脸应另立新簇而非丢弃");
+    }
+
+    /// 簇合并:质心相近但代表仅单向支持 → 拒绝合并(防桥接脸硬拉两簇)。
+    #[test]
+    fn merge_rejected_without_mutual_support() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg", "d.jpg", "e.jpg", "f.jpg"]);
+        // 簇 A:两个正交代表 [1,0,0] 与 [0,1,0],质心 ≈[0.894,0.447,0]。
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        insert_face(&store, 2, &[0.0, 1.0, 0.0], 1.0, Some(1));
+        insert_face(&store, 3, &[1.0, 0.0, 0.0], 1.0, Some(1));
+        // 簇 B:三张同向 [0.894,0.447,0](近重复 → 单代表),质心与 A 几乎重合。
+        for pid in 4..7 {
+            insert_face(&store, pid, &[0.894, 0.447, 0.0], 1.0, Some(2));
+        }
+        let merged = merge_similar_clusters(&store, 0.6).unwrap();
+        assert_eq!(merged, 0, "A 的两个代表只有一个是 B 命中,双向支持不足不应合并");
+        assert_eq!(people_overview(&store).len(), 2, "两簇仍各自独立");
+    }
+
+    /// 归属来源:人工建档/归入标记 manual,移出清除。
+    #[test]
+    fn manual_ops_mark_assign_src() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let f1 = insert_face(&store, 1, &[1.0, 0.0], 1.0, None);
+        let f2 = insert_face(&store, 2, &[1.0, 0.0], 1.0, None);
+        assert_eq!(assign_src_of(&store, f1), None);
+        let pid = create_person(&store, &[f1], Some("Alice")).unwrap();
+        assert_eq!(
+            assign_src_of(&store, f1),
+            Some("manual".to_string()),
+            "建档即人工确认"
+        );
+        assign_faces(&store, &[f2], pid).unwrap();
+        assert_eq!(assign_src_of(&store, f2), Some("manual".to_string()));
+        remove_faces(&store, &[f2]).unwrap();
+        assert_eq!(assign_src_of(&store, f2), None, "移出后归属来源清空");
+        assert!(person_of(&store, f2).is_none());
     }
 
     fn insert_photos(store: &Store, paths: &[&str]) {
