@@ -394,11 +394,12 @@ pub mod ocr {
     }
 }
 
-/// 人脸(M2c):两套检测+识别方案,用户在 选项 > 常规 里选择。
-/// 默认 YuNet 检测 + AdaFace IR-50 识别(均为商业友好许可);
-/// 兼容 insightface antelopev2(SCRFD + ArcFace,权重许可非商用,自备自用)。
-/// 检测模型类型按输出张量数自动识别(单输出 = YuNet,多输出 = SCRFD),
-/// 文件放错也能跑;获取方式见 README。
+/// 人脸(M2c):三套检测+识别方案,用户在 选项 > AI 模型 里选择。
+/// 默认 YuNet 检测 + SFace 识别(OpenCV Zoo,Apache-2.0 含权重,可商用);
+/// 备选 AdaFace IR-50(权重非商用,自备)与 insightface antelopev2
+/// (SCRFD + ArcFace,权重非商用不可再分发,纯手动放置)。
+/// 检测器按输出签名自动识别(YuNet2023 十二输出 / SCRFD 九输出),
+/// 文件放错也能跑;获取方式与许可见 README。
 pub mod face {
     use super::{env, models_dir};
     use ort::session::Session;
