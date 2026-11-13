@@ -2325,6 +2325,8 @@ mod tests {
             while !stop2.load(AtomicOrdering::Relaxed) {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
+                        // Windows 上 accept 出来的套接字会继承监听端的非阻塞,必须改回阻塞。
+                        let _ = sock.set_nonblocking(false);
                         let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
                         let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
                         let mut line = String::new();

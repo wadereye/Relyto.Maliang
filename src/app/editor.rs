@@ -839,23 +839,24 @@ impl App {
                     });
                 });
                 ui.add_space(3.0);
+                // 动作行:纯图标,悬停显示操作说明(与图库/导入页同一套)。
                 ui.horizontal(|ui| {
-                    if ui.button(t("← 返回到图片库")).clicked() {
+                    if super::icon_action(ui, "arrow-left", &t("返回到图片库  Esc"), true) {
                         self.editor_back_to_library();
                     }
                     ui.separator();
-                    if ui.button(t("✦ 手气不错")).clicked() {
+                    if super::icon_action(ui, "wand-sparkles", &t("手气不错"), true) {
                         self.fx_commit_effect(
                             id,
                             t("手气不错"),
                             crate::effects::Effect::oneclick("enhance_auto", BTreeMap::new()),
                         );
                     }
-                    if ui.button(t("▶ 播放")).clicked() {
+                    if super::icon_action(ui, "play", &t("幻灯片放映"), true) {
                         self.start_slideshow();
                     }
                     ui.add_space(6.0);
-                    if ui.button("◀").clicked() {
+                    if super::icon_action(ui, "arrow-left", &t("◀ 上一张"), true) {
                         id = self.editor_step(-1);
                     }
                     if !ids.is_empty() {
@@ -876,7 +877,7 @@ impl App {
                             }
                         }
                     }
-                    if ui.button("▶").clicked() {
+                    if super::icon_action(ui, "arrow-right", &t("下一张 ▶"), true) {
                         id = self.editor_step(1);
                     }
                     ui.add_space(6.0);
@@ -894,25 +895,31 @@ impl App {
                         }
                     }
                     ui.separator();
-                    if ui.small_button("−").clicked() {
+                    if super::icon_action(ui, "zoom-out", &t("缩小"), true) {
                         self.editor_zoom_cmd = 4;
                     }
-                    if ui.small_button("100%").clicked() {
+                    if super::icon_action(ui, "scan", &t("实际大小(100%)"), true) {
                         self.editor_zoom_cmd = 1;
                     }
-                    if ui.small_button("+").clicked() {
+                    if super::icon_action(ui, "zoom-in", &t("放大"), true) {
                         self.editor_zoom_cmd = 3;
                     }
-                    if ui.small_button(t("适应窗口")).clicked() {
+                    if super::icon_action(ui, "maximize", &t("适应窗口"), true) {
                         self.editor_zoom_cmd = 2;
                     }
                     ui.small(format!("{:.0}%", self.preview_zoom * 100.0));
                     ui.separator();
                     ui.add_enabled_ui(!readonly, |ui| {
-                        if ui.small_button("↺").clicked() {
+                        if super::icon_action(
+                            ui,
+                            "rotate-ccw",
+                            &t("↺ 向左旋转  Ctrl+Shift+R"),
+                            true,
+                        ) {
                             self.preview_rotate(id, 3);
                         }
-                        if ui.small_button("↻").clicked() {
+                        if super::icon_action(ui, "rotate-cw", &t("↻ 向右旋转  Ctrl+R"), true)
+                        {
                             self.preview_rotate(id, 1);
                         }
                     });
@@ -920,23 +927,27 @@ impl App {
                     // 动图逐帧播放:只在帧序列解出来后出现,暂停时停在当前帧。
                     if let Some(status) = self.anim_status(id) {
                         let playing = self.anim_playing(id);
-                        if ui
-                            .small_button(if playing {
-                                t("⏸ 暂停动图")
-                            } else {
-                                t("▶ 播放动图")
-                            })
-                            .clicked()
-                        {
+                        let tip = if playing {
+                            t("⏸ 暂停动图")
+                        } else {
+                            t("▶ 播放动图")
+                        };
+                        if super::icon_toggle(
+                            ui,
+                            if playing { "pause" } else { "play" },
+                            &tip,
+                            playing,
+                        ) {
                             self.anim_toggle();
                         }
                         ui.small(status);
                         ui.separator();
                     }
-                    if ui.selectable_label(self.editor_props, t("属性")).clicked() {
+                    if super::icon_toggle(ui, "panel-right", &t("属性面板"), self.editor_props)
+                    {
                         self.editor_props = !self.editor_props;
                     }
-                    if ui.selectable_label(self.editor_film, t("胶片")).clicked() {
+                    if super::icon_toggle(ui, "film", &t("底部胶片带"), self.editor_film) {
                         self.editor_film = !self.editor_film;
                     }
                 });
@@ -1280,7 +1291,7 @@ impl App {
             self.fx_applied_sig = None;
         }
         ui.horizontal(|ui| {
-            if ui.button(t("应用")).clicked() {
+            if super::icon_action(ui, "check", &t("应用"), true) {
                 let params = editor_params(name, self.editor_tool_amount);
                 self.fx_commit_effect(
                     id,
@@ -1290,7 +1301,7 @@ impl App {
                 self.editor_tool = None;
                 self.fx_applied_sig = None;
             }
-            if ui.button(t("取消")).clicked() {
+            if super::icon_action(ui, "x", &t("取消"), true) {
                 self.editor_tool = None;
                 self.fx_applied_sig = None;
             }
@@ -1327,10 +1338,10 @@ impl App {
             self.fx_applied_sig = None;
         }
         ui.horizontal(|ui| {
-            if ui.button(t("应用到这张")).clicked() {
+            if super::icon_action(ui, "check", &t("应用到这张"), true) {
                 self.fx_apply_draft(&[id]);
             }
-            if ui.button(t("重置")).clicked() {
+            if super::icon_action(ui, "rotate-ccw", &t("重置"), true) {
                 self.fx_draft = crate::effects::Adjust::default();
                 self.fx_applied_sig = None;
             }
@@ -1360,20 +1371,19 @@ impl App {
         }
         ui.separator();
         ui.horizontal(|ui| {
-            if ui.button(t("复制所有效果")).clicked() {
+            if super::icon_action(ui, "copy", &t("复制所有效果"), true) {
                 self.fx_copy_all(id);
             }
-            if ui.button(t("粘贴到这张")).clicked() {
+            if super::icon_action(ui, "clipboard-paste", &t("粘贴到这张"), true) {
                 self.fx_paste_all(&[id]);
             }
+            if super::icon_action(ui, "trash-2", &t("清除这张的所有效果"), true) {
+                self.editor_clear_effects(id);
+            }
+            if super::icon_action(ui, "save", &t("保存(烘培效果到原图)"), true) {
+                self.start_bake(id);
+            }
         });
-        if ui.button(t("清除这张的所有效果")).clicked() {
-            self.editor_clear_effects(id);
-        }
-        ui.separator();
-        if ui.button(t("保存(烘培效果到原图)")).clicked() {
-            self.start_bake(id);
-        }
         ui.small(t("保存会先备份原稿,再写回带效果的原图。"));
     }
 
@@ -1428,14 +1438,14 @@ impl App {
         });
         ui.horizontal(|ui| {
             if let Some((w, h)) = self.crop_ratio {
-                if ui.small_button(t("⇄ 对调")).clicked() {
+                if super::icon_action(ui, "arrow-left-right", &t("⇄ 对调"), true) {
                     self.crop_ratio = Some((h, w));
                 }
             }
-            if ui.button(t("应用裁剪")).clicked() {
+            if super::icon_action(ui, "check", &t("应用裁剪"), true) {
                 self.commit_crop(id);
             }
-            if ui.small_button(t("取消")).clicked() {
+            if super::icon_action(ui, "x", &t("取消"), true) {
                 self.crop_mode = false;
                 self.crop_rect = None;
                 self.crop_drag = None;
@@ -1452,7 +1462,7 @@ impl App {
                     .desired_width(80.0),
             );
         });
-        if ui.small_button(t("保存为预设")).clicked() {
+        if super::icon_action(ui, "save", &t("保存为预设"), true) {
             if let (Ok(w), Ok(h)) = (
                 self.crop_cw.trim().parse::<f32>(),
                 self.crop_ch.trim().parse::<f32>(),
@@ -1481,17 +1491,16 @@ impl App {
         self.tags_editor(ui, id);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            if ui
-                .button(if self.star_of(id) != 0 {
-                    t("★ 取消星标")
-                } else {
-                    t("☆ 加星")
-                })
-                .clicked()
-            {
+            let starred = self.star_of(id) != 0;
+            let tip = if starred {
+                t("★ 取消星标")
+            } else {
+                t("☆ 加星")
+            };
+            if super::icon_toggle(ui, "star", &tip, starred) {
                 self.toggle_star(id);
             }
-            if ui.small_button(t("资源管理器")).clicked() {
+            if super::icon_action(ui, "folder-open", &t("在资源管理器中显示"), true) {
                 if let Some(p) = self.photo_path(id) {
                     super::show_in_explorer(&p);
                 }
@@ -1508,23 +1517,10 @@ impl App {
         ui.horizontal(|ui| {
             let can_undo = self.fx_undo.get(&id).map(|s| s.can_undo()).unwrap_or(false);
             let can_redo = self.fx_undo.get(&id).map(|s| s.can_redo()).unwrap_or(false);
-            let w = (ui.available_width() - 12.0) * 0.5;
-            if ui
-                .add_enabled(
-                    can_undo,
-                    egui::Button::new(t("↶ 撤销")).min_size(egui::vec2(w, 26.0)),
-                )
-                .clicked()
-            {
+            if super::icon_action(ui, "undo-2", &t("↶ 撤销"), can_undo) {
                 self.fx_undo_step(id);
             }
-            if ui
-                .add_enabled(
-                    can_redo,
-                    egui::Button::new(t("↷ 重做")).min_size(egui::vec2(w, 26.0)),
-                )
-                .clicked()
-            {
+            if super::icon_action(ui, "redo-2", &t("↷ 重做"), can_redo) {
                 self.fx_redo_step(id);
             }
         });

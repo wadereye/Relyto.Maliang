@@ -52,6 +52,8 @@ const OP_FLUSH: u8 = 6;
 const OP_STATUS: u8 = 7;
 const OP_REBUILD: u8 = 8;
 const OP_CURSOR: u8 = 9;
+/// 追加操作码不改既有帧布局,不必升协议版本;旧服务不认会回 Err,客户端按失败降级。
+const OP_SYNC_MARKER: u8 = 10;
 
 const RP_OK: u8 = 1;
 const RP_ERR: u8 = 2;
@@ -84,6 +86,9 @@ pub enum Req {
     Rebuild { letters: Vec<char> },
     /// 每卷日志游标(追赶判定与诊断)。
     JournalCursor,
+    /// 请服务把机器级数据目录标记改到 `path`:迁移后非提权 UI 写不动 ProgramData,
+    /// 由 LocalSystem 服务代写,服务下次启动即落在新目录。
+    SyncMarker { path: String },
 }
 
 /// 一条命中。比 `nameidx::SearchHit` 多带 size/mtime/cls/rich_state ——
@@ -193,6 +198,7 @@ pub trait Query {
     fn status(&self) -> Resp;
     fn rebuild(&self, letters: &[char]) -> Resp;
     fn cursors(&self) -> Resp;
+    fn sync_marker(&self, path: &str) -> Resp;
 }
 
 /// `nameidx::FileClass` → 线上判别值。
@@ -390,6 +396,11 @@ pub fn encode_req(r: &Req) -> Vec<u8> {
             w.into_vec()
         }
         Req::JournalCursor => W::new(OP_CURSOR).into_vec(),
+        Req::SyncMarker { path } => {
+            let mut w = W::new(OP_SYNC_MARKER);
+            w.str(path);
+            w.into_vec()
+        }
     }
 }
 
@@ -431,6 +442,9 @@ pub fn decode_req(b: &[u8]) -> Result<Req, &'static str> {
             Req::Rebuild { letters }
         }
         OP_CURSOR => Req::JournalCursor,
+        OP_SYNC_MARKER => Req::SyncMarker {
+            path: r.str().ok_or(BAD_FRAME)?,
+        },
         _ => return Err(BAD_FRAME),
     };
     if !r.done() {
@@ -698,6 +712,7 @@ pub fn handle(payload: &[u8], q: &dyn Query) -> Vec<u8> {
         Req::Status => q.status(),
         Req::Rebuild { letters } => q.rebuild(letters),
         Req::JournalCursor => q.cursors(),
+        Req::SyncMarker { path } => q.sync_marker(path),
     };
     encode_resp(&resp)
 }
@@ -816,6 +831,7 @@ mod tests {
         vols: Vec<VolumeIndex>,
         rebuilt: std::cell::RefCell<Vec<char>>,
         flushed: std::cell::Cell<bool>,
+        synced: std::cell::RefCell<Option<String>>,
     }
 
     impl Fake {
@@ -836,6 +852,7 @@ mod tests {
                 vols: vec![b.finish()],
                 rebuilt: Default::default(),
                 flushed: Default::default(),
+                synced: Default::default(),
             }
         }
     }
@@ -934,6 +951,10 @@ mod tests {
                 l2_usn: 90,
             }])
         }
+        fn sync_marker(&self, path: &str) -> Resp {
+            *self.synced.borrow_mut() = Some(path.to_string());
+            Resp::Ok
+        }
     }
 
     /// 测试用建索引条目(与 nameidx/scan 测试里的同名助手一致口径)。
@@ -989,6 +1010,23 @@ mod tests {
             letters: Vec::new(),
         });
         roundtrip_req(&Req::JournalCursor);
+        roundtrip_req(&Req::SyncMarker {
+            path: r"D:\ml".into(),
+        });
+    }
+
+    /// 同步标记请求要原样送到查询面(路径不被截断/改写)。
+    #[test]
+    fn handle_sync_marker_reaches_query() {
+        let f = Fake::new();
+        let out = handle(
+            &encode_req(&Req::SyncMarker {
+                path: r"D:\ml".into(),
+            }),
+            &f,
+        );
+        assert_eq!(decode_resp(&out).unwrap(), Resp::Ok);
+        assert_eq!(f.synced.borrow().as_deref(), Some(r"D:\ml"));
     }
 
     #[test]

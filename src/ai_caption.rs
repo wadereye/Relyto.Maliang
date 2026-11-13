@@ -9,6 +9,11 @@ pub const TEMPLATE_VER: &str = "v1";
 /// 拼一段描述;无可用信息时返回空串。
 pub fn build(store: &Store, photo_id: i64, tag_ver: &str) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let sep = if crate::i18n::lang() == crate::i18n::Lang::En {
+        ", "
+    } else {
+        "、"
+    };
     let labels: Vec<String> = crate::ai_tags::photo_tags(store, photo_id, tag_ver)
         .into_iter()
         .take(6)
@@ -16,7 +21,7 @@ pub fn build(store: &Store, photo_id: i64, tag_ver: &str) -> String {
         .filter(|s| !s.is_empty())
         .collect();
     if !labels.is_empty() {
-        parts.push(labels.join("、"));
+        parts.push(labels.join(sep));
     }
     if let Some(text) = crate::ai_ocr::text_of(store, photo_id) {
         let flat: String = text
@@ -39,7 +44,7 @@ pub fn build(store: &Store, photo_id: i64, tag_ver: &str) -> String {
     names.sort();
     names.dedup();
     if !names.is_empty() {
-        parts.push(names.join("、"));
+        parts.push(names.join(sep));
     }
     // 没有识别结果时不拿纯元数据冒充描述。
     if parts.is_empty() {

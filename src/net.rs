@@ -61,6 +61,8 @@ pub fn start(store: Arc<Store>) -> Result<WifiHandle> {
         while !stop2.load(Ordering::SeqCst) {
             match listener.accept() {
                 Ok((mut sock, _peer)) => {
+                    // Windows 上 accept 出来的套接字会继承监听端的非阻塞,读请求会立刻空手而归。
+                    sock.set_nonblocking(false).ok();
                     sock.set_read_timeout(Some(std::time::Duration::from_secs(30)))
                         .ok();
                     match handle_one(&mut sock, &incoming) {

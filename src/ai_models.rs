@@ -95,7 +95,7 @@ pub const SLOTS: [SlotSpec; 8] = [
         key: "face_det",
         label: "人脸检测 / 识别",
         license: "Apache-2.0",
-        manual: true,
+        manual: false,
         files: &["face_det.onnx", "face_rec_sface.onnx"],
         legacy: &["face_det.onnx", "face_rec_sface.onnx"],
         stage: None,
@@ -179,8 +179,8 @@ pub const ASSETS: &[AssetSlot] = &[
             ModelAsset {
                 file: "face_det.onnx",
                 url: "",
-                bytes: 16923827,
-                sha256: "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+                bytes: 232589,
+                sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
             },
             ModelAsset {
                 file: "face_rec_sface.onnx",
@@ -1351,15 +1351,25 @@ mod tests {
     #[test]
     fn manual_slots_match_download_capability() {
         use crate::models::SourcePref;
-        for key in ["mt_zh_en", "llm_parse", "face_det"] {
+        for key in ["mt_zh_en", "llm_parse"] {
             assert!(spec(key).unwrap().manual, "{key} 应标为手动放置");
             assert!(
                 plans_for_pref(key, "v1", "", SourcePref::Official).is_empty(),
                 "{key} 不应有官方直链"
             );
         }
-        assert!(asset("face_det", "face_det.onnx").is_some());
-        assert!(asset("face_det", "face_rec_sface.onnx").is_some());
+        // 人脸两件可代下载,但只走镜像目录,没有官方直链。
+        assert!(!spec("face_det").unwrap().manual, "face_det 应可代下载");
+        assert!(
+            plans_for_pref("face_det", "v1", "", SourcePref::Official).is_empty(),
+            "face_det 不应有官方直链"
+        );
+        for f in ["face_det.onnx", "face_rec_sface.onnx"] {
+            let a = asset("face_det", f).unwrap();
+            assert!(a.url.is_empty(), "{f} 不该有官方直链");
+            assert_eq!(a.sha256.len(), 64, "{f} 缺 SHA256");
+            assert!(a.bytes > 0, "{f} 缺字节数");
+        }
         assert!(asset("mt_zh_en", "encoder.onnx").is_none());
         assert!(asset("llm_parse", "model.onnx").is_none());
     }

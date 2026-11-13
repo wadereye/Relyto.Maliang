@@ -1015,6 +1015,21 @@ impl Query for Engine {
         out.sort_by_key(|c| c.letter);
         Resp::Cursors(out)
     }
+
+    fn sync_marker(&self, path: &str) -> Resp {
+        let dir = std::path::Path::new(path);
+        if !dir.is_absolute() {
+            return Resp::Err(format!("数据目录必须是绝对路径:{path}"));
+        }
+        match crate::db::sync_machine_marker_to(dir) {
+            Ok(_) => {
+                self.log
+                    .line(&format!("机器级数据目录标记已指向 {}", dir.display()));
+                Resp::Ok
+            }
+            Err(e) => Resp::Err(format!("写机器级数据目录失败:{e}")),
+        }
+    }
 }
 
 /// 管道服务端:一个接受循环 + 每连接一个线程。

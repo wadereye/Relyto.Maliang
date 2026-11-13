@@ -2,7 +2,7 @@
 
 use crate::db::Store;
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use std::collections::HashMap;
 
 /// 一条标签定义。
@@ -17,24 +17,13 @@ pub struct Label {
 
 /// 内置词表(节点, 中文, 英文, 英文 prompt)。
 const BUILTIN: &[(&str, &str, &str, &str)] = &[
-    ("人物/自拍", "自拍", "selfie", "a selfie photo of a person"),
+    ("人物/人像", "人像", "portrait", "a photo of a person"),
     (
         "人物/合影",
         "合影",
         "group photo",
         "a group photo of people",
     ),
-    ("人物/儿童", "儿童", "child", "a photo of a child"),
-    ("人物/婚礼", "婚礼", "wedding", "a wedding photo"),
-    (
-        "人物/证件照",
-        "证件照",
-        "portrait",
-        "a formal portrait of a person",
-    ),
-    ("人物/舞台", "舞台", "stage", "people performing on a stage"),
-    ("人物/运动", "运动人物", "sports", "a person playing sports"),
-    ("人物/背影", "背影", "back view", "the back of a person"),
     ("动物/猫", "猫", "cat", "a photo of a cat"),
     ("动物/狗", "狗", "dog", "a photo of a dog"),
     ("动物/鸟", "鸟", "bird", "a photo of a bird"),
@@ -301,9 +290,9 @@ const BUILTIN: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// 灵敏度档位:每条标签下限与同类兼容分差。
-const SENSITIVITY: [(f32, f32); 3] = [(0.22, 0.03), (0.26, 0.06), (0.30, 0.09)];
-const SELECTION_VERSION: &str = "category-multilabel-v2";
+/// 灵敏度档位:每条标签下限与同类兼容分差(按真实照片余弦分布标定)。
+const SENSITIVITY: [(f32, f32); 3] = [(0.19, 0.03), (0.21, 0.04), (0.23, 0.05)];
+const SELECTION_VERSION: &str = "category-multilabel-v3";
 
 /// 内置词表条目数。
 pub fn builtin_count() -> usize {
@@ -324,24 +313,41 @@ pub fn sensitivity(store: &Store) -> i32 {
         .clamp(0, 2)
 }
 
-/// 写入内置词表(幂等;只补缺失 id)。
+/// 写入内置词表:按 node 认领既有 id,新增条目自增,下线条目连同其自动标签一并清除。
 pub fn seed_labels(store: &Store) -> Result<usize> {
-    let ts = crate::ai_queue::now_ms();
     store.write(|conn| -> Result<usize> {
         let tx = conn.transaction()?;
-        let mut n = 0usize;
+        let mut existing: HashMap<String, i64> = HashMap::new();
         {
-            let mut st = tx.prepare(
-                "INSERT OR IGNORE INTO tag_labels(id, node, name_zh, name_en, prompt_en, parent, builtin, ver)
-                 VALUES(?1, ?2, ?3, ?4, ?5, NULL, 1, 'v1')",
-            )?;
-            for (i, (node, zh, en, prompt)) in BUILTIN.iter().enumerate() {
-                n += st.execute(params![(i + 1) as i64, node, zh, en, prompt])?;
+            let mut st = tx.prepare("SELECT id, node FROM tag_labels WHERE builtin=1")?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for (id, node) in rows.flatten() {
+                existing.insert(node, id);
             }
         }
+        let mut inserted = 0usize;
+        for (node, zh, en, prompt) in BUILTIN.iter() {
+            if let Some(id) = existing.remove(*node) {
+                tx.execute(
+                    "UPDATE tag_labels SET name_zh=?2, name_en=?3, prompt_en=?4 WHERE id=?1",
+                    params![id, zh, en, prompt],
+                )?;
+            } else {
+                inserted += tx.execute(
+                    "INSERT INTO tag_labels(node, name_zh, name_en, prompt_en, parent, builtin, ver)
+                     VALUES(?1, ?2, ?3, ?4, NULL, 1, 'v1')",
+                    params![node, zh, en, prompt],
+                )?;
+            }
+        }
+        for id in existing.into_values() {
+            tx.execute("DELETE FROM auto_tags WHERE label_id=?1", params![id])?;
+            tx.execute("DELETE FROM tag_labels WHERE id=?1", params![id])?;
+        }
         tx.commit()?;
-        let _ = ts;
-        Ok(n)
+        Ok(inserted)
     })
 }
 
@@ -491,23 +497,122 @@ pub fn save(
         })
 }
 
-/// 读取某张照片当前版本的标签(标签 id, 分数, 中文名)。
+/// 人物类节点由人脸检出决定,不参与语义打分。
+pub fn is_people_node(node: &str) -> bool {
+    node == "人物" || node.starts_with("人物/")
+}
+
+/// 按人脸数重写人物标签:0 脸清除,1 脸人像,≥2 脸合影;其余标签保留,合计仍限六条。
+pub fn sync_people_tags(store: &Store, photo_ids: &[i64], ver: &str) -> Result<usize> {
+    if photo_ids.is_empty() {
+        return Ok(0);
+    }
+    let usable = !crate::faces::effective_sig(store).is_empty();
+    store.write(|conn| -> Result<usize> {
+        let tx = conn.transaction()?;
+        let mut portrait: Option<i64> = None;
+        let mut group: Option<i64> = None;
+        {
+            let mut st =
+                tx.prepare("SELECT node, id FROM tag_labels WHERE node IN ('人物/人像','人物/合影')")?;
+            let rows = st.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for (node, id) in rows.flatten() {
+                if node == "人物/人像" {
+                    portrait = Some(id);
+                } else {
+                    group = Some(id);
+                }
+            }
+        }
+        let mut changed = 0usize;
+        for &pid in photo_ids {
+            let (n, conf) = if usable {
+                tx.query_row(
+                    "SELECT COUNT(*), COALESCE(MAX(score), 0.0) FROM faces
+                      WHERE photo_id=?1 AND ignored=0",
+                    params![pid],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)?)),
+                )?
+            } else {
+                (0, 0.0)
+            };
+            let people = match n {
+                0 => None,
+                1 => portrait.map(|id| (id, conf)),
+                _ => group.map(|id| (id, conf)),
+            };
+            let prev: Option<(i64, f64)> = tx
+                .query_row(
+                    "SELECT t.label_id, t.score FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
+                      WHERE t.photo_id=?1 AND t.model_ver=?2 AND (l.node='人物' OR l.node LIKE '人物/%')",
+                    params![pid, ver],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let mut keep: Vec<(i64, f64)> = Vec::new();
+            {
+                let mut st = tx.prepare(
+                    "SELECT t.label_id, t.score FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
+                      WHERE t.photo_id=?1 AND t.model_ver=?2
+                        AND NOT (l.node='人物' OR l.node LIKE '人物/%')
+                      ORDER BY t.score DESC",
+                )?;
+                let rows = st.query_map(params![pid, ver], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                keep.extend(rows.flatten());
+            }
+            let same = match (prev, people) {
+                (None, None) => true,
+                (Some(a), Some(b)) => a.0 == b.0 && (a.1 - b.1).abs() < 1e-6,
+                _ => false,
+            };
+            if same && keep.len() + usize::from(people.is_some()) <= 6 {
+                continue;
+            }
+            tx.execute(
+                "DELETE FROM auto_tags WHERE photo_id=?1 AND model_ver=?2",
+                params![pid, ver],
+            )?;
+            let mut out = Vec::with_capacity(keep.len() + 1);
+            out.extend(people);
+            out.extend(keep);
+            out.truncate(6);
+            {
+                let mut st = tx.prepare(
+                    "INSERT OR REPLACE INTO auto_tags(photo_id, label_id, score, model_ver)
+                     VALUES(?1, ?2, ?3, ?4)",
+                )?;
+                for (id, score) in out {
+                    st.execute(params![pid, id, score, ver])?;
+                }
+            }
+            changed += 1;
+        }
+        tx.commit()?;
+        Ok(changed)
+    })
+}
+
+/// 读取某张照片当前版本的标签(标签 id, 分数, 当前界面语言的名称)。
 pub fn photo_tags(store: &Store, photo_id: i64, ver: &str) -> Vec<(i64, f32, String)> {
+    let en = crate::i18n::lang() == crate::i18n::Lang::En;
     store.read(|conn| {
         let mut out = Vec::new();
         let Ok(mut st) = conn.prepare(
-            "SELECT t.label_id, t.score, l.name_zh FROM auto_tags t
+            "SELECT t.label_id, t.score, l.name_zh, l.name_en FROM auto_tags t
                JOIN tag_labels l ON l.id = t.label_id
               WHERE t.photo_id=?1 AND t.model_ver=?2 ORDER BY t.score DESC",
         ) else {
             return out;
         };
         if let Ok(rows) = st.query_map(params![photo_id, ver], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, f64>(1)? as f32,
-                r.get::<_, String>(2)?,
-            ))
+            let name = if en {
+                r.get::<_, String>(3)?
+            } else {
+                r.get::<_, String>(2)?
+            };
+            Ok((r.get::<_, i64>(0)?, r.get::<_, f64>(1)? as f32, name))
         }) {
             out.extend(rows.flatten());
         }
@@ -537,11 +642,43 @@ pub fn category_ids(store: &Store, category: &str, ver: &str, limit: usize) -> V
     })
 }
 
-/// 分类相簿计数(仅当前版本)。
+/// 某分类下的照片总数(不受展示上限影响)。
+pub fn category_count(store: &Store, category: &str, ver: &str) -> usize {
+    store.read(|conn| {
+        conn.query_row(
+            "SELECT COUNT(DISTINCT t.photo_id) FROM auto_tags t
+               JOIN tag_labels l ON l.id = t.label_id
+              WHERE t.model_ver=?1 AND (l.node=?2 OR l.node LIKE ?3)",
+            params![ver, category, format!("{category}/%")],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize
+    })
+}
+
+/// 分类相簿计数(仅当前版本):一次分组统计,不把 id 拉进内存。
 pub fn category_counts(store: &Store, ver: &str) -> Vec<(&'static str, usize)> {
+    let mut top: HashMap<String, usize> = HashMap::new();
+    store.read(|conn| {
+        let Ok(mut st) = conn.prepare(
+            "SELECT CASE WHEN instr(l.node,'/')>0
+                         THEN substr(l.node,1,instr(l.node,'/')-1)
+                         ELSE l.node END AS cat,
+                    COUNT(DISTINCT t.photo_id)
+               FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
+              WHERE t.model_ver=?1 GROUP BY cat",
+        ) else {
+            return;
+        };
+        if let Ok(rows) = st.query_map(params![ver], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        }) {
+            top.extend(rows.flatten());
+        };
+    });
     CATEGORIES
         .iter()
-        .map(|(node, label)| (*label, category_ids(store, node, ver, usize::MAX).len()))
+        .map(|(node, label)| (*label, top.get(*node).copied().unwrap_or(0)))
         .collect()
 }
 
@@ -557,6 +694,42 @@ pub fn is_text_photo(store: &Store, photo_id: i64, ver: &str) -> bool {
         .unwrap_or(0)
             > 0
     })
+}
+
+/// 一批 id 中已判定为文字类的照片(分块绑定,避开 SQLite 变量上限)。
+pub fn text_photo_ids(store: &Store, ver: &str, ids: &[i64]) -> std::collections::HashSet<i64> {
+    use rusqlite::types::Value;
+    let mut out = std::collections::HashSet::new();
+    if ids.is_empty() {
+        return out;
+    }
+    store.read(|conn| {
+        for chunk in ids.chunks(900) {
+            let sql = format!(
+                "SELECT DISTINCT t.photo_id FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
+                  WHERE l.node LIKE '文档票据/%' AND t.model_ver=?{} AND t.photo_id IN ({})",
+                chunk.len() + 1,
+                (1..=chunk.len())
+                    .map(|i| format!("?{i}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let Ok(mut st) = conn.prepare(&sql) else {
+                continue;
+            };
+            let binds = rusqlite::params_from_iter(
+                chunk
+                    .iter()
+                    .map(|id| Value::from(*id))
+                    .chain(std::iter::once(Value::from(ver.to_string()))),
+            );
+            let Ok(rows) = st.query_map(binds, |r| r.get::<_, i64>(0)) else {
+                continue;
+            };
+            out.extend(rows.flatten());
+        }
+    });
+    out
 }
 
 #[cfg(test)]
@@ -583,6 +756,51 @@ mod tests {
         assert_eq!(seed_labels(&store).unwrap(), builtin_count());
         assert_eq!(seed_labels(&store).unwrap(), 0);
         assert_eq!(label_count(&store), builtin_count());
+    }
+
+    #[test]
+    fn text_photo_ids_spans_binding_chunks() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let lid: i64 = store.read(|c| {
+            c.query_row(
+                "SELECT id FROM tag_labels WHERE node='文档票据/截图'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        let n = 905i64;
+        let marked = [1i64, 900, 901, 905];
+        store
+            .write(|c| -> Result<()> {
+                let tx = c.transaction()?;
+                {
+                    let mut st = tx.prepare(
+                        "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'C:\\',0,0)",
+                    )?;
+                    for id in 1..=n {
+                        st.execute(params![id, format!("C:\\{id}.jpg")])?;
+                    }
+                    let mut tg = tx.prepare(
+                        "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(?1,?2,0.9,'v0')",
+                    )?;
+                    for id in marked {
+                        tg.execute(params![id, lid])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+        let ids: Vec<i64> = (1..=n).collect();
+        let got = text_photo_ids(&store, "v0", &ids);
+        assert_eq!(
+            got,
+            marked.into_iter().collect::<std::collections::HashSet<i64>>(),
+            "跨分块边界(900/901)与末尾都要命中"
+        );
+        assert!(text_photo_ids(&store, "other", &ids).is_empty());
     }
 
     fn label(id: i64, node: &str, zh: &str, en: &str) -> Label {
@@ -644,5 +862,240 @@ mod tests {
         assert_eq!(category_ids(&store, "人物", "v1", 10), vec![1]);
         assert!(category_ids(&store, "动物", "v1", 10).is_empty());
         assert!(category_ids(&store, "人物", "v0", 10).is_empty());
+    }
+
+    /// 分类计数与 id 口径一致:同图多标签只算一张,展示上限不影响总数。
+    #[test]
+    fn category_counts_match_distinct_photos() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let cat = node_id(&store, "动物/猫");
+        let dog = node_id(&store, "动物/狗");
+        let shot = node_id(&store, "文档票据/截图");
+        for id in 1..=3 {
+            add_photo(&store, id);
+        }
+        store
+            .write(|c| {
+                c.execute_batch(&format!(
+                    "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES
+                       (1,{cat},0.5,'v1'),(1,{dog},0.4,'v1'),
+                       (2,{cat},0.6,'v1'),(3,{shot},0.7,'v1'),
+                       (2,{cat},0.9,'v0');"
+                ))
+                .unwrap();
+            });
+        let counts = category_counts(&store, "v1");
+        assert_eq!(counts.len(), CATEGORIES.len());
+        let animals = counts.iter().find(|(n, _)| *n == "动物").unwrap().1;
+        assert_eq!(animals, 2, "同图两个动物标签只算一张");
+        assert_eq!(
+            animals,
+            category_ids(&store, "动物", "v1", usize::MAX).len(),
+            "计数与 id 口径必须一致"
+        );
+        assert_eq!(category_count(&store, "动物", "v1"), 2);
+        assert_eq!(
+            category_ids(&store, "动物", "v1", 1).len(),
+            1,
+            "展示上限只截断 id"
+        );
+        assert_eq!(category_count(&store, "动物", "v0"), 1, "旧版本单独计数");
+        let docs = counts.iter().find(|(n, _)| *n == "截图文档").unwrap().1;
+        assert_eq!(docs, 1);
+        assert_eq!(counts.iter().find(|(n, _)| *n == "人物").unwrap().1, 0);
+    }
+
+    /// 标签名跟着界面语言走,英文界面不再显示中文。
+    #[test]
+    fn photo_tags_follow_ui_language() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let cat = node_id(&store, "动物/猫");
+        add_photo(&store, 1);
+        save(&store, 1, "v1", &[(cat, 0.9)]).unwrap();
+        {
+            let _g = crate::i18n::LangGuard::to(crate::i18n::Lang::Zh);
+            assert_eq!(photo_tags(&store, 1, "v1")[0].2, "猫");
+        }
+        let _g = crate::i18n::LangGuard::to(crate::i18n::Lang::En);
+        assert_eq!(photo_tags(&store, 1, "v1")[0].2, "cat");
+    }
+
+    fn node_id(store: &Store, node: &str) -> i64 {
+        store.read(|c| {
+            c.query_row(
+                "SELECT id FROM tag_labels WHERE node=?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .unwrap()
+        })
+    }
+
+    fn add_photo(store: &Store, id: i64) {
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?2,0,0)",
+                    params![id, format!("p{id}")],
+                )
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn seeding_keeps_ids_and_prunes_retired_nodes() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let group = node_id(&store, "人物/合影");
+        let cat = node_id(&store, "动物/猫");
+        add_photo(&store, 1);
+        store
+            .write(|c| {
+                c.execute_batch(
+                    "UPDATE tag_labels SET prompt_en='drifted' WHERE node='人物/合影';
+                     INSERT INTO tag_labels(id,node,name_zh,name_en,prompt_en,builtin,ver)
+                         VALUES(9001,'人物/旧标签','旧','old','old',1,'v1');
+                     INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(1,9001,0.5,'v1');",
+                )
+            })
+            .unwrap();
+        assert_eq!(seed_labels(&store).unwrap(), 0, "无新增条目时返回 0");
+        assert_eq!(node_id(&store, "人物/合影"), group, "既有 id 不因词表改动而漂移");
+        assert_eq!(node_id(&store, "动物/猫"), cat);
+        let prompt: String = store
+            .read(|c| {
+                c.query_row(
+                    "SELECT prompt_en FROM tag_labels WHERE id=?1",
+                    params![group],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            });
+        assert_ne!(prompt, "drifted", "内置条目的 prompt 应被词表复位");
+        let left: i64 = store
+            .read(|c| {
+                c.query_row(
+                    "SELECT (SELECT COUNT(*) FROM tag_labels WHERE id=9001)
+                          + (SELECT COUNT(*) FROM auto_tags WHERE label_id=9001)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            });
+        assert_eq!(left, 0, "下线条目连同其自动标签一并清除");
+    }
+
+    #[test]
+    fn seeding_readds_missing_node_with_fresh_id() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let cat = node_id(&store, "动物/猫");
+        store
+            .write(|c| c.execute("DELETE FROM tag_labels WHERE node='动物/狗'", []))
+            .unwrap();
+        assert_eq!(seed_labels(&store).unwrap(), 1);
+        assert_eq!(node_id(&store, "动物/猫"), cat, "补条目不得挤占其他 id");
+        assert_ne!(node_id(&store, "动物/狗"), cat);
+        assert_eq!(label_count(&store), builtin_count());
+    }
+
+    #[test]
+    fn people_tags_follow_face_count() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        for id in 1..=4 {
+            add_photo(&store, id);
+        }
+        store
+            .write(|c| {
+                c.execute_batch(
+                    "INSERT INTO faces(id,photo_id,score,ignored) VALUES(1,2,0.9,0);
+                     INSERT INTO faces(id,photo_id,score,ignored) VALUES(2,3,0.8,0),(3,3,0.7,0);
+                     INSERT INTO faces(id,photo_id,score,ignored) VALUES(4,4,0.95,1);",
+                )
+            })
+            .unwrap();
+        let portrait = node_id(&store, "人物/人像");
+        let group = node_id(&store, "人物/合影");
+        assert_eq!(sync_people_tags(&store, &[1, 2, 3, 4], "v1").unwrap(), 2);
+        assert!(photo_tags(&store, 1, "v1").is_empty(), "无人脸不打人物标签");
+        assert_eq!(photo_tags(&store, 2, "v1")[0].0, portrait);
+        assert_eq!(photo_tags(&store, 3, "v1")[0].0, group);
+        assert!(photo_tags(&store, 4, "v1").is_empty(), "已忽略的人脸不计数");
+        assert_eq!(sync_people_tags(&store, &[1, 2, 3, 4], "v1").unwrap(), 0, "重复同步不改写");
+        assert_eq!(category_ids(&store, "人物", "v1", 10), vec![2, 3]);
+    }
+
+    #[test]
+    fn people_tag_keeps_total_within_six() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        add_photo(&store, 1);
+        store
+            .write(|c| {
+                c.execute_batch(
+                    "INSERT INTO faces(id,photo_id,score,ignored) VALUES(1,1,0.9,0),(2,1,0.8,0);",
+                )
+            })
+            .unwrap();
+        let others: Vec<i64> = store.read(|c| {
+            let mut st = c
+                .prepare("SELECT id FROM tag_labels WHERE node NOT LIKE '人物%' ORDER BY id LIMIT 6")
+                .unwrap();
+            let rows = st.query_map([], |r| r.get::<_, i64>(0)).unwrap();
+            rows.flatten().collect()
+        });
+        let tags: Vec<(i64, f32)> = others
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (*id, 0.30 - i as f32 * 0.01))
+            .collect();
+        save(&store, 1, "v1", &tags).unwrap();
+        sync_people_tags(&store, &[1], "v1").unwrap();
+        let got = photo_tags(&store, 1, "v1");
+        assert_eq!(got.len(), 6, "人物标签挤掉最低分,总数仍为六条");
+        assert_eq!(got[0].0, node_id(&store, "人物/合影"));
+        assert!(!got.iter().any(|(id, _, _)| *id == others[5]));
+    }
+
+    #[test]
+    fn people_tags_drop_when_pipeline_stale() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        add_photo(&store, 1);
+        store
+            .write(|c| {
+                c.execute_batch(
+                    "INSERT INTO faces(id,photo_id,score,ignored) VALUES(1,1,0.9,0);",
+                )
+            })
+            .unwrap();
+        sync_people_tags(&store, &[1], "v1").unwrap();
+        assert_eq!(photo_tags(&store, 1, "v1").len(), 1);
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO face_templates(face_id,dim,vec,sig) VALUES(1,128,x'00','old')",
+                    [],
+                )
+            })
+            .unwrap();
+        sync_people_tags(&store, &[1], "v1").unwrap();
+        assert!(photo_tags(&store, 1, "v1").is_empty(), "待重建期间人物标签作废");
+    }
+
+    #[test]
+    fn people_nodes_are_excluded_from_semantic_vocab() {
+        for &(node, _, _, _) in BUILTIN {
+            if is_people_node(node) {
+                assert!(
+                    node == "人物/人像" || node == "人物/合影",
+                    "人物类只保留人脸可判定的两条:{node}"
+                );
+            }
+        }
+        assert!(!is_people_node("人物写真/海报"));
     }
 }

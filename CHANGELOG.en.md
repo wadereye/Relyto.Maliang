@@ -8,6 +8,42 @@ All user-visible changes are documented here, newest first.
 
 ### Changed
 
+**A round of fixes across tags, faces and search**
+
+- People tags are now driven by face detection instead of guessed from semantic
+  similarity; the other categories use lower thresholds, so scenery and group
+  photos that previously never landed in a category album now do.
+- Semantic search shows real relevance instead of a score invented from the
+  rank (the 5th hit used to be 0.200 no matter how poor the match).
+- A full recluster pass runs automatically when a scan finishes, and faces that
+  belong to no cluster are counted and reachable from the people page instead
+  of being invisible.
+- The people list is sorted by photo count descending, so the most-photographed
+  person comes first.
+- "Clear and rescan" now states that it also deletes manual names and
+  must-link / never-link decisions; ignoring a single face ignores only that
+  face rather than making the whole cluster disappear.
+- "Hide low quality" takes effect immediately, and Ctrl+A, export and add-to-album
+  act on the photos on screen under AI category and search results (they used to
+  operate on an empty set).
+- Tag search covers category paths and manual tags (searching "people" or
+  "animals" is no longer always empty); an English UI shows English labels, and
+  generated captions follow the UI language.
+- Category album counts agree with the grid limit and say so when truncated;
+  tags whose name contains `/` are no longer rendered twice.
+- Automatic text recognition now waits for the tag verdict and queues only text
+  photos: the first pass used to mark the whole library done without reading
+  anything, so screenshots and receipts were never recognised afterwards.
+  Disabled or manual-only mode no longer leaves pending work that can never run.
+- Text recognition uses the same decoding path as thumbnails, so videos, RAW
+  files and images with a misleading extension can be read too; files that
+  cannot be decoded are recorded as failures (retryable) instead of spinning
+  every 30 seconds and leaving pending work that never clears.
+- Phone Wi-Fi upload: fixed the server answering 400 as soon as a connection was
+  accepted, which made uploads fail.
+- Background writes are more fault-tolerant: one failing write job no longer
+  silently drops every write after it.
+
 **Default face scheme switched to YuNet + SFace (licensing adjustment)**
 
 - The default scheme is now **YuNet + SFace** (OpenCV Zoo): both models'
@@ -43,11 +79,15 @@ All user-visible changes are documented here, newest first.
   to the built-in path) — pressing "Download models" is enough when models are
   missing, no server configuration required.
 - `ModelURL` now means **mirror fallback**: it ships pointing at a mirror
-  directory and engages automatically when a built-in source answers 404;
-  leave it empty to disable the fallback. Downloads still require an explicit
-  user click before any traffic.
+  directory and engages automatically whenever a built-in source fails
+  (unreachable, HTTP error, or a file that fails verification); only an
+  explicit cancel stops right away. Leave it empty to disable the fallback.
+  Downloads still require an explicit user click before any traffic.
 - antelopev2 weights are non-redistributable and are never fetched by the
   program; the UI now shows the official Release URL with rename instructions.
+- The mirror's face detector file was replaced with the YuNet weights the
+  default scheme actually uses; it previously served a different detector that
+  failed verification and was not the one the default scheme expects.
 
 **Three anti-snowball rules for face clustering**
 

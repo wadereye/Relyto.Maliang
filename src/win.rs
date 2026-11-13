@@ -1100,6 +1100,18 @@ pub fn service_start_elevated() -> Result<(), String> {
     }
 }
 
+/// 从非提权 UI 触发「停 → 同步数据目录标记 → 起」:一次 UAC 让服务搬进新目录。
+pub fn service_restart_elevated() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        elevated_self("--restart-service")
+    }
+    #[cfg(not(windows))]
+    {
+        Err(t("仅支持 Windows").into())
+    }
+}
+
 /// 提权重启自身跑一条子命令并等结果。子进程的具体失败原因在它自己的日志里,
 /// 这里只有退出码可用(release 是 GUI 子系统,stdout 无处可去,不指望它)。
 #[cfg(windows)]
@@ -1480,6 +1492,23 @@ mod tests {
     #[test]
     fn cpu_count_is_at_least_one() {
         assert!(cpu_count() >= 1);
+    }
+
+    /// 扫描线程降优先级生效:BelowNormal 写入后能读回,用完恢复原档(不污染线程池)。
+    #[cfg(windows)]
+    #[test]
+    fn set_thread_priority_below_normal_takes_effect() {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY,
+            THREAD_PRIORITY_BELOW_NORMAL,
+        };
+        let orig = unsafe { GetThreadPriority(GetCurrentThread()) };
+        set_current_thread_priority(Priority::BelowNormal);
+        let now = unsafe { GetThreadPriority(GetCurrentThread()) };
+        assert_eq!(now, THREAD_PRIORITY_BELOW_NORMAL.0, "BelowNormal 应实际生效");
+        unsafe {
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY(orig));
+        }
     }
 
     /// SERVICE_DELETE 是裸常量(windows crate 没导出这个名字),钉住 WinNT.h 的值。

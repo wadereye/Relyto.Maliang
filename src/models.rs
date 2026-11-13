@@ -584,8 +584,7 @@ fn fetch_files(
             return Err(t("已取消下载").into());
         }
         // 候选源按用户偏好来:「自动」= 内置官方直链在前、ModelURL(镜像)兜底;
-        // 选定单源则只用该源。404 才换源(自动档),其余错误(断网/取消)当场
-        // 终止,续传字节留给下一次。
+        // 选定单源则只用该源。
         let mut urls: Vec<String> = Vec::new();
         if pref != SourcePref::Mirror {
             if let Some(u) = builtin_url_for(name) {
@@ -605,16 +604,32 @@ fn fetch_files(
                 &[("name", name.to_string())],
             ));
         }
-        for (si, url) in urls.iter().enumerate() {
-            match download_one(dir, cfg, url, name, i + 1, count, tx, stop, verify) {
-                Ok(()) => break,
-                Err(e) => {
-                    let try_next = e.contains("HTTP 404") && si + 1 < urls.len();
-                    if !try_next {
-                        return Err(e);
-                    }
-                    let _ = std::fs::remove_file(dir.join(format!("{name}.part")));
+        fetch_with_fallback(dir, cfg, name, &urls, i + 1, count, tx, stop, verify)?;
+    }
+    Ok(())
+}
+
+/// 同一个文件逐个源试:只有用户取消才当场终止,其余失败都换下一个源。
+#[allow(clippy::too_many_arguments)]
+fn fetch_with_fallback(
+    dir: &Path,
+    cfg: &Config,
+    name: &str,
+    urls: &[String],
+    idx: usize,
+    count: usize,
+    tx: &Sender<Event>,
+    stop: &AtomicBool,
+    verify: fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    for (si, url) in urls.iter().enumerate() {
+        match download_one(dir, cfg, url, name, idx, count, tx, stop, verify) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if stop.load(Ordering::Relaxed) || si + 1 == urls.len() {
+                    return Err(e);
                 }
+                let _ = std::fs::remove_file(dir.join(format!("{name}.part")));
             }
         }
     }
@@ -973,6 +988,8 @@ mod tests {
             while !stop2.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut sock, _)) => {
+                        // Windows 上 accept 出来的套接字会继承监听端的非阻塞,必须改回阻塞。
+                        let _ = sock.set_nonblocking(false);
                         let _ = sock.set_read_timeout(Some(Duration::from_secs(5)));
                         let mut reader = std::io::BufReader::new(sock.try_clone().unwrap());
                         let mut line = String::new();
@@ -1177,6 +1194,64 @@ mod tests {
             std::fs::metadata(dir.join("face_det.onnx")).unwrap().len(),
             7_000
         );
+    }
+
+    /// 连不上官方源(不是 404)也要回退镜像。
+    #[test]
+    fn falls_back_to_mirror_on_connection_failure() {
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let body: Vec<u8> = (0..9_000u32).map(|i| (i % 251) as u8).collect();
+        let srv = files_server(vec![("/models/face_det.onnx".into(), body.clone())], true);
+        let dir = tmp("connfallback");
+        let urls = vec![
+            format!("http://127.0.0.1:{dead_port}/models/face_det.onnx"),
+            format!("http://127.0.0.1:{}/models/face_det.onnx", srv.port),
+        ];
+        let (tx, _rx) = mpsc::channel::<Event>();
+        let stop = AtomicBool::new(false);
+        fetch_with_fallback(
+            &dir,
+            &model_dir(srv.port),
+            "face_det.onnx",
+            &urls,
+            1,
+            1,
+            &tx,
+            &stop,
+            accept_any,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(dir.join("face_det.onnx")).unwrap(), body);
+        assert!(!dir.join("face_det.onnx.part").exists());
+    }
+
+    /// 用户取消就不许再换源:否则点了取消还会接着连镜像。
+    #[test]
+    fn cancel_does_not_try_next_source() {
+        let body = vec![5u8; 4_000];
+        let srv = files_server(vec![("/models/face_det.onnx".into(), body)], true);
+        let dir = tmp("cancelfallback");
+        let urls = vec![
+            format!("http://127.0.0.1:{}/models/face_det.onnx", srv.port),
+            format!("http://127.0.0.1:{}/models/face_det.onnx", srv.port),
+        ];
+        let (tx, _rx) = mpsc::channel::<Event>();
+        let stop = AtomicBool::new(true);
+        let got = fetch_with_fallback(
+            &dir,
+            &model_dir(srv.port),
+            "face_det.onnx",
+            &urls,
+            1,
+            1,
+            &tx,
+            &stop,
+            accept_any,
+        );
+        assert!(got.is_err(), "取消必须终止");
+        assert!(!dir.join("face_det.onnx").exists(), "取消后不该落下文件");
     }
 
     #[test]

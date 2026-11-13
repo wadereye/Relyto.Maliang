@@ -30,6 +30,16 @@ enum ViewKind {
     Search,
 }
 
+/// 视图所属的左栏抽屉键(切换视图时顺势展开对应抽屉)。
+fn drawer_key(v: ViewKind) -> &'static str {
+    match v {
+        ViewKind::Recent | ViewKind::Albums => "相册",
+        ViewKind::Faces => "人物",
+        ViewKind::Folder => "文件夹",
+        _ => "其他素材",
+    }
+}
+
 impl ViewKind {
     /// 状态栏/历史提示用的一词名(左栏导航项的文案另有取舍,见导航列表)。
     fn label(self) -> &'static str {
@@ -261,10 +271,14 @@ pub struct App {
     folders: Vec<String>,
     selected_folder: usize,
     view: ViewKind,
-    /// 首页「最近更新」的成员(下标指向 `rows`):启动时算一次,不逐帧重排全库。
+    /// 首页「最近更新」的成员(下标指向 `rows`),重算入口见 `refresh_recent`。
     recent_idxs: Vec<usize>,
     /// 相册头那行日期(组内最早拍摄日,中文写法),空串时只报张数。
     recent_date: String,
+    /// 有新缩略图落盘 → 置脏,等节流窗口到了再收进「最近更新」。
+    recent_dirty: bool,
+    /// 上次重算「最近更新」的时刻。
+    recent_at: std::time::Instant,
     texs: TexCache,
     /// 常驻缩略图后台 worker:启动时补存量,扫描后自动补新增。
     thumb_bg: Option<crate::thumbs::ThumbWorker>,
@@ -595,6 +609,8 @@ pub struct App {
     tree_open: HashSet<String>,
     /// 树行缩略图纹理缓存(按照片 id;随当前档位变化,数量有上限就整体丢弃)。
     tree_texs: HashMap<i64, egui::TextureHandle>,
+    /// 视图切换后要展开的左栏抽屉(只作用一帧,随后交回用户收展)。
+    nav_open_drawer: Option<&'static str>,
     /// 当前整页(主面板与导入面板两套整页互切,不是弹窗)。
     page: PageKind,
     /// 导航历史栈(后/前进逐站回退;每站记住整页 + 视图 + 左栏选中)。
@@ -609,6 +625,10 @@ pub struct App {
     import_sel: BTreeSet<usize>,
     /// 最近一次浏览过的导入源(历史站退回导入页时用它恢复清单)。
     last_import_src: String,
+    /// 导入页目录树:展开中的路径(点三角切换,换源后祖先链自动展开)。
+    import_tree_open: HashSet<String>,
+    /// 导入页目录树:子目录缓存(值 = 路径 + 是否导入目录;懒加载,刷新时清空)。
+    import_tree_kids: HashMap<String, Vec<(PathBuf, bool)>>,
     /// 人物列表排序方式(按姓名 / 数量 / 前 10)。
     people_sort: PeopleSort,
     /// 工具栏「新建相册」弹窗(选中照片时把选中项一并放进新相册)。
@@ -628,9 +648,15 @@ pub struct App {
     /// 人脸扫描取消标志(连续扫描整库可能跑很久,得能中途停)。
     #[cfg(feature = "ai")]
     face_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// 人脸扫描本批进度(已走张数, 本批总张数)。
+    /// 人脸扫描全库进度(累计已处理张数, 开扫时待分析总数)。
     #[cfg(feature = "ai")]
     face_prog: (usize, usize),
+    /// 人脸扫描范围单选态(true=只常用目录),重建窗用,确认后落库记住。
+    #[cfg(feature = "ai")]
+    face_scope_common: bool,
+    /// 开机自动续扫只查一次。
+    #[cfg(feature = "ai")]
+    face_resume_done: bool,
     #[cfg(feature = "ai")]
     face_people: Vec<crate::faces::PeopleRow>,
     #[cfg(feature = "ai")]
@@ -649,6 +675,14 @@ pub struct App {
     face_similar_for: Option<i64>,
     #[cfg(feature = "ai")]
     face_similar_thr: f32,
+    /// 相似人脸后台检索通道(查询脸 id, 阈值, 结果);在途时新请求只记重跑。
+    #[cfg(feature = "ai")]
+    face_sim_rx: Option<mpsc::Receiver<(i64, f32, Vec<crate::faces::SimilarFace>)>>,
+    #[cfg(feature = "ai")]
+    face_sim_pending: bool,
+    /// 全量重聚类后台通道。
+    #[cfg(feature = "ai")]
+    recluster_rx: Option<mpsc::Receiver<Result<usize, String>>>,
     /// 合并/拆分约束的目标簇(当前簇之外)。
     #[cfg(feature = "ai")]
     face_merge_target: Option<i64>,
@@ -675,9 +709,12 @@ pub struct App {
     #[cfg(feature = "ai")]
     clip_index_rx: Option<mpsc::Receiver<Result<(usize, usize), String>>>,
     #[cfg(feature = "ai")]
-    clip_search_rx: Option<mpsc::Receiver<Result<(Vec<(i64, f32)>, Option<String>), String>>>,
+    clip_search_rx: Option<mpsc::Receiver<Result<(Vec<(i64, Option<f32>)>, Option<String>), String>>>,
     #[cfg(feature = "ai")]
-    clip_results: Vec<(i64, f32)>,
+    clip_results: Vec<(i64, Option<f32>)>,
+    /// 以图搜图的查询照片名(结果标题用;文本搜索时清空)。
+    #[cfg(feature = "ai")]
+    clip_image_query: Option<String>,
     /// 语义索引语言(英文/中文 CLIP 双模型;搜索按查询语言自动匹配)。
     #[cfg(feature = "ai")]
     clip_lang: crate::clip::Lang,
@@ -858,6 +895,8 @@ enum LinkCmd {
     Stop,
     /// 提权启动已注册的服务,和 `Stop` 成对。
     Start,
+    /// 提权停→同步数据目录标记→起:迁移后让服务立刻用上新目录。
+    Restart,
     /// 请求全量重建;空列表 = 全部可扫卷。
     Rebuild(Vec<char>),
     /// 让服务立刻把内存索引落盘。
@@ -1012,6 +1051,14 @@ fn link_cmd(
             *client = None;
             *backoff = std::time::Duration::from_secs(1);
             let _ = msg_tx.send(LinkMsg::Service("启动", r.err()));
+            ctx.request_repaint();
+            true
+        }
+        LinkCmd::Restart => {
+            let r = crate::win::service_restart_elevated();
+            *client = None;
+            *backoff = std::time::Duration::from_secs(1);
+            let _ = msg_tx.send(LinkMsg::Service("重启", r.err()));
             ctx.request_repaint();
             true
         }
@@ -1410,6 +1457,61 @@ const TAG_COLORS: [(&str, egui::Color32); 10] = [
     ("gray", egui::Color32::from_rgb(140, 140, 140)),
 ];
 
+/// 分类相簿一次展示的上限,网格与选择/导出范围共用同一口径。
+const CATEGORY_LIMIT: usize = 2000;
+
+/// 标签视图的照片范围:库内检索 > AI 分类 > 手动标签,与界面展示同一优先级。
+fn tags_scope_ids(
+    store: &Store,
+    query: &str,
+    query_hits: &[i64],
+    category: Option<&str>,
+    tag: Option<&str>,
+) -> Vec<i64> {
+    #[cfg(feature = "ai")]
+    {
+        if !query.trim().is_empty() {
+            return query_hits.to_vec();
+        }
+        if let Some(node) = category {
+            let ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Tags);
+            return crate::ai_tags::category_ids(store, node, &ver, CATEGORY_LIMIT);
+        }
+    }
+    #[cfg(not(feature = "ai"))]
+    let _ = (query, query_hits, category);
+    tag.and_then(|t| timeline::photos_by_tag(store, t).ok())
+        .unwrap_or_default()
+}
+
+/// 「隐藏低质量」开关对应的质量下限。
+#[cfg(feature = "ai")]
+const FACE_LOW_QUALITY: f32 = 0.4;
+
+/// 人脸筛选开关行:返回两个开关的响应,任一变化都要重算右侧列表。
+#[cfg(feature = "ai")]
+fn face_filter_row(
+    ui: &mut egui::Ui,
+    hide_low: &mut bool,
+    show_ignored: &mut bool,
+) -> (egui::Response, egui::Response) {
+    let a = ui.checkbox(hide_low, t("隐藏低质量"));
+    let b = ui.checkbox(show_ignored, t("显示已忽略"));
+    (a, b)
+}
+
+/// 清除人脸数据的不可撤销警示:重建与切换方案两处共用,红字点明会丢人工整理。
+#[cfg(feature = "ai")]
+fn face_wipe_warning(ui: &mut egui::Ui, action: &str) {
+    ui.colored_label(
+        egui::Color32::LIGHT_RED,
+        t_with(
+            "「{p1}」不可撤销:人物命名与合并/拆分判定会一并删除,需重新人工整理。",
+            &[("p1", action.to_string())],
+        ),
+    );
+}
+
 /// 把标签全路径展开成层级行(深度, 末段名, 全路径, 照片数, 是否真实标签)。
 fn tag_tree_rows(tags: &[timeline::TagInfo]) -> Vec<(usize, String, String, usize, bool)> {
     use std::collections::BTreeMap;
@@ -1490,26 +1592,15 @@ fn path_under_dir(path: &str, dir: &str) -> bool {
     head == b && (tail.is_empty() || tail[0] == b'\\' || tail[0] == b'/')
 }
 
-/// 导入页源列表的一行:图标 + 名称,选中态高亮。返回是否被点中。
-fn source_row(
-    ui: &mut egui::Ui,
-    icon: &'static str,
-    label: &str,
-    path: &Path,
-    cur: &Option<PathBuf>,
-) -> bool {
-    let active = cur.as_deref() == Some(path);
-    let mut clicked = false;
-    ui.horizontal(|ui| {
-        ui.add(toolbar_icon(icon));
-        if ui.selectable_label(active, label).clicked() {
-            clicked = true;
-        }
-    });
-    clicked
+/// 两个目录路径是否指向同一处(大小写不敏感,容忍尾部斜杠)。
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let na = a.to_string_lossy();
+    let nb = b.to_string_lossy();
+    na.trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(nb.trim_end_matches(['\\', '/']))
 }
 
-/// 小节标题(导入页源列表分组:我的文件夹 / 设备 / 我的电脑)。
+/// 导入页左栏分组小标题(我的文件夹 / 设备 / 我的电脑)。
 fn muted_title(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
@@ -1517,6 +1608,24 @@ fn muted_title(ui: &mut egui::Ui, text: &str) {
             .color(crate::theme::p().muted)
             .strong(),
     );
+}
+
+/// 导入源快捷行:图标 + 名称,选中态高亮,返回是否点击。
+fn import_source_row(
+    ui: &mut egui::Ui,
+    icon: &str,
+    label: &str,
+    path: &Path,
+    cur: Option<&Path>,
+) -> bool {
+    let active = cur.is_some_and(|c| same_dir(c, path));
+    ui.horizontal(|ui| {
+        ui.add(toolbar_icon(icon));
+        ui.selectable_label(active, egui::RichText::new(label).color(crate::theme::p().text))
+            .on_hover_text(path.display().to_string())
+            .clicked()
+    })
+    .inner
 }
 
 /// 列一个导入源目录:可入库的图片/RAW 文件 + 可继续下探的子目录。
@@ -1713,6 +1822,9 @@ fn cover_uv([tw, th]: [usize; 2]) -> egui::Rect {
 
 /// 首页虚拟相册的成员上限(超出淘汰最旧)。
 const RECENT_LIMIT: usize = 250;
+
+/// 「最近更新」两次重算的最小间隔:补图洪峰期每批都查库会抢写锁。
+const RECENT_REFRESH_GAP: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 相册头日期:`YYYY-MM-DD` → `YYYY年M月D日`;没有 EXIF 日期时原样返回空串。
 fn cn_date(s: &str) -> String {
@@ -1914,6 +2026,51 @@ const ICON_LIGHT: &[(&str, &[u8])] = &[
         "refresh",
         include_bytes!("../assets/icons/light/refresh.svg"),
     ),
+    (
+        "square",
+        include_bytes!("../assets/icons/light/square.svg"),
+    ),
+    (
+        "square-check",
+        include_bytes!("../assets/icons/light/square-check.svg"),
+    ),
+    (
+        "zoom-in",
+        include_bytes!("../assets/icons/light/zoom-in.svg"),
+    ),
+    (
+        "zoom-out",
+        include_bytes!("../assets/icons/light/zoom-out.svg"),
+    ),
+    (
+        "maximize",
+        include_bytes!("../assets/icons/light/maximize.svg"),
+    ),
+    (
+        "rotate-ccw",
+        include_bytes!("../assets/icons/light/rotate-ccw.svg"),
+    ),
+    (
+        "rotate-cw",
+        include_bytes!("../assets/icons/light/refresh.svg"),
+    ),
+    ("scan", include_bytes!("../assets/icons/light/scan.svg")),
+    ("pause", include_bytes!("../assets/icons/light/pause.svg")),
+    ("film", include_bytes!("../assets/icons/light/film.svg")),
+    ("undo-2", include_bytes!("../assets/icons/light/undo-2.svg")),
+    ("redo-2", include_bytes!("../assets/icons/light/redo-2.svg")),
+    ("check", include_bytes!("../assets/icons/light/check.svg")),
+    (
+        "arrow-left-right",
+        include_bytes!("../assets/icons/light/arrow-left-right.svg"),
+    ),
+    ("save", include_bytes!("../assets/icons/light/save.svg")),
+    ("copy", include_bytes!("../assets/icons/light/copy.svg")),
+    (
+        "clipboard-paste",
+        include_bytes!("../assets/icons/light/clipboard-paste.svg"),
+    ),
+    ("trash-2", include_bytes!("../assets/icons/light/trash-2.svg")),
 ];
 const ICON_DARK: &[(&str, &[u8])] = &[
     (
@@ -1988,6 +2145,45 @@ const ICON_DARK: &[(&str, &[u8])] = &[
         "refresh",
         include_bytes!("../assets/icons/dark/refresh.svg"),
     ),
+    ("square", include_bytes!("../assets/icons/dark/square.svg")),
+    (
+        "square-check",
+        include_bytes!("../assets/icons/dark/square-check.svg"),
+    ),
+    ("zoom-in", include_bytes!("../assets/icons/dark/zoom-in.svg")),
+    (
+        "zoom-out",
+        include_bytes!("../assets/icons/dark/zoom-out.svg"),
+    ),
+    (
+        "maximize",
+        include_bytes!("../assets/icons/dark/maximize.svg"),
+    ),
+    (
+        "rotate-ccw",
+        include_bytes!("../assets/icons/dark/rotate-ccw.svg"),
+    ),
+    (
+        "rotate-cw",
+        include_bytes!("../assets/icons/dark/refresh.svg"),
+    ),
+    ("scan", include_bytes!("../assets/icons/dark/scan.svg")),
+    ("pause", include_bytes!("../assets/icons/dark/pause.svg")),
+    ("film", include_bytes!("../assets/icons/dark/film.svg")),
+    ("undo-2", include_bytes!("../assets/icons/dark/undo-2.svg")),
+    ("redo-2", include_bytes!("../assets/icons/dark/redo-2.svg")),
+    ("check", include_bytes!("../assets/icons/dark/check.svg")),
+    (
+        "arrow-left-right",
+        include_bytes!("../assets/icons/dark/arrow-left-right.svg"),
+    ),
+    ("save", include_bytes!("../assets/icons/dark/save.svg")),
+    ("copy", include_bytes!("../assets/icons/dark/copy.svg")),
+    (
+        "clipboard-paste",
+        include_bytes!("../assets/icons/dark/clipboard-paste.svg"),
+    ),
+    ("trash-2", include_bytes!("../assets/icons/dark/trash-2.svg")),
 ];
 
 /// 内置更新日志全文,「帮助 > 关于」里以 Markdown 渲染。
@@ -2025,6 +2221,26 @@ fn toolbar_icon(name: &str) -> egui::Image<'static> {
         .fit_to_exact_size(egui::vec2(18.0, 18.0))
 }
 
+/// 指定描边色的文件夹图标(灰 = 默认目录,蓝 = 导入目录)。
+fn folder_icon_colored(color: egui::Color32) -> egui::Image<'static> {
+    let (_, bytes) = icon_source("folder");
+    let svg = std::str::from_utf8(bytes).unwrap_or("");
+    let hex = format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b());
+    let mut recolored = svg.to_string();
+    if let Some(i) = svg.find("stroke=\"") {
+        let s = i + 8;
+        if let Some(e) = svg[s..].find('"') {
+            recolored = format!("{}{}{}", &svg[..s], hex, &svg[s + e..]);
+        }
+    }
+    let half = if crate::theme::p().is_light { "l" } else { "d" };
+    egui::Image::from_bytes(
+        format!("bytes://folder-{half}-{}.svg", &hex[1..]),
+        recolored.into_bytes(),
+    )
+    .fit_to_exact_size(egui::vec2(18.0, 18.0))
+}
+
 /// 组头图标(大一号的目录图标)。
 fn album_icon(name: &str, size: f32) -> egui::Image<'static> {
     let (tag, bytes) = icon_source(name);
@@ -2042,6 +2258,19 @@ fn tool_button(name: &str, selected: bool) -> egui::ImageButton<'static> {
     egui::ImageButton::new(toolbar_icon(name))
         .selected(selected)
         .corner_radius(4)
+}
+
+/// 统一的图标动作按钮:悬停显示操作说明,返回是否点击。
+fn icon_action(ui: &mut egui::Ui, icon: &str, tip: &str, enabled: bool) -> bool {
+    ui.add_enabled(enabled, tool_button(icon, false))
+        .on_hover_text(tip)
+        .on_disabled_hover_text(tip)
+        .clicked()
+}
+
+/// 统一的图标开关按钮:选中态高亮,悬停显示操作说明,返回是否点击。
+fn icon_toggle(ui: &mut egui::Ui, icon: &str, tip: &str, selected: bool) -> bool {
+    ui.add(tool_button(icon, selected)).on_hover_text(tip).clicked()
 }
 
 fn load_cjk_font(ctx: &egui::Context) {
@@ -2321,6 +2550,8 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024),
         );
+        #[cfg(feature = "ai")]
+        let face_scope_common = crate::faces::scan_scope_common(&store);
         Self {
             store,
             rows: Vec::new(),
@@ -2330,6 +2561,8 @@ impl App {
             view: ViewKind::Recent,
             recent_idxs: Vec::new(),
             recent_date: String::new(),
+            recent_dirty: false,
+            recent_at: std::time::Instant::now(),
             texs: TexCache::new(TEX_CACHE_CAP),
             thumb_bg: None,
             #[cfg(feature = "ai")]
@@ -2508,6 +2741,7 @@ impl App {
             folder_tree_cache: FolderTree::default(),
             tree_open: HashSet::new(),
             tree_texs: HashMap::new(),
+            nav_open_drawer: None,
             page: PageKind::Library,
             nav_hist: Vec::new(),
             nav_at: 0,
@@ -2515,6 +2749,8 @@ impl App {
             import_entries: Vec::new(),
             import_sel: BTreeSet::new(),
             last_import_src: String::new(),
+            import_tree_open: HashSet::new(),
+            import_tree_kids: HashMap::new(),
             scan_verb: t("扫描"),
             people_sort,
             album_new_win: false,
@@ -2529,6 +2765,10 @@ impl App {
             #[cfg(feature = "ai")]
             face_prog: (0, 0),
             #[cfg(feature = "ai")]
+            face_scope_common,
+            #[cfg(feature = "ai")]
+            face_resume_done: false,
+            #[cfg(feature = "ai")]
             face_people: Vec::new(),
             #[cfg(feature = "ai")]
             sel_cluster: None,
@@ -2542,6 +2782,12 @@ impl App {
             face_similar_for: None,
             #[cfg(feature = "ai")]
             face_similar_thr: 0.35,
+            #[cfg(feature = "ai")]
+            face_sim_rx: None,
+            #[cfg(feature = "ai")]
+            face_sim_pending: false,
+            #[cfg(feature = "ai")]
+            recluster_rx: None,
             #[cfg(feature = "ai")]
             face_sugs: Vec::new(),
             #[cfg(feature = "ai")]
@@ -2569,6 +2815,8 @@ impl App {
             clip_search_rx: None,
             #[cfg(feature = "ai")]
             clip_results: Vec::new(),
+            #[cfg(feature = "ai")]
+            clip_image_query: None,
             #[cfg(feature = "ai")]
             clip_lang: crate::clip::Lang::En,
             #[cfg(feature = "ai")]
@@ -2993,6 +3241,20 @@ impl App {
         }
     }
 
+    /// 停→同步数据目录标记→起:数据目录迁移后让服务立刻搬进新目录。
+    #[cfg(windows)]
+    fn svc_restart(&mut self) {
+        if self.svc_busy {
+            return;
+        }
+        self.svc_busy = true;
+        if let Some(tx) = &self.link_tx {
+            let _ = tx.send(LinkCmd::Restart);
+        } else {
+            self.svc_busy = false;
+        }
+    }
+
     /// 用户在说明窗/选项页定了意向之后的落地动作:落库 + 该动手的动手。
     #[cfg(windows)]
     fn svc_apply_want(&mut self, want: SvcWant) {
@@ -3146,14 +3408,15 @@ impl App {
                 }
                 Ok(LinkMsg::Service(op, err)) => {
                     self.svc_busy = false;
-                    // 「停止/启动」只是运维动作(换二进制、让磁盘歇口),
+                    // 「停止/启动/重启」只是运维动作(换二进制、让磁盘歇口、搬目录),
                     // 不代表用户不想要全盘快查 —— 别把它记成拒绝授权。
-                    let state_only = matches!(op, "停止" | "启动");
+                    let state_only = matches!(op, "停止" | "启动" | "重启");
                     if state_only {
                         self.status = match (&err, op) {
                             (None, "停止") => {
                                 t("索引服务已停止(注册项保留):全盘快查暂不可用,同页可再启动").into()
                             }
+                            (None, "重启") => t("索引服务已重启,正在重连…").into(),
                             (None, _) => t("索引服务已启动,正在重连…").into(),
                             (Some(e), _) => t_with(
                                 "{op}索引服务未完成:{e}(可在 选项 > 全盘快查 重试)",
@@ -4029,6 +4292,8 @@ impl App {
             let _ = self
                 .store
                 .set_dir_intent(&crate::db::DirIntent::new(dir, state, source));
+            // 导入树的灰/蓝着色缓存在父目录的 kids 里,落账后清掉重读。
+            self.import_tree_kids.clear();
         }
         if self.store.promote_dir(dir).unwrap_or(0) > 0 {
             self.sync_dir_promoted(dir);
@@ -4167,7 +4432,11 @@ impl App {
             {
                 self.set_folder_tree(true);
             }
-            ui.menu_button(t("查看选项"), |ui| self.view_options_menu(ui));
+            ui.menu_button(toolbar_icon("sliders-horizontal"), |ui| {
+                self.view_options_menu(ui)
+            })
+            .response
+            .on_hover_text(t("查看选项"));
             ui.separator();
             if ui
                 .add(tool_button("wand-sparkles", self.fx_panel))
@@ -4402,9 +4671,24 @@ impl App {
             .enumerate()
             .map(|(i, r)| (r.id, i))
             .collect();
-        // 首页相册成员:启动时从库里读「已有落盘缩略图」的那批,不把全库按时间
-        // 铺一遍(带上限的虚拟相册)。多取几个候选,
-        // 让硬排除名单把历史脏行挡在相册外;余下的按 SQL 给的时间次序收进清单。
+        self.refresh_recent();
+        self.dups = if self.dup_near {
+            timeline::dup_groups_near(&self.store, NEAR_DUP_DIST).unwrap_or_default()
+        } else {
+            timeline::dup_groups(&self.store).unwrap_or_default()
+        };
+        self.tags = timeline::all_tags(&self.store).unwrap_or_default();
+        if self.selected_folder >= self.folders.len() {
+            self.selected_folder = 0;
+        }
+        self.rows_gen = self.rows_gen.wrapping_add(1);
+        // 工具栏 spinner:本视图还有多少张缩略图没落地(后台 worker 在补就是"有活")。
+        self.pending_thumbs = self.rows.iter().filter(|r| r.thumb_ok == 0).count();
+        self.refresh_tier_count();
+    }
+
+    /// 重算首页「最近更新」成员:只查库收人,不重载 `rows`。
+    fn refresh_recent(&mut self) {
         let watched = self.store.watched_stats();
         let roots: Vec<String> = watched.iter().map(|(p, _)| p.clone()).collect();
         let ids = timeline::load_recent(&self.store, &roots, RECENT_LIMIT * 3).unwrap_or_default();
@@ -4430,20 +4714,9 @@ impl App {
         }
         self.recent_date = cn_date(&timeline::group_date(&self.rows, &recent));
         self.recent_idxs = recent;
-        self.dups = if self.dup_near {
-            timeline::dup_groups_near(&self.store, NEAR_DUP_DIST).unwrap_or_default()
-        } else {
-            timeline::dup_groups(&self.store).unwrap_or_default()
-        };
-        self.tags = timeline::all_tags(&self.store).unwrap_or_default();
         self.watched = watched;
-        if self.selected_folder >= self.folders.len() {
-            self.selected_folder = 0;
-        }
-        self.rows_gen = self.rows_gen.wrapping_add(1);
-        // 工具栏 spinner:本视图还有多少张缩略图没落地(后台 worker 在补就是"有活")。
-        self.pending_thumbs = self.rows.iter().filter(|r| r.thumb_ok == 0).count();
-        self.refresh_tier_count();
+        self.recent_dirty = false;
+        self.recent_at = std::time::Instant::now();
     }
 
     /// 重扫当前全部监听目录。
@@ -4599,6 +4872,7 @@ impl App {
             return;
         }
         self.view = v;
+        self.nav_open_drawer = Some(drawer_key(v));
         self.page = PageKind::Library;
         self.push_nav();
     }
@@ -4628,6 +4902,7 @@ impl App {
         };
         self.page = s.page;
         self.view = s.view;
+        self.nav_open_drawer = Some(drawer_key(s.view));
         self.folder_show_all = s.show_all;
         self.subtree_sel = None;
         self.selected_folder = if self.folders.is_empty() {
@@ -4659,13 +4934,22 @@ impl App {
         self.import_entries = list_import_dir(&dir, &indexed);
         let n = self.import_entries.iter().filter(|e| !e.is_dir).count();
         self.last_import_src = dir.to_string_lossy().into_owned();
+        self.import_tree_reveal(&dir);
         self.import_src = Some(dir);
         self.import_sel.clear();
         self.status = t_with("导入源:{n} 个可入库文件", &[("n", n.to_string())]);
     }
 
+    /// 展开导入源在目录树上的祖先链(换源后树上看得见选中的那一条)。
+    fn import_tree_reveal(&mut self, dir: &Path) {
+        for p in dir.ancestors().take(64) {
+            self.import_tree_open.insert(p.to_string_lossy().into_owned());
+        }
+    }
+
     /// 重读当前源目录(清单按钮「刷新」;新增/删除文件后不必重开页面)。
     fn refresh_import_entries(&mut self) {
+        self.import_tree_kids.clear();
         let Some(dir) = self.import_src.clone() else {
             self.import_entries.clear();
             return;
@@ -4673,133 +4957,271 @@ impl App {
         self.set_import_source(dir);
     }
 
-    /// 导入页左栏:源列表(我的文件夹 / 设备 / 盘根 / 浏览其他文件夹)。
-    ///
-    /// 占掉图库页那栏的位置 —— 导入面板把左侧换成源选择,
-    /// 菜单、工具栏与状态栏保持原位。
-    fn import_sources_ui(&mut self, ui: &mut egui::Ui) {
+    /// 导入页左栏:常用位置/设备快捷入口 + 全盘目录树(点目录 = 设为导入源)。
+    fn import_tree_ui(&mut self, ui: &mut egui::Ui) {
         crate::theme::section_title(ui, t("选择源"));
-        let cur = self.import_src.clone();
-        let mut pick: Option<PathBuf> = None;
-
+        let roots = crate::win::drive_roots();
         let shell = crate::win::known_dirs();
-        if !shell.is_empty() {
-            muted_title(ui, t("我的文件夹"));
-            for p in shell {
-                let name = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| p.display().to_string());
-                if source_row(ui, "folder", &name, &p, &cur) {
-                    pick = Some(p);
-                }
-            }
-        }
-        // 设备:可移动卷(U 盘 / 相机卡)。
         let devs = crate::device::removable_volumes();
-        if !devs.is_empty() {
-            muted_title(ui, t("设备"));
-            for v in devs {
-                let label = crate::win::volume_label(&v)
-                    .map(|l| format!("{l} ({})", v.display()))
-                    .unwrap_or_else(|| {
-                        t_with("可移动磁盘 {p1}", &[("p1", (v.display()).to_string())])
-                    });
-                if source_row(ui, "smartphone", &label, &v, &cur) {
-                    pick = Some(v);
+        egui::ScrollArea::vertical()
+            .id_salt("import-tree")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                // 我的文件夹:壳目录快捷入口,点一下直接设为导入源。
+                if !shell.is_empty() {
+                    muted_title(ui, t("我的文件夹"));
+                    for p in &shell {
+                        let name = p
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.display().to_string());
+                        if import_source_row(ui, "folder", &name, p, self.import_src.as_deref()) {
+                            self.set_import_source(p.clone());
+                        }
+                    }
                 }
-            }
-        }
-        // 我的电脑:本机盘根(网络盘/光驱按扫描策略不列)。
-        let roots: Vec<PathBuf> = crate::win::drive_roots()
-            .into_iter()
-            .filter(|r| {
-                matches!(
-                    crate::win::drive_type(r),
-                    Some(crate::win::DriveType::Fixed)
-                )
-            })
-            .collect();
-        if !roots.is_empty() {
-            muted_title(ui, t("我的电脑"));
-            for r in roots {
-                let label = crate::win::volume_label(&r)
-                    .map(|l| format!("{l} ({})", r.display()))
-                    .unwrap_or_else(|| {
-                        t_with("本地磁盘 {p1}", &[("p1", (r.display()).to_string())])
-                    });
-                if source_row(ui, "hard-drive", &label, &r, &cur) {
-                    pick = Some(r);
+                // 设备:可移动卷(U 盘 / 相机卡)。
+                if !devs.is_empty() {
+                    muted_title(ui, t("设备"));
+                    for v in &devs {
+                        let label = crate::win::volume_label(v)
+                            .map(|l| format!("{l} ({})", v.display()))
+                            .unwrap_or_else(|| {
+                                t_with("可移动磁盘 {p1}", &[("p1", (v.display()).to_string())])
+                            });
+                        if import_source_row(ui, "smartphone", &label, v, self.import_src.as_deref())
+                        {
+                            self.set_import_source(v.clone());
+                        }
+                    }
                 }
-            }
-        }
+                // 我的电脑:全盘目录树(盘根带硬盘图标,可逐级下探)。
+                muted_title(ui, t("我的电脑"));
+                for r in roots {
+                    self.walk_import_tree(ui, &r, 0, false);
+                }
+            });
+    }
 
-        ui.separator();
-        if ui.button(t("浏览其他文件夹…")).clicked() {
-            if let Some(dir) = rfd::FileDialog::new()
-                .set_title(t("选择导入源文件夹"))
-                .pick_folder()
-            {
-                pick = Some(dir);
+    /// 递归画一个磁盘目录节点:子目录懒加载并缓存,硬排除目录不列。
+    fn walk_import_tree(&mut self, ui: &mut egui::Ui, dir: &Path, depth: usize, blue: bool) {
+        if depth > 24 {
+            return;
+        }
+        let path = dir.to_string_lossy().into_owned();
+        let open = self.import_tree_open.contains(&path);
+        if open && !self.import_tree_kids.contains_key(&path) {
+            if self.import_tree_kids.len() > 4096 {
+                self.import_tree_kids.clear();
             }
+            let excl = crate::scan::Exclusions::from_store(&self.store);
+            let mut kids: Vec<(PathBuf, bool)> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_dir()
+                        && excl.exclude_layer_dir(p) != Some(crate::scan::ExcludeLayer::Hard)
+                })
+                .map(|p| {
+                    let blue = self
+                        .store
+                        .dir_intent(&p.to_string_lossy())
+                        .is_some_and(|d| d.state == crate::db::INTENT_IMPORTED);
+                    (p, blue)
+                })
+                .collect();
+            kids.sort_by(|a, b| a.0.cmp(&b.0));
+            self.import_tree_kids.insert(path.clone(), kids);
         }
-        if ui.button(t("刷新清单")).clicked() {
-            self.refresh_import_entries();
-        }
-        if let Some(d) = pick {
-            self.set_import_source(d);
+        let kids = self.import_tree_kids.get(&path).cloned().unwrap_or_default();
+        let is_root = depth == 0;
+        let name = if is_root {
+            let letter = path.trim_end_matches(['\\', '/']).to_string();
+            match crate::win::volume_label(dir) {
+                Some(l) => format!("{l} ({letter})"),
+                None => {
+                    if matches!(
+                        crate::win::drive_type(dir),
+                        Some(crate::win::DriveType::Removable)
+                    ) {
+                        t_with("可移动磁盘 {p1}", &[("p1", letter)])
+                    } else {
+                        t_with("本地磁盘 {p1}", &[("p1", letter)])
+                    }
+                }
+            }
+        } else {
+            dir.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone())
+        };
+        let active = self.import_src.as_deref().is_some_and(|s| same_dir(s, dir));
+        ui.horizontal(|ui| {
+            // 引导虚线与图库树同款:祖先层竖虚线 + 本层横虚线。
+            let line = egui::Stroke::new(1.0_f32, crate::theme::p().faint);
+            let left = ui.cursor().left();
+            let top = ui.cursor().top();
+            let cy = top + 10.0;
+            let mut segs: Vec<egui::Shape> = Vec::new();
+            for i in 0..depth {
+                let x = left + (i as f32) * 10.0 + 5.0;
+                segs.extend(egui::Shape::dashed_line(
+                    &[egui::pos2(x, top), egui::pos2(x, top + 20.0)],
+                    line,
+                    3.0,
+                    3.0,
+                ));
+            }
+            if depth > 0 {
+                let x0 = left + (depth as f32 - 1.0) * 10.0 + 5.0;
+                let x1 = left + (depth as f32) * 10.0 + 12.0;
+                segs.extend(egui::Shape::dashed_line(
+                    &[egui::pos2(x0, cy), egui::pos2(x1, cy)],
+                    line,
+                    3.0,
+                    3.0,
+                ));
+            }
+            ui.painter().extend(segs);
+            ui.add_space((depth as f32) * 10.0);
+            if open && kids.is_empty() {
+                ui.add_space(26.0);
+            } else if ui
+                .small_button(if open { "▾" } else { "▸" })
+                .on_hover_text(t("展开 / 收起"))
+                .clicked()
+            {
+                if open {
+                    self.import_tree_open.remove(&path);
+                } else {
+                    self.import_tree_open.insert(path.clone());
+                }
+            }
+            if is_root {
+                ui.add(toolbar_icon("hard-drive"));
+            } else {
+                let color = if blue {
+                    crate::theme::p().accent
+                } else {
+                    crate::theme::p().muted
+                };
+                ui.add(folder_icon_colored(color));
+            }
+            let text = egui::RichText::new(name.as_str()).color(crate::theme::p().text);
+            if ui
+                .selectable_label(active, text)
+                .on_hover_text(&path)
+                .clicked()
+            {
+                self.set_import_source(dir.to_path_buf());
+            }
+        });
+        if open {
+            for (k, b) in kids {
+                self.walk_import_tree(ui, &k, depth + 1, b);
+            }
         }
     }
 
-    /// 导入页中央区:源 + 文件清单 + 导入动作 + 「返回图库」。
+    /// 导入页中央区:提示行 + 顶部一排图标动作 + 文件清单。
     fn import_page_ui(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading(t("导入照片"));
-                if let Some(src) = &self.import_src {
-                    ui.small(src.display().to_string())
-                        .on_hover_text(t("当前导入源目录"));
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(t("返回图库")).clicked() {
-                        self.go_page(PageKind::Library);
-                    }
-                });
-            });
-            ui.separator();
-
-            if self.import_src.is_none() {
-                ui.small(t(
-                    "左侧还没有可浏览的源:选一个文件夹,或点「浏览其他文件夹…」。",
-                ));
-                return;
-            }
-
-            // 清单头:选择工具 + 计数(计数读的是缓存,不重复读盘)。
             let pics = self.import_entries.iter().filter(|e| !e.is_dir).count();
             let fresh = self
                 .import_entries
                 .iter()
                 .filter(|e| !e.is_dir && !e.in_library)
                 .count();
-            ui.horizontal(|ui| {
-                if ui.button(t("全选照片")).clicked() {
-                    self.import_sel = (0..self.import_entries.len())
-                        .filter(|&i| !self.import_entries[i].is_dir)
-                        .collect();
-                }
-                if ui.button(t("全不选")).clicked() {
-                    self.import_sel.clear();
-                }
-                ui.small(t_with(
-                    "{pics} 个可入库文件(未入库 {fresh} 个),已勾选 {p1} 个",
-                    &[
-                        ("pics", pics.to_string()),
-                        ("fresh", fresh.to_string()),
-                        ("p1", (self.import_sel.len()).to_string()),
-                    ],
+            let sel: Vec<PathBuf> = self
+                .import_sel
+                .iter()
+                .filter_map(|&i| self.import_entries.get(i))
+                .filter(|e| !e.is_dir && !e.in_library)
+                .map(|e| e.path.clone())
+                .collect();
+            let has_src = self.import_src.is_some();
+
+            // 提示行(弱化小字):导入含义 + 当前源与计数。
+            ui.small(t("导入 = 登记该目录进图库并建索引,不移动、不改写原文件。"));
+            if let Some(src) = &self.import_src {
+                ui.horizontal(|ui| {
+                    ui.small(
+                        egui::RichText::new(src.display().to_string())
+                            .color(crate::theme::p().accent),
+                    )
+                    .on_hover_text(t("当前导入源目录"));
+                    ui.small(t_with(
+                        "{pics} 个可入库文件(未入库 {fresh} 个),已勾选 {p1} 个",
+                        &[
+                            ("pics", pics.to_string()),
+                            ("fresh", fresh.to_string()),
+                            ("p1", (self.import_sel.len()).to_string()),
+                        ],
+                    ));
+                });
+            } else {
+                ui.small(t(
+                    "左侧还没有可浏览的源:选一个文件夹,或点「浏览其他文件夹…」。",
                 ));
+            }
+            ui.add_space(6.0);
+
+            // 动作行:纯图标,悬停显示操作说明。
+            let mut back = false;
+            let mut browse = false;
+            let mut refresh = false;
+            let mut select_all = false;
+            let mut select_none = false;
+            let mut import_sel_go = false;
+            let mut import_all_go = false;
+            ui.horizontal(|ui| {
+                back = icon_action(ui, "arrow-left", t("返回图库"), true);
+                browse = icon_action(ui, "folder-open", t("浏览其他文件夹…"), true);
+                refresh = icon_action(ui, "refresh", t("刷新清单"), has_src);
+                ui.separator();
+                select_all = icon_action(ui, "square-check", t("全选照片"), pics > 0);
+                select_none =
+                    icon_action(ui, "square", t("全不选"), !self.import_sel.is_empty());
+                ui.separator();
+                import_sel_go = icon_action(
+                    ui,
+                    "download",
+                    &t_with("导入所选({p1})", &[("p1", (sel.len()).to_string())]),
+                    !sel.is_empty(),
+                );
+                import_all_go = icon_action(ui, "folder-plus", t("导入整个文件夹"), has_src);
             });
+            ui.separator();
+            if back {
+                self.go_page(PageKind::Library);
+            }
+            if browse {
+                if let Some(dir) = rfd::FileDialog::new()
+                    .set_title(t("选择导入源文件夹"))
+                    .pick_folder()
+                {
+                    self.set_import_source(dir);
+                }
+            }
+            if refresh {
+                self.refresh_import_entries();
+            }
+            if select_all {
+                self.import_sel = (0..self.import_entries.len())
+                    .filter(|&i| !self.import_entries[i].is_dir)
+                    .collect();
+            }
+            if select_none {
+                self.import_sel.clear();
+            }
+            if import_sel_go {
+                self.import_selected(sel.clone());
+            }
+            if import_all_go {
+                self.import_whole_folder();
+            }
 
             // 清单本体:把表取出来画,画完回填 —— 逐帧 clone 大目录是白活。
             let entries = std::mem::take(&mut self.import_entries);
@@ -4850,49 +5272,14 @@ impl App {
                             }
                         });
                     }
-                    if entries.is_empty() {
+                    if entries.is_empty() && has_src {
                         ui.small(t("这个目录里没有可入库的图片(或子目录)。"));
                     }
                 });
-            let sel: Vec<PathBuf> = self
-                .import_sel
-                .iter()
-                .filter_map(|&i| entries.get(i))
-                .filter(|e| !e.is_dir && !e.in_library)
-                .map(|e| e.path.clone())
-                .collect();
             self.import_entries = entries;
             if let Some(d) = descend {
                 self.set_import_source(d);
             }
-
-            // 动作行。
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.small(t("导入 = 登记该目录进图库并建索引,不移动、不改写原文件。"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .add_enabled(
-                            !sel.is_empty(),
-                            egui::Button::new(t_with(
-                                "导入所选({p1})",
-                                &[("p1", (sel.len()).to_string())],
-                            )),
-                        )
-                        .on_hover_text(t("只把勾选的文件逐张入库(有进度,可取消)"))
-                        .clicked()
-                    {
-                        self.import_selected(sel.clone());
-                    }
-                    if ui
-                        .button(t("导入整个文件夹"))
-                        .on_hover_text(t("登记该目录并扫描(含子目录)"))
-                        .clicked()
-                    {
-                        self.import_whole_folder();
-                    }
-                });
-            });
         });
     }
 
@@ -5555,6 +5942,42 @@ impl App {
         }
     }
 
+    /// 后台相似人脸检索:全库余弦不放 UI 线程;在途时只记一次重跑。
+    #[cfg(feature = "ai")]
+    fn start_face_similar(&mut self, qid: i64) {
+        self.face_similar_for = Some(qid);
+        if self.face_sim_rx.is_some() {
+            self.face_sim_pending = true;
+            return;
+        }
+        let store = self.store.clone();
+        let thr = self.face_similar_thr;
+        let (tx, rx) = mpsc::channel();
+        self.face_sim_rx = Some(rx);
+        self.status = t("正在全库检索相似人脸…").into();
+        std::thread::spawn(move || {
+            let hits = crate::faces::similar_faces(&store, qid, thr, 60, false);
+            let _ = tx.send((qid, thr, hits));
+        });
+    }
+
+    /// 后台全量重聚类:与扫描共用互斥,忙时按钮禁用。
+    #[cfg(feature = "ai")]
+    fn start_recluster(&mut self) {
+        if self.recluster_rx.is_some() {
+            return;
+        }
+        let store = self.store.clone();
+        let thr = crate::faces::cluster_thr(&store);
+        let (tx, rx) = mpsc::channel();
+        self.recluster_rx = Some(rx);
+        self.status = t("正在重新聚类…").into();
+        std::thread::spawn(move || {
+            let res = crate::faces::recluster_all(&store, thr).map_err(|e| e.to_string());
+            let _ = tx.send(res);
+        });
+    }
+
     /// 后台人脸识别扫描(M2c):加载模型分析一批未分析照片并入库存簇。
     #[cfg(feature = "ai")]
     fn start_face_scan(&mut self) {
@@ -5599,6 +6022,7 @@ impl App {
             &[("remaining", remaining.to_string())],
         );
         std::thread::spawn(move || {
+            crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
             // 连续扫描直到队列空:此前单批 200 张,无人脸照片永远卡住队列,
             // 覆盖整个库要点几百次;face_done 标记修复后一次即可扫完,可取消。
             let res = crate::faces::scan_all(&store, 200, &cancel, &|done, total| {
@@ -5652,7 +6076,11 @@ impl App {
             }
         }
         let include_ignored = self.face_show_ignored;
-        let min_q = if self.face_hide_low { 0.4 } else { 0.0 };
+        let min_q = if self.face_hide_low {
+            FACE_LOW_QUALITY
+        } else {
+            0.0
+        };
         self.face_hits = match (self.sel_person, self.sel_cluster) {
             (Some(pid), _) => {
                 crate::faces::faces_for_person(&self.store, pid, include_ignored, min_q)
@@ -5668,6 +6096,7 @@ impl App {
     #[cfg(feature = "ai")]
     fn check_face_algo_version(&mut self) {
         if crate::faces::pending_rebuild(&self.store) {
+            crate::faces::drop_people_tags(&self.store);
             self.face_version_warn = true;
             return;
         }
@@ -5704,6 +6133,37 @@ impl App {
         });
     }
 
+    /// 以图搜图:用一张照片查全库相似照片,复用语义搜索的后台通道与结果网格。
+    #[cfg(feature = "ai")]
+    fn start_image_search(&mut self, photo_id: i64) {
+        if self.clip_search_rx.is_some() {
+            self.status = t("语义搜索进行中…").into();
+            return;
+        }
+        let path = self
+            .photo_path(photo_id)
+            .or_else(|| self.store.photo_path_by_id(photo_id));
+        let Some(path) = path else {
+            self.status = t("照片不存在").into();
+            return;
+        };
+        let name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or(path);
+        let store = self.store.clone();
+        let (tx, rx) = mpsc::channel();
+        self.clip_search_rx = Some(rx);
+        self.clip_results.clear();
+        self.clip_image_query = Some(name.clone());
+        self.set_view(ViewKind::Semantic);
+        self.status = t_with("正在搜相似照片:{p1}", &[("p1", name)]);
+        std::thread::spawn(move || {
+            let res = crate::clip::search_by_photo(&store, photo_id, 200);
+            let _ = tx.send(res);
+        });
+    }
+
     /// 后台语义搜索(M4b):编码查询文本,与入库嵌入算余弦排序。
     /// 查询语言自动探测(含 CJK → 中文模型);对应语言无索引时给出提示。
     #[cfg(feature = "ai")]
@@ -5712,6 +6172,7 @@ impl App {
             self.status = t("语义搜索进行中…").into();
             return;
         }
+        self.clip_image_query = None;
         let store = self.store.clone();
         let natural = crate::clip::natural_ready(&store);
         let lang = crate::clip::Lang::detect(&query);
@@ -5755,7 +6216,7 @@ impl App {
             } else {
                 parsed.text.clone()
             };
-            let res: Result<(Vec<(i64, f32)>, Option<String>), String> =
+            let res: Result<(Vec<(i64, Option<f32>)>, Option<String>), String> =
                 match crate::clip::search_best(&store, &text, 200) {
                     Ok((mut hits, used_natural)) => {
                         // 分类与时间过滤只在新链路上生效,旧模型没有对应数据。
@@ -5856,11 +6317,7 @@ impl App {
             }
             #[cfg(not(feature = "ai"))]
             ViewKind::Faces => Vec::new(),
-            ViewKind::Tags => self
-                .sel_tag
-                .as_deref()
-                .and_then(|t| timeline::photos_by_tag(&self.store, t).ok())
-                .unwrap_or_default(),
+            ViewKind::Tags => self.tags_scope(),
             #[cfg(feature = "ai")]
             ViewKind::Semantic => {
                 let mut seen = BTreeSet::new();
@@ -7731,34 +8188,23 @@ impl App {
                     }
                 }
                 if ui.small_button(t("找相似人脸")).clicked() {
-                    let thr = self.face_similar_thr;
-                    self.face_similar =
-                        crate::faces::similar_faces(&self.store, f.face_id, thr, 60, false);
-                    self.face_similar_for = Some(f.face_id);
-                    self.status = t_with(
-                        "已在全库找到 {n} 个相近人脸",
-                        &[("n", self.face_similar.len().to_string())],
-                    );
+                    self.start_face_similar(f.face_id);
                 }
                 if ui
                     .small_button(if f.ignored { t("恢复") } else { t("忽略") })
                     .clicked()
                 {
-                    match f.cluster {
-                        Some(cluster) => {
-                            let _ =
-                                crate::faces::ignore_cluster(&self.store, cluster, !f.ignored);
-                        }
-                        None => {
-                            let _ = crate::faces::set_ignored(
-                                &self.store,
-                                &[f.face_id],
-                                !f.ignored,
-                            );
-                        }
-                    }
+                    let _ =
+                        crate::faces::set_ignored(&self.store, &[f.face_id], !f.ignored);
                     self.face_show_ignored = true;
                     self.refresh_people_and_suggestions();
+                }
+                if let Some(cluster) = f.cluster {
+                    if !f.ignored && ui.small_button(t("忽略此组")).clicked() {
+                        let _ = crate::faces::ignore_cluster(&self.store, cluster, true);
+                        self.face_show_ignored = true;
+                        self.refresh_people_and_suggestions();
+                    }
                 }
             });
             if self.face_name_draft.as_ref().map(|(k, _)| *k) == Some(f.face_id) {
@@ -7827,7 +8273,7 @@ impl App {
             .changed()
         {
             self.face_similar_thr = thr;
-            self.face_similar = crate::faces::similar_faces(&self.store, qid, thr, 60, false);
+            self.start_face_similar(qid);
         }
         if qface.person_id.is_none() {
             ui.small(t("当前脸还未归入人物;先命名再点「加入此人物」。"));
@@ -7914,13 +8360,7 @@ impl App {
             Some(Ok(msg)) => {
                 self.status = msg;
                 self.refresh_people_and_suggestions();
-                self.face_similar = crate::faces::similar_faces(
-                    &self.store,
-                    qid,
-                    self.face_similar_thr,
-                    60,
-                    false,
-                );
+                self.start_face_similar(qid);
             }
             Some(Err(e)) => {
                 self.status = t_with("操作失败: {e}", &[("e", e.to_string())]);
@@ -8165,17 +8605,56 @@ impl App {
         });
     }
 
+    /// 标签视图当前筛选出的照片(展示与选择/导出共用同一范围)。
+    fn tags_scope(&self) -> Vec<i64> {
+        #[cfg(feature = "ai")]
+        return tags_scope_ids(
+            &self.store,
+            &self.ai_query,
+            &self.ai_query_hits,
+            self.sel_category.as_deref(),
+            self.sel_tag.as_deref(),
+        );
+        #[cfg(not(feature = "ai"))]
+        return tags_scope_ids(&self.store, "", &[], None, self.sel_tag.as_deref());
+    }
+
+    /// AI 分类与计数(5 秒缓存):侧栏与设置页共用,不每帧查库。
+    #[cfg(feature = "ai")]
+    fn ai_categories(&mut self) -> Vec<(&'static str, &'static str, usize)> {
+        let fresh = self
+            .ai_category_cache
+            .as_ref()
+            .map(|(t, _)| t.elapsed() < std::time::Duration::from_secs(5))
+            .unwrap_or(false);
+        if !fresh {
+            let ver =
+                crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+            let counts = crate::ai_tags::category_counts(&self.store, &ver);
+            let list = crate::ai_tags::CATEGORIES
+                .iter()
+                .zip(counts)
+                .map(|((node, label), (_, n))| (*node, *label, n))
+                .collect();
+            self.ai_category_cache = Some((std::time::Instant::now(), list));
+        }
+        self.ai_category_cache
+            .as_ref()
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
     /// 标签视图:库内检索 / AI 分类 / 手动标签三种筛选。
     fn tags_view(&mut self, ui: &mut egui::Ui) {
+        let ids = self.tags_scope();
+        let cells: Vec<usize> = ids
+            .iter()
+            .filter_map(|id| self.id_row.get(id).copied())
+            .collect();
         #[cfg(feature = "ai")]
         {
             let q = self.ai_query.trim().to_string();
             if !q.is_empty() {
-                let cells: Vec<usize> = self
-                    .ai_query_hits
-                    .iter()
-                    .filter_map(|id| self.id_row.get(id).copied())
-                    .collect();
                 ui.heading(t_with(
                     "库内检索 «{p1}» · {p2} 张",
                     &[("p1", q), ("p2", (cells.len()).to_string())],
@@ -8187,25 +8666,27 @@ impl App {
                 return;
             }
             if let Some(node) = self.sel_category.clone() {
-                let ver =
-                    crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
-                let ids = crate::ai_tags::category_ids(&self.store, &node, &ver, 2000);
-                let cells: Vec<usize> = ids
-                    .iter()
-                    .filter_map(|id| self.id_row.get(id).copied())
-                    .collect();
                 let name = crate::ai_tags::CATEGORIES
                     .iter()
                     .find(|(n, _)| *n == node.as_str())
                     .map(|(_, l)| *l)
                     .unwrap_or("");
+                let ver =
+                    crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+                let total = crate::ai_tags::category_count(&self.store, &node, &ver);
                 ui.heading(t_with(
                     "分类 «{p1}» · {p2} 张",
-                    &[
-                        ("p1", t(name).to_string()),
-                        ("p2", (cells.len()).to_string()),
-                    ],
+                    &[("p1", t(name).to_string()), ("p2", total.to_string())],
                 ));
+                if total > ids.len() {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        t_with(
+                            "仅显示前 {p1} 张,用库内检索可缩小范围。",
+                            &[("p1", ids.len().to_string())],
+                        ),
+                    );
+                }
                 if cells.is_empty() {
                     ui.label(t("该分类下还没有照片。"));
                 }
@@ -8213,22 +8694,12 @@ impl App {
                 return;
             }
         }
-        self.tags_plain_view(ui);
-    }
-
-    /// 手动标签:选中标签后展示该标签下的照片。
-    fn tags_plain_view(&mut self, ui: &mut egui::Ui) {
         match self.sel_tag.clone() {
             None => {
                 ui.heading(t("标签"));
                 ui.label(t("左侧选择一个标签,查看标有该标签的照片。"));
             }
             Some(tag) => {
-                let ids = timeline::photos_by_tag(&self.store, &tag).unwrap_or_default();
-                let cells: Vec<usize> = ids
-                    .iter()
-                    .filter_map(|id| self.id_row.get(id).copied())
-                    .collect();
                 ui.heading(t_with("标签 «{tag}» · {p1} 张", &[("tag", tag.to_string()), ("p1", (cells.len()).to_string())]));
                 self.photo_grid(ui, "tags-grid", &cells);
             }
@@ -8361,7 +8832,6 @@ impl App {
                     }
                 });
         });
-        let tag_ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
         ui.small(t_with(
             "词表 {p1} 条 · 语义向量 {p2} 条 · OCR 文档 {p3} 篇 · 人脸约束 {p4} 条",
             &[
@@ -8378,9 +8848,9 @@ impl App {
                 ("p4", (crate::ai_review::all(&self.store).len()).to_string()),
             ],
         ));
-        let counts = crate::ai_tags::category_counts(&self.store, &tag_ver);
+        let counts = self.ai_categories();
         ui.horizontal_wrapped(|ui| {
-            for (name, n) in counts {
+            for (_, name, n) in counts {
                 if n > 0 {
                     ui.small(format!("{}:{n}", t(name)));
                 }
@@ -8831,8 +9301,19 @@ impl App {
                             t("更改后,数据库/全盘索引/模型在下次启动时复制到新目录(原目录文件保留);本会话继续用原目录。"),
                         );
                         ui.small(
-                            t("索引服务认的是安装时记下的数据目录;改过目录后要先「卸载索引服务…」再重新安装,它才会跟着搬。"),
+                            t("索引服务会跟随新数据目录:迁移完成后自动更新机器级标记;服务正在运行时点「重启索引服务」立刻生效。"),
                         );
+                        #[cfg(windows)]
+                        if crate::db::data_migrated_this_run()
+                            && matches!(
+                                crate::win::service_state(),
+                                crate::win::ServiceState::Running
+                            )
+                        {
+                            if ui.button(t("重启索引服务(应用新数据目录)")).clicked() {
+                                self.svc_restart();
+                            }
+                        }
                         ui.separator();
                         // 缩略图缓存:库搬到大盘时缓存跟着走,不再默默写系统盘。
                         ui.heading(egui::RichText::new(t("缩略图缓存")).size(14.0));
@@ -9739,6 +10220,655 @@ impl App {
         }
     }
 
+    /// 左栏「文件夹」抽屉明细:目录树 / 平铺列表。
+    fn nav_folder_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new(t("文件夹"))
+                    .size(12.0)
+                    .color(crate::theme::p().muted)
+                    .strong(),
+            );
+            ui.with_layout(
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| {
+                    let tip = format!(
+                        "{} — {}",
+                        t("全部文件夹"),
+                        t("中间栏一次铺开所有文件夹(每组一个相册头)")
+                    );
+                    if icon_toggle(ui, "images", &tip, self.folder_show_all) {
+                        self.folder_show_all = true;
+                        self.subtree_sel = None;
+                    }
+                },
+            );
+        });
+        if self.folder_tree {
+            // 真递归目录树:每层缩进,三角展开/收起;
+            // 只有装了照片的目录才是可选项(点父级 = 展开)。
+            self.folder_tree_ui(ui, ctx);
+        } else {
+            // 扁平文件夹视图(平铺列表)。
+            for (i, f) in self.folders.clone().iter().enumerate() {
+                let on = !self.folder_show_all && self.selected_folder == i;
+                if ui.selectable_label(on, f).clicked() {
+                    self.selected_folder = i;
+                    self.subtree_sel = None;
+                    self.folder_show_all = false;
+                    // 平铺列表同样是「进目录」:树形那条点完会补派生账,
+                    // 这里漏掉就让两种文件夹视图行为不一致。
+                    self.enter_dir(f);
+                    self.tree_reveal(f);
+                }
+            }
+        }
+    }
+
+    /// 左栏「相簿」抽屉明细:新建 / 列表 / 重命名 / 删除。
+    fn nav_albums_detail(&mut self, ui: &mut egui::Ui) {
+        crate::theme::section_title(ui, t("相簿"));
+        let albums = self.store.albums();
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.album_input)
+                    .hint_text(t("新相簿名称")),
+            );
+            if ui.button(t("新建")).clicked() && !self.album_input.trim().is_empty()
+            {
+                match self.store.album_create(self.album_input.trim()) {
+                    Ok(aid) => {
+                        self.sel_album = Some(aid);
+                        self.album_input.clear();
+                    }
+                    Err(e) => {
+                        self.fx_msg =
+                            t_with("新建相簿失败: {e}", &[("e", e.to_string())])
+                    }
+                }
+            }
+        });
+        ui.separator();
+        for (aid, name, n) in albums {
+            if ui
+                .selectable_label(
+                    self.sel_album == Some(aid),
+                    t_with(
+                        "{name} · {n} 张",
+                        &[("name", name.to_string()), ("n", n.to_string())],
+                    ),
+                )
+                .clicked()
+            {
+                self.sel_album = Some(aid);
+            }
+        }
+        if let Some(a) = self.sel_album {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.album_input)
+                        .hint_text(t("重命名为")),
+                );
+                if ui.button(t("重命名")).clicked()
+                    && !self.album_input.trim().is_empty()
+                {
+                    if let Err(e) =
+                        self.store.album_rename(a, self.album_input.trim())
+                    {
+                        self.fx_msg =
+                            t_with("重命名失败: {e}", &[("e", e.to_string())]);
+                    } else {
+                        self.album_input.clear();
+                    }
+                }
+            });
+            if ui.button(t("删除当前相簿")).clicked() {
+                let _ = self.store.album_delete(a);
+                self.sel_album = None;
+            }
+        }
+    }
+
+    /// 左栏「标签」抽屉明细:检索、AI 分类与标签树。
+    fn nav_tags_detail(&mut self, ui: &mut egui::Ui) {
+        crate::theme::section_title(ui, t("标签"));
+        #[cfg(feature = "ai")]
+        {
+            ui.label(t("库内检索:标签、图中文字或描述"));
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.ai_query)
+                    .hint_text(t("输入标签名 / 图中文字 / 描述,即输即搜…"))
+                    .desired_width(f32::INFINITY),
+            );
+            if resp.changed() {
+                self.sel_tag = None;
+                self.sel_category = None;
+                self.ai_query_hits.clear();
+                let q = self.ai_query.trim().to_string();
+                if !q.is_empty() {
+                    let tag_ver = crate::ai_queue::stage_version(
+                        &self.store,
+                        crate::ai_queue::Stage::Tags,
+                    );
+                    let tags = crate::ai_search::tag_search(
+                        &self.store, &tag_ver, &q, 200,
+                    );
+                    let ocr =
+                        crate::ai_ocr::search(&self.store, &q, 200);
+                    let cap = crate::ai_search::caption_search(
+                        &self.store, &q, 200,
+                    );
+                    self.ai_query_hits = crate::ai_search::fuse(
+                        &[tags, ocr, cap],
+                        60.0,
+                        200,
+                    )
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                }
+            }
+            ui.separator();
+            ui.label(t("AI 分类"));
+            let cats = self.ai_categories();
+            for (node, label, n) in cats {
+                let resp = ui.selectable_label(
+                    self.sel_category.as_deref() == Some(node),
+                    t_with(
+                        "{p1}  ·  {p2} 张",
+                        &[
+                            ("p1", t(label).to_string()),
+                            ("p2", (n).to_string()),
+                        ],
+                    ),
+                );
+                if resp.clicked() {
+                    if self.sel_category.as_deref() == Some(node) {
+                        self.sel_category = None;
+                    } else {
+                        self.sel_category = Some(node.to_string());
+                        self.sel_tag = None;
+                        self.ai_query.clear();
+                        self.ai_query_hits.clear();
+                    }
+                }
+            }
+            ui.separator();
+        }
+        ui.label(t_with(
+            "共 {p1} 个(右键设颜色/重命名/删除)",
+            &[("p1", (self.tags.len()).to_string())],
+        ));
+        if self.tag_rename.is_some() {
+            let old = self.tag_rename.as_ref().unwrap().0.clone();
+            let mut confirm = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.label(t_with(
+                    "重命名 «{p1}»",
+                    &[("p1", old.clone())],
+                ));
+                if let Some((_, input)) = self.tag_rename.as_mut() {
+                    ui.add(
+                        egui::TextEdit::singleline(input)
+                            .hint_text(t("新标签名")),
+                    );
+                }
+                confirm = ui.button(t("重命名")).clicked();
+                cancel = ui.button(t("取消")).clicked();
+            });
+            if cancel {
+                self.tag_rename = None;
+            } else if confirm {
+                let new = self
+                    .tag_rename
+                    .as_ref()
+                    .map(|(_, s)| s.trim().to_string())
+                    .unwrap_or_default();
+                match timeline::rename_tag(&self.store, &old, &new) {
+                    Ok(ids) => {
+                        if self.sel_tag.as_deref() == Some(old.as_str()) {
+                            self.sel_tag = Some(new.clone());
+                        }
+                        for id in ids {
+                            let star = self.star_of(id);
+                            self.sync_sidecars(id, star);
+                        }
+                        self.tags = timeline::all_tags(&self.store)
+                            .unwrap_or_default();
+                        self.tag_rename = None;
+                        self.status = t("标签已重命名").into();
+                    }
+                    Err(_) => {
+                        self.status =
+                            t("重命名失败:名称为空或已存在").into();
+                    }
+                }
+            }
+        }
+        if let Some(name) = self.tag_delete.clone() {
+            let n = self
+                .tags
+                .iter()
+                .find(|x| x.name == name)
+                .map(|x| x.count)
+                .unwrap_or(0);
+            let mut confirm = false;
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                ui.label(t_with(
+                    "确定删除标签 «{p1}»(含子标签)? 将同时从 {p2} 张照片上移除",
+                    &[("p1", name.clone()), ("p2", n.to_string())],
+                ));
+                confirm = ui.button(t("删除")).clicked();
+                cancel = ui.button(t("取消")).clicked();
+            });
+            if cancel {
+                self.tag_delete = None;
+            } else if confirm {
+                match timeline::delete_tag(&self.store, &name) {
+                    Ok(ids) => {
+                        if self.sel_tag.as_deref() == Some(name.as_str()) {
+                            self.sel_tag = None;
+                        }
+                        for id in ids {
+                            let star = self.star_of(id);
+                            self.sync_sidecars(id, star);
+                        }
+                        self.tags = timeline::all_tags(&self.store)
+                            .unwrap_or_default();
+                        self.tag_delete = None;
+                        self.status = t("标签已删除").into();
+                    }
+                    Err(_) => {
+                        self.status = t("删除标签失败").into();
+                    }
+                }
+            }
+        }
+        // 标签只渲染一份:层级缩进 + 色标 + 右键菜单都在同一行上。
+        for (depth, label, path, count, real) in tag_tree_rows(&self.tags) {
+            let color = self
+                .tags
+                .iter()
+                .find(|x| x.name == path)
+                .and_then(|x| x.color.clone());
+            ui.horizontal(|ui| {
+                ui.add_space(depth as f32 * 12.0);
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(10.0, 10.0),
+                    egui::Sense::hover(),
+                );
+                if real {
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        tag_color(color.as_deref())
+                            .unwrap_or_else(|| egui::Color32::from_gray(90)),
+                    );
+                }
+                let text = if real {
+                    t_with(
+                        "{p1}  ·  {p2} 张",
+                        &[("p1", label), ("p2", count.to_string())],
+                    )
+                } else {
+                    label
+                };
+                let resp = ui.selectable_label(
+                    self.sel_tag.as_deref() == Some(path.as_str()),
+                    text,
+                );
+                if resp.clicked() {
+                    // 再次点击已选中的标签 = 取消筛选(回到全部)
+                    if self.sel_tag.as_deref() == Some(path.as_str()) {
+                        self.sel_tag = None;
+                    } else {
+                        self.sel_tag = Some(path.clone());
+                    }
+                    #[cfg(feature = "ai")]
+                    {
+                        self.sel_category = None;
+                        self.ai_query.clear();
+                        self.ai_query_hits.clear();
+                    }
+                }
+                if !real {
+                    return;
+                }
+                resp.context_menu(|ui| {
+                    ui.label(crate::i18n::t("标签颜色"));
+                    for (cname, cval) in TAG_COLORS {
+                        let mark = if Some(cval) == tag_color(color.as_deref()) {
+                            "● "
+                        } else {
+                            "○ "
+                        };
+                        if ui
+                            .button(format!(
+                                "{mark}{}",
+                                crate::i18n::t(tag_color_name(cname))
+                            ))
+                            .clicked()
+                        {
+                            let _ = timeline::set_tag_color(
+                                &self.store,
+                                &path,
+                                Some(cname),
+                            );
+                            self.tags = timeline::all_tags(&self.store)
+                                .unwrap_or_default();
+                            ui.close();
+                        }
+                    }
+                    if ui.button(crate::i18n::t("无颜色")).clicked() {
+                        let _ = timeline::set_tag_color(&self.store, &path, None);
+                        self.tags = timeline::all_tags(&self.store)
+                            .unwrap_or_default();
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .button(crate::i18n::t("重命名标签"))
+                        .clicked()
+                    {
+                        self.tag_rename = Some((path.clone(), path.clone()));
+                        self.tag_delete = None;
+                        ui.close();
+                    }
+                    if ui.button(crate::i18n::t("删除标签")).clicked() {
+                        self.tag_delete = Some(path.clone());
+                        self.tag_rename = None;
+                        ui.close();
+                    }
+                });
+            });
+        }
+    }
+
+    #[cfg(feature = "ai")]
+    /// 左栏「人物」抽屉明细:聚类列表与命名建议。
+    fn nav_faces_detail(&mut self, ui: &mut egui::Ui) {
+        crate::theme::section_title(ui, t("人物"));
+        ui.horizontal(|ui| {
+            let (hide, ignored) =
+                face_filter_row(ui, &mut self.face_hide_low, &mut self.face_show_ignored);
+            if hide.changed() || ignored.changed() {
+                self.refresh_face_hits();
+            }
+        });
+        ui.label(t_with(
+            "共 {p1} 组 · 未分析 {p2} 张",
+            &[
+                ("p1", (self.face_people.len()).to_string()),
+                (
+                    "p2",
+                    (crate::faces::remaining_count(&self.store)).to_string(),
+                ),
+            ],
+        ));
+        // 全量重聚类:向量重排簇号,身份按成员多数票继承。
+        let failed = crate::faces::failed_count(&self.store);
+        let unassigned = crate::faces::unassigned_count(&self.store);
+        if unassigned > 0 {
+            ui.colored_label(
+                crate::theme::p().accent,
+                t_with(
+                    "未归簇 {p1} 脸 · 点「重新聚类」收齐",
+                    &[("p1", unassigned.to_string())],
+                ),
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.recluster_rx.is_none(),
+                    egui::Button::new(t("重新聚类")),
+                )
+                .clicked()
+            {
+                self.start_recluster();
+            }
+            if failed > 0
+                && ui
+                    .button(t_with(
+                        "重试失败 ({p1})",
+                        &[("p1", failed.to_string())],
+                    ))
+                    .clicked()
+            {
+                match crate::faces::retry_failed(&self.store) {
+                    Ok(n) => {
+                        self.status = t_with(
+                            "已重新排队 {n} 张失败照片",
+                            &[("n", n.to_string())],
+                        );
+                        self.refresh_people_and_suggestions();
+                        if n > 0 {
+                            self.start_face_scan();
+                        }
+                    }
+                    Err(e) => {
+                        self.status = t_with(
+                            "重试失败: {e}",
+                            &[("e", e.to_string())],
+                        );
+                    }
+                }
+            }
+        });
+        // 待命名组按相似度建议并入已有档案,不新建同名身份。
+        if !self.face_sugs.is_empty() {
+            ui.separator();
+            ui.label(t("命名建议:"));
+            for s in self.face_sugs.clone() {
+                ui.horizontal(|ui| {
+                    ui.label(t_with(
+                        "簇 {p1} → {p2} ({p3} · {p4} 张)",
+                        &[
+                            ("p1", (s.cluster).to_string()),
+                            ("p2", (s.name).to_string()),
+                            ("p3", format!("{p3:.2}", p3 = (s.score))),
+                            ("p4", (s.count).to_string()),
+                        ],
+                    ));
+                    if ui.small_button(t("并入人物")).clicked() {
+                        match crate::faces::merge_into_person(
+                            &self.store,
+                            s.cluster,
+                            s.person_id,
+                            s.target_person_id,
+                        ) {
+                            Ok(_) => {
+                                self.status = t_with(
+                                    "已并入:{name}",
+                                    &[("name", s.name.clone())],
+                                );
+                            }
+                            Err(e) => {
+                                self.status = t_with(
+                                    "并入失败: {e}",
+                                    &[("e", e.to_string())],
+                                );
+                            }
+                        }
+                        self.refresh_people_and_suggestions();
+                    }
+                });
+            }
+        }
+        for p in self.sorted_people() {
+            let display = p.person.clone().unwrap_or_else(|| {
+                match p.person_id {
+                    None => t_with(
+                        "未归属 · 簇 {p1}",
+                        &[("p1", (p.cluster).to_string())],
+                    )
+                    .to_string(),
+                    Some(pid) => t_with(
+                        "未命名人物 {p1}",
+                        &[("p1", pid.to_string())],
+                    )
+                    .to_string(),
+                }
+            });
+            let label = t_with(
+                "{display}  ·  {p1} 张  · 质量 {p2}",
+                &[
+                    ("display", display.to_string()),
+                    ("p1", (p.count).to_string()),
+                    ("p2", format!("{p2:.2}", p2 = (p.quality))),
+                ],
+            );
+            let selected = self.sel_person == p.person_id
+                && self.sel_cluster == Some(p.cluster);
+            if ui.selectable_label(selected, label).clicked() {
+                self.sel_person = p.person_id;
+                self.sel_cluster = Some(p.cluster);
+                self.refresh_face_hits();
+            }
+        }
+        // 已忽略簇(可选中后恢复)
+        if self.face_show_ignored {
+            for cid in crate::faces::ignored_clusters(&self.store) {
+                let label = t_with(
+                    "簇 {cid}  · 已忽略",
+                    &[("cid", cid.to_string())],
+                );
+                let selected = self.sel_person.is_none()
+                    && self.sel_cluster == Some(cid);
+                if ui.selectable_label(selected, label).clicked() {
+                    self.sel_person = None;
+                    self.sel_cluster = Some(cid);
+                    self.refresh_face_hits();
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ai")]
+    /// 左栏「语义搜索」抽屉明细:查询、模型状态与结果。
+    fn nav_semantic_detail(&mut self, ui: &mut egui::Ui) {
+        crate::theme::section_title(ui, t("语义搜索"));
+        let resp = ui.text_edit_singleline(&mut self.input_query);
+        let enter =
+            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if (enter || icon_action(ui, "search", t("搜索"), self.clip_search_rx.is_none()))
+            && self.clip_search_rx.is_none()
+        {
+            let q = self.input_query.trim().to_string();
+            if !q.is_empty() {
+                self.start_clip_search(q);
+            }
+        }
+        if self.clip_search_rx.is_some() {
+            ui.spinner();
+            ui.label(t("搜索中…"));
+        }
+        ui.separator();
+        // 索引语言单选(中英双模型;搜索按查询含 CJK 自动匹配)
+        ui.horizontal(|ui| {
+            ui.label(t("模型:"));
+            ui.selectable_value(
+                &mut self.clip_lang,
+                crate::clip::Lang::En,
+                t("英文"),
+            );
+            ui.selectable_value(
+                &mut self.clip_lang,
+                crate::clip::Lang::Zh,
+                t("中文"),
+            );
+        });
+        // 模型目录里实际放了哪些 .onnx:一个都没有就直说,
+        // 免得用户点了「语义索引」才在后台线程里撞到"模型缺失"。
+        let models = crate::ai::available_models();
+        if models.is_empty() {
+            ui.small(t("模型目录还没有 .onnx 模型文件,请先放入后再索引"));
+            ui.small(
+                crate::ai::models_dir()
+                    .map(|d| {
+                        t_with(
+                            "模型目录:{p1}",
+                            &[("p1", (d.display()).to_string())],
+                        )
+                    })
+                    .unwrap_or_default(),
+            );
+        } else {
+            ui.small(t_with(
+                "已装模型:{p1}",
+                &[("p1", (models.join("、")).to_string())],
+            ));
+        }
+        let natural = crate::clip::natural_ready(&self.store);
+        let indexed = crate::clip::progress(&self.store, self.clip_lang);
+        let total_zh =
+            crate::clip::clip_count_lang(&self.store, crate::clip::Lang::Zh);
+        let total_en =
+            crate::clip::clip_count_lang(&self.store, crate::clip::Lang::En);
+        ui.label(t_with(
+            "已索引({p1}){indexed} / {p2} 张",
+            &[
+                (
+                    "p1",
+                    if natural {
+                        t("语义向量").to_string()
+                    } else {
+                        self.clip_lang.label().to_string()
+                    },
+                ),
+                ("indexed", indexed.to_string()),
+                ("p2", (self.rows.len()).to_string()),
+            ],
+        ));
+        if indexed < self.rows.len() {
+            if natural {
+                ui.label(t("语义索引正在后台补建,稍后再试。"));
+            } else {
+                ui.label(t_with(
+                    "点 工具 > 语义索引 补嵌(当前{p1}模型,较慢)",
+                    &[("p1", (self.clip_lang.label()).to_string())],
+                ));
+            }
+        }
+        if total_en + total_zh > 0 {
+            ui.label(t_with(
+                "中/英索引量:{total_zh} / {total_en}",
+                &[
+                    ("total_zh", total_zh.to_string()),
+                    ("total_en", total_en.to_string()),
+                ],
+            ));
+        }
+        ui.separator();
+        ui.label(t_with(
+            "结果 {p1} 张",
+            &[("p1", (self.clip_results.len()).to_string())],
+        ));
+        for (pid, score) in self.clip_results.clone() {
+            let path = self
+                .id_row
+                .get(&pid)
+                .map(|&i| self.rows[i].path.clone())
+                .unwrap_or_default();
+            let fname = Path::new(&path)
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or(path);
+            let label = match score {
+                Some(s) => format!("{s:.3}  {fname}"),
+                None => format!("{}  {fname}", t("文本命中")),
+            };
+            if ui.selectable_label(false, label).clicked() {
+                if self.id_row.contains_key(&pid) {
+                    self.preview = Some(pid);
+                }
+            }
+        }
+    }
+
     /// 左栏一条导航项(条目后带 `(n)` 计数)。
     fn nav_item(&mut self, ui: &mut egui::Ui, label: &str, v: ViewKind, count: Option<usize>) {
         let active = self.view == v;
@@ -9996,6 +11126,43 @@ impl App {
         let _ = self
             .store
             .set_setting("folder_details", if details { "1" } else { "0" });
+    }
+
+    /// 重复照片视图的顶部工具条:近似开关(漏斗图标)+ 组数提示。
+    fn dups_toolbar_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if icon_toggle(
+                ui,
+                "funnel",
+                &t_with(
+                    "包含近似重复(hamming≤{NEAR_DUP_DIST})",
+                    &[("NEAR_DUP_DIST", NEAR_DUP_DIST.to_string())],
+                ),
+                self.dup_near,
+            ) {
+                self.dup_near = !self.dup_near;
+                self.dups = if self.dup_near {
+                    timeline::dup_groups_near(&self.store, NEAR_DUP_DIST).unwrap_or_default()
+                } else {
+                    timeline::dup_groups(&self.store).unwrap_or_default()
+                };
+            }
+            ui.separator();
+            let label = if self.dup_near {
+                t_with(
+                    "重复照片 {p1} 组(含近似)",
+                    &[("p1", (self.dups.len()).to_string())],
+                )
+            } else {
+                t_with("重复照片 {p1} 组", &[("p1", (self.dups.len()).to_string())])
+            };
+            ui.label(
+                egui::RichText::new(label)
+                    .size(11.0)
+                    .color(crate::theme::p().muted),
+            );
+        });
+        ui.separator();
     }
 
     /// 点选语义(网格格子与详细列表行共用):
@@ -10462,6 +11629,12 @@ impl App {
             };
             self.tag_batch_input.clear();
             self.tag_batch_open = true;
+            ui.close();
+        }
+        // 以图搜图(视频没有语义向量,不给入口)。
+        #[cfg(feature = "ai")]
+        if !t.movie && ui.button(crate::i18n::t("搜相似照片")).clicked() {
+            self.start_image_search(t.id);
             ui.close();
         }
         // 加入相簿(相簿不移动文件;已加入的打勾,点击移除)。
@@ -11302,6 +12475,241 @@ mod tests {
             r2.2 - r2.0
         );
     }
+
+    /// 标签视图的选择/导出范围必须跟着当前筛选走:库内检索 > AI 分类 > 手动标签。
+    #[test]
+    #[cfg(feature = "ai")]
+    fn tags_scope_matches_visible_filter() {
+        let store = Store::open_mem().unwrap();
+        crate::ai_tags::seed_labels(&store).unwrap();
+        for id in 1..=3i64 {
+            store
+                .write(|c| {
+                    c.execute(
+                        "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'.',0,0)",
+                        rusqlite::params![id, format!("p{id}.jpg")],
+                    )
+                })
+                .unwrap();
+        }
+        let ver = crate::ai_queue::stage_version(&store, crate::ai_queue::Stage::Tags);
+        let cat = store.read(|c| {
+            c.query_row(
+                "SELECT id FROM tag_labels WHERE node='动物/猫'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        });
+        crate::ai_tags::save(&store, 2, &ver, &[(cat, 0.9)]).unwrap();
+        timeline::add_tag(&store, 3, "旅行").unwrap();
+
+        assert!(tags_scope_ids(&store, "", &[], None, None).is_empty());
+        assert_eq!(tags_scope_ids(&store, "", &[], None, Some("旅行")), vec![3]);
+        // 选了分类就按分类取,残留的手动标签选择不参与。
+        assert_eq!(
+            tags_scope_ids(&store, "", &[], Some("动物"), Some("旅行")),
+            vec![2]
+        );
+        // 检索词非空时优先级最高,直接用命中集。
+        assert_eq!(
+            tags_scope_ids(&store, "猫", &[1, 2], Some("动物"), Some("旅行")),
+            vec![1, 2]
+        );
+        // 纯空白不算检索,回落到分类。
+        assert_eq!(
+            tags_scope_ids(&store, "   ", &[1], Some("动物"), None),
+            vec![2]
+        );
+    }
+
+    /// 标签列表只渲染一份:每个真实标签恰好一行,层级组节点不占标签名额。
+    #[test]
+    fn tag_tree_rows_lists_each_tag_once() {
+        let tags = vec![
+            timeline::TagInfo {
+                name: "旅行/2024".into(),
+                color: None,
+                count: 2,
+            },
+            timeline::TagInfo {
+                name: "旅行/2025".into(),
+                color: None,
+                count: 3,
+            },
+            timeline::TagInfo {
+                name: "猫".into(),
+                color: None,
+                count: 5,
+            },
+        ];
+        let rows = tag_tree_rows(&tags);
+        let mut paths: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        let n = paths.len();
+        paths.sort_unstable();
+        paths.dedup();
+        assert_eq!(paths.len(), n, "同一路径多行就会在界面上重复: {rows:?}");
+        let real: Vec<(&str, usize)> = rows
+            .iter()
+            .filter(|r| r.4)
+            .map(|r| (r.2.as_str(), r.3))
+            .collect();
+        assert_eq!(real.len(), tags.len(), "真实标签行数应等于标签数");
+        for t in &tags {
+            let hit = real.iter().find(|(p, _)| *p == t.name.as_str());
+            assert_eq!(hit.map(|(_, c)| *c), Some(t.count), "标签 {} 的行不对", t.name);
+        }
+        let group = rows.iter().find(|r| r.2 == "旅行").expect("应有层级组节点");
+        assert!(!group.4, "组节点不是真实标签");
+        assert_eq!(group.0, 0);
+        assert_eq!(
+            rows.iter().find(|r| r.2 == "旅行/2024").unwrap().0,
+            1,
+            "子标签要缩进一层"
+        );
+    }
+
+    /// 无窗口跑一帧:同一 Context 连续多帧,才能模拟真实的按下与抬起。
+    #[cfg(feature = "ai")]
+    fn ui_frame(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut f: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| f(ui));
+        })
+    }
+
+    #[cfg(feature = "ai")]
+    fn pointer_events(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            },
+        ]
+    }
+
+    /// 两个筛选开关都必须把点击报成「变了」,否则右侧人脸列表不会重算。
+    #[test]
+    #[cfg(feature = "ai")]
+    fn face_filter_row_reports_both_toggles() {
+        let ctx = egui::Context::default();
+        // (隐藏低质量, 显示已忽略, 本帧是否有变化, 两个开关的点击区)
+        let st = std::cell::RefCell::new((false, false, false, Vec::<egui::Rect>::new()));
+        let mut draw = |ui: &mut egui::Ui| {
+            let mut s = st.borrow_mut();
+            let (hide, ignored, changed, rects) = &mut *s;
+            ui.horizontal(|ui| {
+                let (a, b) = face_filter_row(ui, hide, ignored);
+                *changed = a.changed() || b.changed();
+                *rects = vec![a.rect, b.rect];
+            });
+        };
+        ui_frame(&ctx, vec![], &mut draw);
+        let rects = st.borrow().3.clone();
+        assert!(!st.borrow().2, "没点就不该报变化");
+        assert_eq!(rects.len(), 2);
+        assert!(
+            rects[0].width() > 0.0 && rects[1].width() > 0.0,
+            "开关应有可点区域: {rects:?}"
+        );
+        assert!(
+            rects[1].left() >= rects[0].right(),
+            "两个开关不应重叠: {rects:?}"
+        );
+
+        for (i, want) in [(0usize, true), (1usize, false)] {
+            let pos = rects[i].center();
+            ui_frame(&ctx, pointer_events(pos, true), &mut draw);
+            ui_frame(&ctx, pointer_events(pos, false), &mut draw);
+            let s = st.borrow();
+            assert!(s.2, "点第 {} 个开关必须报变化", i + 1);
+            assert_eq!(s.0, want, "「隐藏低质量」状态不对");
+            assert_eq!(s.1, !want, "「显示已忽略」状态不对");
+            drop(s);
+            // 再点一次应翻回去,证明不是只生效一次。
+            ui_frame(&ctx, pointer_events(pos, true), &mut draw);
+            ui_frame(&ctx, pointer_events(pos, false), &mut draw);
+            let s = st.borrow();
+            assert!(s.2, "回点也要报变化");
+            assert_eq!((s.0, s.1), (false, false), "回点后应复位");
+        }
+        // 空帧不该报变化。
+        ui_frame(&ctx, vec![], &mut draw);
+        assert!(!st.borrow().2, "无输入的帧不该报变化");
+    }
+
+    /// 「隐藏低质量」的门槛要真能挡掉低质量脸,且不误伤高质量脸。
+    #[test]
+    #[cfg(feature = "ai")]
+    fn hide_low_quality_filters_face_list() {
+        let store = Store::open_mem().unwrap();
+        store.write(|c| {
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0)",
+                [],
+            )
+            .unwrap();
+            for (id, q) in [(1i64, 0.9f64), (2, 0.2)] {
+                c.execute(
+                    "INSERT INTO faces(id,photo_id,x1,y1,x2,y2,cluster,score,quality,ignored)
+                     VALUES(?1,1,0,0,1,1,7,0.9,?2,0)",
+                    rusqlite::params![id, q],
+                )
+                .unwrap();
+            }
+        });
+        assert_eq!(crate::faces::faces_for_cluster(&store, 7, false, 0.0).len(), 2);
+        let hi = crate::faces::faces_for_cluster(&store, 7, false, FACE_LOW_QUALITY);
+        assert_eq!(hi.len(), 1, "低质量脸应被挡掉");
+        assert_eq!(hi[0].face_id, 1);
+        assert!(hi[0].quality >= FACE_LOW_QUALITY);
+    }
+
+    /// 两个破坏性入口都要红字警示,并把具体动作名写进警示里。
+    #[test]
+    #[cfg(feature = "ai")]
+    fn face_wipe_warning_paints_red_with_action() {
+        let ctx = egui::Context::default();
+        for action in ["清除并重新扫描", "切换并重建"] {
+            let out = ui_frame(&ctx, vec![], |ui| {
+                face_wipe_warning(ui, action);
+            });
+            let mut found = false;
+            for clipped in &out.shapes {
+                if let egui::Shape::Text(ts) = &clipped.shape {
+                    let text = ts.galley.text();
+                    if !text.contains("不可撤销") {
+                        continue;
+                    }
+                    assert!(text.contains(action), "警示应点明动作名: {text}");
+                    assert!(
+                        ts.galley
+                            .job
+                            .sections
+                            .iter()
+                            .any(|s| s.format.color == egui::Color32::LIGHT_RED),
+                        "警示必须是红字: {text}"
+                    );
+                    found = true;
+                }
+            }
+            assert!(found, "「{action}」的不可撤销警示没有画出来");
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -11348,6 +12756,15 @@ impl eframe::App for App {
                 }
             }
             self.model_prompt_window(ctx);
+        }
+        // 开机自动续扫:待办>0 且模型就位、非待重建、无在跑扫描时后台接着扫
+        // (范围沿用已记住的选择);只查一次,模型缺失不弹下载窗。
+        #[cfg(feature = "ai")]
+        if !self.face_resume_done {
+            self.face_resume_done = true;
+            if self.face_rx.is_none() && crate::faces::should_resume(&self.store) {
+                self.start_face_scan();
+            }
         }
         // 显示优先:上一帧真正画在屏幕上的目录整批发给后台 worker
         // 当第一优先 —— 用户看哪儿,缩略图就先补哪儿。在帧首发是为了拿得到「上一帧
@@ -11504,6 +12921,10 @@ impl eframe::App for App {
                 // 库里刚多了一批已生成记录,顺手刷新;不写 status ——
                 // 逐批覆盖会让状态栏文字一直跳,进度看「N缓存 x/y」就够了。
                 self.refresh_tier_count();
+                // 只有 Normal 档回写 thumb_ok,「最近更新」的入组门槛才跟着动。
+                if self.thumb_tier == crate::thumbs::Tier::Normal {
+                    self.recent_dirty = true;
+                }
                 // 缩略图就位且索引已启用才排入语义向量阶段。
                 #[cfg(feature = "ai")]
                 if self.ai_enabled {
@@ -11511,6 +12932,10 @@ impl eframe::App for App {
                 }
                 ctx.request_repaint();
             }
+        }
+        // 新缩略图落盘 → 「最近更新」按节流收人(尾批由后台定时重绘兜住)。
+        if self.recent_dirty && self.recent_at.elapsed() >= RECENT_REFRESH_GAP {
+            self.refresh_recent();
         }
         // 预览后台完成信号 → 清掉预览纹理缓存,让下一帧重新加载。
         if let Some(w) = &self.preview_bg {
@@ -11678,7 +13103,13 @@ impl eframe::App for App {
             let mut finished: Option<Result<(usize, usize), String>> = None;
             for m in msgs {
                 match m {
-                    FaceScan::Progress(done, total) => self.face_prog = (done, total),
+                    FaceScan::Progress(done, total) => {
+                        self.face_prog = (done, total);
+                        self.status = t_with(
+                            "正在人脸识别(全库连续扫描,剩余 {remaining} 张)…",
+                            &[("remaining", total.saturating_sub(done).to_string())],
+                        );
+                    }
                     FaceScan::Done(res) => finished = Some(res),
                 }
             }
@@ -11700,6 +13131,61 @@ impl eframe::App for App {
         }
         #[cfg(feature = "ai")]
         if self.face_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        // 相似人脸后台检索轮询:查询脸或阈值已变的结果直接丢弃。
+        #[cfg(feature = "ai")]
+        if let Some(rx) = &self.face_sim_rx {
+            if let Ok((qid, thr, hits)) = rx.try_recv() {
+                self.face_sim_rx = None;
+                if self.face_similar_for == Some(qid)
+                    && (thr - self.face_similar_thr).abs() < 1e-6
+                {
+                    let n = hits.len();
+                    self.face_similar = hits;
+                    self.status = t_with(
+                        "已在全库找到 {n} 个相近人脸",
+                        &[("n", n.to_string())],
+                    );
+                }
+                if self.face_sim_pending {
+                    self.face_sim_pending = false;
+                    if let Some(q) = self.face_similar_for {
+                        self.start_face_similar(q);
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "ai")]
+        if self.face_sim_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
+        // 全量重聚类轮询。
+        #[cfg(feature = "ai")]
+        if let Some(rx) = &self.recluster_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.recluster_rx = None;
+                match res {
+                    Ok(n) => {
+                        self.status = t_with(
+                            "重新聚类完成:共 {n} 簇",
+                            &[("n", n.to_string())],
+                        );
+                    }
+                    Err(e) => {
+                        self.status = t_with(
+                            "重新聚类失败: {e}",
+                            &[("e", e.to_string())],
+                        )
+                    }
+                }
+                self.sel_cluster = None;
+                self.sel_person = None;
+                self.refresh_people_and_suggestions();
+            }
+        }
+        #[cfg(feature = "ai")]
+        if self.recluster_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         // CLIP(M4b)语义索引轮询
@@ -12564,14 +14050,14 @@ impl eframe::App for App {
                             self.status = t_with("正在取消{verb}{p1}…", &[("verb", verb.to_string()), ("p1", (self.scan_scope).to_string())]);
                         }
                     }
-                    // 人脸扫描进度(分母 = 本批待分析张数;逐张回报,不会卡在 0%)。
+                    // 人脸扫描进度(分母 = 开扫时全库待分析张数;逐张回报,不会卡在 0%)。
                     #[cfg(feature = "ai")]
                     if self.face_rx.is_some() {
                         let (d, t) = self.face_prog;
-                        let frac = if t > 0 { d as f32 / t as f32 } else { 0.0 };
+                        let frac = if t > 0 { (d as f32 / t as f32).min(1.0) } else { 0.0 };
                         ui.separator();
                         ui.label(t_with("正在扫描人物… {p1}%", &[("p1", ((frac * 100.0).round() as i32).to_string())]))
-                            .on_hover_text(t_with("本批 {d}/{t} 张 · 全库剩 {p1} 张", &[("d", d.to_string()), ("t", t.to_string()), ("p1", (crate::faces::remaining_count(&self.store)).to_string())]));
+                            .on_hover_text(t_with("已完成 {d}/{t} 张 · 剩余 {p1} 张", &[("d", d.to_string()), ("t", t.to_string()), ("p1", t.saturating_sub(d).to_string())]));
                         ui.add(egui::ProgressBar::new(frac).desired_width(140.0));
                         if let Some(c) = &self.face_cancel {
                             if ui.button(crate::i18n::t("取消人物扫描")).clicked() {
@@ -12634,15 +14120,14 @@ impl eframe::App for App {
             .width_range(196.0..=360.0)
             .frame(crate::theme::side_frame())
             .show(ctx, |ui| {
-                // 导入页:左栏换成源选择,
+                // 导入页:左栏换成全盘目录树(点目录 = 设为导入源),
                 // 右栏抽屉/效果面板也一并收起,见对应开关。
                 if self.page == PageKind::Import {
-                    self.import_sources_ui(ui);
+                    self.import_tree_ui(ui);
                     return;
                 }
                 crate::theme::section_title(ui, t("库"));
-                // 左栏是四个可折叠分组头(相册 / 人物 / 文件夹 / 其他素材),
-                // 每条带 (n) 计数;分组区限高,下面留给随视图切换的明细面板。
+                // 单栏抽屉:四个可折叠分类,明细内联在所属分类下,整栏共用一条滚动。
                 let recent_n = self.recent_idxs.len();
                 let folders_n = self.folders.len();
                 let tags_n = self.tags.len();
@@ -12654,35 +14139,57 @@ impl eframe::App for App {
                     // egui 0.33 默认 auto_shrink 两轴都开,横向会缩到内容宽,
                     // 面板右半边留空;这里横向必须撑满。
                     .auto_shrink([false, true])
-                    .max_height(260.0)
                     .show(ui, |ui| {
                         egui::CollapsingHeader::new(egui::RichText::new(t("相册")).strong())
                             .default_open(true)
+                            .open(if self.nav_open_drawer == Some("相册") { Some(true) } else { None })
                             .show(ui, |ui| {
                                 self.nav_item(ui, t("最近更新"), ViewKind::Recent, Some(recent_n));
                                 self.nav_item(ui, t("相簿"), ViewKind::Albums, None);
+                                if self.view == ViewKind::Albums {
+                                    self.nav_albums_detail(ui);
+                                }
                             });
                         egui::CollapsingHeader::new(egui::RichText::new(t("人物")).strong())
                             .default_open(true)
+                            .open(if self.nav_open_drawer == Some("人物") { Some(true) } else { None })
                             .show(ui, |ui| {
                                 #[cfg(feature = "ai")]
-                                self.nav_item(ui, t("人物"), ViewKind::Faces, Some(people_n));
+                                {
+                                    self.nav_item(ui, t("人物"), ViewKind::Faces, Some(people_n));
+                                    if self.view == ViewKind::Faces {
+                                        self.nav_faces_detail(ui);
+                                    }
+                                }
                                 #[cfg(not(feature = "ai"))]
                                 ui.label(t("(未启用人物功能)"));
                             });
                         egui::CollapsingHeader::new(egui::RichText::new(t("文件夹")).strong())
                             .default_open(true)
+                            .open(if self.nav_open_drawer == Some("文件夹") { Some(true) } else { None })
                             .show(ui, |ui| {
-                                // 常用位置:四个壳目录。点了直接定位到图库里
-                                // 对应的目录,目录没导入时状态栏给出明确提示。
-                                for (label, path) in crate::win::common_places() {
-                                    if ui
-                                        .selectable_label(false, label)
-                                        .on_hover_text(t("定位到这个常用位置"))
-                                        .clicked()
-                                    {
-                                        self.goto_known_dir(path, label);
-                                    }
+                                // 常用位置:四个壳目录 + 用户导入目录。点了直接定位到
+                                // 图库里对应的目录,目录没导入时状态栏给出明确提示。
+                                for (label, path) in crate::db::common_dirs(&self.store) {
+                                    let imported = self
+                                        .store
+                                        .dir_intent(&path.to_string_lossy())
+                                        .is_some_and(|d| d.state == crate::db::INTENT_IMPORTED);
+                                    let color = if imported {
+                                        crate::theme::p().accent
+                                    } else {
+                                        crate::theme::p().muted
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.add(folder_icon_colored(color));
+                                        if ui
+                                            .selectable_label(false, label.as_str())
+                                            .on_hover_text(t("定位到这个常用位置"))
+                                            .clicked()
+                                        {
+                                            self.goto_known_dir(Some(path), &label);
+                                        }
+                                    });
                                 }
                                 // 「所有文件夹」是视图级入口:中间栏一次铺开全部目录。
                                 // 不能走 nav_item —— 视图已经是 Folder 时 set_view 会
@@ -12706,9 +14213,13 @@ impl eframe::App for App {
                                     self.folder_show_all = true;
                                     self.subtree_sel = None;
                                 }
+                                if self.view == ViewKind::Folder {
+                                    self.nav_folder_detail(ui, ctx);
+                                }
                             });
                         egui::CollapsingHeader::new(egui::RichText::new(t("其他素材")).strong())
                             .default_open(true)
+                            .open(if self.nav_open_drawer == Some("其他素材") { Some(true) } else { None })
                             .show(ui, |ui| {
                                 self.nav_item(ui, t("时间线"), ViewKind::Timeline, None);
                                 self.nav_item(ui, t("标签"), ViewKind::Tags, Some(tags_n));
@@ -12721,744 +14232,15 @@ impl eframe::App for App {
                                     Some(dups_n),
                                 );
                                 self.nav_item(ui, t("快速查找"), ViewKind::Search, None);
+                                match self.view {
+                                    ViewKind::Tags => self.nav_tags_detail(ui),
+                                    #[cfg(feature = "ai")]
+                                    ViewKind::Semantic => self.nav_semantic_detail(ui),
+                                    _ => {}
+                                }
                             });
                     });
-                ui.add_space(6.0);
-                ui.separator();
-                match self.view {
-                    ViewKind::Folder => {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(t("文件夹"))
-                                    .size(12.0)
-                                    .color(crate::theme::p().muted)
-                                    .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui
-                                        .small_button(t("全部文件夹"))
-                                        .on_hover_text(t(
-                                            "中间栏一次铺开所有文件夹(每组一个相册头)",
-                                        ))
-                                        .clicked()
-                                    {
-                                        self.folder_show_all = true;
-                                        self.subtree_sel = None;
-                                    }
-                                },
-                            );
-                        });
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                if self.folder_tree {
-                                    // 真递归目录树:每层缩进,三角展开/收起;
-                                    // 只有装了照片的目录才是可选项(点父级 = 展开)。
-                                    self.folder_tree_ui(ui, ctx);
-                                } else {
-                                    // 扁平文件夹视图(平铺列表)。
-                                    for (i, f) in self.folders.clone().iter().enumerate() {
-                                        let on = !self.folder_show_all && self.selected_folder == i;
-                                        if ui.selectable_label(on, f).clicked() {
-                                            self.selected_folder = i;
-                                            self.subtree_sel = None;
-                                            self.folder_show_all = false;
-                                            // 平铺列表同样是「进目录」:树形那条点完会补派生账,
-                                            // 这里漏掉就让两种文件夹视图行为不一致。
-                                            self.enter_dir(f);
-                                            self.tree_reveal(f);
-                                        }
-                                    }
-                                }
-                            });
-                    }
-                    // 相簿(照片 id 的命名集合,不动文件)。
-                    ViewKind::Albums => {
-                        crate::theme::section_title(ui, t("相簿"));
-                        let albums = self.store.albums();
-                        ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.album_input)
-                                    .hint_text(t("新相簿名称")),
-                            );
-                            if ui.button(t("新建")).clicked() && !self.album_input.trim().is_empty()
-                            {
-                                match self.store.album_create(self.album_input.trim()) {
-                                    Ok(aid) => {
-                                        self.sel_album = Some(aid);
-                                        self.album_input.clear();
-                                    }
-                                    Err(e) => {
-                                        self.fx_msg =
-                                            t_with("新建相簿失败: {e}", &[("e", e.to_string())])
-                                    }
-                                }
-                            }
-                        });
-                        ui.separator();
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (aid, name, n) in albums {
-                                    if ui
-                                        .selectable_label(
-                                            self.sel_album == Some(aid),
-                                            t_with(
-                                                "{name} · {n} 张",
-                                                &[("name", name.to_string()), ("n", n.to_string())],
-                                            ),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.sel_album = Some(aid);
-                                    }
-                                }
-                            });
-                        if let Some(a) = self.sel_album {
-                            ui.separator();
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::TextEdit::singleline(&mut self.album_input)
-                                        .hint_text(t("重命名为")),
-                                );
-                                if ui.button(t("重命名")).clicked()
-                                    && !self.album_input.trim().is_empty()
-                                {
-                                    if let Err(e) =
-                                        self.store.album_rename(a, self.album_input.trim())
-                                    {
-                                        self.fx_msg =
-                                            t_with("重命名失败: {e}", &[("e", e.to_string())]);
-                                    } else {
-                                        self.album_input.clear();
-                                    }
-                                }
-                            });
-                            if ui.button(t("删除当前相簿")).clicked() {
-                                let _ = self.store.album_delete(a);
-                                self.sel_album = None;
-                            }
-                        }
-                    }
-                    ViewKind::Tags => {
-                        crate::theme::section_title(ui, t("标签"));
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                #[cfg(feature = "ai")]
-                                {
-                                    ui.label(t("库内检索:标签、图中文字或描述"));
-                                    let resp = ui.add(
-                                        egui::TextEdit::singleline(&mut self.ai_query)
-                                            .hint_text(t("输入标签名 / 图中文字 / 描述,即输即搜…"))
-                                            .desired_width(f32::INFINITY),
-                                    );
-                                    if resp.changed() {
-                                        self.sel_tag = None;
-                                        self.sel_category = None;
-                                        self.ai_query_hits.clear();
-                                        let q = self.ai_query.trim().to_string();
-                                        if !q.is_empty() {
-                                            let tag_ver = crate::ai_queue::stage_version(
-                                                &self.store,
-                                                crate::ai_queue::Stage::Tags,
-                                            );
-                                            let tags = crate::ai_search::tag_search(
-                                                &self.store, &tag_ver, &q, 200,
-                                            );
-                                            let ocr =
-                                                crate::ai_ocr::search(&self.store, &q, 200);
-                                            let cap = crate::ai_search::caption_search(
-                                                &self.store, &q, 200,
-                                            );
-                                            self.ai_query_hits = crate::ai_search::fuse(
-                                                &[tags, ocr, cap],
-                                                60.0,
-                                                200,
-                                            )
-                                            .into_iter()
-                                            .map(|(id, _)| id)
-                                            .collect();
-                                        }
-                                    }
-                                    ui.separator();
-                                    ui.label(t("AI 分类"));
-                                    let fresh = self
-                                        .ai_category_cache
-                                        .as_ref()
-                                        .map(|(t, _)| {
-                                            t.elapsed() < std::time::Duration::from_secs(5)
-                                        })
-                                        .unwrap_or(false);
-                                    if !fresh {
-                                        let tag_ver = crate::ai_queue::stage_version(
-                                            &self.store,
-                                            crate::ai_queue::Stage::Tags,
-                                        );
-                                        let list = crate::ai_tags::CATEGORIES
-                                            .iter()
-                                            .map(|(node, label)| {
-                                                let n = crate::ai_tags::category_ids(
-                                                    &self.store,
-                                                    node,
-                                                    &tag_ver,
-                                                    usize::MAX,
-                                                )
-                                                .len();
-                                                (*node, *label, n)
-                                            })
-                                            .collect();
-                                        self.ai_category_cache =
-                                            Some((std::time::Instant::now(), list));
-                                    }
-                                    let cats = self
-                                        .ai_category_cache
-                                        .as_ref()
-                                        .map(|(_, v)| v.clone())
-                                        .unwrap_or_default();
-                                    for (node, label, n) in cats {
-                                        let resp = ui.selectable_label(
-                                            self.sel_category.as_deref() == Some(node),
-                                            t_with(
-                                                "{p1}  ·  {p2} 张",
-                                                &[
-                                                    ("p1", t(label).to_string()),
-                                                    ("p2", (n).to_string()),
-                                                ],
-                                            ),
-                                        );
-                                        if resp.clicked() {
-                                            if self.sel_category.as_deref() == Some(node) {
-                                                self.sel_category = None;
-                                            } else {
-                                                self.sel_category = Some(node.to_string());
-                                                self.sel_tag = None;
-                                                self.ai_query.clear();
-                                                self.ai_query_hits.clear();
-                                            }
-                                        }
-                                    }
-                                    ui.separator();
-                                }
-                                ui.label(t_with(
-                                    "共 {p1} 个(右键设颜色/重命名/删除)",
-                                    &[("p1", (self.tags.len()).to_string())],
-                                ));
-                                let tree = tag_tree_rows(&self.tags);
-                                if tree.iter().any(|(d, ..)| *d > 0) {
-                                    ui.label(t("标签分组"));
-                                    for (depth, label, path, count, real) in tree {
-                                        let text = if real {
-                                            t_with(
-                                                "{p1}  ·  {p2} 张",
-                                                &[("p1", label), ("p2", count.to_string())],
-                                            )
-                                        } else {
-                                            label
-                                        };
-                                        let shown = format!("{}{}", "    ".repeat(depth), text);
-                                        if ui
-                                            .selectable_label(
-                                                self.sel_tag.as_deref() == Some(path.as_str()),
-                                                shown,
-                                            )
-                                            .clicked()
-                                        {
-                                            if self.sel_tag.as_deref() == Some(path.as_str()) {
-                                                self.sel_tag = None;
-                                            } else {
-                                                self.sel_tag = Some(path.clone());
-                                            }
-                                            #[cfg(feature = "ai")]
-                                            {
-                                                self.sel_category = None;
-                                                self.ai_query.clear();
-                                                self.ai_query_hits.clear();
-                                            }
-                                        }
-                                    }
-                                    ui.separator();
-                                }
-                                if self.tag_rename.is_some() {
-                                    let old = self.tag_rename.as_ref().unwrap().0.clone();
-                                    let mut confirm = false;
-                                    let mut cancel = false;
-                                    ui.horizontal(|ui| {
-                                        ui.label(t_with(
-                                            "重命名 «{p1}»",
-                                            &[("p1", old.clone())],
-                                        ));
-                                        if let Some((_, input)) = self.tag_rename.as_mut() {
-                                            ui.add(
-                                                egui::TextEdit::singleline(input)
-                                                    .hint_text(t("新标签名")),
-                                            );
-                                        }
-                                        confirm = ui.button(t("重命名")).clicked();
-                                        cancel = ui.button(t("取消")).clicked();
-                                    });
-                                    if cancel {
-                                        self.tag_rename = None;
-                                    } else if confirm {
-                                        let new = self
-                                            .tag_rename
-                                            .as_ref()
-                                            .map(|(_, s)| s.trim().to_string())
-                                            .unwrap_or_default();
-                                        match timeline::rename_tag(&self.store, &old, &new) {
-                                            Ok(ids) => {
-                                                if self.sel_tag.as_deref() == Some(old.as_str()) {
-                                                    self.sel_tag = Some(new.clone());
-                                                }
-                                                for id in ids {
-                                                    let star = self.star_of(id);
-                                                    self.sync_sidecars(id, star);
-                                                }
-                                                self.tags = timeline::all_tags(&self.store)
-                                                    .unwrap_or_default();
-                                                self.tag_rename = None;
-                                                self.status = t("标签已重命名").into();
-                                            }
-                                            Err(_) => {
-                                                self.status =
-                                                    t("重命名失败:名称为空或已存在").into();
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(name) = self.tag_delete.clone() {
-                                    let n = self
-                                        .tags
-                                        .iter()
-                                        .find(|x| x.name == name)
-                                        .map(|x| x.count)
-                                        .unwrap_or(0);
-                                    let mut confirm = false;
-                                    let mut cancel = false;
-                                    ui.horizontal(|ui| {
-                                        ui.label(t_with(
-                                            "确定删除标签 «{p1}»(含子标签)? 将同时从 {p2} 张照片上移除",
-                                            &[("p1", name.clone()), ("p2", n.to_string())],
-                                        ));
-                                        confirm = ui.button(t("删除")).clicked();
-                                        cancel = ui.button(t("取消")).clicked();
-                                    });
-                                    if cancel {
-                                        self.tag_delete = None;
-                                    } else if confirm {
-                                        match timeline::delete_tag(&self.store, &name) {
-                                            Ok(ids) => {
-                                                if self.sel_tag.as_deref() == Some(name.as_str()) {
-                                                    self.sel_tag = None;
-                                                }
-                                                for id in ids {
-                                                    let star = self.star_of(id);
-                                                    self.sync_sidecars(id, star);
-                                                }
-                                                self.tags = timeline::all_tags(&self.store)
-                                                    .unwrap_or_default();
-                                                self.tag_delete = None;
-                                                self.status = t("标签已删除").into();
-                                            }
-                                            Err(_) => {
-                                                self.status = t("删除标签失败").into();
-                                            }
-                                        }
-                                    }
-                                }
-                                for t in self.tags.clone() {
-                                    ui.horizontal(|ui| {
-                                        let (rect, _) = ui.allocate_exact_size(
-                                            egui::vec2(10.0, 10.0),
-                                            egui::Sense::hover(),
-                                        );
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            2.0,
-                                            tag_color(t.color.as_deref())
-                                                .unwrap_or_else(|| egui::Color32::from_gray(90)),
-                                        );
-                                        let resp = ui.selectable_label(
-                                            self.sel_tag.as_deref() == Some(t.name.as_str()),
-                                            t_with(
-                                                "{p1}  ·  {p2} 张",
-                                                &[
-                                                    ("p1", (t.name).to_string()),
-                                                    ("p2", (t.count).to_string()),
-                                                ],
-                                            ),
-                                        );
-                                        if resp.clicked() {
-                                            // 再次点击已选中的标签 = 取消筛选(回到全部)
-                                            if self.sel_tag.as_deref() == Some(t.name.as_str()) {
-                                                self.sel_tag = None;
-                                            } else {
-                                                self.sel_tag = Some(t.name.clone());
-                                            }
-                                            #[cfg(feature = "ai")]
-                                            {
-                                                self.sel_category = None;
-                                                self.ai_query.clear();
-                                                self.ai_query_hits.clear();
-                                            }
-                                        }
-                                        resp.context_menu(|ui| {
-                                            ui.label(crate::i18n::t("标签颜色"));
-                                            for (cname, cval) in TAG_COLORS {
-                                                let mark = if Some(cval)
-                                                    == tag_color(t.color.as_deref())
-                                                {
-                                                    "● "
-                                                } else {
-                                                    "○ "
-                                                };
-                                                if ui
-                                                    .button(format!(
-                                                        "{mark}{}",
-                                                        crate::i18n::t(tag_color_name(cname))
-                                                    ))
-                                                    .clicked()
-                                                {
-                                                    let _ = timeline::set_tag_color(
-                                                        &self.store,
-                                                        &t.name,
-                                                        Some(cname),
-                                                    );
-                                                    self.tags = timeline::all_tags(&self.store)
-                                                        .unwrap_or_default();
-                                                    ui.close();
-                                                }
-                                            }
-                                            if ui.button(crate::i18n::t("无颜色")).clicked() {
-                                                let _ = timeline::set_tag_color(
-                                                    &self.store,
-                                                    &t.name,
-                                                    None,
-                                                );
-                                                self.tags = timeline::all_tags(&self.store)
-                                                    .unwrap_or_default();
-                                                ui.close();
-                                            }
-                                            ui.separator();
-                                            if ui
-                                                .button(crate::i18n::t("重命名标签"))
-                                                .clicked()
-                                            {
-                                                self.tag_rename =
-                                                    Some((t.name.clone(), t.name.clone()));
-                                                self.tag_delete = None;
-                                                ui.close();
-                                            }
-                                            if ui.button(crate::i18n::t("删除标签")).clicked() {
-                                                self.tag_delete = Some(t.name.clone());
-                                                self.tag_rename = None;
-                                                ui.close();
-                                            }
-                                        });
-                                    });
-                                }
-                            });
-                    }
-                    #[cfg(feature = "ai")]
-                    ViewKind::Faces => {
-                        crate::theme::section_title(ui, t("人物"));
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.face_hide_low, t("隐藏低质量"));
-                            ui.checkbox(&mut self.face_show_ignored, t("显示已忽略"));
-                        });
-                        ui.label(t_with(
-                            "共 {p1} 组 · 未分析 {p2} 张",
-                            &[
-                                ("p1", (self.face_people.len()).to_string()),
-                                (
-                                    "p2",
-                                    (crate::faces::remaining_count(&self.store)).to_string(),
-                                ),
-                            ],
-                        ));
-                        // 全量重聚类:向量重排簇号,身份按成员多数票继承。
-                        let failed = crate::faces::failed_count(&self.store);
-                        ui.horizontal(|ui| {
-                            if ui.button(t("重新聚类")).clicked() {
-                                match crate::faces::recluster_all(
-                                    &self.store,
-                                    crate::faces::cluster_thr(&self.store),
-                                ) {
-                                    Ok(n) => {
-                                        self.status = t_with(
-                                            "重新聚类完成:共 {n} 簇",
-                                            &[("n", n.to_string())],
-                                        );
-                                    }
-                                    Err(e) => {
-                                        self.status = t_with(
-                                            "重新聚类失败: {e}",
-                                            &[("e", e.to_string())],
-                                        )
-                                    }
-                                }
-                                self.sel_cluster = None;
-                                self.sel_person = None;
-                                self.refresh_people_and_suggestions();
-                            }
-                            if failed > 0
-                                && ui
-                                    .button(t_with(
-                                        "重试失败 ({p1})",
-                                        &[("p1", failed.to_string())],
-                                    ))
-                                    .clicked()
-                            {
-                                match crate::faces::retry_failed(&self.store) {
-                                    Ok(n) => {
-                                        self.status = t_with(
-                                            "已重新排队 {n} 张失败照片",
-                                            &[("n", n.to_string())],
-                                        );
-                                        self.refresh_people_and_suggestions();
-                                        if n > 0 {
-                                            self.start_face_scan();
-                                        }
-                                    }
-                                    Err(e) => {
-                                        self.status = t_with(
-                                            "重试失败: {e}",
-                                            &[("e", e.to_string())],
-                                        );
-                                    }
-                                }
-                            }
-                        });
-                        // 待命名组按相似度建议并入已有档案,不新建同名身份。
-                        if !self.face_sugs.is_empty() {
-                            ui.separator();
-                            ui.label(t("命名建议:"));
-                            for s in self.face_sugs.clone() {
-                                ui.horizontal(|ui| {
-                                    ui.label(t_with(
-                                        "簇 {p1} → {p2} ({p3} · {p4} 张)",
-                                        &[
-                                            ("p1", (s.cluster).to_string()),
-                                            ("p2", (s.name).to_string()),
-                                            ("p3", format!("{p3:.2}", p3 = (s.score))),
-                                            ("p4", (s.count).to_string()),
-                                        ],
-                                    ));
-                                    if ui.small_button(t("并入人物")).clicked() {
-                                        match crate::faces::merge_into_person(
-                                            &self.store,
-                                            s.cluster,
-                                            s.person_id,
-                                            s.target_person_id,
-                                        ) {
-                                            Ok(_) => {
-                                                self.status = t_with(
-                                                    "已并入:{name}",
-                                                    &[("name", s.name.clone())],
-                                                );
-                                            }
-                                            Err(e) => {
-                                                self.status = t_with(
-                                                    "并入失败: {e}",
-                                                    &[("e", e.to_string())],
-                                                );
-                                            }
-                                        }
-                                        self.refresh_people_and_suggestions();
-                                    }
-                                });
-                            }
-                        }
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for p in self.sorted_people() {
-                                    let display = p.person.clone().unwrap_or_else(|| {
-                                        match p.person_id {
-                                            None => t_with(
-                                                "未归属 · 簇 {p1}",
-                                                &[("p1", (p.cluster).to_string())],
-                                            )
-                                            .to_string(),
-                                            Some(pid) => t_with(
-                                                "未命名人物 {p1}",
-                                                &[("p1", pid.to_string())],
-                                            )
-                                            .to_string(),
-                                        }
-                                    });
-                                    let label = t_with(
-                                        "{display}  ·  {p1} 张  · 质量 {p2}",
-                                        &[
-                                            ("display", display.to_string()),
-                                            ("p1", (p.count).to_string()),
-                                            ("p2", format!("{p2:.2}", p2 = (p.quality))),
-                                        ],
-                                    );
-                                    let selected = self.sel_person == p.person_id
-                                        && self.sel_cluster == Some(p.cluster);
-                                    if ui.selectable_label(selected, label).clicked() {
-                                        self.sel_person = p.person_id;
-                                        self.sel_cluster = Some(p.cluster);
-                                        self.refresh_face_hits();
-                                    }
-                                }
-                                // 已忽略簇(可选中后恢复)
-                                if self.face_show_ignored {
-                                    for cid in crate::faces::ignored_clusters(&self.store) {
-                                        let label = t_with(
-                                            "簇 {cid}  · 已忽略",
-                                            &[("cid", cid.to_string())],
-                                        );
-                                        let selected = self.sel_person.is_none()
-                                            && self.sel_cluster == Some(cid);
-                                        if ui.selectable_label(selected, label).clicked() {
-                                            self.sel_person = None;
-                                            self.sel_cluster = Some(cid);
-                                            self.refresh_face_hits();
-                                        }
-                                    }
-                                }
-                            });
-                    }
-                    #[cfg(feature = "ai")]
-                    ViewKind::Semantic => {
-                        crate::theme::section_title(ui, t("语义搜索"));
-                        let resp = ui.text_edit_singleline(&mut self.input_query);
-                        let enter =
-                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                        if (enter || ui.button(t("搜索")).clicked())
-                            && self.clip_search_rx.is_none()
-                        {
-                            let q = self.input_query.trim().to_string();
-                            if !q.is_empty() {
-                                self.start_clip_search(q);
-                            }
-                        }
-                        if self.clip_search_rx.is_some() {
-                            ui.spinner();
-                            ui.label(t("搜索中…"));
-                        }
-                        ui.separator();
-                        // 索引语言单选(中英双模型;搜索按查询含 CJK 自动匹配)
-                        ui.horizontal(|ui| {
-                            ui.label(t("模型:"));
-                            ui.selectable_value(
-                                &mut self.clip_lang,
-                                crate::clip::Lang::En,
-                                t("英文"),
-                            );
-                            ui.selectable_value(
-                                &mut self.clip_lang,
-                                crate::clip::Lang::Zh,
-                                t("中文"),
-                            );
-                        });
-                        // 模型目录里实际放了哪些 .onnx:一个都没有就直说,
-                        // 免得用户点了「语义索引」才在后台线程里撞到"模型缺失"。
-                        let models = crate::ai::available_models();
-                        if models.is_empty() {
-                            ui.small(t("模型目录还没有 .onnx 模型文件,请先放入后再索引"));
-                            ui.small(
-                                crate::ai::models_dir()
-                                    .map(|d| {
-                                        t_with(
-                                            "模型目录:{p1}",
-                                            &[("p1", (d.display()).to_string())],
-                                        )
-                                    })
-                                    .unwrap_or_default(),
-                            );
-                        } else {
-                            ui.small(t_with(
-                                "已装模型:{p1}",
-                                &[("p1", (models.join("、")).to_string())],
-                            ));
-                        }
-                        let natural = crate::clip::natural_ready(&self.store);
-                        let indexed = crate::clip::progress(&self.store, self.clip_lang);
-                        let total_zh =
-                            crate::clip::clip_count_lang(&self.store, crate::clip::Lang::Zh);
-                        let total_en =
-                            crate::clip::clip_count_lang(&self.store, crate::clip::Lang::En);
-                        ui.label(t_with(
-                            "已索引({p1}){indexed} / {p2} 张",
-                            &[
-                                (
-                                    "p1",
-                                    if natural {
-                                        t("语义向量").to_string()
-                                    } else {
-                                        self.clip_lang.label().to_string()
-                                    },
-                                ),
-                                ("indexed", indexed.to_string()),
-                                ("p2", (self.rows.len()).to_string()),
-                            ],
-                        ));
-                        if indexed < self.rows.len() {
-                            if natural {
-                                ui.label(t("语义索引正在后台补建,稍后再试。"));
-                            } else {
-                                ui.label(t_with(
-                                    "点 工具 > 语义索引 补嵌(当前{p1}模型,较慢)",
-                                    &[("p1", (self.clip_lang.label()).to_string())],
-                                ));
-                            }
-                        }
-                        if total_en + total_zh > 0 {
-                            ui.label(t_with(
-                                "中/英索引量:{total_zh} / {total_en}",
-                                &[
-                                    ("total_zh", total_zh.to_string()),
-                                    ("total_en", total_en.to_string()),
-                                ],
-                            ));
-                        }
-                        ui.separator();
-                        ui.label(t_with(
-                            "结果 {p1} 张",
-                            &[("p1", (self.clip_results.len()).to_string())],
-                        ));
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (pid, score) in self.clip_results.clone() {
-                                    let path = self
-                                        .id_row
-                                        .get(&pid)
-                                        .map(|&i| self.rows[i].path.clone())
-                                        .unwrap_or_default();
-                                    let fname = Path::new(&path)
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or(path);
-                                    if ui
-                                        .selectable_label(false, format!("{score:.3}  {fname}"))
-                                        .clicked()
-                                    {
-                                        if self.id_row.contains_key(&pid) {
-                                            self.preview = Some(pid);
-                                        }
-                                    }
-                                }
-                            });
-                    }
-                    ViewKind::Recent
-                    | ViewKind::Timeline
-                    | ViewKind::Duplicates
-                    | ViewKind::Search => {
-                        crate::theme::section_title(ui, t("当前视图"));
-                        ui.label(t_with(
-                            "{p1} 张",
-                            &[("p1", (self.view_ids().len()).to_string())],
-                        ));
-                    }
-                    #[cfg(not(feature = "ai"))]
-                    ViewKind::Faces | ViewKind::Semantic => {}
-                }
+                self.nav_open_drawer = None;
             });
 
         // 快速查找:结果形态(任意文件/文件夹列表)与照片网格差异大,自绘面板。
@@ -13485,10 +14267,11 @@ impl eframe::App for App {
             );
             // 滚动事件派发后的目标偏移 → 作为 ScrollArea 的初始偏移
             // (egui 会用 `state.offset` 记忆滚动位置,这里只在有目标时覆盖一次)。
-            // 文件夹视图先画视图级常驻工具条(过滤 + 明细/缩略图切换):
-            // 在滚动区之外,滚到哪都钉在顶部。
-            if self.view == ViewKind::Folder {
-                self.folder_toolbar_ui(ui);
+            // 视图级常驻工具条先画(在滚动区之外,滚到哪都钉在顶部)。
+            match self.view {
+                ViewKind::Folder => self.folder_toolbar_ui(ui),
+                ViewKind::Duplicates => self.dups_toolbar_ui(ui),
+                _ => {}
             }
             let mut gallery = egui::ScrollArea::vertical().id_salt("gallery");
             if let Some(t) = self.gallery_scroll_target.take() {
@@ -13498,11 +14281,11 @@ impl eframe::App for App {
                 match self.view {
                     ViewKind::Recent => {
                         // 首页:相册头(标题 / 日期 / 张数 / 动作) → 已缓存成员的
-                        // 行式缩略图。成员清单在 rebuild 时算好,这里不碰全表。
+                        // 行式缩略图。成员清单由 refresh_recent 算好,这里不碰全表。
                         self.recent_header(ui);
                         ui.add_space(6.0);
                         if self.recent_idxs.is_empty() {
-                            ui.label(t("最近更新里还没有照片:等缩略图生成后点上方「刷新」,或到「文件夹」里点开一个目录。"));
+                            ui.label(t("最近更新里还没有照片:缩略图生成后会自动收进来,也可到「文件夹」里点开一个目录。"));
                         } else {
                             if self.recent_idxs.len() < 20 && !self.watched.is_empty() {
                                 ui.label(
@@ -13534,34 +14317,11 @@ impl eframe::App for App {
                         self.months = months;
                     }
                     ViewKind::Duplicates => {
-                        let near_label = if self.dup_near {
-                            t_with("重复照片 {p1} 组(含近似)", &[("p1", (self.dups.len()).to_string())])
-                        } else {
-                            t_with("重复照片 {p1} 组", &[("p1", (self.dups.len()).to_string())])
-                        };
-                        ui.horizontal(|ui| {
-                            ui.heading(near_label);
-                            if ui
-                                .checkbox(
-                                    &mut self.dup_near,
-                                    t_with("包含近似重复(hamming≤{NEAR_DUP_DIST})", &[("NEAR_DUP_DIST", NEAR_DUP_DIST.to_string())]),
-                                )
-                                .changed()
-                            {
-                                self.dups = if self.dup_near {
-                                    timeline::dup_groups_near(&self.store, NEAR_DUP_DIST)
-                                        .unwrap_or_default()
-                                } else {
-                                    timeline::dup_groups(&self.store).unwrap_or_default()
-                                };
-                            }
-                        });
-                        ui.add_space(4.0);
                         if self.dups.is_empty() {
                             ui.label(if self.dup_near {
                                 t("没有检测到重复或近似重复")
                             } else {
-                                t("没有检测到重复(哈希精确一致才计为一组;勾选下方可含近似重复)")
+                                t("没有检测到重复(哈希精确一致才计为一组;点顶部漏斗可含近似重复)")
                             });
                         }
                         let dups = std::mem::take(&mut self.dups);
@@ -13824,15 +14584,36 @@ impl eframe::App for App {
                         #[cfg(feature = "ai")]
                         {
                             if self.clip_results.is_empty() {
-                                ui.heading(t("语义搜索"));
-                                if crate::clip::natural_ready(&self.store) {
-                                    ui.label(t("左侧输入关键词或一句话,支持中英文、标签与图中文字。"));
+                                if let Some(name) = self.clip_image_query.clone() {
+                                    ui.heading(t_with(
+                                        "相似照片(查询:{p1})",
+                                        &[("p1", name)]
+                                    ));
+                                    ui.label(t("没有找到相似照片;索引还没覆盖的照片不会参与比对。"));
                                 } else {
-                                    ui.label(t("左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");首次使用请先 工具 > 语义索引。"));
+                                    ui.heading(t("语义搜索"));
+                                    if crate::clip::natural_ready(&self.store) {
+                                        ui.label(t("左侧输入关键词或一句话,支持中英文、标签与图中文字。"));
+                                    } else {
+                                        ui.label(t("左侧输入关键词(英文效果最佳,如 \"a cat\"、\"beach\");首次使用请先 工具 > 语义索引。"));
+                                    }
                                 }
                             } else {
-                                let q = self.input_query.trim().to_string();
-                                ui.heading(t_with("语义结果 {p1} 张(查询:{q})", &[("p1", (self.clip_results.len()).to_string()), ("q", q.to_string())]));
+                                let n = self.clip_results.len().to_string();
+                                let head = match self.clip_image_query.clone() {
+                                    Some(name) => t_with(
+                                        "相似照片 {p1} 张(查询:{p2})",
+                                        &[("p1", n), ("p2", name)]
+                                    ),
+                                    None => {
+                                        let q = self.input_query.trim().to_string();
+                                        t_with(
+                                            "语义结果 {p1} 张(查询:{q})",
+                                            &[("p1", n), ("q", q)]
+                                        )
+                                    }
+                                };
+                                ui.heading(head);
                                 let cells: Vec<usize> = self
                                     .clip_results
                                     .iter()
@@ -14476,6 +15257,7 @@ impl eframe::App for App {
                         }
                     });
                     ui.separator();
+                    ui.small(t("图标颜色:灰 = 默认目录,蓝 = 导入目录"));
                     if self.watched.is_empty() {
                         ui.label(t("(空)用上面的「添加文件夹…」把图片文件夹加入图库。"));
                     }
@@ -14483,7 +15265,17 @@ impl eframe::App for App {
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         for (path, count) in watched {
                             let exists = Path::new(&path).is_dir();
+                            let imported = self
+                                .store
+                                .dir_intent(&path)
+                                .is_some_and(|d| d.state == crate::db::INTENT_IMPORTED);
+                            let color = if imported {
+                                crate::theme::p().accent
+                            } else {
+                                crate::theme::p().muted
+                            };
                             ui.horizontal(|ui| {
+                                ui.add(folder_icon_colored(color));
                                 ui.vertical(|ui| {
                                     ui.label(egui::RichText::new(&path).strong());
                                     ui.small(if exists {
@@ -14636,6 +15428,12 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label(t_with("切换到「{p1}」后,现有的人脸特征向量与簇不通用,需要重建。", &[("p1", (pend.label()).to_string())]));
                     ui.small(t("确认后清除全部人脸数据(含人物命名)并按新方案重新扫描;取消则维持当前方案,不混用新旧结果。"));
+                    face_wipe_warning(ui, &t("切换并重建"));
+                    ui.add_space(6.0);
+                    ui.label(t("扫描范围:"));
+                    ui.radio_value(&mut self.face_scope_common, false, t("全盘"));
+                    ui.radio_value(&mut self.face_scope_common, true, t("只常用目录"));
+                    ui.small(t("常用目录 = 我的文档/图片/视频/桌面 + 你导入的文件夹;其余照片保持未分析,以后选全盘可补扫。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button(t("切换并重建")).clicked() {
@@ -14657,6 +15455,7 @@ impl eframe::App for App {
                         let _ = self.store.set_setting("face_algo_version", &tag);
                         self.refresh_people_and_suggestions();
                         if crate::ai::face::Faces::models_present(pend) {
+                            crate::faces::set_scan_scope(&self.store, self.face_scope_common);
                             self.start_face_scan();
                             self.status = t_with(
                                 "已切换到 {p1},现有人脸数据已清除,正在按新方案重新扫描",
@@ -14685,6 +15484,12 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label(t("人脸数据与当前管线不一致(权重或处理版本已变化),旧结果暂不参与检索、聚类和自动归档。"));
                     ui.label(t("确认后清除全部人脸数据并按当前方案重新扫描;稍后处理则继续保持待重建,不会自动覆盖人工命名。"));
+                    face_wipe_warning(ui, &t("清除并重新扫描"));
+                    ui.add_space(6.0);
+                    ui.label(t("扫描范围:"));
+                    ui.radio_value(&mut self.face_scope_common, false, t("全盘"));
+                    ui.radio_value(&mut self.face_scope_common, true, t("只常用目录"));
+                    ui.small(t("常用目录 = 我的文档/图片/视频/桌面 + 你导入的文件夹;其余照片保持未分析,以后选全盘可补扫。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui.button(t("清除并重新扫描")).clicked() {
@@ -14693,6 +15498,7 @@ impl eframe::App for App {
                                     let tag = crate::faces::algo_tag(&self.store);
                                     let _ = self.store.set_setting("face_algo_version", &tag);
                                     self.face_version_warn = false;
+                                    crate::faces::set_scan_scope(&self.store, self.face_scope_common);
                                     self.start_face_scan();
                                 }
                                 Err(e) => {

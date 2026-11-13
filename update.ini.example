@@ -38,7 +38,8 @@ RestartService=1
 # 模型下载目录:服务端放模型文件的目录,结尾带「/」。程序按固定文件名
 # (face_det.onnx / face_rec.onnx)在这个目录下取文件,存进数据目录的 models\。
 # 留空 = 不提供下载,界面只给手动放置指引。
-# 只有默认方案(YuNet + AdaFace,Apache-2.0 / MIT)可由程序代下载;
+# 默认方案(YuNet + SFace,均 Apache-2.0)与 AdaFace 识别件(社区 ONNX 导出,
+# 权重训练数据条款由使用者自决)可由程序代下载;
 # insightface antelopev2 的权重许可不可再分发,界面不会给下载按钮。
 # 建议用 https;服务端放什么模型由部署方自行选择与授权,
 # 程序落盘前会用 onnxruntime 真加载一次,加载不了的內容直接丢弃。

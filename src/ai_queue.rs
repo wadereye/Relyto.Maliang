@@ -189,6 +189,8 @@ pub fn enqueue_for_ids(store: &Store, stage: Stage, ids: &[i64]) {
 pub fn enqueue_all(store: &Store) -> Result<usize> {
     let rules = store.read(rules_from_conn);
     let versions = Stage::ALL.map(|stage| stage_version(store, stage));
+    let tag_ver = stage_version(store, Stage::Tags);
+    let ocr_auto = crate::ai_ocr::mode(store) == crate::ai_ocr::Mode::Auto;
     let mut last = 0i64;
     let mut total = 0usize;
     loop {
@@ -212,9 +214,17 @@ pub fn enqueue_all(store: &Store) -> Result<usize> {
             break;
         };
         last = tail.0;
+        // OCR 只排标签已判定的文字照片:提前空跑记完成会让它此后永远不再识别。
+        let text_ids = if ocr_auto {
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            crate::ai_tags::text_photo_ids(store, &tag_ver, &ids)
+        } else {
+            std::collections::HashSet::new()
+        };
         let ts = now_ms();
-        store.write(|conn| -> Result<()> {
+        total += store.write(|conn| -> Result<usize> {
             let tx = conn.transaction()?;
+            let mut n = 0usize;
             {
                 let mut st = tx.prepare(
                     "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
@@ -231,14 +241,16 @@ pub fn enqueue_all(store: &Store) -> Result<usize> {
                 for (id, path) in &rows {
                     let prio = priority_with_rules(&rules, path);
                     for (i, stage) in Stage::ALL.iter().enumerate() {
-                        st.execute(params![stage.as_str(), id, prio, ts, versions[i]])?;
+                        if *stage == Stage::Ocr && !text_ids.contains(id) {
+                            continue;
+                        }
+                        n += st.execute(params![stage.as_str(), id, prio, ts, versions[i]])?;
                     }
                 }
             }
             tx.commit()?;
-            Ok(())
+            Ok(n)
         })?;
-        total += rows.len() * Stage::ALL.len();
     }
     Ok(total)
 }
@@ -377,6 +389,11 @@ pub fn purge_done(store: &Store, stage: Stage, model_ver: &str) -> Result<()> {
 pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
     let rules = store.read(rules_from_conn);
     let ver = stage_version(store, stage);
+    let tag_ver = stage_version(store, Stage::Tags);
+    let ocr_auto = crate::ai_ocr::mode(store) == crate::ai_ocr::Mode::Auto;
+    if stage == Stage::Ocr && !ocr_auto {
+        return Ok(0);
+    }
     let mut last = 0i64;
     let mut total = 0usize;
     loop {
@@ -400,9 +417,16 @@ pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
             break;
         };
         last = tail.0;
+        let text_ids = if stage == Stage::Ocr {
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            crate::ai_tags::text_photo_ids(store, &tag_ver, &ids)
+        } else {
+            std::collections::HashSet::new()
+        };
         let ts = now_ms();
-        store.write(|conn| -> Result<()> {
+        total += store.write(|conn| -> Result<usize> {
             let tx = conn.transaction()?;
+            let mut n = 0usize;
             {
                 let mut st = tx.prepare(
                     "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
@@ -417,14 +441,16 @@ pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
                       )",
                 )?;
                 for (id, path) in &rows {
+                    if stage == Stage::Ocr && !text_ids.contains(id) {
+                        continue;
+                    }
                     let prio = priority_with_rules(&rules, path);
-                    st.execute(params![stage.as_str(), id, prio, ts, ver])?;
+                    n += st.execute(params![stage.as_str(), id, prio, ts, ver])?;
                 }
             }
             tx.commit()?;
-            Ok(())
+            Ok(n)
         })?;
-        total += rows.len();
     }
     Ok(total)
 }
@@ -599,13 +625,72 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_all_covers_every_photo_and_stage() {
+    fn enqueue_all_covers_every_photo_for_clip_and_tags() {
         let store = mem();
         add_photo(&store, 1, r"C:\a\1.jpg");
         add_photo(&store, 2, r"C:\a\2.jpg");
         let n = enqueue_all(&store).unwrap();
-        assert_eq!(n, 6);
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs"), 6);
+        assert_eq!(n, 4);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs"), 4);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE stage='ocr'"),
+            0,
+            "标签还没判定文字类,OCR 不该入队"
+        );
+    }
+
+    #[test]
+    fn ocr_queues_only_text_photos() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\a\1.jpg");
+        add_photo(&store, 2, r"C:\a\2.jpg");
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let ver = stage_version(&store, Stage::Tags);
+        let lid: i64 = store.read(|c| {
+            c.query_row(
+                "SELECT id FROM tag_labels WHERE node='文档票据/截图'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(2,?1,0.9,?2)",
+                    params![lid, ver],
+                )
+            })
+            .unwrap();
+        assert_eq!(enqueue_all_for(&store, Stage::Ocr).unwrap(), 1);
+        let ids: Vec<i64> = store.read(|c| {
+            let mut st = c
+                .prepare("SELECT photo_id FROM ai_jobs WHERE stage='ocr'")
+                .unwrap();
+            st.query_map([], |r| r.get(0)).unwrap().flatten().collect()
+        });
+        assert_eq!(ids, vec![2], "只有文字类照片该排 OCR");
+        assert_eq!(
+            enqueue_all_for(&store, Stage::Ocr).unwrap(),
+            0,
+            "重复入队不该多排"
+        );
+    }
+
+    #[test]
+    fn ocr_not_queued_when_automatic_disabled() {
+        for mode in ["off", "selected"] {
+            let store = mem();
+            store.set_setting(crate::ai_ocr::Mode::KEY, mode).unwrap();
+            add_photo(&store, 1, r"C:\a\1.jpg");
+            assert_eq!(enqueue_all(&store).unwrap(), 2, "{mode} 模式只排两阶段");
+            assert_eq!(enqueue_all_for(&store, Stage::Ocr).unwrap(), 0);
+            assert_eq!(
+                count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE stage='ocr'"),
+                0,
+                "{mode} 模式不该留下永远跑不掉的 OCR 待办"
+            );
+        }
     }
 
     #[test]
@@ -627,7 +712,7 @@ mod tests {
         );
         assert_eq!(clip1, 0);
         assert_eq!(ocr2, 0);
-        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs"), 4);
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_jobs"), 3);
     }
 
     /// 性能基准:50 万合成行的造数、入队与取批耗时(默认忽略,手动加 `--ignored` 跑)。

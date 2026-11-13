@@ -17,10 +17,27 @@ use rusqlite::Connection;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// 异步写任务:闭包拿到唯一写连接。
 type WriteJob = Box<dyn FnOnce(&mut Connection) + Send>;
+
+/// 取写连接:锁中毒也照跑,并丢掉 panic 留下的半截事务,别让后续写全悬在里面。
+fn lock_writer(w: &Mutex<Connection>) -> MutexGuard<'_, Connection> {
+    let conn = w.lock().unwrap_or_else(|e| e.into_inner());
+    if !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+    conn
+}
+
+/// 跑一个异步写任务:单个任务 panic 只丢它自己,不带走写线程和后面所有写。
+fn run_job(conn: &mut Connection, job: WriteJob) {
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(conn))).is_err();
+    if panicked && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK;");
+    }
+}
 
 /// 只读连接池里最多闲置的连接数(超出的用完即弃)。
 const READ_POOL_IDLE: usize = 4;
@@ -182,6 +199,14 @@ fn machine_marker_dir() -> Option<PathBuf> {
 /// 本进程是否以服务形态运行(只有 `--service` 入口会置起)。
 static SERVICE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 本次启动是否真的搬过数据目录(UI 据此给出「重启索引服务」出口)。
+static DATA_MIGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本次启动是否完成过数据目录迁移。
+pub fn data_migrated_this_run() -> bool {
+    DATA_MIGRATED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 声明「本进程是常驻服务」,让数据目录走机器级默认值。
 /// 必须在任何 [`data_dir`] 调用之前执行(服务的第一个动作)。
 pub fn enter_service_mode() {
@@ -251,15 +276,26 @@ pub fn data_dir() -> PathBuf {
 /// AppData —— 那正是本次要根治的「各建一套库」。多账号机器上以最后一次
 /// 装服务的人为准(装服务本身就是机器级动作)。
 pub fn sync_machine_marker() -> std::io::Result<PathBuf> {
+    sync_machine_marker_to(&data_dir())
+}
+
+/// 把指定数据目录写进机器级标记:迁移完成后让服务跟上,口径同安装时。
+pub fn sync_machine_marker_to(dir: &Path) -> std::io::Result<PathBuf> {
     let marker = machine_marker_path();
-    std::fs::create_dir_all(marker.parent().unwrap())?;
-    // 机器级文件只由本函数写(不含 [update] 节),整份重写安全。
-    // 旧 data.location 留着不删:服务可能还是按旧文件名读的旧版。
-    std::fs::write(
-        &marker,
-        format!("[location]\ndata_dir={}\n", data_dir().display()),
-    )?;
+    write_machine_marker(&marker, dir)?;
     Ok(marker)
+}
+
+/// 机器级文件只由这里写(不含 [update] 节),整份重写安全。
+/// 旧 data.location 留着不删:服务可能还是按旧文件名读的旧版。
+fn write_machine_marker(marker: &Path, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(marker.parent().unwrap())?;
+    std::fs::write(marker, format!("[location]\ndata_dir={}\n", dir.display()))
+}
+
+/// 机器级标记里记的数据目录(没标记/没写目录 = None)。
+pub fn machine_marker_target() -> Option<PathBuf> {
+    machine_marker_dir()
 }
 
 /// 选项页:设定数据目录(写统一配置的 [location] 节;`None` = 恢复默认)。
@@ -358,6 +394,7 @@ pub fn migrate_pending_data() {
             let kept =
                 rewrite_marker_text(&text, Some(format!("data_dir={}", target.display())), None);
             let _ = std::fs::write(&marker_path, kept);
+            DATA_MIGRATED.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     } else {
         // 指回自身:清掉 pending 即可。
@@ -1509,6 +1546,9 @@ impl Store {
         // 单独执行 WAL 切换:库尾 WAL 需要恢复/截断时失败点都在这里,带上上下文便于定位。
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .context("开启 WAL 日志模式")?;
+        // 外键开关是连接级的,必须在任何事务之前打开,否则 schema 里的 CASCADE 全是死的。
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .context("开启外键约束")?;
         conn.execute_batch(SCHEMA)?;
         // 旧库迁移:按需补列(列已存在时静默)
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN dhash INTEGER;");
@@ -1600,7 +1640,11 @@ impl Store {
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_rich_state ON photos(rich_state);
              CREATE INDEX IF NOT EXISTS idx_photos_ext ON photos(ext);
-             CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);",
+             CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
+             CREATE INDEX IF NOT EXISTS idx_faces_photo ON faces(photo_id);
+             CREATE INDEX IF NOT EXISTS idx_faces_cluster ON faces(cluster);
+             CREATE INDEX IF NOT EXISTS idx_photo_tags_tag ON photo_tags(tag_id);
+             CREATE INDEX IF NOT EXISTS idx_tags_parent ON tags(parent_id);",
         );
         // frn64 唯一索引 = L1 增量落库的 upsert 冲突靶。
         // **不能**做成 partial index:`ON CONFLICT(frn64)` 只认无 WHERE 的
@@ -1655,7 +1699,7 @@ impl Store {
     /// 内存库(测试)直接回退写连接。
     pub fn read<T>(&self, f: impl FnOnce(&Connection) -> T) -> T {
         let Some(path) = self.file.clone() else {
-            let conn = self.writer.lock().unwrap();
+            let conn = lock_writer(&self.writer);
             return f(&conn);
         };
         let popped = self.readers.lock().unwrap().pop();
@@ -1664,7 +1708,7 @@ impl Store {
             None => match Self::open_reader(&path) {
                 Some(c) => c,
                 None => {
-                    let conn = self.writer.lock().unwrap();
+                    let conn = lock_writer(&self.writer);
                     return f(&conn);
                 }
             },
@@ -1680,7 +1724,7 @@ impl Store {
 
     /// 同步写网关:要返回值 / 事务 / 大批量写走这里(排队等唯一写连接)。
     pub fn write<T>(&self, f: impl FnOnce(&mut Connection) -> T) -> T {
-        let mut conn = self.writer.lock().unwrap();
+        let mut conn = lock_writer(&self.writer);
         f(&mut conn)
     }
 
@@ -1697,12 +1741,10 @@ impl Store {
                     .spawn(move || {
                         // 首个任务阻塞等;之后同锁排干积压(一次加锁跑一批)。
                         while let Ok(job) = rx.recv() {
-                            let Ok(mut conn) = writer.lock() else {
-                                break;
-                            };
-                            job(&mut conn);
+                            let mut conn = lock_writer(&writer);
+                            run_job(&mut conn, job);
                             while let Ok(job) = rx.try_recv() {
-                                job(&mut conn);
+                                run_job(&mut conn, job);
                             }
                         }
                     });
@@ -1712,7 +1754,11 @@ impl Store {
                 slot.as_ref().expect("写队列入口必在").clone()
             }
         };
-        let _ = tx.send(Box::new(f));
+        if let Err(e) = tx.send(Box::new(f)) {
+            // 写线程没起来(资源不足):当场同步写,不把任务静默丢掉。
+            let mut conn = lock_writer(&self.writer);
+            (e.0)(&mut conn);
+        }
     }
 
     /// 打开一条只读连接(池补充用);失败返回 None(调用方回退写连接)。
@@ -1738,7 +1784,7 @@ impl Store {
     /// 测试夹具专用:借写连接直接造数据/验证(生产代码一律走网关)。
     #[cfg(test)]
     pub(crate) fn test_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
-        self.writer.lock().unwrap()
+        lock_writer(&self.writer)
     }
 
     pub fn upsert_watched(&self, p: &Path) -> Result<()> {
@@ -1834,6 +1880,21 @@ impl Store {
                     (p, n as usize)
                 })
                 .collect()
+        })
+    }
+
+    /// 用户主动导入的目录(dir_intent state=imported)。
+    pub fn imported_dirs(&self) -> Vec<PathBuf> {
+        self.read(|conn| {
+            let mut st = match conn
+                .prepare("SELECT path FROM dir_intent WHERE state='imported' ORDER BY path")
+            {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(|r| r.ok()).map(PathBuf::from).collect())
+                .unwrap_or_default()
         })
     }
 
@@ -2218,11 +2279,7 @@ impl Store {
         })
     }
 
-    /// 删除一批照片行及其**全部**引用行(须在事务内调用)。
-    ///
-    /// SQLite 外键级联默认关闭,只删 photos 会留下孤儿行 ——
-    /// rowid 复用后孤儿会错挂到新照片上,所以引用表必须逐一显式删。
-    /// 同时往变更日志写 `removed`(便于回溯:这些行不是用户手动移除的)。
+    /// 删除一批照片行及其全部引用行(须在事务内调用),并往变更日志写 removed。
     fn delete_photo_rows(tx: &rusqlite::Transaction<'_>, rows: &[(i64, String)]) -> Result<()> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2721,6 +2778,18 @@ impl Store {
             conn.query_row(
                 "SELECT id FROM photos WHERE uid64=?1",
                 rusqlite::params![uid as i64],
+                |r| r.get(0),
+            )
+            .ok()
+        })
+    }
+
+    /// 按照片 id 查路径(不在当前视图时兜底)。
+    pub fn photo_path_by_id(&self, id: i64) -> Option<String> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT path FROM photos WHERE id=?1",
+                rusqlite::params![id],
                 |r| r.get(0),
             )
             .ok()
@@ -4120,7 +4189,7 @@ fn like_escape(s: &str) -> String {
 /// 转义口径:`ESCAPE '\'` 下字面反斜杠要写两遍,而结尾那个 `%` 必须**裸着**
 /// 才是通配符。所以子树模式 = 转义后的目录 + 转义后的分隔符 + 裸 `%`;
 /// 卷根要先去掉结尾分隔符,否则会多转义出一个字面反斜杠。
-fn dir_like(dir: &str) -> (String, String) {
+pub(crate) fn dir_like(dir: &str) -> (String, String) {
     let d = norm_dir(dir);
     let base = d.trim_end_matches(['\\', '/']);
     // 子树通配的分隔符跟着路径自己的写法走:POSIX 上 `photos.parent` 只有 `/`,
@@ -4145,6 +4214,31 @@ pub fn default_roots() -> Vec<PathBuf> {
     crate::win::known_dirs()
 }
 
+/// 常用目录统一列表:四个壳目录 + 用户导入目录,归一去重(壳目录优先)。
+pub fn common_dirs(store: &Store) -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (label, path) in crate::win::common_places() {
+        if let Some(p) = path {
+            let key = norm_dir(&p.to_string_lossy()).to_ascii_uppercase();
+            if seen.insert(key) {
+                out.push((label.to_string(), p));
+            }
+        }
+    }
+    for p in store.imported_dirs() {
+        let key = norm_dir(&p.to_string_lossy()).to_ascii_uppercase();
+        if seen.insert(key) {
+            let label = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string_lossy().to_string());
+            out.push((label, p));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4158,6 +4252,38 @@ mod tests {
         let kv = crate::update::parse_kv(SETTINGS_TEMPLATE);
         assert_eq!(kv.get("updateurl").unwrap(), DEFAULT_UPDATE_URL);
         assert_eq!(kv.get("modelurl").unwrap(), DEFAULT_MODEL_URL);
+    }
+
+    /// 常用目录统一列表:壳目录在前,导入目录追加并按归一大小写去重。
+    #[test]
+    fn common_dirs_aggregates_and_dedups() {
+        let store = Store::open_mem().unwrap();
+        let shell_paths: Vec<_> = crate::win::common_places()
+            .iter()
+            .filter_map(|(_, p)| p.clone())
+            .collect();
+        let base = common_dirs(&store);
+        assert_eq!(base.len(), shell_paths.len(), "无导入时常用目录=壳目录");
+        let conn = store.test_conn();
+        if let Some(first) = shell_paths.first() {
+            let dup = first.to_string_lossy().to_ascii_lowercase();
+            conn.execute(
+                "INSERT INTO dir_intent(path,state,source) VALUES(?1,'imported','import')",
+                rusqlite::params![dup],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO dir_intent(path,state,source) VALUES('Z:\\UniqueImport','imported','import')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let after = common_dirs(&store);
+        assert_eq!(after.len(), base.len() + 1, "重复壳目录应去重,唯一导入追加一个");
+        let last = after.last().unwrap();
+        assert_eq!(last.0, "UniqueImport", "导入目录标签取末段名");
+        assert_eq!(last.1, std::path::PathBuf::from("Z:\\UniqueImport"));
     }
 
     #[test]
@@ -4371,6 +4497,22 @@ mod tests {
                 "机器级默认值不能等于用户 AppData,否则服务照样各建一套库"
             );
         }
+    }
+
+    /// 机器级标记整份重写:只含 [location] 一节,目录按传入值落盘。
+    #[test]
+    fn write_machine_marker_roundtrip() {
+        let base = std::env::temp_dir().join(format!("rk-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let marker = base.join("maliang.ini");
+        write_machine_marker(&marker, Path::new("D:\\ml")).unwrap();
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(parse_location(&text).0, Some(PathBuf::from("D:\\ml")));
+        assert!(!text.contains("[update]"), "机器级标记不带升级节");
+        write_machine_marker(&marker, Path::new("E:\\other")).unwrap();
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(parse_location(&text).0, Some(PathBuf::from("E:\\other")));
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// 缓存搬运:只补缺、不覆盖、瞬态文件不跟,成功后清来源。
@@ -6028,6 +6170,148 @@ mod tests {
             fcols.contains(&"ignored".to_string()),
             "faces 列: {fcols:?}"
         );
+    }
+
+    /// 四条热路径索引必须建出来,并且真的被查询计划选中。
+    #[test]
+    fn hot_path_indexes_are_used() {
+        let store = Store::open_mem().unwrap();
+        let names: Vec<String> = store.read(|c| {
+            c.prepare("SELECT name FROM sqlite_master WHERE type='index'")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        for (idx, sql) in [
+            (
+                "idx_photo_tags_tag",
+                "SELECT photo_id FROM photo_tags WHERE tag_id=1",
+            ),
+            ("idx_faces_photo", "SELECT id FROM faces WHERE photo_id=1"),
+            ("idx_faces_cluster", "SELECT id FROM faces WHERE cluster=1"),
+            ("idx_tags_parent", "SELECT id FROM tags WHERE parent_id=1"),
+        ] {
+            assert!(names.iter().any(|n| n == idx), "缺索引 {idx}: {names:?}");
+            let plan = store.read(|c| {
+                c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .filter_map(|r| r.ok())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            });
+            assert!(plan.contains(idx), "{sql} 没走 {idx}: {plan}");
+        }
+    }
+
+    /// 外键必须真的开着:删照片级联清引用行,挂空照片的插入要被拒。
+    #[test]
+    fn foreign_keys_cascade_and_reject_orphans() {
+        let store = Store::open_mem().unwrap();
+        let on: i64 = store
+            .test_conn()
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(on, 1, "写连接的外键开关必须是 ON");
+        store.write(|c| {
+            c.execute_batch(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,1);
+                 INSERT INTO tags(id,name) VALUES(10,'旅行');
+                 INSERT INTO photo_tags(photo_id,tag_id) VALUES(1,10);
+                 INSERT INTO faces(id,photo_id) VALUES(100,1);
+                 INSERT INTO face_templates(face_id,dim,vec) VALUES(100,2,x'00000000');
+                 INSERT INTO thumb_tiers(photo_id,tier) VALUES(1,0);
+                 INSERT INTO clips(photo_id,dim,vec) VALUES(1,2,x'00000000');",
+            )
+            .unwrap();
+        });
+        let err = store.write(|c| {
+            c.execute("INSERT INTO faces(photo_id) VALUES(999)", [])
+                .unwrap_err()
+                .to_string()
+        });
+        assert!(err.contains("FOREIGN KEY"), "挂空照片应被外键拒绝: {err}");
+        store.write(|c| c.execute("DELETE FROM photos WHERE id=1", []).unwrap());
+        for (tbl, sql) in [
+            ("photo_tags", "SELECT COUNT(*) FROM photo_tags"),
+            ("faces", "SELECT COUNT(*) FROM faces"),
+            ("face_templates", "SELECT COUNT(*) FROM face_templates"),
+            ("thumb_tiers", "SELECT COUNT(*) FROM thumb_tiers"),
+            ("clips", "SELECT COUNT(*) FROM clips"),
+        ] {
+            let n: i64 = store.read(|c| c.query_row(sql, [], |r| r.get(0)).unwrap());
+            assert_eq!(n, 0, "{tbl} 没跟着照片级联删除");
+        }
+    }
+
+    /// 同步写 panic 把锁弄中毒后,异步写和读都必须照常落地。
+    #[test]
+    fn async_writes_survive_poisoned_writer() {
+        let store = Store::open_mem().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.write(|_| panic!("同步写炸了"));
+        }));
+        assert!(store.writer.lock().is_err(), "前置条件:写锁应已中毒");
+        store.write_async(|c| {
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(7,'p7','.',0,0)",
+                [],
+            )
+            .unwrap();
+        });
+        store.flush();
+        store.write(|c| {
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(8,'p8','.',0,0)",
+                [],
+            )
+            .unwrap();
+        });
+        let ids: Vec<i64> = store.read(|c| {
+            c.prepare("SELECT id FROM photos ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(ids, vec![7, 8], "中毒后异步写与同步写都不能丢");
+    }
+
+    /// 单个异步任务 panic(且事务只写了一半)不能带走写线程和后面的任务。
+    #[test]
+    fn panicking_async_job_does_not_kill_write_thread() {
+        let store = Store::open_mem().unwrap();
+        store.write_async(|c| {
+            let _tx = c.unchecked_transaction().unwrap();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(11,'p11','.',0,0)",
+                [],
+            )
+            .unwrap();
+            panic!("任务炸在半截事务里");
+        });
+        store.write_async(|c| {
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(12,'p12','.',0,0)",
+                [],
+            )
+            .unwrap();
+        });
+        store.flush();
+        let ids: Vec<i64> = store.read(|c| {
+            c.prepare("SELECT id FROM photos ORDER BY id")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect()
+        });
+        assert_eq!(ids, vec![12], "半截事务要回滚,后续任务要照跑");
+        assert!(store.writer.lock().is_ok(), "任务 panic 不该把写锁弄中毒");
     }
 
     // ===== uid64 =====

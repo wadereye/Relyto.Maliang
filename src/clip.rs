@@ -842,7 +842,11 @@ pub fn scan_batch_lang(store: &Store, lang: Lang, cap: usize) -> Result<(usize, 
 }
 
 /// 新版自然语言检索:预处理 → MobileCLIP2 文本编码 → 向量/标签/OCR 融合。
-pub fn search_natural(store: &Store, query: &str, limit: usize) -> Result<Vec<(i64, f32)>, String> {
+pub fn search_natural(
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(i64, Option<f32>)>, String> {
     if !crate::ai_models::stage_ready(store, crate::ai_queue::Stage::Clip) {
         return Err(t("缺少 MobileCLIP2 模型").into());
     }
@@ -861,19 +865,14 @@ pub fn search_natural(store: &Store, query: &str, limit: usize) -> Result<Vec<(i
     let emb = text.embed_text(&prepared.prompt)?;
     let clip_ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Clip);
     let tag_ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Tags);
-    let ids = crate::ai_search::hybrid(
+    Ok(crate::ai_search::hybrid(
         store,
         &clip_ver,
         &tag_ver,
         &prepared.stripped,
         Some(&emb),
         limit,
-    );
-    Ok(ids
-        .into_iter()
-        .enumerate()
-        .map(|(i, id)| (id, 1.0 / (1.0 + i as f32)))
-        .collect())
+    ))
 }
 
 /// 新链路是否可用(只认新版产物文件)。
@@ -886,7 +885,7 @@ pub fn search_best(
     store: &Store,
     query: &str,
     limit: usize,
-) -> Result<(Vec<(i64, f32)>, bool), String> {
+) -> Result<(Vec<(i64, Option<f32>)>, bool), String> {
     if natural_ready(store) {
         search_natural(store, query, limit).map(|hits| (hits, true))
     } else {
@@ -920,7 +919,7 @@ pub fn search_lang(
     lang: Lang,
     query: &str,
     limit: usize,
-) -> Result<Vec<(i64, f32)>, String> {
+) -> Result<Vec<(i64, Option<f32>)>, String> {
     let q = match lang {
         Lang::En => {
             let mut engine = ClipText::load()?;
@@ -932,6 +931,22 @@ pub fn search_lang(
             engine.embed_text(&q)?
         }
     };
+    Ok(with_scores(search_table(store, lang, &q, None, limit)))
+}
+
+/// 纯向量链路的每条命中都有真实余弦。
+fn with_scores(hits: Vec<(i64, f32)>) -> Vec<(i64, Option<f32>)> {
+    hits.into_iter().map(|(id, s)| (id, Some(s))).collect()
+}
+
+/// 单语言向量表精确检索(向量已归一化,点积即余弦)。
+fn search_table(
+    store: &Store,
+    lang: Lang,
+    q: &[f32],
+    exclude: Option<i64>,
+    limit: usize,
+) -> Vec<(i64, f32)> {
     let rows: Vec<(i64, Vec<u8>)> = store
         .read(|conn| -> Result<Vec<(i64, Vec<u8>)>, String> {
             let mut st = conn
@@ -948,9 +963,12 @@ pub fn search_lang(
             }
             Ok(out)
         })
-        .map_err(|e| e.to_string())?;
+        .unwrap_or_default();
     let mut hits: Vec<(i64, f32)> = Vec::new();
     for (pid, blob) in rows {
+        if exclude == Some(pid) {
+            continue;
+        }
         let v = blob_to_vec(&blob);
         if v.len() != DIM {
             continue;
@@ -962,7 +980,83 @@ pub fn search_lang(
     }
     hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     hits.truncate(limit);
-    Ok(hits)
+    hits
+}
+
+/// 读某语言模型下一张照片的向量。
+fn load_vec_lang(store: &Store, lang: Lang, photo_id: i64) -> Option<Vec<f32>> {
+    let sql = format!("SELECT vec FROM {} WHERE photo_id=?1", lang.table());
+    store
+        .read(|conn| {
+            conn.query_row(&sql, rusqlite::params![photo_id], |r| r.get::<_, Vec<u8>>(0))
+        })
+        .ok()
+        .map(|b| blob_to_vec(&b))
+}
+
+/// 以图搜图:优先复用查询照片的已有向量,缺失时用当前链路视觉模型现编码。
+/// 返回(命中, 旧链路语言标注);新链路标注为 None。
+pub fn search_by_photo(
+    store: &Store,
+    photo_id: i64,
+    limit: usize,
+) -> Result<(Vec<(i64, Option<f32>)>, Option<String>), String> {
+    if natural_ready(store) {
+        let ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Clip);
+        let q = match crate::ai_search::load_vec(store, photo_id, &ver) {
+            Some(v) => v,
+            None => encode_query_photo(store, photo_id, None)?,
+        };
+        let hits =
+            crate::ai_search::vector_search_excluding(store, &ver, &q, photo_id, limit);
+        return Ok((with_scores(hits), None));
+    }
+    // 旧链路:查询照片的向量在哪张语言表就用哪张;都没有则取索引量多的一方。
+    let lang = [Lang::En, Lang::Zh]
+        .into_iter()
+        .find(|l| load_vec_lang(store, *l, photo_id).is_some())
+        .unwrap_or_else(|| {
+            if clip_count_lang(store, Lang::En) >= clip_count_lang(store, Lang::Zh) {
+                Lang::En
+            } else {
+                Lang::Zh
+            }
+        });
+    if clip_count_lang(store, lang) == 0 {
+        return Err(t("还没有语义索引 — 请先在 工具 > 语义索引 补嵌").into());
+    }
+    let q = match load_vec_lang(store, lang, photo_id) {
+        Some(v) => v,
+        None => encode_query_photo(store, photo_id, Some(lang))?,
+    };
+    Ok((
+        with_scores(search_table(store, lang, &q, Some(photo_id), limit)),
+        Some(lang.label().to_string()),
+    ))
+}
+
+/// 现编码查询照片(不写索引,索引仍由后台阶段统一建)。
+fn encode_query_photo(
+    store: &Store,
+    photo_id: i64,
+    lang: Option<Lang>,
+) -> Result<Vec<f32>, String> {
+    let path: String = store
+        .read(|conn| {
+            conn.query_row(
+                "SELECT path FROM photos WHERE id=?1",
+                rusqlite::params![photo_id],
+                |r| r.get(0),
+            )
+        })
+        .map_err(|_| t("照片不存在"))?;
+    let img = crate::thumbs::load_for_ai(std::path::Path::new(&path), 1024)
+        .map_err(|e| e.to_string())?;
+    match lang {
+        None => MobileClipVision::load(store)?.embed_image(&img),
+        Some(Lang::En) => ClipVision::load()?.embed_image(&img),
+        Some(Lang::Zh) => CnClipVision::load()?.embed_image(&img),
+    }
 }
 
 /// MobileCLIP2 图像预处理:短边缩到 256、居中裁剪、ToTensor(0~1,官方不做均值方差归一化)。
@@ -1103,6 +1197,102 @@ mod tests {
 
     fn models_dir_present() -> bool {
         models_dir().map(|d| d.is_dir()).unwrap_or(false)
+    }
+
+    fn unit_vec(dim: usize, hot: usize) -> Vec<f32> {
+        let mut v = vec![0.0; dim];
+        v[hot] = 1.0;
+        v
+    }
+
+    fn add_photo(store: &Store, id: i64) {
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id, path, parent, mtime, size) VALUES(?1, ?2, 'C:\\', 0, 0)",
+                    rusqlite::params![id, format!("C:\\p{id}.jpg")],
+                )
+            })
+            .unwrap();
+    }
+
+    /// 单语言表检索:余弦排序、排除自身、截断。
+    #[test]
+    fn search_table_orders_and_excludes() {
+        let store = test_store();
+        for id in [1, 2, 3] {
+            add_photo(&store, id);
+        }
+        let mut mix = unit_vec(DIM, 0);
+        mix[1] = 0.6;
+        let n = (1.0 + 0.36f32).sqrt();
+        for x in &mut mix {
+            *x /= n;
+        }
+        save_clip_lang(&store, Lang::En, 1, &unit_vec(DIM, 0)).unwrap();
+        save_clip_lang(&store, Lang::En, 2, &unit_vec(DIM, 1)).unwrap();
+        save_clip_lang(&store, Lang::En, 3, &mix).unwrap();
+        let q = unit_vec(DIM, 0);
+        let got = search_table(&store, Lang::En, &q, Some(1), 10);
+        assert_eq!(got.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3, 2]);
+        let one = search_table(&store, Lang::En, &q, None, 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, 1);
+        assert!(search_table(&store, Lang::Zh, &q, None, 10).is_empty());
+    }
+
+    /// 旧链路以图搜图:复用查询照片已有向量,不依赖模型。
+    #[test]
+    fn image_search_legacy_reuses_vector_and_excludes_self() {
+        let store = test_store();
+        if natural_ready(&store) {
+            return;
+        }
+        for id in [1, 2, 3] {
+            add_photo(&store, id);
+        }
+        save_clip_lang(&store, Lang::En, 1, &unit_vec(DIM, 0)).unwrap();
+        save_clip_lang(&store, Lang::En, 2, &unit_vec(DIM, 1)).unwrap();
+        let mut mix = unit_vec(DIM, 0);
+        mix[1] = 0.6;
+        let n = (1.0 + 0.36f32).sqrt();
+        for x in &mut mix {
+            *x /= n;
+        }
+        save_clip_lang(&store, Lang::En, 3, &mix).unwrap();
+        let (hits, note) = search_by_photo(&store, 1, 10).unwrap();
+        assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3, 2]);
+        assert!(note.is_some(), "旧链路应带语言标注");
+    }
+
+    /// 没有任何索引时明确报错,不静默返回空。
+    #[test]
+    fn image_search_without_index_reports_missing() {
+        let store = test_store();
+        if natural_ready(&store) {
+            return;
+        }
+        add_photo(&store, 1);
+        assert!(search_by_photo(&store, 1, 10).is_err());
+    }
+
+    /// 新链路以图搜图:已有向量直接复用(需要真实模型,缺则跳过)。
+    #[test]
+    fn image_search_natural_reuses_stored_vector() {
+        let store = test_store();
+        if !natural_ready(&store) {
+            return;
+        }
+        let ver = crate::ai_queue::stage_version(&store, crate::ai_queue::Stage::Clip);
+        for id in [1, 2, 3] {
+            add_photo(&store, id);
+        }
+        crate::ai_search::save_vec(&store, 1, &ver, &[1.0, 0.0]).unwrap();
+        crate::ai_search::save_vec(&store, 2, &ver, &[0.0, 1.0]).unwrap();
+        crate::ai_search::save_vec(&store, 3, &ver, &[0.8, 0.6]).unwrap();
+        let (hits, note) = search_by_photo(&store, 1, 10).unwrap();
+        assert_eq!(hits.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![3, 2]);
+        assert!(note.is_none());
     }
 
     /// 中文查询模板是模型输入,不随界面语言变化。
@@ -1345,13 +1535,10 @@ mod tests {
         let hits = search_lang(&store, Lang::En, "a photo of a person", 10).unwrap();
         assert_eq!(hits.len(), 2, "应返回 2 条");
         assert_eq!(hits[0].0, 1, "人脸照片应排第一");
-        assert!(hits[0].1 > 0.15, "图文余弦应 > 0.15,实际 {}", hits[0].1);
+        let s0 = hits[0].1.expect("纯向量链路每条命中都有余弦");
+        let s1 = hits[1].1.expect("纯向量链路每条命中都有余弦");
+        assert!(s0 > 0.15, "图文余弦应 > 0.15,实际 {s0}");
         assert_eq!(hits[1].0, 2);
-        assert!(
-            hits[1].1 < hits[0].1,
-            "无关照片分数应更低:{} < {}",
-            hits[1].1,
-            hits[0].1
-        );
+        assert!(s1 < s0, "无关照片分数应更低:{s1} < {s0}");
     }
 }

@@ -234,6 +234,10 @@ impl Runner {
             let labels = crate::ai_tags::labels(store);
             let mut out = Vec::with_capacity(labels.len());
             for l in labels {
+                // 人物类走人脸检出,语义打分不可靠,连文本向量都不必算。
+                if crate::ai_tags::is_people_node(&l.node) {
+                    continue;
+                }
                 let t = self.text(store)?;
                 let v = t.embed_text(&l.prompt)?;
                 out.push((l.id, v));
@@ -256,7 +260,7 @@ fn clip_image(store: &Store, photo_id: i64) -> Result<image::DynamicImage, Strin
 fn execute_clip(store: &Store, runner: &mut Runner, photo_id: i64, ver: &str) -> Outcome {
     let img = match clip_image(store, photo_id) {
         Ok(i) => i,
-        Err(e) => return Outcome::Skip(e),
+        Err(e) => return Outcome::Fail(e),
     };
     let emb = match runner.vision(store).and_then(|v| v.embed_image(&img)) {
         Ok(e) => e,
@@ -292,6 +296,9 @@ fn execute_tags(store: &Store, runner: &mut Runner, photo_id: i64, tag_ver: &str
     if let Err(e) = crate::ai_tags::save(store, photo_id, tag_ver, &scores) {
         return Outcome::Fail(e);
     }
+    if let Err(e) = crate::ai_tags::sync_people_tags(store, &[photo_id], tag_ver) {
+        return Outcome::Fail(e.to_string());
+    }
     let _ = crate::ai_caption::generate(store, photo_id, tag_ver, false);
     if crate::ai_ocr::should_auto(store, photo_id, tag_ver) {
         let _ = ai_queue::enqueue(store, Stage::Ocr, photo_id, ai_queue::P_DEFAULT);
@@ -322,28 +329,18 @@ fn execute_ocr(
     let img = match crate::thumbs::load_cached_tier(crate::thumbs::Tier::Preview, photo_id) {
         Some(i) => i,
         None => {
-            // 文档/票据类 1024 不足,回退原图并限制长边。
+            // 文档/票据类 1024 不足,回退原图限长边;解码走统一基底,视频与改扩展名的图才读得出来。
             let path = store.read(|conn| {
                 conn.query_row("SELECT path FROM photos WHERE id=?1", [photo_id], |r| {
                     r.get::<_, String>(0)
                 })
                 .ok()
             });
-            match path.and_then(|p| image::open(p).ok()) {
-                Some(i) => {
-                    let (w, h) = (i.width(), i.height());
-                    if w.max(h) > 2048 {
-                        let s = 2048.0 / w.max(h) as f32;
-                        i.resize(
-                            (w as f32 * s) as u32,
-                            (h as f32 * s) as u32,
-                            image::imageops::FilterType::Triangle,
-                        )
-                    } else {
-                        i
-                    }
-                }
-                None => return Outcome::Skip("缺预览图".into()),
+            match path
+                .and_then(|p| crate::thumbs::load_for_ai(std::path::Path::new(&p), 2048).ok())
+            {
+                Some(i) => i,
+                None => return Outcome::Fail("读不出图像".into()),
             }
         }
     };
@@ -664,5 +661,50 @@ mod tests {
         // 无模型时 drain/release 不应阻塞,失败后调度器应恢复可用状态。
         assert!(crate::ai_models::replace_model(&store, &sched, "ocr_det", "v1").is_err());
         assert!(!sched.is_paused(), "替换失败也必须解除暂停");
+    }
+
+    /// 读不出图像要立案失败:无限延后会让待办永远清不完,worker 每 30 秒空转一轮。
+    #[test]
+    fn unreadable_file_fails_instead_of_deferring_forever() {
+        let store = Store::open_mem().unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id, path, parent, mtime, size)
+                     VALUES(1, 'C:\\gone\\x.png', 'C:\\gone', 0, 0)",
+                    [],
+                )
+            })
+            .unwrap();
+        let mut runner = Runner::default();
+        assert!(matches!(
+            execute_clip(&store, &mut runner, 1, "v0"),
+            Outcome::Fail(_)
+        ));
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let ver = ai_queue::stage_version(&store, Stage::Tags);
+        let lid: i64 = store.read(|c| {
+            c.query_row(
+                "SELECT id FROM tag_labels WHERE node='文档票据/截图'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES(1,?1,0.9,?2)",
+                    params![lid, ver],
+                )
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                execute_ocr(&store, &mut runner, 1, "v0", ai_queue::P_DEFAULT),
+                Outcome::Fail(_)
+            ),
+            "文字类照片读不出图像时同样要立案,不能一直延后"
+        );
     }
 }

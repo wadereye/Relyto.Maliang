@@ -90,13 +90,55 @@ use crate::i18n::{t, t_with};
 use eframe::egui;
 use std::sync::Arc;
 
+/// 起服务前同步机器级标记;写不动只警告不拦启动(口径同安装时)。
+fn warn_if_marker_unwritable() {
+    if let Err(e) = db::sync_machine_marker() {
+        eprintln!(
+            "{}",
+            t_with(
+                "警告:机器级数据目录写不进去({e}),服务会改建在 ProgramData 而不是 {p2}",
+                &[
+                    ("e", e.to_string()),
+                    ("p2", format!("{:?}", db::data_dir())),
+                ],
+            )
+        );
+    }
+}
+
+/// 机器级标记跟随当前数据目录:先直写(提权时可行),写不动就请正在跑的
+/// 服务代写(LocalSystem 写得动 ProgramData);服务没跑则留给下次 --start-service。
+fn sync_machine_marker_after_migration() {
+    if std::env::var_os("MALIANG_DATA_DIR")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+    if !win::service_installed() {
+        return;
+    }
+    let target = db::data_dir();
+    if db::machine_marker_target().as_deref() == Some(target.as_path()) {
+        return;
+    }
+    if db::sync_machine_marker_to(&target).is_ok() {
+        return;
+    }
+    if let Ok(mut c) = ipc::Client::connect(500) {
+        let _ = c.call_ok(&ipc::Req::SyncMarker {
+            path: target.to_string_lossy().into_owned(),
+        });
+    }
+}
+
 /// 命令行子命令。返回 `true` 表示本次启动只是跑子命令,不进 GUI。
 ///
 /// - `--export-assets <路径>` / `--import-assets <路径>`:资源包文本导出 / 导入。
 /// - `--service`:索引服务主体(SCM 拉起,见 [`service`])。
 /// - `--console`:同一套引擎跑前台控制台(调试)。
 /// - `--install-service` / `--uninstall-service`:提权子命令,注册 / 撤销服务。
-/// - `--stop-service` / `--start-service`:提权子命令,只停 / 只起(不动注册项)。
+/// - `--stop-service` / `--start-service` / `--restart-service`:提权子命令,只停 / 只起 / 搬目录后重启。
 /// - `--mft-scan [卷字母表]` / `--mft-check` / `--mft-diag`:索引人工入口与诊断。
 /// - `--check-update`:按统一配置 maliang.ini 检查一次版本清单并打印(验证配置用)。
 /// - `--download-update`:抓清单、后台下载并校验,不安装(部署时验证代理/Range 用)。
@@ -247,11 +289,36 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
-        // 提权子命令:**只启动**已注册的服务(不改配置)。和 --stop-service 成对,
+        // 提权子命令:**只启动**已注册的服务。和 --stop-service 成对,
         // 停完只有这一条回头路,不用重新安装、也少一次 UAC 之外的等待。
         "--start-service" => {
+            // 起前把机器级标记同步到当前数据目录:目录迁过而标记没跟上时,
+            // 直接起会在旧目录另建一套库(界面与索引各看各的)。
+            warn_if_marker_unwritable();
             match win::service_start() {
                 Ok(()) => println!("{}", t("索引服务已启动")),
+                Err(e) => {
+                    eprintln!(
+                        "{}",
+                        t_with("启动索引服务失败:{e}", &[("e", e.to_string())])
+                    );
+                    std::process::exit(1);
+                }
+            }
+            true
+        }
+        // 提权子命令:停 → 同步机器级标记 → 起,一次 UAC 让服务搬进新数据目录。
+        "--restart-service" => {
+            if let Err(e) = win::service_stop() {
+                eprintln!(
+                    "{}",
+                    t_with("停止索引服务失败:{e}", &[("e", e.to_string())])
+                );
+                std::process::exit(1);
+            }
+            warn_if_marker_unwritable();
+            match win::service_start() {
+                Ok(()) => println!("{}", t("索引服务已重启")),
                 Err(e) => {
                     eprintln!(
                         "{}",
@@ -398,6 +465,7 @@ fn handle_cli(args: &[String]) -> bool {
                 ("--uninstall-service", t("卸载索引服务")),
                 ("--start-service", t("启动索引服务")),
                 ("--stop-service", t("停止索引服务")),
+                ("--restart-service", t("重启索引服务")),
                 ("--service", t("以索引服务运行")),
                 ("--console", t("控制台模式运行")),
                 ("--mft-scan", t("扫描名字索引")),
@@ -470,6 +538,9 @@ fn main() -> eframe::Result {
     if handle_cli(&args) {
         return Ok(());
     }
+    // 数据目录迁完后机器级标记要跟上:服务只认标记,不更新就继续在旧目录建库。
+    // 必须先于 restore_service_if_interrupted —— 那里可能顺手把服务起回来。
+    sync_machine_marker_after_migration();
     // 上次替换留下的旧程序备份,这时已没人占用,顺手清掉。
     update::cleanup_old_exe();
     // 上次安装把服务停了却没起回来(helper 被杀 / 断电)时,在这里补一次。

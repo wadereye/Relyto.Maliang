@@ -8,16 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-/// 人脸算法版本(写 settings;与库中记录不一致时 GUI 提示重扫)。
-/// 检测/嵌入变化使库中向量不通用,必须升版本;只动聚类策略(阈值/门控/
-/// 合并)向量仍通用,不升 —— 重聚类即可应用,升了反而误导用户清数据。
-/// v3: 修复识别裁剪图预处理(to_rgb32f 0~1 值误按 0~255 归一化)。
-/// v4: 检测/识别切换 YuNet + AdaFace IR-50(替换非商用 antelopev2)为默认方案;
-///     antelopev2 保留为可选方案,版本号连同方案名一起比对。
-/// v5: EXIF 方向摆正后再检测(竖拍手机照不再因人脸横躺而漏检);
-///     检测输入 640 → 1280(小脸检出率);聚类阈值 0.5 → 0.6;
-///     photos_todo 改按 photos.face_done 标记(没检出人脸的照片不再卡队列)。
-/// v6: 管线签名含权重哈希与导出契约,模板逐条存签名并隔离旧向量。
+/// 人脸算法版本(写 settings):检测/嵌入或签名契约变了才升,只动聚类策略不升。
 pub const FACE_ALGO_VERSION: &str = "v6";
 
 /// 对齐与采样版本(112 模板、五点相似变换、双线性黑边)。
@@ -114,7 +105,7 @@ struct FaceRec {
     emb: Vec<f32>,
 }
 
-/// 当前人脸方案(选项 > 常规 选择,默认 YuNet + AdaFace)。
+/// 当前人脸方案(选项 > 常规 选择,默认 YuNet + SFace)。
 pub fn current_algo(store: &Store) -> crate::ai::face::FaceAlgo {
     crate::ai::face::FaceAlgo::from_key(&store.get_setting("face_algo").unwrap_or_default())
 }
@@ -195,6 +186,13 @@ pub fn pending_rebuild(store: &Store) -> bool {
     effective_sig(store).is_empty()
 }
 
+/// 开机自动续扫判据:非待重建、有待办、模型就位(是否已有在跑扫描由调用方判)。
+pub fn should_resume(store: &Store) -> bool {
+    !pending_rebuild(store)
+        && remaining_count(store) > 0
+        && crate::ai::face::Faces::models_present(current_algo(store))
+}
+
 /// 旧库迁移口径:face_done=1 且算法标识未变,视为已按当前版本处理。
 fn legacy_scanned(store: &Store) -> bool {
     store.get_setting("face_algo_version").map(|v| v == algo_tag(store)).unwrap_or(false)
@@ -214,20 +212,86 @@ pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
         return Vec::new();
     }
     let legacy = legacy_scanned(store) as i32;
+    let (scope_sql, scope_pats) = scope_clause(store);
     store.read(|conn| {
+        let rules = crate::ai_queue::rules_from_conn(conn);
+        let base = 3 + scope_pats.len();
+        let (order_sql, order_params) = priority_order(&rules, base);
+        let limit_idx = base + order_params.len();
         let sql = format!(
-            "SELECT p.id, p.path FROM photos p WHERE {TODO_WHERE} ORDER BY p.id LIMIT ?3"
+            "SELECT p.id, p.path FROM photos p WHERE {TODO_WHERE}{scope_sql} ORDER BY {order_sql} LIMIT ?{limit_idx}"
         );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(sig));
+        params.push(Box::new(legacy));
+        for p in scope_pats {
+            params.push(Box::new(p));
+        }
+        params.extend(order_params);
+        params.push(Box::new(cap as i64));
         let mut st = match conn.prepare(&sql) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        st.query_map(params![sig, legacy, cap as i64], |r| {
+        st.query_map(rusqlite::params_from_iter(params), |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
         })
         .map(|rows| rows.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     })
+}
+
+/// 人脸扫描范围是否限定常用目录(设置 face_scan_scope=common)。
+pub fn scan_scope_common(store: &Store) -> bool {
+    store.get_setting("face_scan_scope").as_deref() == Some("common")
+}
+
+/// 记住人脸扫描范围选择。
+pub fn set_scan_scope(store: &Store, common: bool) {
+    let _ = store.set_setting("face_scan_scope", if common { "common" } else { "all" });
+}
+
+/// 常用目录范围的 SQL 过滤片段与 LIKE 参数(占位符从 ?3 起);全库范围返回空。
+fn scope_clause(store: &Store) -> (String, Vec<String>) {
+    if !scan_scope_common(store) {
+        return (String::new(), Vec::new());
+    }
+    let dirs = crate::db::common_dirs(store);
+    if dirs.is_empty() {
+        return (" AND 0".to_string(), Vec::new());
+    }
+    let mut pats = Vec::new();
+    let mut ors = Vec::new();
+    for (_, p) in &dirs {
+        let idx = 3 + pats.len();
+        ors.push(format!("p.path LIKE ?{idx} ESCAPE '\\'"));
+        pats.push(crate::db::dir_like(&p.to_string_lossy()).1);
+    }
+    (format!(" AND ({})", ors.join(" OR ")), pats)
+}
+
+/// 待办排序:复用 AI 目录优先级(最长前缀先命中),未命中默认档,再按 id。
+fn priority_order(
+    rules: &[(String, i32)],
+    base: usize,
+) -> (String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut rules = rules.to_vec();
+    rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    let mut whens = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut idx = base;
+    for (prefix, prio) in &rules {
+        whens.push(format!("WHEN p.path LIKE ?{idx} ESCAPE '\\' THEN ?{}", idx + 1));
+        params.push(Box::new(crate::db::dir_like(prefix).1));
+        params.push(Box::new(*prio));
+        idx += 2;
+    }
+    let order = if whens.is_empty() {
+        "p.id".to_string()
+    } else {
+        format!("CASE {} ELSE {} END, p.id", whens.join(" "), crate::ai_queue::P_DEFAULT)
+    };
+    (order, params)
 }
 
 /// 存一张人脸(含质量评分与嵌入模板)。
@@ -515,6 +579,8 @@ struct ClusterMem {
     reps: Vec<Member>,
     sum: Vec<f32>,
     wsum: f32,
+    /// 质心缓存:成员一变就重算一次,打分时只读,不再每脸×每簇归一化。
+    cent: Option<Vec<f32>>,
 }
 
 impl ClusterMem {
@@ -524,16 +590,22 @@ impl ClusterMem {
             reps: Vec::new(),
             sum: vec![0.0; dim],
             wsum: 0.0,
+            cent: None,
         }
     }
 
-    fn centroid(&self) -> Option<Vec<f32>> {
-        sum_centroid(&self.sum, self.wsum)
+    fn refresh_centroid(&mut self) {
+        self.cent = sum_centroid(&self.sum, self.wsum);
+    }
+
+    fn centroid(&self) -> Option<&[f32]> {
+        self.cent.as_deref()
     }
 
     fn add(&mut self, m: &Member, thr: f32) {
         member_add(&mut self.sum, &mut self.wsum, &mut self.reps, m, thr);
         self.members.push(m.clone());
+        self.refresh_centroid();
     }
 }
 
@@ -642,8 +714,9 @@ fn rep_claim(reps: &[Member], v: &[f32], thr_eff: f32) -> (usize, f32) {
     (support, agg)
 }
 
-/// 认领所需支持数:有人工锚点或仅单模板的组 1 票即可;
-/// 纯自动的多模板组必须 2 票,单张自动脸不能独自吸收更多人。
+/// 认领所需支持数:有人工锚点或仅单模板的组 1 票即可;纯自动的多模板组必须 2 票。
+/// 单模板自动组可凭 1 票吸一张脸,吸满两张后转为多模板组、此后需 2 票,
+/// 垃圾簇因此在增量路径上难以滚雪球。
 fn required_support(reps: &[Member]) -> usize {
     if reps.len() >= 2 && !reps.iter().any(|r| r.manual) {
         2
@@ -717,7 +790,8 @@ fn forced_by_must(
 /// 聚合相似度决定;过该簇的成熟度阈值且与次高簇拉开足够余量才归簇,
 /// 都不够格则新建簇,模棱两可的留在未分配,下批随质心移动或合并结果再判。
 /// 同图两张脸默认不并(人工 must 例外);忽略的脸不参与也不成簇。
-pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
+/// 私有:只能在人脸任务守卫内调用,外部一律走 scan_all / recluster_all。
+fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
     let sig = effective_sig(store);
     if sig.is_empty() {
         return Ok(0);
@@ -762,11 +836,12 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
             }
             for cm in clusters.values_mut() {
                 cm.reps = rep_select(&cm.members, thr);
+                cm.refresh_centroid();
             }
             let mut cluster_pid: BTreeMap<i64, (i64, i64)> = BTreeMap::new();
             let mut st = conn.prepare(
                 "SELECT cluster, person_id, COUNT(*) FROM faces
-                 WHERE cluster IS NOT NULL AND person_id IS NOT NULL
+                 WHERE cluster IS NOT NULL AND person_id IS NOT NULL AND ignored=0
                  GROUP BY cluster, person_id",
             )?;
             let mut rows = st.query([])?;
@@ -871,7 +946,7 @@ pub fn assign_clusters(store: &Store, thr: f32) -> Result<usize> {
                 continue;
             }
             if let Some(c) = cm.centroid() {
-                cents.push((cid, cos(&c, &m.v)));
+                cents.push((cid, cos(c, &m.v)));
             }
         }
         cents.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -970,7 +1045,8 @@ fn must_between(must: &HashMap<i64, Vec<i64>>, a: &[i64], b: &[i64]) -> bool {
 }
 
 /// 合并质心足够相近的簇;已命名人物所在的簇互不合并,只重排簇号。
-pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
+/// 私有:只能在人脸任务守卫内调用,外部一律走 recluster_all。
+fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     let sig = effective_sig(store);
     if sig.is_empty() {
         return Ok(0);
@@ -1017,6 +1093,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         }
         for cm in acc.values_mut() {
             cm.reps = rep_select(&cm.members, thr);
+            cm.refresh_centroid();
         }
         let mut named: HashSet<i64> = HashSet::new();
         let mut st = conn.prepare(
@@ -1048,16 +1125,20 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     // (被并的簇即刻移出,后续只会再并入仍存活的簇,不会出现链式改号)。
     let mut merges: Vec<(i64, i64)> = Vec::new(); // (被并掉的簇, 保留方)
     loop {
-        let cents: Vec<(i64, Vec<f32>)> = clusters
-            .iter()
-            .filter_map(|(&cid, cm)| cm.centroid().map(|c| (cid, c)))
-            .collect();
+        // 质心已缓存,每轮只取簇号;排序让同分时的取舍可复现。
+        let mut cids: Vec<i64> = clusters.keys().copied().collect();
+        cids.sort_unstable();
         let mut best: Option<(i64, i64, f32)> = None;
-        for i in 0..cents.len() {
-            for j in i + 1..cents.len() {
-                let (a, ma) = &cents[i];
-                let (b, mb) = &cents[j];
-                let (Some(ia), Some(ib)) = (members.get(a), members.get(b)) else {
+        for i in 0..cids.len() {
+            for j in i + 1..cids.len() {
+                let (a, b) = (cids[i], cids[j]);
+                let (Some(ca), Some(cb)) = (clusters.get(&a), clusters.get(&b)) else {
+                    continue;
+                };
+                let (Some(ma), Some(mb)) = (ca.centroid(), cb.centroid()) else {
+                    continue;
+                };
+                let (Some(ia), Some(ib)) = (members.get(&a), members.get(&b)) else {
                     continue;
                 };
                 let forced = must_between(&must, ia, ib);
@@ -1065,22 +1146,19 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
                 if never_between(&never, ia, ib) {
                     continue;
                 }
-                if !forced && named.contains(a) && named.contains(b) {
+                if !forced && named.contains(&a) && named.contains(&b) {
                     continue;
                 }
                 // 同图两簇默认不并,避免合照里的不同人被当成同一个人。
                 let shared = photos
-                    .get(a)
-                    .map(|pa| photos.get(b).map(|pb| pa.iter().any(|p| pb.contains(p))).unwrap_or(false))
+                    .get(&a)
+                    .map(|pa| photos.get(&b).map(|pb| pa.iter().any(|p| pb.contains(p))).unwrap_or(false))
                     .unwrap_or(false);
                 if shared && !forced {
                     continue;
                 }
                 let c = cos(ma, mb);
                 if !forced {
-                    let (Some(ca), Some(cb)) = (clusters.get(a), clusters.get(b)) else {
-                        continue;
-                    };
                     // 任一方成员过少时支撑弱,合并阈值同样收紧,防绕过年轻簇保护。
                     let thr_eff = if ca.members.len() < CLUSTER_MATURE
                         || cb.members.len() < CLUSTER_MATURE
@@ -1100,7 +1178,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
                 // must 对带 2.0 偏置,保证排在所有普通候选之前。
                 let sc = if forced { 2.0 + c } else { c };
                 if (forced || c >= thr) && best.map(|(_, _, bc)| sc > bc).unwrap_or(true) {
-                    best = Some((*a, *b, sc));
+                    best = Some((a, b, sc));
                 }
             }
         }
@@ -1126,6 +1204,7 @@ pub fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         kept.wsum += moved.wsum;
         kept.members.append(&mut moved.members);
         kept.reps = rep_select(&kept.members, thr);
+        kept.refresh_centroid();
         if let Some(ids) = members.remove(&drop) {
             members.get_mut(&keep).unwrap().extend(ids);
         }
@@ -1183,7 +1262,7 @@ pub fn people_overview(store: &Store) -> Vec<PeopleRow> {
                FROM faces WHERE cluster IS NOT NULL AND ignored=0 AND person_id IS NULL
                GROUP BY cluster) g
              LEFT JOIN people p ON p.id = g.pid
-             ORDER BY g.cnt, g.cluster",
+             ORDER BY g.cnt DESC, g.cluster",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
@@ -1508,6 +1587,7 @@ pub fn rename_person(store: &Store, person_id: i64, name: &str) -> Result<()> {
         bail!("名字过长");
     }
     let name = name.to_string();
+    let _g = face_task_guard()?;
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         let holder: Option<i64> = tx
@@ -1534,12 +1614,10 @@ pub fn rename_person(store: &Store, person_id: i64, name: &str) -> Result<()> {
     })
 }
 
-/// 按簇命名:把簇号映射到稳定身份后再写名字(无身份簇先建档)。
+/// 按簇命名:整簇人脸归入同一稳定身份后再写名字。
+/// 簇内已有身份(多数票)则沿用,否则新建;命名会把簇里尚未归属的脸
+/// 一并扫进该身份,避免「命名一个簇却只命一部分」。
 pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
-    let pid = store.read(|conn| cluster_person(conn, cluster));
-    if let Some(pid) = pid {
-        return rename_person(store, pid, name);
-    }
     let name = name.trim();
     if name.is_empty() {
         bail!("名字不能为空");
@@ -1548,25 +1626,47 @@ pub fn rename_cluster(store: &Store, cluster: i64, name: &str) -> Result<()> {
         bail!("名字过长");
     }
     let name = name.to_string();
+    let _g = face_task_guard()?;
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
+        let ids: Vec<i64> = {
+            let mut st = tx.prepare("SELECT id FROM faces WHERE cluster=?1")?;
+            let rows = st.query_map(params![cluster], |r| r.get(0))?;
+            rows.filter_map(|r| r.ok()).collect()
+        };
+        if ids.is_empty() {
+            bail!("该簇没有人脸");
+        }
+        if never_conflict(&tx, &ids)? {
+            bail!("该簇人脸之间存在「不同人」约束,请先移除冲突约束");
+        }
+        let pid = match cluster_person(&tx, cluster) {
+            Some(p) => p,
+            None => alloc_person_id(&tx)?,
+        };
         let holder: Option<i64> = tx
             .query_row("SELECT id FROM people WHERE name=?1", params![name], |r| {
                 r.get(0)
             })
             .ok();
-        if holder.is_some() {
-            bail!("已有人物使用该名字");
+        if let Some(id) = holder {
+            if id != pid {
+                bail!("已有人物使用该名字");
+            }
         }
-        let pid = alloc_person_id(&tx)?;
-        let n = tx.execute(
-            "UPDATE faces SET person_id=?1, assign_src='manual' WHERE cluster=?2 AND person_id IS NULL",
+        tx.execute(
+            "UPDATE faces SET person_id=?1 WHERE cluster=?2",
             params![pid, cluster],
         )?;
-        if n == 0 {
-            bail!("该簇没有待归属的人脸");
-        }
-        tx.execute("INSERT INTO people(id,name) VALUES(?1,?2)", params![pid, name])?;
+        tx.execute(
+            "UPDATE faces SET assign_src='manual' WHERE person_id=?1",
+            params![pid],
+        )?;
+        tx.execute(
+            "INSERT INTO people(id,name) VALUES(?1,?2)
+             ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+            params![pid, name],
+        )?;
         tx.commit()?;
         Ok(())
     })
@@ -1755,7 +1855,7 @@ pub fn set_ignored(store: &Store, face_ids: &[i64], ignored: bool) -> Result<usi
     let mut ids = face_ids.to_vec();
     ids.sort_unstable();
     ids.dedup();
-    store.write(move |conn| -> Result<usize> {
+    let n = store.write(move |conn| -> Result<usize> {
         let tx = conn.unchecked_transaction()?;
         let mut n = 0usize;
         {
@@ -1766,7 +1866,23 @@ pub fn set_ignored(store: &Store, face_ids: &[i64], ignored: bool) -> Result<usi
         }
         tx.commit()?;
         Ok(n)
-    })
+    })?;
+    let photos = store.read(|conn| {
+        let mut out = Vec::new();
+        let Ok(mut st) = conn.prepare("SELECT photo_id FROM faces WHERE id=?1") else {
+            return out;
+        };
+        for id in face_ids {
+            if let Ok(p) = st.query_row(params![id], |r| r.get::<_, i64>(0)) {
+                out.push(p);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    });
+    refresh_people_tags(store, photos);
+    Ok(n)
 }
 
 /// 用所选人脸新建人物(身份号全局唯一;可选名字需未占用)。
@@ -1822,6 +1938,7 @@ pub fn create_person(store: &Store, face_ids: &[i64], name: Option<&str>) -> Res
 
 /// 忽略/恢复整个簇(误检簇一键排除)。
 pub fn ignore_cluster(store: &Store, cluster: i64, ignored: bool) -> Result<()> {
+    let _g = face_task_guard()?;
     store.write(|conn| -> Result<()> {
         conn.execute(
             "UPDATE faces SET ignored=?1 WHERE cluster=?2",
@@ -1829,6 +1946,19 @@ pub fn ignore_cluster(store: &Store, cluster: i64, ignored: bool) -> Result<()> 
         )?;
         Ok(())
     })?;
+    let photos = store.read(|conn| {
+        let mut out = Vec::new();
+        let Ok(mut st) =
+            conn.prepare("SELECT DISTINCT photo_id FROM faces WHERE cluster=?1")
+        else {
+            return out;
+        };
+        if let Ok(rows) = st.query_map(params![cluster], |r| r.get::<_, i64>(0)) {
+            out.extend(rows.flatten());
+        }
+        out
+    });
+    refresh_people_tags(store, photos);
     Ok(())
 }
 
@@ -1886,6 +2016,11 @@ pub fn wipe_faces(store: &Store) -> Result<()> {
         tx.execute("DELETE FROM faces", [])?;
         tx.execute("DELETE FROM people", [])?;
         tx.execute("DELETE FROM face_scan", [])?;
+        tx.execute(
+            "DELETE FROM auto_tags WHERE label_id IN
+                 (SELECT id FROM tag_labels WHERE node='人物' OR node LIKE '人物/%')",
+            [],
+        )?;
         tx.execute("UPDATE photos SET face_done = 0", [])?;
         tx.commit()?;
         Ok(())
@@ -1900,11 +2035,38 @@ pub fn remaining_count(store: &Store) -> usize {
         return 0;
     }
     let legacy = legacy_scanned(store) as i32;
+    let (scope_sql, scope_pats) = scope_clause(store);
     store.read(|conn| {
-        let sql = format!("SELECT COUNT(*) FROM photos p WHERE {TODO_WHERE}");
-        conn.query_row(&sql, params![sig, legacy], |r| r.get::<_, i64>(0))
+        let sql = format!("SELECT COUNT(*) FROM photos p WHERE {TODO_WHERE}{scope_sql}");
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        params.push(Box::new(sig));
+        params.push(Box::new(legacy));
+        for p in scope_pats {
+            params.push(Box::new(p));
+        }
+        conn.query_row(&sql, rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0))
             .map(|n| n as usize)
             .unwrap_or(0)
+    })
+}
+
+/// 已检出但未归簇的脸数(增量聚类的漏网项,重聚类可收齐)。
+pub fn unassigned_count(store: &Store) -> usize {
+    let sig = effective_sig(store);
+    if sig.is_empty() {
+        return 0;
+    }
+    let dim = emb_dim(store);
+    store.read(|conn| {
+        conn.query_row(
+            "SELECT COUNT(*) FROM faces f
+               JOIN face_templates t ON t.face_id=f.id AND t.dim=?1 AND t.sig=?2
+              WHERE f.cluster IS NULL AND f.ignored=0",
+            params![dim, sig],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n as usize)
+        .unwrap_or(0)
     })
 }
 
@@ -1930,6 +2092,7 @@ pub fn scan_batch(
     cap: usize,
     on_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Result<(usize, usize)> {
+    let _guard = face_task_guard()?;
     scan_batch_inner(store, cap, None, on_progress)
 }
 
@@ -2044,8 +2207,7 @@ fn scan_batch_inner(
     Ok((photo_count, face_count))
 }
 
-/// 连续扫描直到库里没有未处理照片(批间聚类一次;cancel 置位后当前照片处理完即停)。
-/// 返回累计(成功照片数, 人脸数)。失败项已落库,不再自动重试。
+/// 连续扫描直到队列空;进度按全库口径回报(累计已处理, 开扫时待处理总数),可取消。
 pub fn scan_all(
     store: &Store,
     cap: usize,
@@ -2053,19 +2215,54 @@ pub fn scan_all(
     on_progress: &(dyn Fn(usize, usize) + Send + Sync),
 ) -> Result<(usize, usize)> {
     let _guard = face_task_guard()?;
+    let total = remaining_count(store);
+    let done = std::sync::atomic::AtomicUsize::new(0);
     let (mut photo_total, mut face_total) = (0usize, 0usize);
     loop {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let (p, f) = scan_batch_inner(store, cap, Some(cancel), on_progress)?;
+        let before = done.load(Ordering::Relaxed);
+        let (p, f) = scan_batch_inner(store, cap, Some(cancel), &|step, _| {
+            let d = before + step;
+            done.store(d, Ordering::Relaxed);
+            on_progress(d, total);
+        })?;
         photo_total += p;
         face_total += f;
-        if p == 0 && f == 0 {
+        // 本批一张都没走 = 队列空;整批失败也要继续,不能按成功数判停。
+        if done.load(Ordering::Relaxed) == before {
             break;
         }
     }
+    // 收尾补一次全量重聚类:增量聚类会留下未归簇的脸,批处理能收齐。
+    if !cancel.load(Ordering::Relaxed) {
+        recluster_locked(store, cluster_thr(store))?;
+    }
+    if photo_total > 0 {
+        refresh_people_tags(store, analyzed_photo_ids(store));
+    }
     Ok((photo_total, face_total))
+}
+
+/// 人物标签由人脸数派生,人脸状态变化后按当前标签版本刷新。
+fn refresh_people_tags(store: &Store, photos: Vec<i64>) {
+    if photos.is_empty() {
+        return;
+    }
+    let ver = crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Tags);
+    let _ = crate::ai_tags::sync_people_tags(store, &photos, &ver);
+}
+
+/// 人脸数据待重建期间,派生的人物标签一并作废(旧结果不参与检索)。
+pub fn drop_people_tags(store: &Store) {
+    let _ = store.write(|conn| {
+        conn.execute(
+            "DELETE FROM auto_tags WHERE label_id IN
+                 (SELECT id FROM tag_labels WHERE node='人物' OR node LIKE '人物/%')",
+            [],
+        )
+    });
 }
 
 /// 重聚类分组累加器(加权和 + 同图约束所需的照片集合)。
@@ -2094,6 +2291,11 @@ fn linked_faces(map: &HashMap<i64, Vec<i64>>, face: i64, others: &[i64]) -> bool
 /// 全量重聚类:只按向量重排簇号,身份由成员旧 person_id 多数票继承。
 pub fn recluster_all(store: &Store, thr: f32) -> Result<usize> {
     let _guard = face_task_guard()?;
+    recluster_locked(store, thr)
+}
+
+/// 全量重聚类主体(调用方已持人脸任务互斥)。
+fn recluster_locked(store: &Store, thr: f32) -> Result<usize> {
     let sig = effective_sig(store);
     if sig.is_empty() {
         return Ok(0);
@@ -2526,6 +2728,12 @@ mod tests {
             blob.extend_from_slice(&v.to_le_bytes());
         }
         let c = store.test_conn();
+        // 外键约束开着,脸必须挂在真实照片行上。
+        c.execute(
+            "INSERT OR IGNORE INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'.',0,0)",
+            params![photo_id, format!("p{photo_id}.jpg")],
+        )
+        .unwrap();
         c.execute(
             "INSERT INTO faces(photo_id,x1,y1,x2,y2,score,quality,ignored,cluster,person_id)
              VALUES(?1,10,10,50,50,0.9,?2,0,?3,?4)",
@@ -2846,6 +3054,249 @@ mod tests {
         assert_eq!(failed_count(&store), 0);
     }
 
+    /// 待办按目录优先级排序;只常用目录范围按导入目录前缀过滤。
+    #[test]
+    fn photos_todo_scope_filter_and_priority() {
+        let store = test_store();
+        let conn = store.test_conn();
+        conn.execute(
+            "INSERT INTO dir_intent(path,state,source) VALUES('D:\\Scope','imported','import')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO ai_priority_rules(prefix,prio) VALUES('d:\\scope',1)", [])
+            .unwrap();
+        conn.execute("INSERT INTO ai_priority_rules(prefix,prio) VALUES('d:\\other',2)", [])
+            .unwrap();
+        for (id, path) in [
+            (1, "D:\\Scope\\sub\\a.jpg"),
+            (2, "D:\\Other\\b.jpg"),
+            (3, "D:\\Scope\\c.jpg"),
+        ] {
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,kind) VALUES(?1,?2,'.',0,1,0)",
+                params![id, path],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let all = photos_todo(&store, 10);
+        assert_eq!(
+            all.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![1, 3, 2],
+            "常用目录优先级在前,同级按 id: {all:?}"
+        );
+        assert_eq!(remaining_count(&store), 3);
+        set_scan_scope(&store, true);
+        let scoped = photos_todo(&store, 10);
+        let ids: Vec<_> = scoped.iter().map(|(id, _)| *id).collect();
+        assert!(ids.contains(&1) && ids.contains(&3) && !ids.contains(&2), "范围外应排除: {ids:?}");
+        assert_eq!(remaining_count(&store), 2);
+    }
+
+    /// 扫描范围设置往返:默认全库,common/all 互切并落库记忆。
+    #[test]
+    fn scan_scope_roundtrip() {
+        let store = test_store();
+        assert!(!scan_scope_common(&store), "默认应为全库");
+        set_scan_scope(&store, true);
+        assert!(scan_scope_common(&store));
+        assert_eq!(store.get_setting("face_scan_scope").as_deref(), Some("common"));
+        set_scan_scope(&store, false);
+        assert!(!scan_scope_common(&store));
+        assert_eq!(store.get_setting("face_scan_scope").as_deref(), Some("all"));
+    }
+
+    /// 范围过滤片段:全库为空;常用目录每个目录贡献一条子树 LIKE 参数(从 ?3 起)。
+    #[test]
+    fn scope_clause_patterns() {
+        let store = test_store();
+        let (sql, pats) = scope_clause(&store);
+        assert!(sql.is_empty() && pats.is_empty(), "全库范围不应有过滤片段");
+        store
+            .test_conn()
+            .execute(
+                "INSERT INTO dir_intent(path,state,source) VALUES('Z:\\CommonTest','imported','import')",
+                [],
+            )
+            .unwrap();
+        set_scan_scope(&store, true);
+        let (sql, pats) = scope_clause(&store);
+        let dirs = crate::db::common_dirs(&store);
+        assert_eq!(pats.len(), dirs.len(), "每个常用目录一个 LIKE 参数");
+        assert!(sql.contains("LIKE ?3"), "占位符应从 ?3 起: {sql}");
+        assert!(
+            pats.iter().any(|p| p.contains("CommonTest") && p.ends_with('%')),
+            "导入目录应生成子树通配: {pats:?}"
+        );
+    }
+
+    /// 待办优先级:最长前缀先命中(深目录盖过浅目录),未命中落默认档,同级按 id。
+    #[test]
+    fn priority_order_longest_prefix() {
+        let store = test_store();
+        let conn = store.test_conn();
+        conn.execute(
+            "INSERT INTO ai_priority_rules(prefix,prio) VALUES('d:\\photos',5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ai_priority_rules(prefix,prio) VALUES('d:\\photos\\family',1)",
+            [],
+        )
+        .unwrap();
+        for (id, path) in [
+            (1, "D:\\Photos\\misc\\a.jpg"),
+            (2, "D:\\Photos\\Family\\b.jpg"),
+            (3, "D:\\Other\\c.jpg"),
+            (4, "D:\\Photos\\Family\\d.jpg"),
+        ] {
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,kind) VALUES(?1,?2,'.',0,1,0)",
+                params![id, path],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let ids: Vec<_> = photos_todo(&store, 10).iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![2, 4, 1, 3], "最长前缀优先,同级按 id: {ids:?}");
+    }
+
+    /// 自动续扫判据:空库不续;有待办时取决于模型就位;待重建一律不续。
+    #[test]
+    fn should_resume_predicate() {
+        let store = test_store();
+        assert!(!should_resume(&store), "空库无待办,不续扫");
+        store
+            .test_conn()
+            .execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,kind) VALUES(1,'D:\\X\\a.jpg','.',0,1,0)",
+                [],
+            )
+            .unwrap();
+        let present = crate::ai::face::Faces::models_present(current_algo(&store));
+        assert_eq!(
+            should_resume(&store),
+            present,
+            "有待办+非重建时,续扫与否应完全取决于模型就位"
+        );
+        let fid = insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.5, None);
+        store
+            .test_conn()
+            .execute(
+                "UPDATE face_templates SET sig='stale-sig' WHERE face_id=?1",
+                params![fid],
+            )
+            .unwrap();
+        assert!(pending_rebuild(&store), "旧签名模板应触发待重建");
+        assert!(!should_resume(&store), "待重建时不自动续扫");
+    }
+
+    /// 空队列:scan_all 立即返回 (0,0),不触发进度回调(此路径无需加载模型)。
+    #[test]
+    fn scan_all_empty_queue() {
+        let store = test_store();
+        let cancel = AtomicBool::new(false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let (p, f) = scan_all(&store, 200, &cancel, &|_, _| {
+            calls.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+        assert_eq!((p, f), (0, 0));
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "空队列不应回报进度");
+        assert_eq!(remaining_count(&store), 0);
+    }
+
+    /// 真实模型端到端:跨批进度单调累计到 total、扫完待办归零、开扫即取消不耗队列。
+    #[test]
+    #[ignore = "需要真实人脸模型与临时图片,显式 --ignored 运行"]
+    fn scan_all_global_progress_real_models() {
+        let algo = crate::ai::face::FaceAlgo::SFace;
+        if !crate::ai::face::Faces::models_present(algo) {
+            eprintln!("SFace 模型未就位,跳过");
+            return;
+        }
+        let _serial = test_serial();
+        let store = test_store();
+        let _ = store.set_setting("face_algo", "sface");
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let dir = std::env::temp_dir().join(format!("maliang_scan_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::env::var_os("MALIANG_FACE_TEST_IMAGE").map(std::path::PathBuf::from);
+        let ext = src
+            .as_ref()
+            .and_then(|s| s.extension())
+            .map(|e| e.to_string_lossy().to_string())
+            .unwrap_or_else(|| "png".to_string());
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let p = dir.join(format!("t{i}.{ext}"));
+            match &src {
+                Some(s) => {
+                    std::fs::copy(s, &p).unwrap();
+                }
+                None => {
+                    image::RgbImage::from_fn(64, 64, |x, y| {
+                        image::Rgb([(x * 4) as u8, (y * 4) as u8, 128])
+                    })
+                    .save(&p)
+                    .unwrap();
+                }
+            }
+            paths.push(p);
+        }
+        let conn = store.test_conn();
+        for (i, p) in paths.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,kind) VALUES(?1,?2,'.',0,1,0)",
+                params![(i + 1) as i64, p.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let total0 = remaining_count(&store);
+        assert_eq!(total0, paths.len());
+        // 开扫即取消:不动队列,不加载模型。
+        let cancel = AtomicBool::new(true);
+        let (p0, f0) = scan_all(&store, 2, &cancel, &|_, _| {}).unwrap();
+        assert_eq!((p0, f0), (0, 0));
+        assert_eq!(remaining_count(&store), total0, "取消不应消耗待办");
+        // cap=2 < 3 张:强制跨批,验证 done 是全局累计而非每批重置。
+        let cancel = AtomicBool::new(false);
+        let seen = Mutex::new(Vec::<(usize, usize)>::new());
+        let (p, f) = scan_all(&store, 2, &cancel, &|d, t| {
+            seen.lock().unwrap().push((d, t));
+        })
+        .unwrap();
+        let log = seen.lock().unwrap();
+        assert!(!log.is_empty(), "应有进度回调");
+        assert!(
+            log.iter().all(|(_, t)| *t == total0),
+            "total 应恒为开扫口径 {total0}: {log:?}"
+        );
+        let mut last = 0;
+        for (d, _) in log.iter() {
+            assert!(*d >= last, "done 应单调不减: {log:?}");
+            last = *d;
+        }
+        assert_eq!(last, total0, "扫完 done 应等于 total: {log:?}");
+        assert_eq!(remaining_count(&store), 0, "扫完待办应归零");
+        assert_eq!(p, paths.len(), "每张都应提交(含 0 脸)");
+        assert_eq!(unassigned_count(&store), 0, "扫完自动补跑的重聚类应收齐全部脸");
+        if f > 0 {
+            let ver = crate::ai_queue::stage_version(&store, crate::ai_queue::Stage::Tags);
+            assert!(
+                !crate::ai_tags::category_ids(&store, "人物", &ver, 100).is_empty(),
+                "检出人脸的照片应自动带上人物标签"
+            );
+        }
+        if src.is_some() {
+            assert!(f > 0, "真实人脸图应检出人脸");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// map_unorient 是预览侧 map_orient 的逆:正着转过去再映射回来要还原。
     #[test]
     fn map_unorient_roundtrips() {
@@ -3145,6 +3596,44 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(rows[0].count, 4);
+    }
+
+    /// 质心缓存必须跟着成员走:加脸与并簇之后都等于按增量和重算,不能读到旧值。
+    #[test]
+    fn centroid_cache_tracks_membership() {
+        let mut cm = ClusterMem::new(2);
+        assert!(cm.centroid().is_none(), "空簇没有质心");
+        cm.add(
+            &Member { v: vec![1.0, 0.0], q: 0.9, photo: 1, manual: false },
+            0.6,
+        );
+        let first = cm.centroid().unwrap().to_vec();
+        assert!((first[0] - 1.0).abs() < 1e-6 && first[1].abs() < 1e-6);
+        cm.add(
+            &Member { v: vec![0.0, 1.0], q: 0.9, photo: 2, manual: false },
+            0.6,
+        );
+        assert_eq!(
+            cm.centroid().unwrap().to_vec(),
+            sum_centroid(&cm.sum, cm.wsum).unwrap(),
+            "加脸后缓存应等于重算"
+        );
+        assert_ne!(cm.centroid().unwrap().to_vec(), first, "质心应随新成员转向");
+        // 并簇直接累加增量和,不走 add,同样要刷新缓存。
+        let mut other = ClusterMem::new(2);
+        other.add(
+            &Member { v: vec![0.0, 1.0], q: 0.5, photo: 3, manual: false },
+            0.6,
+        );
+        for (x, y) in cm.sum.iter_mut().zip(&other.sum) {
+            *x += y;
+        }
+        cm.wsum += other.wsum;
+        cm.members.append(&mut other.members);
+        cm.refresh_centroid();
+        let c = cm.centroid().unwrap().to_vec();
+        assert_eq!(c, sum_centroid(&cm.sum, cm.wsum).unwrap());
+        assert!(c[1] > c[0], "并入偏 y 的簇后质心应偏 y: {c:?}");
     }
 
     /// 年轻簇(成员 < 3)吸脸收紧:余弦 0.66 过常规阈值、过不了年轻簇的,
@@ -3470,6 +3959,40 @@ mod tests {
         assert_eq!(names, vec!["张三".to_string(), "李四".to_string()]);
         assert_eq!(person_of(&store, 1), Some(1));
         assert_eq!(person_of(&store, 2), Some(2), "两个簇映射到不同身份");
+    }
+
+    /// 命名混合簇:已有身份的脸沿用该身份,尚未归属的脸一并扫入,不再只命一部分。
+    #[test]
+    fn rename_cluster_sweeps_unassigned_faces_into_identity() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg"]);
+        let named_a = insert_face_with(&store, 1, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        let named_b = insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        let unowned = insert_face_with(&store, 3, &[1.0, 0.0], 1.0, Some(1), None);
+        rename_person(&store, 11, "张三").unwrap();
+        rename_cluster(&store, 1, "张三").unwrap();
+        assert_eq!(person_of(&store, named_a), Some(11));
+        assert_eq!(person_of(&store, named_b), Some(11));
+        assert_eq!(
+            person_of(&store, unowned),
+            Some(11),
+            "未归属的脸应被扫进同一身份"
+        );
+        assert_eq!(people_rows(&store), vec![(11, "张三".to_string())]);
+        assert_eq!(faces_for_person(&store, 11, false, 0.0).len(), 3);
+    }
+
+    /// 命名整簇受「不同人」约束保护:簇内存在 never 时拒绝,身份不变。
+    #[test]
+    fn rename_cluster_respects_never_constraint() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let a = insert_face_with(&store, 1, &[1.0, 0.0], 1.0, Some(1), Some(11));
+        let b = insert_face_with(&store, 2, &[1.0, 0.0], 1.0, Some(1), None);
+        crate::ai_review::add(&store, a, b, crate::ai_review::Kind::Never).unwrap();
+        assert!(rename_cluster(&store, 1, "张三").is_err());
+        assert_eq!(person_of(&store, b), None, "冲突时未归属的脸不被扫入");
+        assert!(people_rows(&store).is_empty());
     }
 
     /// 清除人脸数据在事务内连约束与扫描状态一起清掉。
@@ -3882,5 +4405,133 @@ mod tests {
         assert!(pending_rebuild(&store));
         assert!(photos_todo(&store, 10).is_empty());
         assert!(scan_batch(&store, 10, &|_, _| {}).is_err());
+    }
+
+    /// 人脸任务互斥:守卫被占着时扫描入口必须排队,不能并发改写人脸结果。
+    #[test]
+    fn scan_entry_waits_for_face_task_guard() {
+        let _s = test_serial();
+        let store = test_store();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let g = face_task_guard().unwrap();
+        let h = std::thread::spawn(move || {
+            let _ = scan_batch(&store, 10, &|_, _| {});
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "守卫被占时扫描不该跑完"
+        );
+        drop(g);
+        h.join().unwrap();
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok());
+    }
+
+    /// 人物标签的词表 id(按节点取,词表增删不写死 id)。
+    fn people_label(store: &Store, node: &str) -> i64 {
+        store
+            .test_conn()
+            .query_row(
+                "SELECT id FROM tag_labels WHERE node=?1",
+                params![node],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn tag_ver(store: &Store) -> String {
+        crate::ai_queue::stage_version(store, crate::ai_queue::Stage::Tags)
+    }
+
+    /// 未归簇计数只认当前签名与维度,已归簇/已忽略的不算。
+    #[test]
+    fn unassigned_count_counts_only_current_pipeline() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        assert_eq!(unassigned_count(&store), 0);
+        insert_face(&store, 1, &[1.0, 0.0], 0.9, None);
+        insert_face(&store, 1, &[0.0, 1.0], 0.9, Some(3));
+        let ign = insert_face(&store, 2, &[0.0, 0.0, 1.0], 0.9, None);
+        set_ignored(&store, &[ign], true).unwrap();
+        assert_eq!(unassigned_count(&store), 1, "已归簇与已忽略的不计入");
+        store.set_setting("face_algo", "adaface").unwrap();
+        assert_eq!(unassigned_count(&store), 0, "待重建期间不报未归簇");
+    }
+
+    /// 增量归簇留下的漏网脸,全量重聚类能收齐(扫完自动补跑的就是这一步)。
+    #[test]
+    fn recluster_collects_faces_left_unassigned() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg"]);
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.9, None);
+        insert_face(&store, 2, &[0.99, 0.01, 0.0], 0.5, None);
+        insert_face(&store, 3, &[0.0, 1.0, 0.0], 0.9, None);
+        assert_eq!(unassigned_count(&store), 3);
+        recluster_all(&store, 0.6).unwrap();
+        assert_eq!(unassigned_count(&store), 0, "重聚类后不应再有未归簇的脸");
+        assert_eq!(people_overview(&store).len(), 2);
+    }
+
+    /// 单脸忽略不牵连整组,且人物标签随人脸数改写。
+    #[test]
+    fn ignoring_one_face_keeps_group_and_refreshes_people_tag() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg"]);
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let f1 = insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.9, Some(7));
+        let f2 = insert_face(&store, 1, &[0.0, 1.0, 0.0], 0.9, Some(7));
+        let ver = tag_ver(&store);
+        crate::ai_tags::sync_people_tags(&store, &[1], &ver).unwrap();
+        let tags = crate::ai_tags::photo_tags(&store, 1, &ver);
+        assert_eq!(tags[0].0, people_label(&store, "人物/合影"));
+        set_ignored(&store, &[f1], true).unwrap();
+        let other: i64 = store
+            .test_conn()
+            .query_row("SELECT ignored FROM faces WHERE id=?1", params![f2], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(other, 0, "忽略单脸不得连带整组");
+        let tags = crate::ai_tags::photo_tags(&store, 1, &ver);
+        assert_eq!(tags[0].0, people_label(&store, "人物/人像"), "剩一张脸应改判人像");
+        ignore_cluster(&store, 7, true).unwrap();
+        assert!(
+            crate::ai_tags::photo_tags(&store, 1, &ver).is_empty(),
+            "整组忽略后人物标签应清除"
+        );
+    }
+
+    /// 人物列表按人数从多到少排。
+    #[test]
+    fn people_overview_orders_by_count_desc() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg", "c.jpg", "d.jpg"]);
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.9, Some(2));
+        insert_face(&store, 2, &[0.0, 1.0, 0.0], 0.9, Some(1));
+        insert_face(&store, 3, &[0.0, 1.0, 0.0], 0.9, Some(1));
+        insert_face(&store, 4, &[0.0, 1.0, 0.0], 0.9, Some(1));
+        let rows = people_overview(&store);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].count, 3, "人多的排前面");
+        assert_eq!(rows[1].count, 1);
+    }
+
+    /// 清空人脸数据时,派生的人物标签一并作废。
+    #[test]
+    fn wipe_faces_clears_people_tags() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg"]);
+        crate::ai_tags::seed_labels(&store).unwrap();
+        insert_face(&store, 1, &[1.0, 0.0, 0.0], 0.9, None);
+        let ver = tag_ver(&store);
+        crate::ai_tags::sync_people_tags(&store, &[1], &ver).unwrap();
+        assert_eq!(crate::ai_tags::photo_tags(&store, 1, &ver).len(), 1);
+        wipe_faces(&store).unwrap();
+        assert!(crate::ai_tags::photo_tags(&store, 1, &ver).is_empty());
     }
 }
