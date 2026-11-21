@@ -8158,11 +8158,15 @@ impl App {
     /// 抽屉「标签」页 AI 自动标签区:按(照片,版本)缓存,点一下采纳为手动标签。
     #[cfg(feature = "ai")]
     fn drawer_auto_tags_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        let ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+        let ver = format!(
+            "{}|{:?}",
+            crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags),
+            crate::i18n::lang()
+        );
         let stale = self
             .drawer_auto_tags
             .as_ref()
-            .map(|(kid, kver, _)| *kid != id || kver != &ver)
+            .map(|(kid, kver, tags)| *kid != id || kver != &ver || tags.is_empty())
             .unwrap_or(true);
         if stale {
             let tags = crate::ai_tags::photo_tags(&self.store, id, &ver);
