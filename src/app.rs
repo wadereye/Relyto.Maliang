@@ -8735,6 +8735,10 @@ impl App {
                 ));
                 if cells.is_empty() {
                     ui.label(t("没有命中的照片;先启用 AI 索引可生成标签、文字与描述索引。"));
+                    #[cfg(feature = "ai")]
+                    if !self.ai_enabled && ui.button(t("启用 AI 索引")).clicked() {
+                        self.enable_ai_index();
+                    }
                 }
                 self.photo_grid(ui, "tag-search-grid", &cells);
                 return;
@@ -8823,6 +8827,17 @@ impl App {
         });
     }
 
+    /// 一键启用后台 AI 索引:写设置、恢复调度、全库入队。
+    #[cfg(feature = "ai")]
+    fn enable_ai_index(&mut self) {
+        let _ = self.store.set_setting("ai_enabled", "1");
+        self.ai_enabled = true;
+        if let Some(s) = &self.ai_sched {
+            s.resume();
+        }
+        self.enqueue_all_ai();
+    }
+
     /// 选项页「AI 行为」:基础开关、暂停恢复与队列统计。
     #[cfg(feature = "ai")]
     fn ai_options_ui(&mut self, ui: &mut egui::Ui) {
@@ -8866,14 +8881,23 @@ impl App {
                 .add_enabled(paused, egui::Button::new(t("继续")))
                 .clicked()
             {
-                let _ = self.store.set_setting("ai_enabled", "1");
-                self.ai_enabled = true;
-                if let Some(s) = &self.ai_sched {
-                    s.resume();
-                }
-                self.enqueue_all_ai();
+                self.enable_ai_index();
             }
         });
+        if crate::ai_queue::Stage::ALL
+            .iter()
+            .any(|s| !crate::ai_models::stage_ready(&self.store, *s))
+        {
+            ui.horizontal(|ui| {
+                ui.colored_label(
+                    egui::Color32::from_rgb(230, 145, 56),
+                    t("部分模型未下载,对应索引不会运行。"),
+                );
+                if ui.small_button(t("去下载")).clicked() {
+                    self.options_tab = 5;
+                }
+            });
+        }
         if ui.button(t("立即入队全库")).clicked() {
             self.enqueue_all_ai();
         }

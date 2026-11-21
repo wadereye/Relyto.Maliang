@@ -1584,4 +1584,7 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("文本命中", "Text match"),
 ("AI 自动标签(点一下采纳为手动标签):", "AI auto tags (click to adopt as manual tag):"),
 ("(暂无自动标签:启用 AI 索引并等待处理完成)", "(No auto tags yet: enable AI indexing and wait for it to finish)"),
+("部分模型未下载,对应索引不会运行。", "Some models are not downloaded; the corresponding indexing will not run."),
+("去下载", "Download models"),
+("启用 AI 索引", "Enable AI indexing"),
 ];
