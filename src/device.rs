@@ -189,6 +189,11 @@ unsafe extern "system" fn wnd_proc(
         if let Some(tx) = device_event_sender() {
             if let Some(ev) = translate_device_change(wparam.0 as u32, lparam.0 as usize) {
                 let _ = tx.send(ev);
+                if let Ok(g) = EVENT_CTX.lock() {
+                    if let Some(c) = g.as_ref() {
+                        c.request_repaint();
+                    }
+                }
             }
         }
     }
@@ -200,6 +205,9 @@ unsafe extern "system" fn wnd_proc(
 /// 用 `Mutex<Option<Sender>>` 而非 `OnceLock`:后者一旦设置就不可替换,
 /// 监听器若被重启(停止后再启动)就会把事件发到**已废弃**的旧 channel。
 static EVENT_TX: std::sync::Mutex<Option<mpsc::Sender<DeviceEvent>>> = std::sync::Mutex::new(None);
+
+// 事件送达后唤醒 UI(窗口过程只能通过全局状态拿到)。
+static EVENT_CTX: std::sync::Mutex<Option<egui::Context>> = std::sync::Mutex::new(None);
 
 #[cfg(windows)]
 fn device_event_sender() -> Option<mpsc::Sender<DeviceEvent>> {
@@ -227,13 +235,17 @@ fn set_device_event_sender(tx: mpsc::Sender<DeviceEvent>) -> bool {
 /// 失败时(非 Windows / 建窗失败)返回一个 `rx` 立即关闭的监听器,
 /// UI 侧 `try_recv` 得不到任何事件,等于"未启用",不影响其它功能。
 #[cfg(windows)]
-pub fn spawn_device_watcher() -> DeviceWatcher {
+pub fn spawn_device_watcher(ctx: egui::Context) -> DeviceWatcher {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
 
     // 全局 Sender(窗口过程需要);可替换,支持监听器重启。
     set_device_event_sender(tx.clone());
+    // 全局 ctx 同样可替换,事件送达即唤醒主窗口。
+    if let Ok(mut g) = EVENT_CTX.lock() {
+        *g = Some(ctx);
+    }
 
     let handle = std::thread::spawn(move || {
         unsafe {
@@ -310,6 +322,10 @@ impl DeviceWatcher {
         if let Ok(mut g) = EVENT_TX.lock() {
             *g = None;
         }
+        // 同步清掉全局 ctx,避免向已停用的监听器上下文请求重绘。
+        if let Ok(mut g) = EVENT_CTX.lock() {
+            *g = None;
+        }
     }
 }
 
@@ -339,7 +355,7 @@ pub fn removable_volumes() -> Vec<PathBuf> {
 
 /// 非 Windows:无 WM_DEVICECHANGE 隐藏窗口,返回一个不出事件的监听器(等价于“未启用”)。
 #[cfg(not(windows))]
-pub fn spawn_device_watcher() -> DeviceWatcher {
+pub fn spawn_device_watcher(_ctx: egui::Context) -> DeviceWatcher {
     let (_tx, rx) = mpsc::channel();
     DeviceWatcher {
         stop: Arc::new(AtomicBool::new(false)),

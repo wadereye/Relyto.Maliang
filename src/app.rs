@@ -2957,7 +2957,7 @@ impl App {
         self.watch_mode = Some(w.mode);
         // 设备热插拔监听(WM_DEVICECHANGE 链路)。
         // 新接入的相机/手机/可移动盘 → 自动扫描该卷。
-        self.device_watch = Some(crate::device::spawn_device_watcher());
+        self.device_watch = Some(crate::device::spawn_device_watcher(ctx.clone()));
         self.last_volumes = crate::device::removable_volumes();
         self.rebuild();
         // 人脸模型就位检查:缺件时提示可下载(不替用户花流量,点了才联网)。
@@ -13162,6 +13162,10 @@ impl eframe::App for App {
                     Ok(msg) => msg,
                     Err(e) => t_with("设为壁纸失败: {e}", &[("e", e.to_string())]),
                 };
+            }
+            // 操作仍在进行时限时唤醒,保证结果文案及时上屏。
+            if self.wallpaper_rx.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
             }
         }
         // 图库维护(备份/压缩/清理缺失)结果轮询
