@@ -835,12 +835,33 @@ pub fn auto_relocate_system_cache() -> (usize, bool) {
     (moved, ok)
 }
 
-/// 由标签全路径重算父层级(挂到最长的已存在祖先)。
-pub(crate) const REBUILD_TAG_PARENTS_SQL: &str =
-    "UPDATE tags SET parent_id = (
-       SELECT p.id FROM tags p
-        WHERE substr(tags.name, 1, length(p.name) + 1) = p.name || '/'
-        ORDER BY length(p.name) DESC LIMIT 1);";
+/// 按名称路径重算标签父层级(挂到最长的已存在祖先;只写有变化的行)。
+pub(crate) fn recompute_tag_parents(conn: &Connection) -> rusqlite::Result<()> {
+    let all: Vec<(i64, String, Option<i64>)> = {
+        let mut st = conn.prepare("SELECT id, name, parent_id FROM tags")?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let by_name: std::collections::HashMap<&str, i64> =
+        all.iter().map(|(id, name, _)| (name.as_str(), *id)).collect();
+    let mut put = conn.prepare("UPDATE tags SET parent_id=?2 WHERE id=?1")?;
+    for (id, name, cur) in &all {
+        // 由近及远找第一个已存在祖先("a/b/c" 先试 "a/b" 再试 "a")。
+        let mut want: Option<i64> = None;
+        let mut stem = name.as_str();
+        while let Some(pos) = stem.rfind('/') {
+            stem = &stem[..pos];
+            if let Some(pid) = by_name.get(stem) {
+                want = Some(*pid);
+                break;
+            }
+        }
+        if cur != &want {
+            put.execute(rusqlite::params![id, want])?;
+        }
+    }
+    Ok(())
+}
 
 const SCHEMA: &str = r#"
 PRAGMA journal_mode=WAL;
@@ -887,6 +908,17 @@ CREATE TABLE IF NOT EXISTS photos (
 );
 CREATE INDEX IF NOT EXISTS idx_photos_taken ON photos(taken_utc);
 CREATE INDEX IF NOT EXISTS idx_photos_parent ON photos(parent);
+-- 「按最近更改」与「最近更新」的排序键是归一化 mtime 表达式;表达式索引让
+-- 这两路 ORDER BY 走索引(旧写法全表扫描 + 临时 B 树排序)。表达式必须与
+-- timeline::MTIME_SQL 逐字一致才可能被查询规划器命中;带上 id DESC 后
+-- 「最近更新」的 `ORDER BY … DESC, p.id DESC` 也一并命中。
+CREATE INDEX IF NOT EXISTS idx_photos_mtime_desc ON photos(
+    CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
+         WHEN mtime >= 100000000000 THEN mtime / 1000
+         ELSE mtime END DESC, id DESC);
+-- 「按大小」/「按名称」两路排序的索引(名称要带 COLLATE NOCASE 才对得上)。
+CREATE INDEX IF NOT EXISTS idx_photos_size ON photos(size);
+CREATE INDEX IF NOT EXISTS idx_photos_path_nocase ON photos(path COLLATE NOCASE);
 -- 注意:建在迁移列(如 cam_id)上的索引不能写在这里 —— 旧库表已存在,
 -- CREATE TABLE IF NOT EXISTS 跳过、索引先于 ALTER 执行会直接失败。
 -- 这类索引一律放 `from_conn` 的迁移段(ALTER 之后)。
@@ -1574,7 +1606,7 @@ impl Store {
         );
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN color TEXT;");
         let _ = conn.execute_batch("ALTER TABLE tags ADD COLUMN parent_id INTEGER;");
-        let _ = conn.execute_batch(REBUILD_TAG_PARENTS_SQL);
+        let _ = recompute_tag_parents(&conn);
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lat REAL;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN lon REAL;");
         // uid64 持久唯一标识(64 位无符号整数列)。
@@ -1654,6 +1686,13 @@ impl Store {
         // 所以它们照样共存,仍按 path 身份走。
         let _ = conn
             .execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_frn64 ON photos(frn64);");
+        // 变更日志条数封顶(启动时裁一次即可,写入侧另有时间窗清理)。
+        // 行数不足时子查询为 NULL,比较落空、不误删。
+        let _ = conn.execute(
+            "DELETE FROM changes WHERE id <= \
+             (SELECT id FROM changes ORDER BY ts DESC, id DESC LIMIT 1 OFFSET 20000)",
+            [],
+        );
         // 写连接兜底等待:与异步写批/其它同步写撞车时排队而不是报 BUSY。
         let _ = conn.busy_timeout(std::time::Duration::from_millis(5000));
         let store = Store {
@@ -1683,6 +1722,9 @@ impl Store {
         store
             .hard_purged
             .store(purged, std::sync::atomic::Ordering::Relaxed);
+        // 启动迁移的标记写(set_setting)走异步队列:返回前排干,
+        // 启动即写/读的路径不再受队列时序影响。
+        store.flush();
         Ok(store)
     }
 
@@ -1925,7 +1967,7 @@ impl Store {
             .unwrap()
             .insert(k.to_string(), Some(v.to_string()));
         let (k, v) = (k.to_string(), v.to_string());
-        self.write(move |conn| {
+        self.write_async(move |conn| {
             let _ = conn.execute(
                 "INSERT INTO settings(k,v) VALUES(?1,?2)
                  ON CONFLICT(k) DO UPDATE SET v=?2",
@@ -2488,11 +2530,14 @@ impl Store {
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let (path, action) = (path.to_string(), action.to_string());
-        self.write(move |conn| {
+        self.write_async(move |conn| {
             let _ = conn.execute(
                 "INSERT INTO changes(ts,path,action,photo_id) VALUES(?1,?2,?3,?4)",
                 rusqlite::params![ts, path, action, photo_id],
             );
+            // 长期挂机的监听会话也别把日志表养到无限大:按时间窗清,走 idx_changes_ts。
+            let cutoff = ts - 90 * 24 * 3600 * 1000;
+            let _ = conn.execute("DELETE FROM changes WHERE ts < ?1", rusqlite::params![cutoff]);
         });
         Ok(())
     }
@@ -2559,13 +2604,15 @@ impl Store {
             return Ok(0);
         }
         self.write(move |conn| {
-            for (id, path, size, mtime) in &rows {
-                let u = fnv1a64(&format!("{path}|{size}|{mtime}"));
-                conn.execute(
-                    "UPDATE photos SET uid64=?2 WHERE id=?1",
-                    rusqlite::params![id, u as i64],
-                )?;
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut st = tx.prepare_cached("UPDATE photos SET uid64=?2 WHERE id=?1")?;
+                for (id, path, size, mtime) in &rows {
+                    let u = fnv1a64(&format!("{path}|{size}|{mtime}"));
+                    st.execute(rusqlite::params![id, u as i64])?;
+                }
             }
+            tx.commit()?;
             Ok(rows.len())
         })
     }
@@ -2595,16 +2642,18 @@ impl Store {
             return Ok(0);
         }
         self.write(move |conn| {
+            let tx = conn.unchecked_transaction()?;
             let mut n = 0usize;
-            for (id, path) in &rows {
-                if let Some(e) = Self::ext_of(path) {
-                    conn.execute(
-                        "UPDATE photos SET ext=?2 WHERE id=?1",
-                        rusqlite::params![id, e],
-                    )?;
-                    n += 1;
+            {
+                let mut st = tx.prepare_cached("UPDATE photos SET ext=?2 WHERE id=?1")?;
+                for (id, path) in &rows {
+                    if let Some(e) = Self::ext_of(path) {
+                        st.execute(rusqlite::params![id, e])?;
+                        n += 1;
+                    }
                 }
             }
+            tx.commit()?;
             Ok(n)
         })
     }
@@ -2812,11 +2861,17 @@ impl Store {
     /// 冲突分支**只升不降**:门说在作用域内才可能把 0 抬到 1,已派生(2)与
     /// 坏文件(3)由 [`Store::invalidate_dir`] / [`Store::mark_bad_media`] 管;
     /// 文件变了(mtime 不同)则退回 1 重派生,与 `thumb_ok` 的重置同一口径。
+    /// 测试便捷入口(生产一律走 [`Store::ingest_l1_batch`])。
+    #[cfg(test)]
     pub fn ingest_l1_rows(&self, rows: &[L1Row], gate: Option<&ScopeGate>) -> Result<L1Ingest> {
+        self.ingest_l1_batch(rows.to_vec(), gate)
+    }
+
+    /// 落库(owned 批次入口:调用方已按批 clone 好,这里不再整批克隆)。
+    pub fn ingest_l1_batch(&self, rows: Vec<L1Row>, gate: Option<&ScopeGate>) -> Result<L1Ingest> {
         if rows.is_empty() {
             return Ok(L1Ingest::default());
         }
-        let rows = rows.to_vec();
         self.write(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let mut ins = tx.prepare_cached(
@@ -3076,17 +3131,23 @@ impl Store {
         if pending.is_empty() {
             return Ok(0);
         }
+        let pool = crate::timeline::CAM_POOL.to_string();
         let mut migrated = 0usize;
-        for (id, cam) in &pending {
-            // 每行一次写连接驻留 + 更新(同锁完成,避免两条写交错)。
-            let (pool, id) = (crate::timeline::CAM_POOL.to_string(), *id);
-            let cam = cam.clone();
+        for chunk in pending.chunks(5000) {
+            let pool = pool.clone();
+            let rows = chunk.to_vec();
             let n: usize = self.write(move |conn| -> Result<usize> {
-                let cid = Self::intern_tx(conn, &pool, &cam)?;
-                Ok(conn.execute(
-                    "UPDATE photos SET cam_id=?2, cam=NULL WHERE id=?1",
-                    rusqlite::params![id, cid],
-                )?)
+                let tx = conn.unchecked_transaction()?;
+                let mut n = 0usize;
+                {
+                    let mut put = tx.prepare_cached("UPDATE photos SET cam_id=?2, cam=NULL WHERE id=?1")?;
+                    for (id, cam) in &rows {
+                        let cid = Self::intern_tx(&tx, &pool, cam)?;
+                        n += put.execute(rusqlite::params![id, cid])?;
+                    }
+                }
+                tx.commit()?;
+                Ok(n)
             })?;
             migrated += n;
         }
@@ -3399,7 +3460,7 @@ impl Store {
     }
 
     pub fn clear_tier_row(&self, photo_id: i64, tier: u8) {
-        let _ = self.write(move |conn| {
+        let _ = self.write_async(move |conn| {
             let _ = conn.execute(
                 "DELETE FROM thumb_tiers WHERE photo_id=?1 AND tier=?2",
                 rusqlite::params![photo_id, tier as i64],
@@ -6375,6 +6436,7 @@ mod tests {
         store.log_change("/pics/a.jpg", "added", Some(1)).unwrap();
         store.log_change("/pics/b.jpg", "modified", None).unwrap();
         store.log_change("/pics/c.jpg", "removed", None).unwrap();
+        store.flush();
         assert_eq!(store.change_count(), 3);
 
         let recent = store.recent_changes(10);

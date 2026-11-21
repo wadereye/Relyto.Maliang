@@ -505,6 +505,9 @@ fn window_icon() -> egui::IconData {
 }
 
 fn main() -> eframe::Result {
+    // OpenMP 线程上限必须在任何线程起来前定好(见 ai::pre_init)。
+    #[cfg(feature = "ai")]
+    crate::ai::pre_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     // 更新相关的子命令都不碰数据库,没必要先做分钟级的数据目录迁移。
     let is_update_helper = matches!(

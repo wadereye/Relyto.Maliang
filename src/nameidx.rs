@@ -2022,6 +2022,7 @@ pub fn ingest_l1(
         return Ok(crate::db::L1Ingest::default());
     }
     let gate = crate::db::ScopeGate::load(store);
+    // 硬排除的行连结构都不落库;要摘掉的按 FRN 反删 L2 旧行。
     let mut kept: Vec<&crate::db::L1Row> = Vec::with_capacity(rows.len());
     let mut dropped: Vec<i64> = Vec::new();
     for r in rows {
@@ -2032,9 +2033,10 @@ pub fn ingest_l1(
         }
     }
     let mut out = crate::db::L1Ingest::default();
+    // 每批 clone 一次后交给 owned 入口(旧写法在 db 侧又 `to_vec()` 整批克隆)。
     for c in kept.chunks(L1_INGEST_CHUNK) {
-        let batch: Vec<crate::db::L1Row> = c.iter().map(|r| (*r).clone()).collect();
-        let r = store.ingest_l1_rows(&batch, Some(&gate))?;
+        let batch: Vec<crate::db::L1Row> = c.iter().copied().cloned().collect();
+        let r = store.ingest_l1_batch(batch, Some(&gate))?;
         out.inserted += r.inserted;
         out.updated += r.updated;
     }

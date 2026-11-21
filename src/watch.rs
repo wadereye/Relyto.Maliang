@@ -204,10 +204,10 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                         let n = if dirs.is_empty() {
                             0
                         } else {
-                            // 事件路径与兜底路径共用同一份排除规则
-                            // 快路慢路不许各判一套。
-                            let excl = crate::scan::Exclusions::from_store(&store);
-                            scan_dirs(&store, &dirs, &excl)
+                            // 事件批次读一次门:逐文件重载全表是卡顿主要来源。
+                            // 事件路径与兜底路径共用同一份排除规则,快路慢路不许各判一套。
+                            let ctx = crate::scan::IngestCtx::load(&store);
+                            scan_dirs(&store, &dirs, &ctx.excl, &ctx)
                         };
                         if n == 0 && removed == 0 && renamed.is_empty() {
                             continue;
@@ -337,7 +337,12 @@ fn affected_dirs(paths: &[PathBuf], roots: &[PathBuf]) -> Vec<PathBuf> {
 
 /// 逐文件入库(事件驱动的粒度:`FindNextFileW` 一次一个目录项)。
 /// 返回新增/变更的文件数。被排除的目录整棵剪掉(与 [`snapshot`] 同一份规则)。
-fn scan_dirs(store: &Store, dirs: &[PathBuf], excl: &crate::scan::Exclusions) -> usize {
+fn scan_dirs(
+    store: &Store,
+    dirs: &[PathBuf],
+    excl: &crate::scan::Exclusions,
+    ctx: &crate::scan::IngestCtx,
+) -> usize {
     let mut n = 0usize;
     for d in dirs {
         let it = WalkDir::new(d)
@@ -347,7 +352,7 @@ fn scan_dirs(store: &Store, dirs: &[PathBuf], excl: &crate::scan::Exclusions) ->
             .filter(|e| e.file_type().is_file())
             .filter(|e| crate::scan::is_indexable(e.path()));
         for e in it {
-            if crate::scan::index_file(store, e.path()).unwrap_or(false) {
+            if crate::scan::index_file_ctx(store, e.path(), None, ctx).unwrap_or(false) {
                 n += 1;
             }
         }
@@ -393,7 +398,11 @@ fn poll_once(
     }
     let dirs = affected_dirs(&changed, roots);
     let n = dirs.len();
-    scan_dirs(store, &dirs, &excl);
+    let ctx = crate::scan::IngestCtx {
+        excl: excl.clone(),
+        gate: crate::db::ScopeGate::load(store),
+    };
+    scan_dirs(store, &dirs, &excl, &ctx);
     (added, modified, n)
 }
 

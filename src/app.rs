@@ -267,7 +267,7 @@ struct AnimState {
 pub struct App {
     store: Arc<Store>,
     rows: Vec<PhotoRow>,
-    months: Vec<(String, Vec<usize>)>,
+    months: Vec<(String, Vec<usize>, bool)>,
     folders: Vec<String>,
     selected_folder: usize,
     view: ViewKind,
@@ -313,6 +313,8 @@ pub struct App {
     scan_verb: &'static str,
     status: String,
     dups: Vec<Dup>,
+    /// 重复组缓存是否过期(进入重复视图时才重算,不进每次 rebuild)。
+    dups_dirty: bool,
     /// 重复视图:包含近似重复(hamming ≤ NEAR_DUP_DIST)。
     dup_near: bool,
     id_row: HashMap<i64, usize>,
@@ -561,6 +563,9 @@ pub struct App {
     slide_last: std::time::Instant,
     /// 暂停(空格切换)。
     slide_pause: bool,
+    /// 幻灯片字幕缓存(换张才读库,不逐帧查)。
+    slide_cap_id: Option<i64>,
+    slide_cap: String,
     /// 每张停留秒数(默认 3 秒)。
     slide_interval: f32,
     /// 循环放映(设置项 slideshow_loop,默认开)。
@@ -1846,6 +1851,22 @@ fn cn_date(s: &str) -> String {
     s.to_string()
 }
 
+/// 月份键(`by_month` 的 `"YYYY-MM"`)→ 「2026年11月」;不是月份键就原样返回。
+fn cn_month(s: &str) -> String {
+    let p: Vec<&str> = s.split('-').collect();
+    if p.len() == 2 {
+        let y = p[0].parse::<u32>().unwrap_or(0);
+        let m = p[1].parse::<u32>().unwrap_or(0);
+        if y > 0 && m > 0 {
+            return t_with(
+                "{p1}年{p2}月",
+                &[("p1", (y).to_string()), ("p2", (m).to_string())],
+            );
+        }
+    }
+    s.to_string()
+}
+
 /// 行式缩略图布局的一行:每项 (rows 下标, 该格宽) 与本行统一高。
 /// 不把照片裁成正方形:同行等高,各自按宽高比取宽,行尾贴近右边界。
 struct ThumbRow {
@@ -2631,6 +2652,7 @@ impl App {
             import_devices_err: String::new(),
             status: t("就绪").into(),
             dups: Vec::new(),
+            dups_dirty: true,
             dup_near: false,
             id_row: HashMap::new(),
             preview: None,
@@ -2721,6 +2743,8 @@ impl App {
             slideshow: false,
             slide_last: std::time::Instant::now(),
             slide_pause: false,
+            slide_cap_id: None,
+            slide_cap: String::new(),
             slide_interval: 3.0,
             slide_loop: true,
             caption_edit: None,
@@ -2890,6 +2914,7 @@ impl App {
         self.thumb_bg = Some(crate::thumbs::spawn_worker(
             self.store.clone(),
             crate::thumbs::visible_dirs(),
+            ctx.clone(),
         ));
         // AI 调度器:默认暂停,由「工具 > 继续 AI 索引」或选项页开启。
         #[cfg(feature = "ai")]
@@ -4651,7 +4676,8 @@ impl App {
         // UI 层不再拿全表二次排序(大图库下每帧搬全表不可接受)。
         let rows = timeline::load_query(&self.store, self.sort_by, self.sort_rev, &self.filters)
             .unwrap_or_default();
-        self.months = timeline::by_month(&rows).into_iter().rev().collect(); // 新月份在前
+        // 月份组序与组内行同向:未反向 = 新在前,勾了「反向排序」则旧在前。
+        self.months = timeline::by_month(&rows, self.sort_rev);
         let mut seen = BTreeSet::new();
         let mut folders = Vec::new();
         for r in &rows {
@@ -4672,11 +4698,9 @@ impl App {
             .map(|(i, r)| (r.id, i))
             .collect();
         self.refresh_recent();
-        self.dups = if self.dup_near {
-            timeline::dup_groups_near(&self.store, NEAR_DUP_DIST).unwrap_or_default()
-        } else {
-            timeline::dup_groups(&self.store).unwrap_or_default()
-        };
+        // 重复组是全表扫描(近似档还带 O(n²)):不进每次 rebuild,
+        // 进入重复视图时懒算(见 ViewKind::Duplicates 渲染分支)。
+        self.dups_dirty = true;
         self.tags = timeline::all_tags(&self.store).unwrap_or_default();
         if self.selected_folder >= self.folders.len() {
             self.selected_folder = 0;
@@ -5336,12 +5360,14 @@ impl App {
             let mut scanned = 0usize;
             let mut indexed = 0usize;
             let mut skipped = 0usize;
+            // 门整批读一次:逐文件重载全表在大批导入时是主要卡顿来源。
+            let ctx = crate::scan::IngestCtx::load(&store);
             for p in &paths {
                 if ctrl.is_cancelled() {
                     break;
                 }
                 scanned += 1;
-                match crate::scan::index_file_ctrl(&store, p, Some(&ctrl)) {
+                match crate::scan::index_file_ctx(&store, p, Some(&ctrl), &ctx) {
                     Ok(true) => indexed += 1,
                     Ok(false) => skipped += 1,
                     Err(_) => {}
@@ -7885,6 +7911,8 @@ impl App {
             if resp.lost_focus() || enter {
                 if *cap != self.store.get_caption(id) {
                     let _ = self.store.set_caption(id, cap);
+                    // 幻灯片字幕按 id 记忆化,标题改了要让缓存失效。
+                    self.slide_cap_id = None;
                     self.fx_msg = t("标题已保存").into();
                 }
             }
@@ -9521,10 +9549,12 @@ impl App {
                 if self.slide_pause {
                     line = t_with("[已暂停]  {line}", &[("line", line.to_string())]);
                 }
-                let cap = self
-                    .preview
-                    .map(|id| self.store.get_caption(id))
-                    .unwrap_or_default();
+                let cur = self.preview;
+                if self.slide_cap_id != cur {
+                    self.slide_cap = cur.map(|id| self.store.get_caption(id)).unwrap_or_default();
+                    self.slide_cap_id = cur;
+                }
+                let cap = self.slide_cap.clone();
                 ui.horizontal(|ui| {
                     if !cap.is_empty() {
                         ui.label(
@@ -12717,6 +12747,8 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         // 自动更新后台线程:让它自己收尾,别留一条游离线程被进程硬砍。
         self.updater.stop();
+        // 异步写队列先排干,免得刚改的设置/变更日志随进程被砍掉。
+        self.store.flush();
         if let Some(w) = self.thumb_bg.take() {
             w.stop();
         }
@@ -13234,8 +13266,13 @@ impl eframe::App for App {
         if self.wifi.is_some() || self.wifi_panel {
             ctx.request_repaint_after(std::time::Duration::from_millis(1000));
         }
-        // 后台任务进行中则定时重绘
-        if self.scan_busy.load(Ordering::Relaxed) || self.thumb_bg.is_some() {
+        // 后台任务进行中则定时重绘(worker 空轮后定居,空闲不占 CPU)
+        let thumb_busy = self
+            .thumb_bg
+            .as_ref()
+            .map(|w| w.active.load(Ordering::Relaxed))
+            .unwrap_or(false);
+        if self.scan_busy.load(Ordering::Relaxed) || thumb_busy {
             // 扫描中用更短的间隔,让进度条流畅(持续回调驱动)。
             let ms = if self.scan_busy.load(Ordering::Relaxed) {
                 100
@@ -14301,22 +14338,49 @@ impl eframe::App for App {
                     }
                     ViewKind::Timeline => {
                         let months = std::mem::take(&mut self.months);
-                        for (label, idxs) in &months {
+                        for (key, idxs, file_time) in &months {
                             ui.add_space(6.0);
                             // 日期分组头(弱化的小标题,不与缩略图抢视线)。
+                            // 标题用中文月份写法 + 张数;网格 id 仍走裸月键,不随语言变。
+                            // 整组都没有 EXIF 时如实写明依据是文件时间,不冒充拍摄时间。
+                            let title = if key.is_empty() {
+                                t("未知时间").to_string()
+                            } else {
+                                let m = cn_month(key);
+                                if *file_time {
+                                    format!("{m} · {}", t("按文件时间"))
+                                } else {
+                                    m
+                                }
+                            };
                             ui.label(
-                                egui::RichText::new(label)
-                                    .size(13.0)
-                                    .color(crate::theme::p().muted)
-                                    .strong(),
+                                egui::RichText::new(t_with(
+                                    "{p1}  ·  {p2} 张",
+                                    &[
+                                        ("p1", title),
+                                        ("p2", (idxs.len()).to_string()),
+                                    ],
+                                ))
+                                .size(13.0)
+                                .color(crate::theme::p().muted)
+                                .strong(),
                             );
                             ui.add_space(4.0);
-                            self.photo_grid(ui, &format!("tl-{label}"), idxs);
+                            self.photo_grid(ui, &format!("tl-{key}"), idxs);
                             ui.add_space(12.0);
                         }
                         self.months = months;
                     }
                     ViewKind::Duplicates => {
+                        if self.dups_dirty {
+                            self.dups = if self.dup_near {
+                                timeline::dup_groups_near(&self.store, NEAR_DUP_DIST)
+                                    .unwrap_or_default()
+                            } else {
+                                timeline::dup_groups(&self.store).unwrap_or_default()
+                            };
+                            self.dups_dirty = false;
+                        }
                         if self.dups.is_empty() {
                             ui.label(if self.dup_near {
                                 t("没有检测到重复或近似重复")

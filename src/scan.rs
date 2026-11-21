@@ -914,21 +914,41 @@ fn shell_dimensions(p: &Path) -> Option<(i32, i32)> {
     Some((w as i32, h as i32))
 }
 
-/// 索引**单个**文件(事件驱动用)。
-///
-/// 事件驱动(watch)拿到的是"哪个文件变了",不是"哪个目录变了";
-/// 这里只处理这一个文件,不做整树遍历 —— 目录项枚举的粒度
-/// 是 `FindNextFileW` 一次拿一个目录项的属性。
-///
-/// 返回 `true` 表示该文件被写入了索引(新文件或内容有变)。
+/// 索引**单个**文件(事件驱动路径便利入口:自建门)。
+#[allow(dead_code)]
 pub fn index_file(store: &Store, path: &Path) -> Result<bool> {
     index_file_ctrl(store, path, None)
 }
 
-/// 带取消检查的单文件入库(事件驱动路径)。
-///
-/// `ctrl` 为 `Some` 时,入库前查一次取消标志 —— 取消后不再写库。
+/// 批量入库上下文:排除规则与作用域门整批只读一次库。
+pub struct IngestCtx {
+    pub excl: Exclusions,
+    pub gate: crate::db::ScopeGate,
+}
+
+impl IngestCtx {
+    /// 读一次库建门(批量路径入口调用;逐文件路径复用它避免每文件全表重载)。
+    pub fn load(store: &Store) -> Self {
+        IngestCtx {
+            excl: Exclusions::from_store(store),
+            gate: crate::db::ScopeGate::load(store),
+        }
+    }
+}
+
+/// 带取消检查的单文件入库(自建门;批量路径请优先用 [`index_file_ctx`])。
+#[allow(dead_code)]
 pub fn index_file_ctrl(store: &Store, path: &Path, ctrl: Option<&ScanControl>) -> Result<bool> {
+    index_file_ctx(store, path, ctrl, &IngestCtx::load(store))
+}
+
+/// 单文件入库(批量路径用:门已由调用方整批读好)。
+pub fn index_file_ctx(
+    store: &Store,
+    path: &Path,
+    ctrl: Option<&ScanControl>,
+    ctx: &IngestCtx,
+) -> Result<bool> {
     if let Some(c) = ctrl {
         if c.is_cancelled() {
             return Ok(false);
@@ -938,8 +958,7 @@ pub fn index_file_ctrl(store: &Store, path: &Path, ctrl: Option<&ScanControl>) -
         return Ok(false);
     }
     // 排除规则:路径上任一级目录命中排除名则跳过。
-    let excl = Exclusions::from_store(store);
-    if excl.excludes_path(path) {
+    if ctx.excl.excludes_path(path) {
         return Ok(false);
     }
     let md = std::fs::metadata(path)?;
@@ -975,7 +994,7 @@ pub fn index_file_ctrl(store: &Store, path: &Path, ctrl: Option<&ScanControl>) -
     };
 
     let rec = read_record(path, size, mtime);
-    store_insert(store, &[rec])?;
+    store_insert_gated(store, &[rec], &ctx.gate)?;
     // 事件驱动路径也要写变更日志(否则只有扫描会记,监听发现的变化会丢)。
     let _ = store.log_change(&key, if existed { "modified" } else { "added" }, None);
     Ok(true)
@@ -1003,6 +1022,14 @@ fn store_insert(store: &Store, records: &[Record]) -> Result<()> {
     }
     // 门读一次库,之后逐行判定纯内存(百万行落库不能被逐行查库拖成 IO 密集)。
     let gate = crate::db::ScopeGate::load(store);
+    store_insert_gated(store, records, &gate)
+}
+
+/// 门已备好的批量落库(供逐文件事件路径复用同一张门)。
+fn store_insert_gated(store: &Store, records: &[Record], gate: &crate::db::ScopeGate) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
     // 注意:必须用 execute_batch —— rusqlite 的 `execute` 只接受单条语句,
     // 传多条会报 "Multiple statements provided"。
     for chunk in records.chunks(INSERT_CHUNK) {
@@ -1602,6 +1629,7 @@ mod tests {
         let store = Store::open_mem().unwrap();
         // 新文件 → added
         assert!(index_file(&store, &p).unwrap());
+        store.flush();
         let log = store.recent_changes(10);
         assert_eq!(log.len(), 1, "应记录一条变更: {log:?}");
         assert_eq!(log[0].2, "added");
@@ -1613,6 +1641,7 @@ mod tests {
         // 内容变了 → modified
         std::fs::write(&p, b"changed-content-different-size").unwrap();
         assert!(index_file(&store, &p).unwrap());
+        store.flush();
         let log = store.recent_changes(10);
         assert_eq!(log.len(), 2, "应记录第二条变更: {log:?}");
         assert_eq!(log[0].2, "modified");
@@ -1635,6 +1664,7 @@ mod tests {
 
         let store = Store::open_mem().unwrap();
         let _ = scan_dir(&store, &[dir.clone()]).unwrap();
+        store.flush();
         let log = store.recent_changes(10);
         assert!(!log.is_empty(), "应有变更记录");
         assert!(

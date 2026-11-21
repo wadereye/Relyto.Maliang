@@ -724,6 +724,10 @@ pub struct ThumbWorker {
     /// UI 发布的可见目录清单(可见优先 + 全库兜底)。
     /// 用 [`ThumbWorker::publish_visible`] 写,worker 每轮取行前读一次快照。
     visible: VisibleDirs,
+    /// 是否有活要干(空轮后置闲;UI 据此决定要不要持续重绘)。
+    pub active: Arc<AtomicBool>,
+    /// 唤醒定居的 UI(发布新清单 / 落批时主动 request_repaint)。
+    ctx: egui::Context,
 }
 
 /// 一次性给**误判**的坏图销案(台账 3,427 条里 3,340 条写着
@@ -761,13 +765,20 @@ fn reset_misfiled_bad_media_once(store: &crate::db::Store) {
 ///   按需从对应档位的缓存取,缺则生成 —— 各档独立记账)。
 ///
 /// 线程优先级降为 BelowNormal,不与 UI 抢核。
-pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> ThumbWorker {
+pub fn spawn_worker(
+    store: Arc<crate::db::Store>,
+    visible: VisibleDirs,
+    ctx: egui::Context,
+) -> ThumbWorker {
     let (tx, rx) = mpsc::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = stop.clone();
+    let active = Arc::new(AtomicBool::new(true));
+    let active2 = active.clone();
     let tier = Arc::new(AtomicU8::new(Tier::Normal as u8));
     let tier2 = tier.clone();
     let visible2 = visible.clone();
+    let ctx2 = ctx.clone();
     let handle = std::thread::spawn(move || {
         crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
         // 误判坏图的一次性销案放在 worker 线程里做:几千个文件要各读一次头,
@@ -784,12 +795,16 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
             // 档位切换 → 重新标记(UI 侧会清纹理缓存,重新加载该档)。
             if t != last_tier {
                 last_tier = t;
+                active2.store(true, Ordering::Relaxed);
             }
             // 可见清单每轮取一次快照:锁只在这一瞬间持有,生成期间不碰它。
             let vis: Vec<String> = visible2.lock().unwrap().clone();
             let ids = backfill_tier(&store, t, &vis, batch).unwrap_or_default();
             if !ids.is_empty() {
+                active2.store(true, Ordering::Relaxed);
                 let _ = tx.send(ids);
+                // 唤醒定居的 UI:补完一批就该换真图。
+                ctx2.request_repaint();
                 // 优先队列批间也让一下(BATCH_GAP_MS):洪峰期不与 UI 帧抢核。
                 std::thread::sleep(Duration::from_millis(BATCH_GAP_MS));
                 // 立刻继续下一批,直到这一轮补完。
@@ -801,12 +816,16 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
             if t == Tier::Normal {
                 let idle = backfill_idle(&store, IDLE_BATCH).unwrap_or_default();
                 if !idle.is_empty() {
+                    active2.store(true, Ordering::Relaxed);
                     let _ = tx.send(idle);
+                    ctx2.request_repaint();
                     std::thread::sleep(Duration::from_millis(IDLE_GAP_MS));
                     continue;
                 }
             }
             // 全库都补齐了:睡一会再查(扫描新增照片后自动补齐)。
+            // 空轮 → 置闲:UI 据此定居,不再常驻 300ms 重绘。
+            active2.store(false, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(2000));
         }
     });
@@ -816,6 +835,8 @@ pub fn spawn_worker(store: Arc<crate::db::Store>, visible: VisibleDirs) -> Thumb
         done: rx,
         tier,
         visible,
+        active,
+        ctx,
     }
 }
 
@@ -828,6 +849,9 @@ impl ThumbWorker {
         let mut g = self.visible.lock().unwrap();
         if *g != dirs {
             *g = dirs;
+            // 新清单 = 有新活:置忙 + 唤醒定居的 UI。
+            self.active.store(true, Ordering::Relaxed);
+            self.ctx.request_repaint();
         }
     }
 
@@ -1238,7 +1262,7 @@ mod tests {
             )
             .unwrap();
         }
-        let worker = spawn_worker(store.clone(), visible_dirs());
+        let worker = spawn_worker(store.clone(), visible_dirs(), egui::Context::default());
         // 等待 worker 回报(最多 5s)
         let mut done = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1325,6 +1349,8 @@ mod tests {
             "坏文件应返回 None"
         );
         assert!(!p.exists(), "坏文件应被删掉");
+        // 自愈写库走异步队列,先排干再断言。
+        store.flush();
         let (ok, rs): (i64, i64) = store
             .test_conn()
             .query_row(

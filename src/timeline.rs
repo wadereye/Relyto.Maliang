@@ -25,9 +25,8 @@ pub struct PhotoRow {
     pub lon: Option<f64>,
     /// 媒体类型:0=图片,1=视频(;`video::kind`)。
     pub kind: i32,
-    /// 磁盘修改时间(ms,扫描器写入):「按最近更改排序」的 SQL 键。
-    /// Rust 侧暂只用于属性面板展示,排序本身在 SQL 完成。
-    #[allow(dead_code)]
+    /// 磁盘修改时间(ms,扫描器写入):「按最近更改排序」的 SQL 键;
+    /// 没有 EXIF 拍摄时间时,时间线的月份桶也取自它(`month_from_mtime`)。
     pub mtime: i64,
     /// 文件字节数:「按大小排序」的 SQL 键;属性面板展示用。
     #[allow(dead_code)]
@@ -46,11 +45,28 @@ const MTIME_SQL: &str = "CASE WHEN p.mtime >= 100000000000000 THEN p.mtime / 100
                               WHEN p.mtime >= 100000000000 THEN p.mtime / 1000
                               ELSE p.mtime END";
 
+/// 时间线排序键:有 EXIF 拍摄时间就用它,没有时用文件修改时间兜底。
+///
+/// 兜底值先按 `MTIME_SQL` 归一成秒,再用 SQLite 的 `localtime` 修饰转成与
+/// `taken_utc` 同一种 ISO 文本(`taken_utc` 存的本就是相机当地时间,不是 UTC),
+/// 两种来源因此可以直接按字典序比先后,不必混合整数与文本。
+/// `'unixepoch'` 不能省:SQLite 对整数时间值默认按儒略日解释,少了它
+/// 秒级时间戳会被算成 1970-2000 年,整条时间线全部错位。
+/// 截图 / PNG / 视频永远没有 EXIF,不兜底整个时间线就只剩「未知时间」。
+/// `mtime <= 0` 落成 NULL:那是真没有时间,不能编一个 1970 年出来。
+/// Rust 侧的月份桶见 `month_from_mtime`,必须与这里同一口径。
+fn time_key_sql() -> String {
+    format!(
+        "COALESCE(NULLIF(p.taken_utc,''), CASE WHEN {MTIME_SQL} > 0 \
+         THEN strftime('%Y-%m-%dT%H:%M:%S', {MTIME_SQL}, 'unixepoch', 'localtime') END)"
+    )
+}
+
 /// 排序方式(工具栏「查看选项」> 排序;四个排序项:
 /// 按拍摄日期 / 最近 / 按尺寸 / 按名称)。
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum SortBy {
-    /// 拍摄日期(`Sort by &Creation Date`,默认,新在前)。
+    /// 拍摄日期(`Sort by &Creation Date`,默认,新在前;没有 EXIF 时按文件修改时间)。
     #[default]
     Date,
     /// 最近更改日期(`Sort by &Recent Changes`,新在前)。
@@ -212,15 +228,18 @@ pub fn load_query(
         );
     }
     // 各模式的"自然方向"(反向开关再翻转):日期/更改新在前、大小大在前、名称升序。
+    // 日期走 `time_key_sql`:没有 EXIF 的照片按文件时间落在自己该在的那个月,
+    // 只有两种时间都没有的(键为 NULL)恒排最后。
+    let tk = time_key_sql();
     let order = match sort {
-        SortBy::Date => "p.taken_utc IS NULL, p.taken_utc DESC".to_string(),
+        SortBy::Date => format!("({tk} IS NULL), {tk} DESC"),
         SortBy::Recent => format!("{MTIME_SQL} DESC"),
         SortBy::Size => "p.size DESC".to_string(),
         SortBy::Name => "p.path COLLATE NOCASE ASC".to_string(),
     };
     let order = if reverse {
         match sort {
-            SortBy::Date => "p.taken_utc IS NULL, p.taken_utc ASC".to_string(),
+            SortBy::Date => format!("({tk} IS NULL), {tk} ASC"),
             SortBy::Recent => format!("{MTIME_SQL} ASC"),
             SortBy::Size => "p.size ASC".to_string(),
             SortBy::Name => "p.path COLLATE NOCASE DESC".to_string(),
@@ -389,19 +408,73 @@ pub fn group_date(rows: &[PhotoRow], idx: &[usize]) -> String {
     }
 }
 
-/// 按月聚合，返回（月份分组、行索引），行序与输入一致（BTreeMap 按月名升序）。
-pub fn by_month(rows: &[PhotoRow]) -> Vec<(String, Vec<usize>)> {
-    let mut buckets: std::collections::BTreeMap<String, Vec<usize>> = Default::default();
-    for (i, r) in rows.iter().enumerate() {
-        let bucket = r
-            .taken
-            .as_ref()
-            .filter(|t| t.len() >= 7)
-            .map(|t| t[..7].to_string())
-            .unwrap_or_else(|| t("未知时间").into());
-        buckets.entry(bucket).or_default().push(i);
+/// `photos.mtime`(毫秒)归一成 UNIX 秒,口径与 `MTIME_SQL` 必须一致。
+/// 单位混乱是历史遗留:同一列里既有秒也有毫秒,直接比大小会让大的那批永远在前。
+fn mtime_secs(mtime: i64) -> i64 {
+    if mtime >= 100_000_000_000_000 {
+        mtime / 1_000_000
+    } else if mtime >= 100_000_000_000 {
+        mtime / 1_000
+    } else {
+        mtime
     }
-    buckets.into_iter().collect()
+}
+
+/// 文件修改时间落的月份桶(`"YYYY-MM"`,本地时区)。
+/// `mtime <= 0` 返回 None —— 没有权威时间的行不许伪装成 1970 年。
+/// 口径与 SQL 侧 `time_key_sql` 一致:归一成秒后按本地时区取月。
+fn month_from_mtime(mtime: i64) -> Option<String> {
+    use chrono::TimeZone;
+    let secs = mtime_secs(mtime);
+    if secs <= 0 {
+        return None;
+    }
+    chrono::Local
+        .timestamp_opt(secs, 0)
+        .latest()
+        .map(|d| d.format("%Y-%m").to_string())
+}
+
+/// 按月聚合,返回 `(月份键 "YYYY-MM", 行下标, 整组是否只能按文件时间归类)`;
+/// 组内保持传入顺序。
+///
+/// 月键优先取 EXIF 拍摄时间,缺失时按文件修改时间兜底(见 `month_from_mtime`)。
+/// `oldest_first=false`(默认)新月份在前。月键只存裸 `"YYYY-MM"`:显示文案由
+/// UI 侧格式化,分组与排序不受界面语言影响。
+/// 两种时间都没有的单独一组(键为空串),**两个方向都排在末尾** ——
+/// 否则它会被倒序翻到时间线最顶上。
+pub fn by_month(rows: &[PhotoRow], oldest_first: bool) -> Vec<(String, Vec<usize>, bool)> {
+    // 桶值 = (行下标, 组内有 EXIF 拍摄时间的张数);后者决定第三项那个"只能按文件时间"标记。
+    let mut buckets: std::collections::BTreeMap<String, (Vec<usize>, usize)> = Default::default();
+    let mut undated: Vec<usize> = Vec::new();
+    for (i, r) in rows.iter().enumerate() {
+        let taken = r.taken.as_deref().filter(|t| t.len() >= 7);
+        let key = match (taken, month_from_mtime(r.mtime)) {
+            (Some(t), _) => t[..7].to_string(),
+            (None, Some(m)) => m,
+            (None, None) => {
+                undated.push(i);
+                continue;
+            }
+        };
+        let e = buckets.entry(key).or_default();
+        e.0.push(i);
+        if taken.is_some() {
+            e.1 += 1;
+        }
+    }
+    let mut out: Vec<(String, Vec<usize>, bool)> = buckets
+        .into_iter()
+        .map(|(k, (idx, dated))| (k, idx, dated == 0))
+        .collect();
+    // BTreeMap 出来就是旧月份在前;默认要新在前。空键那组不参与翻转。
+    if !oldest_first {
+        out.reverse();
+    }
+    if !undated.is_empty() {
+        out.push((String::new(), undated, true));
+    }
+    out
 }
 
 /// 星标（0/1）。
@@ -567,7 +640,7 @@ pub fn add_tag(store: &Store, id: i64, name: &str) -> Result<()> {
              SELECT ?1, id FROM tags WHERE name=?2",
             rusqlite::params![id, name],
         )?;
-        conn.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
+        crate::db::recompute_tag_parents(conn)?;
         Ok(())
     })?;
     Ok(())
@@ -616,7 +689,7 @@ pub fn rename_tag(store: &Store, old: &str, new: &str) -> Result<Vec<i64>> {
         if n == 0 {
             anyhow::bail!("标签不存在");
         }
-        tx.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
+        crate::db::recompute_tag_parents(&tx)?;
         tx.commit()?;
         Ok(())
     })?;
@@ -638,7 +711,7 @@ pub fn delete_tag(store: &Store, name: &str) -> Result<Vec<i64>> {
             &format!("DELETE FROM tags WHERE {cond}"),
             rusqlite::params![name, prefix],
         )?;
-        tx.execute_batch(crate::db::REBUILD_TAG_PARENTS_SQL)?;
+        crate::db::recompute_tag_parents(&tx)?;
         tx.commit()?;
         Ok(())
     })?;
@@ -860,14 +933,13 @@ mod tests {
     use crate::db::Store;
 
     fn one_photo(store: &Store) -> i64 {
-        store
-            .test_conn()
-            .execute(
-                "INSERT INTO photos(path,parent,mtime,size) VALUES('a.jpg','.',0,0)",
-                [],
-            )
-            .unwrap();
-        store.test_conn().last_insert_rowid()
+        let c = store.test_conn();
+        c.execute(
+            "INSERT INTO photos(path,parent,mtime,size) VALUES('a.jpg','.',0,0)",
+            [],
+        )
+        .unwrap();
+        c.last_insert_rowid()
     }
 
     /// 复核修复:删除标签后 DB 关联必须真正消失(此前 XMP 残留会把标签复活回 DB)。
@@ -908,14 +980,13 @@ mod tests {
         let store = Store::open_mem().unwrap();
         let a = one_photo(&store);
         let b = {
-            store
-                .test_conn()
-                .execute(
-                    "INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)",
-                    [],
-                )
-                .unwrap();
-            store.test_conn().last_insert_rowid()
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)",
+                [],
+            )
+            .unwrap();
+            c.last_insert_rowid()
         };
         add_tag(&store, a, "cat").unwrap();
         add_tag(&store, b, "cat").unwrap();
@@ -941,14 +1012,13 @@ mod tests {
         let store = Store::open_mem().unwrap();
         let a = one_photo(&store);
         let extra = |path: &str| -> i64 {
-            store
-                .test_conn()
-                .execute(
-                    "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'.',0,0)",
-                    rusqlite::params![path],
-                )
-                .unwrap();
-            store.test_conn().last_insert_rowid()
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(path,parent,mtime,size) VALUES(?1,'.',0,0)",
+                rusqlite::params![path],
+            )
+            .unwrap();
+            c.last_insert_rowid()
         };
         let b = extra("b.jpg");
         let c = extra("c.jpg");
@@ -981,10 +1051,10 @@ mod tests {
         let store = Store::open_mem().unwrap();
         let a = one_photo(&store);
         let b = {
-            store.test_conn()
-                .execute("INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)", [])
+            let c = store.test_conn();
+            c.execute("INSERT INTO photos(path,parent,mtime,size) VALUES('b.jpg','.',0,0)", [])
                 .unwrap();
-            store.test_conn().last_insert_rowid()
+            c.last_insert_rowid()
         };
         add_tag(&store, a, "旅行").unwrap();
         add_tag(&store, a, "旅行/2024").unwrap();
@@ -1491,11 +1561,13 @@ mod tests {
         );
     }
 
-    /// 四种排序方式 + 反向开关的方向;NULL 拍摄时间恒排最后(反向也不提前)。
+    /// 四种排序方式 + 反向开关的方向。
+    /// 「按拍摄日期」没有 EXIF 的那张按文件时间插进序列;
+    /// 只有两种时间都没有的(mtime=0)恒排最后,反向也不提前。
     #[test]
     fn load_query_sorts_and_reverse() {
         let store = Store::open_mem().unwrap();
-        // 路径故意混大小写,验证 NOCASE;a/B/c 与 taken、mtime、size 三组次序互不相同。
+        // 路径故意混大小写,验证 NOCASE;a/B/c/d 与 taken、mtime、size 四组次序互不相同。
         insert_photo(
             &store,
             "/p/a.jpg",
@@ -1518,7 +1590,20 @@ mod tests {
             300,
             None,
         );
-        insert_photo(&store, "/p/c.jpg", "/p", None, 0, 0, 20, 200, None);
+        // 没有 EXIF,但文件时间是 2024-02-01 12:00 UTC(取正午:任何时区都不会把月挪走)。
+        insert_photo(
+            &store,
+            "/p/c.jpg",
+            "/p",
+            None,
+            0,
+            0,
+            1_706_788_800_000,
+            200,
+            None,
+        );
+        // 拍摄时间与文件时间都没有。
+        insert_photo(&store, "/p/d.jpg", "/p", None, 0, 0, 0, 50, None);
         let order = |sort: SortBy, reverse: bool| -> Vec<String> {
             load_query(&store, sort, reverse, &Filters::default())
                 .unwrap()
@@ -1526,22 +1611,34 @@ mod tests {
                 .map(|r| r.path.rsplit('/').next().unwrap().to_string())
                 .collect()
         };
-        // 拍摄日期:新在前,无 EXIF 排最后
-        assert_eq!(order(SortBy::Date, false), ["a.jpg", "B.jpg", "c.jpg"]);
+        // 拍摄日期:新在前;c.jpg 靠文件时间落在 2024-02,插在两张有 EXIF 的中间
+        assert_eq!(order(SortBy::Date, false), ["a.jpg", "c.jpg", "B.jpg", "d.jpg"]);
         assert_eq!(
             order(SortBy::Date, true),
-            ["B.jpg", "a.jpg", "c.jpg"],
-            "反向仍 NULL 最后"
+            ["B.jpg", "c.jpg", "a.jpg", "d.jpg"],
+            "反向:旧在前,两种时间都没有的仍最后"
         );
         // 最近更改:mtime 大在前
-        assert_eq!(order(SortBy::Recent, false), ["a.jpg", "c.jpg", "B.jpg"]);
-        assert_eq!(order(SortBy::Recent, true), ["B.jpg", "c.jpg", "a.jpg"]);
+        assert_eq!(order(SortBy::Recent, false), ["c.jpg", "a.jpg", "B.jpg", "d.jpg"]);
+        assert_eq!(order(SortBy::Recent, true), ["d.jpg", "B.jpg", "a.jpg", "c.jpg"]);
         // 大小:大在前
-        assert_eq!(order(SortBy::Size, false), ["B.jpg", "c.jpg", "a.jpg"]);
-        assert_eq!(order(SortBy::Size, true), ["a.jpg", "c.jpg", "B.jpg"]);
+        assert_eq!(order(SortBy::Size, false), ["B.jpg", "c.jpg", "a.jpg", "d.jpg"]);
+        assert_eq!(order(SortBy::Size, true), ["d.jpg", "a.jpg", "c.jpg", "B.jpg"]);
         // 名称:NOCASE 升序
-        assert_eq!(order(SortBy::Name, false), ["a.jpg", "B.jpg", "c.jpg"]);
-        assert_eq!(order(SortBy::Name, true), ["c.jpg", "B.jpg", "a.jpg"]);
+        assert_eq!(order(SortBy::Name, false), ["a.jpg", "B.jpg", "c.jpg", "d.jpg"]);
+        assert_eq!(order(SortBy::Name, true), ["d.jpg", "c.jpg", "B.jpg", "a.jpg"]);
+    }
+
+    /// 文件时间落月桶:秒 / 毫秒 / 微秒三种历史单位都归到同一个月;
+    /// 0(没有权威时间)不落桶,交给「未知时间」那组。
+    #[test]
+    fn month_from_mtime_normalizes_units() {
+        // 2024-02-01T12:00:00Z
+        assert_eq!(month_from_mtime(1_706_788_800), Some("2024-02".into()));
+        assert_eq!(month_from_mtime(1_706_788_800_000), Some("2024-02".into()));
+        assert_eq!(month_from_mtime(1_706_788_800_000_000), Some("2024-02".into()));
+        assert_eq!(month_from_mtime(0), None);
+        assert_eq!(month_from_mtime(-5), None);
     }
 
     /// 派生状态不参与排序:rich_state=0 只表示「还没轮到后台批量派生」,
@@ -1659,6 +1756,71 @@ mod tests {
         let rows2 = load_query(&store, SortBy::Recent, false, &Filters::default()).unwrap();
         let g2 = by_folder(&rows2);
         assert_eq!(g2[0].0, "/fb", "parent 空 → 从 path 反推父目录");
+    }
+
+    /// 时间线分组:默认新月份在前,勾「反向排序」后旧月份在前;
+    /// 没有 EXIF 的按文件时间进各自的月,两种时间都没有的(空键)两个方向都沉底。
+    #[test]
+    fn by_month_newest_first_with_undated_last() {
+        let store = Store::open_mem().unwrap();
+        insert_photo(&store, "/t/n1.jpg", "/t", Some("2026-11-20T00:00:00"), 0, 0, 1, 1, None);
+        insert_photo(&store, "/t/n2.jpg", "/t", Some("2026-11-03T00:00:00"), 0, 0, 2, 1, None);
+        insert_photo(&store, "/t/o1.jpg", "/t", Some("2026-10-15T00:00:00"), 0, 0, 3, 1, None);
+        insert_photo(&store, "/t/d1.jpg", "/t", Some("2025-12-01T00:00:00"), 0, 0, 4, 1, None);
+        // 没有 EXIF,只有文件时间:2026-10-15 与 2026-09-10(都取正午 UTC,免得时区把月挪走)。
+        insert_photo(&store, "/t/f1.jpg", "/t", None, 0, 0, 1_792_065_600_000, 1, None);
+        insert_photo(&store, "/t/f2.jpg", "/t", None, 0, 0, 1_789_041_600_000, 1, None);
+        // 两种时间都没有。
+        insert_photo(&store, "/t/none.jpg", "/t", None, 0, 0, 0, 1, None);
+
+        let cells = |reverse: bool| -> Vec<(String, bool)> {
+            let rows = load_query(&store, SortBy::Date, reverse, &Filters::default()).unwrap();
+            by_month(&rows, reverse)
+                .into_iter()
+                .map(|(k, _, file_time)| (k, file_time))
+                .collect()
+        };
+        assert_eq!(
+            cells(false),
+            [
+                ("2026-11".into(), false),
+                ("2026-10".into(), false),
+                ("2026-09".into(), true),
+                ("2025-12".into(), false),
+                (String::new(), true),
+            ],
+            "默认倒序:新月份在前;没有 EXIF 的按文件时间进各自的月,整组都没有才标「按文件时间」"
+        );
+        assert_eq!(
+            cells(true),
+            [
+                ("2025-12".into(), false),
+                ("2026-09".into(), true),
+                ("2026-10".into(), false),
+                ("2026-11".into(), false),
+                (String::new(), true),
+            ],
+            "反向:旧月份在前,两种时间都没有的一组仍最后"
+        );
+
+        let rows = load_query(&store, SortBy::Date, false, &Filters::default()).unwrap();
+        let groups = by_month(&rows, false);
+        assert_eq!(groups[0].1.len(), 2, "同月的两张归一组");
+        assert_eq!(
+            rows[groups[0].1[0]].path,
+            "/t/n1.jpg",
+            "组内保持当前排序(新在前)"
+        );
+        let in_group = |gi: usize, path: &str| {
+            groups[gi].1.iter().any(|i| rows[*i].path == path)
+        };
+        assert!(in_group(1, "/t/o1.jpg") && in_group(1, "/t/f1.jpg"), "文件时间的兜底并入真实月份");
+        assert_eq!(groups[1].2, false, "组里只要有一张有 EXIF,就不整组标成按文件时间");
+        assert_eq!(
+            groups[4].1,
+            vec![rows.iter().position(|r| r.path == "/t/none.jpg").unwrap()],
+            "两种时间都没有的单独一组"
+        );
     }
 
     /// 组内全无 EXIF 拍摄时间 → 组头日期为空串(UI 改显示张数,不编造假日期)。

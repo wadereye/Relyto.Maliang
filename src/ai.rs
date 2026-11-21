@@ -12,11 +12,35 @@ pub fn models_dir() -> Option<std::path::PathBuf> {
 
 static ENV: OnceLock<Result<Environment, String>> = OnceLock::new();
 
+/// 进程早期(main 单线程阶段)设置 OpenMP 线程上限:运行库只在初始化时读
+/// 环境变量,且多线程后改环境变量与并发读有竞争,必须提前到任何线程起来之前。
+pub fn pre_init() {
+    let intra = (crate::win::cpu_count() / 2).max(1);
+    std::env::set_var("OMP_NUM_THREADS", intra.to_string());
+}
+
 /// 进程级唯一 Environment;运行库不可用时返回错误,不终止进程。
 pub(crate) fn env() -> Result<&'static Environment, String> {
-    ENV.get_or_init(|| ort::init().build().map_err(|e| e.to_string()))
-        .as_ref()
-        .map_err(|e| e.clone())
+    ENV.get_or_init(|| {
+        // 全局线程池限到半核、关自旋等待:默认配置吃满全部逻辑核并忙等,
+        // 会把 UI 与缩略图 worker 一起拖卡。选项不被支持时退回默认构建。
+        // (OpenMP 构建的运行库只认 OMP_NUM_THREADS,见 pre_init。)
+        let intra = (crate::win::cpu_count() / 2).max(1);
+        let pool = ort::environment::GlobalThreadPoolOptions::default()
+            .with_intra_threads(intra)
+            .and_then(|o| o.with_inter_threads(1))
+            .and_then(|o| o.with_spin_control(false));
+        match pool {
+            Ok(o) => ort::init()
+                .with_global_thread_pool(o)
+                .with_telemetry(false)
+                .build()
+                .map_err(|e| e.to_string()),
+            Err(_) => ort::init().build().map_err(|e| e.to_string()),
+        }
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 /// 用 onnxruntime 加载一个模型,返回输入输出名(连通性冒烟/导入校验用)。
