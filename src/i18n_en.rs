@@ -1582,4 +1582,6 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("未归簇 {p1} 脸 · 点「重新聚类」收齐", "{p1} unclustered faces · click \"Recluster\" to collect them"),
 ("「{p1}」不可撤销:人物命名与合并/拆分判定会一并删除,需重新人工整理。", "\"{p1}\" cannot be undone: person names and merge/split decisions are deleted as well and must be redone by hand."),
 ("文本命中", "Text match"),
+("AI 自动标签(点一下采纳为手动标签):", "AI auto tags (click to adopt as manual tag):"),
+("(暂无自动标签:启用 AI 索引并等待处理完成)", "(No auto tags yet: enable AI indexing and wait for it to finish)"),
 ];

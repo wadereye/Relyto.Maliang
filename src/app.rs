@@ -665,6 +665,8 @@ pub struct App {
     #[cfg(feature = "ai")]
     face_version_checked: bool,
     #[cfg(feature = "ai")]
+    drawer_auto_tags: Option<(i64, String, Vec<(i64, f32, String)>)>,
+    #[cfg(feature = "ai")]
     face_people: Vec<crate::faces::PeopleRow>,
     #[cfg(feature = "ai")]
     sel_cluster: Option<i64>,
@@ -2796,6 +2798,8 @@ impl App {
             face_resume_done: false,
             #[cfg(feature = "ai")]
             face_version_checked: false,
+            #[cfg(feature = "ai")]
+            drawer_auto_tags: None,
             #[cfg(feature = "ai")]
             face_people: Vec::new(),
             #[cfg(feature = "ai")]
@@ -8116,6 +8120,11 @@ impl App {
             return;
         };
         self.tags_editor(ui, id);
+        #[cfg(feature = "ai")]
+        {
+            ui.add_space(6.0);
+            self.drawer_auto_tags_ui(ui, id);
+        }
         ui.add_space(6.0);
         ui.separator();
         ui.small(t("库内标签(点一下即加到本张):"));
@@ -8142,6 +8151,38 @@ impl App {
                         self.sync_sidecars(id, self.star_of(id));
                     }
                 });
+            }
+        });
+    }
+
+    /// 抽屉「标签」页 AI 自动标签区:按(照片,版本)缓存,点一下采纳为手动标签。
+    #[cfg(feature = "ai")]
+    fn drawer_auto_tags_ui(&mut self, ui: &mut egui::Ui, id: i64) {
+        let ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
+        let stale = self
+            .drawer_auto_tags
+            .as_ref()
+            .map(|(kid, kver, _)| *kid != id || kver != &ver)
+            .unwrap_or(true);
+        if stale {
+            let tags = crate::ai_tags::photo_tags(&self.store, id, &ver);
+            self.drawer_auto_tags = Some((id, ver, tags));
+        }
+        let Some((_, _, cached)) = &self.drawer_auto_tags else {
+            return;
+        };
+        let tags = cached.clone();
+        ui.small(t("AI 自动标签(点一下采纳为手动标签):"));
+        if tags.is_empty() {
+            ui.small(t("(暂无自动标签:启用 AI 索引并等待处理完成)"));
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (_, score, name) in tags {
+                if ui.small_button(format!("{name} {score:.2}")).clicked() {
+                    let _ = timeline::add_tag(&self.store, id, &name);
+                    self.sync_sidecars(id, self.star_of(id));
+                }
             }
         });
     }
