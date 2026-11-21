@@ -1587,4 +1587,6 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("部分模型未下载,对应索引不会运行。", "Some models are not downloaded; the corresponding indexing will not run."),
 ("去下载", "Download models"),
 ("启用 AI 索引", "Enable AI indexing"),
+("失败明细", "Failure details"),
+("{p1} · {p2} 次 · {p3}", "{p1} · {p2} attempts · {p3}"),
 ];

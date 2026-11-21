@@ -480,6 +480,27 @@ pub fn failed_count(store: &Store) -> usize {
     })
 }
 
+/// 当前签名失败明细:路径、尝试次数、错误摘要,最近失败在前。
+pub fn failed_list(store: &Store, limit: usize) -> Vec<(String, i32, String)> {
+    let sig = effective_sig(store);
+    store.read(|conn| {
+        let mut out = Vec::new();
+        let Ok(mut st) = conn.prepare(
+            "SELECT p.path, f.attempts, COALESCE(f.error,'') FROM face_scan f
+               JOIN photos p ON p.id = f.photo_id
+              WHERE f.sig=?1 AND f.state=?2 ORDER BY f.ts DESC LIMIT ?3",
+        ) else {
+            return out;
+        };
+        if let Ok(rows) = st.query_map(params![sig, SCAN_FAILED, limit as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        }) {
+            out.extend(rows.filter_map(|r| r.ok()));
+        }
+        out
+    })
+}
+
 /// 把失败项重新放回待处理队列。
 pub fn retry_failed(store: &Store) -> Result<usize> {
     let sig = effective_sig(store);
@@ -3052,6 +3073,30 @@ mod tests {
         let todo = photos_todo(&store, 10);
         assert!(todo.iter().any(|(id, _)| *id == 4), "重试后失败项回到队列");
         assert_eq!(failed_count(&store), 0);
+    }
+
+    #[test]
+    fn failed_list_reports_path_attempts_error() {
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let sig = algo_tag(&store);
+        let conn = store.test_conn();
+        conn.execute(
+            "INSERT INTO face_scan(photo_id,sig,state,attempts,error) VALUES(1,?1,?2,2,'decode failed')",
+            params![sig, SCAN_FAILED],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO face_scan(photo_id,sig,state) VALUES(2,?1,2)",
+            params![sig],
+        )
+        .unwrap();
+        drop(conn);
+        let list = failed_list(&store, 10);
+        assert_eq!(list.len(), 1, "只列当前签名的失败项");
+        assert!(list[0].0.ends_with("a.jpg"));
+        assert_eq!(list[0].1, 2);
+        assert_eq!(list[0].2, "decode failed");
     }
 
     /// 待办按目录优先级排序;只常用目录范围按导入目录前缀过滤。

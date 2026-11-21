@@ -10758,6 +10758,18 @@ impl App {
                 }
             }
         });
+        if failed > 0 {
+            egui::CollapsingHeader::new(t("失败明细"))
+                .default_open(false)
+                .show(ui, |ui| {
+                    for (path, attempts, err) in crate::faces::failed_list(&self.store, 50) {
+                        ui.small(t_with(
+                            "{p1} · {p2} 次 · {p3}",
+                            &[("p1", path), ("p2", attempts.to_string()), ("p3", err)],
+                        ));
+                    }
+                });
+        }
         // 待命名组按相似度建议并入已有档案,不新建同名身份。
         if !self.face_sugs.is_empty() {
             ui.separator();
