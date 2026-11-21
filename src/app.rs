@@ -2,7 +2,7 @@ use crate::db::Store;
 use crate::i18n::{t, t_with};
 use crate::timeline::{self, PhotoRow};
 use eframe::egui;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -431,6 +431,7 @@ pub struct App {
     tier_cached: usize,
     /// 图库行集的版本号(每次 rebuild 自增)。缓存的派生数据靠它判新旧。
     rows_gen: u64,
+    grid_layouts: GridLayouts,
     /// 「文件夹」视图的行下标缓存:(版本号, 文件夹, 行下标, 组头日期)。
     /// 每帧从全部行里按目录筛一遍是 O(行数) 次路径字符串运算,没必要。
     folder_cells: (u64, String, Vec<usize>, String),
@@ -1873,6 +1874,7 @@ fn cn_month(s: &str) -> String {
 
 /// 行式缩略图布局的一行:每项 (rows 下标, 该格宽) 与本行统一高。
 /// 不把照片裁成正方形:同行等高,各自按宽高比取宽,行尾贴近右边界。
+#[derive(Clone)]
 struct ThumbRow {
     cells: Vec<(usize, f32)>,
     h: f32,
@@ -2402,9 +2404,10 @@ fn show_in_explorer(path: &str) {
 /// 用块文件 + 纹理缓存,不会随浏览量无限增长;
 /// LRU 超出上限时淘汰最久未用的条目。
 struct TexCache {
-    map: HashMap<i64, egui::TextureHandle>,
-    /// 访问顺序(队首最久未用)。
-    order: Vec<i64>,
+    map: HashMap<i64, (egui::TextureHandle, u64)>,
+    /// 访问序:tick → id,队首最久未用。
+    order: BTreeMap<u64, i64>,
+    clock: u64,
     /// 已请求过但**还没有**落盘缩略图的照片 id(显示灰色占位块)。
     /// 后台 worker 生成完后从 `update` 里清掉,让格子重新加载真图。
     pending: std::collections::HashSet<i64>,
@@ -2415,7 +2418,8 @@ impl TexCache {
     fn new(cap: usize) -> Self {
         TexCache {
             map: HashMap::new(),
-            order: Vec::new(),
+            order: BTreeMap::new(),
+            clock: 0,
             pending: std::collections::HashSet::new(),
             cap,
         }
@@ -2423,28 +2427,33 @@ impl TexCache {
 
     /// 取纹理并标记为最近使用。
     fn get(&mut self, id: i64) -> Option<egui::TextureHandle> {
-        let t = self.map.get(&id)?.clone();
-        if let Some(p) = self.order.iter().position(|x| *x == id) {
-            self.order.remove(p);
-        }
-        self.order.push(id);
+        let (t, old) = self.map.get(&id)?;
+        let t = t.clone();
+        let old = *old;
+        self.order.remove(&old);
+        self.clock += 1;
+        self.order.insert(self.clock, id);
+        self.map.get_mut(&id).unwrap().1 = self.clock;
         Some(t)
     }
 
     /// 插入纹理;超出上限时淘汰最久未用的(egui 的 `TextureHandle` drop 会释放显存)。
     fn put(&mut self, id: i64, t: egui::TextureHandle) {
         self.pending.remove(&id);
-        if self.map.insert(id, t).is_none() {
-            self.order.push(id);
-        } else if let Some(p) = self.order.iter().position(|x| *x == id) {
-            self.order.remove(p);
-            self.order.push(id);
+        self.clock += 1;
+        if let Some((_, old)) = self.map.insert(id, (t, self.clock)) {
+            self.order.remove(&old);
         }
+        self.order.insert(self.clock, id);
+        self.evict();
+    }
+
+    fn evict(&mut self) {
         while self.map.len() > self.cap {
-            let Some(old) = self.order.first().copied() else {
+            let Some((&tick, &old)) = self.order.iter().next() else {
                 break;
             };
-            self.order.remove(0);
+            self.order.remove(&tick);
             self.map.remove(&old);
         }
     }
@@ -2475,7 +2484,7 @@ impl TexCache {
     /// 只保留仍然存在的照片 id(重建视图时调用)。
     fn retain(&mut self, alive: &BTreeSet<i64>) {
         self.map.retain(|k, _| alive.contains(k));
-        self.order.retain(|k| alive.contains(k));
+        self.order.retain(|_, k| alive.contains(k));
         self.pending.retain(|k| alive.contains(k));
     }
 
@@ -2493,13 +2502,41 @@ impl TexCache {
     fn set_cap(&mut self, cap: usize) {
         self.cap = cap;
         // 立刻收缩:多出来的纹理现在就该释放显存。
-        while self.map.len() > self.cap {
-            let Some(old) = self.order.first().copied() else {
-                break;
-            };
-            self.order.remove(0);
-            self.map.remove(&old);
+        self.evict();
+    }
+}
+
+/// 网格布局缓存键:视图代数 + 格数 + 宽/行高/间距(按位比较)。
+type LayoutKey = (u64, usize, u32, u32, u32);
+
+/// 每个分组(salt)一份布局缓存:键没变就不重算行排布。
+struct GridLayouts {
+    map: HashMap<String, (LayoutKey, Vec<ThumbRow>)>,
+}
+
+impl GridLayouts {
+    fn new() -> Self {
+        GridLayouts { map: HashMap::new() }
+    }
+
+    fn get_or_compute(
+        &mut self,
+        salt: &str,
+        key: LayoutKey,
+        compute: impl FnOnce() -> Vec<ThumbRow>,
+    ) -> Vec<ThumbRow> {
+        if let Some((k, rows)) = self.map.get(salt) {
+            if *k == key {
+                return rows.clone();
+            }
         }
+        let rows = compute();
+        self.map.insert(salt.to_string(), (key, rows.clone()));
+        rows
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
     }
 }
 
@@ -2613,6 +2650,7 @@ impl App {
             thumb_decode_count: 0,
             tier_cached: 0,
             rows_gen: 0,
+            grid_layouts: GridLayouts::new(),
             folder_cells: Default::default(),
             folder_groups: Default::default(),
             last_scroll_y: 0.0,
@@ -4714,6 +4752,7 @@ impl App {
             self.selected_folder = 0;
         }
         self.rows_gen = self.rows_gen.wrapping_add(1);
+        self.grid_layouts.clear();
         // 工具栏 spinner:本视图还有多少张缩略图没落地(后台 worker 在补就是"有活")。
         self.pending_thumbs = self.rows.iter().filter(|r| r.thumb_ok == 0).count();
         self.refresh_tier_count();
@@ -11590,9 +11629,19 @@ impl App {
         // 再画格子。渲染帧不一次写几十个目录的账,所以有上限。
         self.drain_adopts(MAX_ADOPT_PER_FRAME);
         let base = self.thumb_tier.size() as f32;
-        let gap = 14.0;
+        let gap: f32 = 14.0;
         let avail = ui.available_width();
-        let layout = thumb_rows(&self.rows, cells, avail, base, gap);
+        let key: LayoutKey = (
+            self.rows_gen,
+            cells.len(),
+            avail.to_bits(),
+            base.to_bits(),
+            gap.to_bits(),
+        );
+        let rows_ref = &self.rows;
+        let layout =
+            self.grid_layouts
+                .get_or_compute(salt, key, || thumb_rows(rows_ref, cells, avail, base, gap));
         // 行级虚拟化:视口外的行不建 widget,只按该行确定的高度占位。
         // 占位记法:每行连它后面的那个间距一起记(行高 + gap),这样后续行
         // 依旧落在原来的位置;若占位段结尾就是整个网格,得多退一次间距,
@@ -12821,6 +12870,80 @@ mod tests {
             }
             assert!(found, "「{action}」的不可撤销警示没有画出来");
         }
+    }
+
+    fn dummy_tex(ctx: &egui::Context, name: &str) -> egui::TextureHandle {
+        ctx.load_texture(
+            name,
+            egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
+            egui::TextureOptions::LINEAR,
+        )
+    }
+
+    #[test]
+    fn tex_cache_evicts_least_recently_used() {
+        let ctx = egui::Context::default();
+        let mut c = TexCache::new(2);
+        c.put(1, dummy_tex(&ctx, "a"));
+        c.put(2, dummy_tex(&ctx, "b"));
+        c.get(1);
+        c.put(3, dummy_tex(&ctx, "c"));
+        assert!(c.has(1), "刚访问过的不该被淘汰");
+        assert!(!c.has(2), "最久未用的先淘汰");
+        assert!(c.has(3));
+    }
+
+    #[test]
+    fn tex_cache_set_cap_shrinks_immediately() {
+        let ctx = egui::Context::default();
+        let mut c = TexCache::new(4);
+        for id in 1..=4 {
+            c.put(id, dummy_tex(&ctx, &format!("t{id}")));
+        }
+        c.set_cap(2);
+        assert!(!c.has(1));
+        assert!(!c.has(2));
+        assert!(c.has(3));
+        assert!(c.has(4));
+    }
+
+    #[test]
+    fn tex_cache_retain_drops_dead_ids() {
+        let ctx = egui::Context::default();
+        let mut c = TexCache::new(4);
+        c.put(1, dummy_tex(&ctx, "a"));
+        c.put(2, dummy_tex(&ctx, "b"));
+        c.mark_pending(3);
+        let alive: BTreeSet<i64> = [2i64, 3].into_iter().collect();
+        c.retain(&alive);
+        assert!(!c.has(1));
+        assert!(c.has(2));
+        assert!(c.is_pending(3));
+        c.put(1, dummy_tex(&ctx, "c"));
+        assert!(c.has(1), "淘汰账不能残留已删 id 的旧序");
+    }
+
+    #[test]
+    fn grid_layouts_cache_by_key() {
+        let mut g = GridLayouts::new();
+        // Cell 计数:让闭包可复制,能多次按值传入
+        let calls = std::cell::Cell::new(0);
+        let key: LayoutKey = (7, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
+        let mk = || {
+            calls.set(calls.get() + 1);
+            vec![ThumbRow { cells: vec![(0, 10.0)], h: 120.0 }]
+        };
+        g.get_or_compute("m1", key, mk);
+        g.get_or_compute("m1", key, mk);
+        assert_eq!(calls.get(), 1, "同键应命中缓存");
+        let key2: LayoutKey = (8, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
+        g.get_or_compute("m1", key2, mk);
+        assert_eq!(calls.get(), 2, "视图代数变了要重算");
+        g.get_or_compute("m2", key2, mk);
+        assert_eq!(calls.get(), 3, "不同分组各算各的");
+        g.clear();
+        g.get_or_compute("m1", key2, mk);
+        assert_eq!(calls.get(), 4, "清空后重算");
     }
 }
 
