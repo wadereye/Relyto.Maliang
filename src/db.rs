@@ -3475,44 +3475,93 @@ impl Store {
         });
     }
 
-    pub fn missing_tier(&self, tier: u8, visible: &[String], limit: usize) -> Vec<(i64, String)> {
+    pub fn missing_tier(
+        &self,
+        tier: u8,
+        visible: &[String],
+        skip: &[i64],
+        limit: usize,
+    ) -> Vec<(i64, String)> {
         if limit == 0 {
             return Vec::new();
         }
         if tier != 1 {
-            // 其余档走 thumb_tiers 表:没有该行 = 还没生成。这些档只在用户
-            // 真点开时按需回填,不参与作用域门控。
-            return self.read(move |conn| {
-                let mut st = match conn.prepare(
-                    "SELECT p.id, p.path FROM photos p
-                     LEFT JOIN thumb_tiers t ON t.photo_id=p.id AND t.tier=?2
-                     WHERE t.photo_id IS NULL ORDER BY p.id LIMIT ?1",
-                ) {
-                    Ok(s) => s,
-                    Err(_) => return Vec::new(),
-                };
-                st.query_map(rusqlite::params![limit as i64, tier as i64], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
-                })
-                .ok()
-                .map(|it| it.filter_map(|r| r.ok()).collect())
-                .unwrap_or_default()
-            });
+            // 其余档走 thumb_tiers 表:可见优先 + 全库兜底,与中档同一口径。
+            let mut o = self.missing_tier_pass(tier, visible, skip, limit);
+            if o.len() < limit && !visible.is_empty() {
+                let mut sk: Vec<i64> = skip.to_vec();
+                sk.extend(o.iter().map(|r| r.0));
+                o.extend(self.missing_tier_pass(tier, &[], &sk, limit - o.len()));
+            }
+            return o;
         }
         // 第一趟只服务用户眼前那几个目录:立刻做,不设稳定期。
-        // 其余批次都走稳定期:反复改写的文件(下载中、接收目录、编辑器保存)
-        // 等它安静一会儿再重做一次,避免同一张图被反复解码。
         let out = if visible.is_empty() {
-            self.pending_rich(&[], limit, &[], true)
+            self.pending_rich(&[], limit, skip, true)
         } else {
-            let mut o = self.pending_rich(visible, limit, &[], false);
+            let mut o = self.pending_rich(visible, limit, skip, false);
             if o.len() < limit {
-                let skip: Vec<i64> = o.iter().map(|r| r.0).collect();
-                o.extend(self.pending_rich(&[], limit - o.len(), &skip, true));
+                let mut sk: Vec<i64> = skip.to_vec();
+                sk.extend(o.iter().map(|r| r.0));
+                o.extend(self.pending_rich(&[], limit - o.len(), &sk, true));
             }
             o
         };
         out
+    }
+
+    /// 非中档的一趟取行:缺该档记账行、不在坏文件台账、不在跳过名单。
+    fn missing_tier_pass(
+        &self,
+        tier: u8,
+        dirs: &[String],
+        skip: &[i64],
+        limit: usize,
+    ) -> Vec<(i64, String)> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let mut sql = String::from(
+            "SELECT p.id, p.path FROM photos p
+             LEFT JOIN thumb_tiers t ON t.photo_id=p.id AND t.tier=?1
+             WHERE t.photo_id IS NULL
+               AND upper(p.path) NOT IN (SELECT upper(path) FROM bad_media)",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(tier as i64)];
+        let dirs: Vec<&String> = dirs
+            .iter()
+            .filter(|d| !d.trim().is_empty())
+            .take(64)
+            .collect();
+        if !dirs.is_empty() {
+            let mut ors = Vec::with_capacity(dirs.len());
+            for d in dirs {
+                params.push(Box::new(like_escape(&norm_dir(d))));
+                ors.push(format!("p.parent LIKE ?{} ESCAPE '\\'", params.len()));
+            }
+            sql.push_str(&format!(" AND ({})", ors.join(" OR ")));
+        }
+        if !skip.is_empty() {
+            params.push(Box::new(skip_json(skip)));
+            sql.push_str(&format!(
+                " AND p.id NOT IN (SELECT value FROM json_each(?{}))",
+                params.len()
+            ));
+        }
+        sql.push_str(" ORDER BY p.id");
+        params.push(Box::new(limit as i64));
+        sql.push_str(&format!(" LIMIT ?{}", params.len()));
+        self.read(move |conn| {
+            let mut st = match conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            st.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?)))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
     }
 
     /// 闲时低速补齐:既不在常用/导入目录、又不在排除名单里的普通照片。
@@ -3520,29 +3569,40 @@ impl Store {
     /// 只在派生队列排空之后由后台调用,每轮固定一小批,不跟用户眼前的图
     /// 或常用目录抢时间。按最近变更优先取,让全盘的重复检测、首页与时间线
     /// 数据最终补齐;排除名单在 Rust 侧过滤(名单来自设置,SQL 里查不到)。
-    pub fn missing_idle(&self, limit: usize) -> Vec<(i64, String)> {
+    pub fn missing_idle(&self, skip: &[i64], limit: usize) -> Vec<(i64, String)> {
         if limit == 0 {
             return Vec::new();
         }
+        let mut sql = String::from(
+            "SELECT id, path, parent FROM photos
+             WHERE rich_state=0 AND thumb_ok=0
+               AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if !skip.is_empty() {
+            params.push(Box::new(skip_json(skip)));
+            sql.push_str(&format!(
+                " AND id NOT IN (SELECT value FROM json_each(?{}))",
+                params.len()
+            ));
+        }
+        sql.push_str(
+            " ORDER BY CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
+                            WHEN mtime >= 100000000000 THEN mtime / 1000
+                            ELSE mtime END DESC, id",
+        );
+        params.push(Box::new(limit as i64 * 4));
+        sql.push_str(&format!(" LIMIT ?{}", params.len()));
         let cand: Vec<(i64, String, String)> = self.read(|conn| {
-            let mut st = match conn.prepare(
-                "SELECT id, path, parent FROM photos
-                 WHERE rich_state=0 AND thumb_ok=0
-                   AND upper(path) NOT IN (SELECT upper(path) FROM bad_media)
-                 ORDER BY CASE WHEN mtime >= 100000000000000 THEN mtime / 1000000
-                               WHEN mtime >= 100000000000 THEN mtime / 1000
-                               ELSE mtime END DESC, id
-                 LIMIT ?1",
-            ) {
+            let mut st = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(_) => return Vec::new(),
             };
-            st.query_map([limit as i64 * 4], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
-            .ok()
-            .map(|it| it.filter_map(|r| r.ok()).collect())
-            .unwrap_or_default()
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            st.query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .ok()
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
         });
         let excl = crate::scan::Exclusions::from_store(self);
         cand.into_iter()
@@ -4239,6 +4299,14 @@ fn like_escape(s: &str) -> String {
     s.replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+/// 跳过名单绑成 JSON 数组,SQL 侧用 json_each 展开(避免逐 id 拼参数)。
+fn skip_json(skip: &[i64]) -> String {
+    format!(
+        "[{}]",
+        skip.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
+    )
 }
 
 /// 目录子树匹配用的两条 LIKE 模式:(直属该目录, 该目录子树)。
@@ -5221,7 +5289,7 @@ mod tests {
         // 台账说已生成、但磁盘缓存没了的行,按张放行要一并退回待派生。
         assert_eq!(store.promote_photos(&[3]).unwrap(), 1);
         let missing: Vec<i64> = store
-            .missing_tier(1, &[], 10)
+            .missing_tier(1, &[], &[], 10)
             .into_iter()
             .map(|r| r.0)
             .collect();
@@ -5246,14 +5314,14 @@ mod tests {
             .unwrap();
         }
         let mut idle: Vec<i64> = store
-            .missing_tier(1, &[], 10)
+            .missing_tier(1, &[], &[], 10)
             .into_iter()
             .map(|r| r.0)
             .collect();
         idle.sort();
         assert_eq!(idle, vec![1, 3], "首次派生与已安静的重做行照常出队");
         let mut visible: Vec<i64> = store
-            .missing_tier(1, &["/p".to_string()], 10)
+            .missing_tier(1, &["/p".to_string()], &[], 10)
             .into_iter()
             .map(|r| r.0)
             .collect();
@@ -5771,7 +5839,7 @@ mod tests {
             .unwrap();
         }
         let ids = |s: &Store| -> Vec<i64> {
-            s.missing_tier(1, &[], 10)
+            s.missing_tier(1, &[], &[], 10)
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect()
@@ -5817,13 +5885,13 @@ mod tests {
         }
         let vis = vec!["/near".to_string()];
         let ids: Vec<i64> = store
-            .missing_tier(1, &vis, 2)
+            .missing_tier(1, &vis, &[], 2)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
         assert_eq!(ids, vec![2, 3], "先补眼前的");
         let ids: Vec<i64> = store
-            .missing_tier(1, &vis, 3)
+            .missing_tier(1, &vis, &[], 3)
             .into_iter()
             .map(|(id, _)| id)
             .collect();
@@ -5832,6 +5900,126 @@ mod tests {
             vec![2, 3, 1],
             "可见的拿完了,不足一批用全库补齐且不重复"
         );
+    }
+
+    #[test]
+    fn missing_tier_big_prefers_visible_then_falls_back() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            for (id, parent) in [(1, "/far"), (2, "/near"), (3, "/near")] {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size)
+                     VALUES(?1,?2 || '/' || ?1 || '.jpg',?2,0,0)",
+                    rusqlite::params![id, parent],
+                )
+                .unwrap();
+            }
+        }
+        let vis = vec!["/near".to_string()];
+        let ids: Vec<i64> = store
+            .missing_tier(2, &vis, &[], 2)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![2, 3], "大档也先补眼前的");
+        let ids: Vec<i64> = store
+            .missing_tier(2, &vis, &[], 3)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![2, 3, 1], "可见拿完用全库兜底且不重复");
+    }
+
+    #[test]
+    fn missing_tier_big_excludes_bad_media() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'/x/bad.jpg','/x',0,0)",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(2,'/x/ok.jpg','/x',0,0)",
+                [],
+            )
+            .unwrap();
+        }
+        store.mark_bad_media("/x/bad.jpg", "decode failed").unwrap();
+        let ids: Vec<i64> = store
+            .missing_tier(2, &[], &[], 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![2], "立案的坏文件不再进大档队列");
+    }
+
+    #[test]
+    fn missing_tier_big_skips_given_ids() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            for id in [1i64, 2, 3] {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size)
+                     VALUES(?1,'/x/' || ?1 || '.jpg','/x',0,0)",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let ids: Vec<i64> = store
+            .missing_tier(2, &[], &[1, 2], 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![3], "跳过名单里的 id 不返回");
+    }
+
+    #[test]
+    fn missing_tier_normal_skips_given_ids() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            for id in [1i64, 2, 3] {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                     VALUES(?1,'/x/' || ?1 || '.jpg','/x',0,0,1)",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let ids: Vec<i64> = store
+            .missing_tier(1, &[], &[1, 2], 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![3], "中档跳过名单生效");
+    }
+
+    #[test]
+    fn missing_idle_skips_given_ids() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            for id in [1i64, 2, 3] {
+                c.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size,rich_state)
+                     VALUES(?1,'/x/' || ?1 || '.jpg','/x',0,0,0)",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+            }
+        }
+        let ids: Vec<i64> = store
+            .missing_idle(&[1, 2], 10)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![3], "闲时队列跳过名单生效");
     }
 
     #[test]
@@ -6468,12 +6656,12 @@ mod tests {
             c.last_insert_rowid()
         };
         // 未生成时 missing_tier 应返回该照片。
-        let missing = store.missing_tier(TIER_BIG, &[], 10);
+        let missing = store.missing_tier(TIER_BIG, &[], &[], 10);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].0, pid);
 
         store.mark_tier_done(pid, TIER_BIG).unwrap();
-        assert!(store.missing_tier(TIER_BIG, &[], 10).is_empty());
+        assert!(store.missing_tier(TIER_BIG, &[], &[], 10).is_empty());
         assert_eq!(store.tier_count(TIER_BIG), 1);
         // 重复标记幂等。
         store.mark_tier_done(pid, TIER_BIG).unwrap();
@@ -6482,26 +6670,26 @@ mod tests {
         // Normal 档走 photos.thumb_ok,不走 thumb_tiers;取行看的是派生队列
         // 状态:rich_state=0 的行不进队列(由按张放行 / 闲时补齐处理)。
         assert!(
-            store.missing_tier(TIER_NORMAL, &[], 10).is_empty(),
+            store.missing_tier(TIER_NORMAL, &[], &[], 10).is_empty(),
             "没排进派生队列的行不进回填队列"
         );
         store
             .test_conn()
             .execute("UPDATE photos SET rich_state=1 WHERE id=?1", [pid])
             .unwrap();
-        assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
+        assert_eq!(store.missing_tier(TIER_NORMAL, &[], &[], 10).len(), 1);
         // 派生完成是 thumb_ok 与 rich_state 一起落定(mark_derived 一条语句):
         // 只改 thumb_ok 却还停在排队态,属于要重做的行,仍会出队。
         store
             .test_conn()
             .execute("UPDATE photos SET thumb_ok=1 WHERE id=?1", [pid])
             .unwrap();
-        assert_eq!(store.missing_tier(TIER_NORMAL, &[], 10).len(), 1);
+        assert_eq!(store.missing_tier(TIER_NORMAL, &[], &[], 10).len(), 1);
         store
             .test_conn()
             .execute("UPDATE photos SET rich_state=2 WHERE id=?1", [pid])
             .unwrap();
-        assert!(store.missing_tier(TIER_NORMAL, &[], 10).is_empty());
+        assert!(store.missing_tier(TIER_NORMAL, &[], &[], 10).is_empty());
         assert_eq!(store.tier_count(TIER_NORMAL), 1);
     }
 

@@ -545,12 +545,19 @@ pub fn apply_exif_rotation(img: image::DynamicImage, orient: u32) -> image::Dyna
     }
 }
 
+/// 一轮回填的产出:成功 id + 云占位跳过 id(调用方记会话级跳过账)。
+#[derive(Default)]
+pub struct BackfillOut {
+    pub ok: Vec<i64>,
+    pub cloud_skipped: Vec<i64>,
+}
+
 /// 批量后台生成缺失缩略图；返回成功生成的照片 id 列表，仅成功才置 thumb_ok=1。
 ///
 /// 注意:生成过程**不持有数据库锁**(只锁一小会儿取 id/path 列表),
 /// 否则解码大图会长时间阻塞 UI 的数据库访问。
 pub fn backfill(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
-    backfill_tier(store, Tier::Normal, &[], limit)
+    Ok(backfill_tier(store, Tier::Normal, &[], &[], limit)?.ok)
 }
 
 /// 批量生成指定档位缺失的缩略图。
@@ -564,9 +571,10 @@ pub fn backfill_tier(
     store: &crate::db::Store,
     tier: Tier,
     visible: &[String],
+    skip: &[i64],
     limit: usize,
-) -> Result<Vec<i64>> {
-    let rows = store.missing_tier(tier as u8, visible, limit);
+) -> Result<BackfillOut> {
+    let rows = store.missing_tier(tier as u8, visible, skip, limit);
     backfill_rows(store, tier, rows)
 }
 
@@ -575,8 +583,8 @@ pub fn backfill_tier(
 /// 打开时缓存早已落盘、只按索引取字节,文件夹切换才快;
 /// 若一律等用户切过去才补,每次进新文件夹都要现等生成。这里在空闲时
 /// 一小批一小批铺过去,任何可见目录 / 新导入一出现就立刻让位。
-pub fn backfill_idle(store: &crate::db::Store, limit: usize) -> Result<Vec<i64>> {
-    let rows = store.missing_idle(limit);
+pub fn backfill_idle(store: &crate::db::Store, skip: &[i64], limit: usize) -> Result<BackfillOut> {
+    let rows = store.missing_idle(skip, limit);
     backfill_rows(store, Tier::Normal, rows)
 }
 
@@ -604,44 +612,48 @@ fn backfill_rows(
     store: &crate::db::Store,
     tier: Tier,
     rows: Vec<(i64, String)>,
-) -> Result<Vec<i64>> {
+) -> Result<BackfillOut> {
     if rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BackfillOut::default());
     }
-    let (ok, failed): (
-        Vec<(i64, u64, Option<crate::scan::Derived>)>,
-        Vec<(i64, &String, String)>,
-    ) = thumb_pool().install(|| {
+    enum RowOut {
+        Cloud(i64),
+        Done(i64, u64, Option<crate::scan::Derived>),
+        Fail(i64, String),
+    }
+    let outs: Vec<RowOut> = thumb_pool().install(|| {
         rows.par_iter()
-            .filter_map(|(id, path)| {
-                // 云盘占位文件(OneDrive / SeaFile 按需下载):生成缩略图要打开
-                // 内容,会把占位文件整个拉下来。跳过且**不记账**——这不是坏文件,
-                // 用户以后打开/钉住文件后,行还在缺失队列里自然补上。
+            .map(|(id, path)| {
+                // 云占位:跳过并上报,由 worker 记会话级跳过账,队列得以推进。
                 if crate::win::is_cloud_placeholder(Path::new(path)) {
-                    return None;
+                    return RowOut::Cloud(*id);
                 }
-                Some(match generate_tier(tier, *id, Path::new(path)) {
+                match generate_tier(tier, *id, Path::new(path)) {
                     Ok(h) => {
-                        // 派生列(EXIF / 尺寸 / GPS / 机身)在这一趟读:
-                        // 发现路径不打开文件内容,这里是唯一读它的地方。
-                        // 只在中档读 —— 其余档共用同一份 EXIF,重读是白花的 IO。
                         let d = (tier == Tier::Normal)
                             .then(|| crate::scan::read_derived(Path::new(path)));
-                        rayon::iter::Either::Left((*id, h, d))
+                        RowOut::Done(*id, h, d)
                     }
-                    // 失败也要记账:否则下一轮队列还会取回同一批坏文件,
-                    // worker 永远空转在开头(已知问题: 回收站 $I*.jpg 元数据)。
-                    Err(e) => rayon::iter::Either::Right((*id, path, short_reason(&e))),
-                })
+                    Err(e) => RowOut::Fail(*id, short_reason(&e)),
+                }
             })
-            .partition_map(|either| either)
+            .collect()
     });
-    for (id, path, why) in &failed {
-        escalate_failure(store, *id, path, why);
-    }
-    // 删除竞态:生成期间照片可能已被移出图库(监听对账),
-    // 刚落盘的缩略图必须清掉,否则 rowid 复用时会被当成新照片的缓存。
     let alive: std::collections::HashMap<i64, String> = rows.iter().cloned().collect();
+    let mut ok: Vec<(i64, u64, Option<crate::scan::Derived>)> = Vec::new();
+    let mut cloud_skipped: Vec<i64> = Vec::new();
+    for o in outs {
+        match o {
+            RowOut::Cloud(id) => cloud_skipped.push(id),
+            RowOut::Done(id, h, d) => ok.push((id, h, d)),
+            RowOut::Fail(id, why) => {
+                if let Some(p) = alive.get(&id) {
+                    escalate_failure(store, id, p, &why);
+                }
+            }
+        }
+    }
+    // 删除竞态:生成期间照片可能已被移出图库,刚落盘的缓存必须清掉。
     let (ok, stale): (
         Vec<(i64, u64, Option<crate::scan::Derived>)>,
         Vec<(i64, u64, Option<crate::scan::Derived>)>,
@@ -652,10 +664,12 @@ fn backfill_rows(
         purge_cached(*id);
     }
     if ok.is_empty() {
-        return Ok(Vec::new());
+        return Ok(BackfillOut {
+            ok: Vec::new(),
+            cloud_skipped,
+        });
     }
     if tier == Tier::Normal {
-        // 派生列 + thumb_ok + dhash + rich_state 一条 UPDATE 落定(见 `mark_derived`)。
         let batch: Vec<(i64, u64, Option<&crate::scan::Derived>)> =
             ok.iter().map(|(id, h, d)| (*id, *h, d.as_ref())).collect();
         store.mark_derived(&batch)?;
@@ -663,7 +677,10 @@ fn backfill_rows(
     for (id, _, _) in &ok {
         let _ = store.mark_tier_done(*id, tier as u8);
     }
-    Ok(ok.into_iter().map(|(id, _, _)| id).collect())
+    Ok(BackfillOut {
+        ok: ok.into_iter().map(|(id, _, _)| id).collect(),
+        cloud_skipped,
+    })
 }
 
 /// 派生失败记账,累计到阈值就立案进坏媒体台账。
@@ -789,42 +806,50 @@ pub fn spawn_worker(
         // 占住写库连接,首启全盘场景下 UI 会长时间看不到新图。
         let batch = (crate::win::cpu_count() * 4).clamp(8, 32);
         let mut last_tier = Tier::Normal;
+        // 云占位会话级跳过账:5 分钟后重查一次(用户可能已钉住/下载)。
+        let mut cloud_skip: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        let mut skip_born = std::time::Instant::now();
         while !stop2.load(Ordering::Relaxed) {
             let cur = tier2.load(Ordering::Relaxed);
             let t = Tier::from_u8(cur).unwrap_or(Tier::Normal);
-            // 档位切换 → 重新标记(UI 侧会清纹理缓存,重新加载该档)。
             if t != last_tier {
                 last_tier = t;
+                cloud_skip.clear();
+                skip_born = std::time::Instant::now();
                 active2.store(true, Ordering::Relaxed);
             }
-            // 可见清单每轮取一次快照:锁只在这一瞬间持有,生成期间不碰它。
+            if skip_born.elapsed() > Duration::from_secs(300) {
+                cloud_skip.clear();
+                skip_born = std::time::Instant::now();
+            }
             let vis: Vec<String> = visible2.lock().unwrap().clone();
-            let ids = backfill_tier(&store, t, &vis, batch).unwrap_or_default();
+            let skip: Vec<i64> = cloud_skip.iter().copied().collect();
+            let out = backfill_tier(&store, t, &vis, &skip, batch).unwrap_or_default();
+            let had_cloud = !out.cloud_skipped.is_empty();
+            cloud_skip.extend(out.cloud_skipped);
+            let ids = out.ok;
             if !ids.is_empty() {
                 active2.store(true, Ordering::Relaxed);
                 let _ = tx.send(ids);
-                // 唤醒定居的 UI:补完一批就该换真图。
                 ctx2.request_repaint();
-                // 优先队列批间也让一下(BATCH_GAP_MS):洪峰期不与 UI 帧抢核。
                 std::thread::sleep(Duration::from_millis(BATCH_GAP_MS));
-                // 立刻继续下一批,直到这一轮补完。
                 continue;
             }
-            // 常用目录 / 可见目录 / 新导入都排空了 —— 才轮到其余目录。
-            // 每批只补一小把,中间让出 CPU;下一轮开头会重新检查优先队列,
-            // 用户一滚动或导入就立刻让位,不会跟眼前的图抢时间。
             if t == Tier::Normal {
-                let idle = backfill_idle(&store, IDLE_BATCH).unwrap_or_default();
-                if !idle.is_empty() {
+                let idle = backfill_idle(&store, &skip, IDLE_BATCH).unwrap_or_default();
+                cloud_skip.extend(idle.cloud_skipped);
+                if !idle.ok.is_empty() {
                     active2.store(true, Ordering::Relaxed);
-                    let _ = tx.send(idle);
+                    let _ = tx.send(idle.ok);
                     ctx2.request_repaint();
                     std::thread::sleep(Duration::from_millis(IDLE_GAP_MS));
                     continue;
                 }
             }
-            // 全库都补齐了:睡一会再查(扫描新增照片后自动补齐)。
-            // 空轮 → 置闲:UI 据此定居,不再常驻 300ms 重绘。
+            // 本批全是云占位:立刻取下一批(跳过账已记),不空睡 2 秒。
+            if had_cloud {
+                continue;
+            }
             active2.store(false, Ordering::Relaxed);
             std::thread::sleep(Duration::from_millis(2000));
         }
@@ -1207,7 +1232,7 @@ mod tests {
         }
         // 每轮:取到这张 → 生成失败 → 记账。三轮后达阈值立案。
         for round in 1..=3 {
-            let ids = backfill_tier(&store, Tier::Normal, &[], 10).unwrap();
+            let ids = backfill_tier(&store, Tier::Normal, &[], &[], 10).unwrap().ok;
             assert!(ids.is_empty(), "第 {round} 轮不应有成功产出");
         }
         let (f, rs): (i64, i64) = store
@@ -1226,7 +1251,7 @@ mod tests {
         );
         // 出队:worker 得以推进到后续照片,不再每轮重试同一张坏图。
         assert!(
-            store.missing_tier(1, &[], 10).is_empty(),
+            store.missing_tier(1, &[], &[], 10).is_empty(),
             "立案后应离开回填队列"
         );
     }
@@ -1306,8 +1331,9 @@ mod tests {
             .unwrap();
         }
         assert!(
-            backfill_tier(&store, Tier::Normal, &[], 10)
+            backfill_tier(&store, Tier::Normal, &[], &[], 10)
                 .unwrap()
+                .ok
                 .is_empty(),
             "作用域外的行不该被派生"
         );
@@ -1497,7 +1523,7 @@ mod tests {
         }
 
         // Big 档(2):不写 thumb_ok,只写 thumb_tiers。
-        let ids = backfill_tier(&store, Tier::Big, &[], 10).unwrap();
+        let ids = backfill_tier(&store, Tier::Big, &[], &[], 10).unwrap().ok;
         assert_eq!(ids, vec![photo_id], "应生成 Big 档");
         let ok: i64 = store
             .test_conn()
@@ -1509,7 +1535,7 @@ mod tests {
         assert_eq!(store.tier_count(Tier::Big as u8), 1, "应记入 thumb_tiers");
 
         // 再调一次 → 没有缺失的了(幂等)。
-        let again = backfill_tier(&store, Tier::Big, &[], 10).unwrap();
+        let again = backfill_tier(&store, Tier::Big, &[], &[], 10).unwrap().ok;
         assert!(again.is_empty(), "已生成的档不应重复生成");
 
         let _ = std::fs::remove_dir_all(&dir);
