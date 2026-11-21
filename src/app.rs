@@ -432,6 +432,7 @@ pub struct App {
     /// 图库行集的版本号(每次 rebuild 自增)。缓存的派生数据靠它判新旧。
     rows_gen: u64,
     grid_layouts: GridLayouts,
+    fx_cache: std::cell::RefCell<FxCache>,
     /// 「文件夹」视图的行下标缓存:(版本号, 文件夹, 行下标, 组头日期)。
     /// 每帧从全部行里按目录筛一遍是 O(行数) 次路径字符串运算,没必要。
     folder_cells: (u64, String, Vec<usize>, String),
@@ -2540,6 +2541,33 @@ impl GridLayouts {
     }
 }
 
+/// 预览效果栈单条目缓存:同 id 同写代数直接命中,不再每帧查库。
+struct FxCache {
+    entry: Option<(i64, u64, crate::effects::FilterStack)>,
+}
+
+impl FxCache {
+    fn new() -> Self {
+        FxCache { entry: None }
+    }
+
+    fn get(
+        &mut self,
+        id: i64,
+        gen: u64,
+        load: impl FnOnce() -> crate::effects::FilterStack,
+    ) -> crate::effects::FilterStack {
+        if let Some((cid, cgen, st)) = &self.entry {
+            if *cid == id && *cgen == gen {
+                return st.clone();
+            }
+        }
+        let st = load();
+        self.entry = Some((id, gen, st.clone()));
+        st
+    }
+}
+
 impl App {
     /// 初次设置向导配色:推荐档绿底(服务说明页与照片范围页共用)。
     const GRANT_GREEN: egui::Color32 = egui::Color32::from_rgb(0x2E, 0x8B, 0x47);
@@ -2651,6 +2679,7 @@ impl App {
             tier_cached: 0,
             rows_gen: 0,
             grid_layouts: GridLayouts::new(),
+            fx_cache: std::cell::RefCell::new(FxCache::new()),
             folder_cells: Default::default(),
             folder_groups: Default::default(),
             last_scroll_y: 0.0,
@@ -6663,10 +6692,13 @@ impl App {
 
     /// 读某张照片已保存的效果栈(`photos.filters` 列)。
     fn fx_stack_for(&self, id: i64) -> crate::effects::FilterStack {
-        match self.store.get_filters(id) {
-            Some(s) => crate::effects::FilterStack::parse(&s),
-            None => crate::effects::FilterStack::new(),
-        }
+        let gen = self.store.filters_gen();
+        self.fx_cache.borrow_mut().get(id, gen, || {
+            match self.store.get_filters(id) {
+                Some(s) => crate::effects::FilterStack::parse(&s),
+                None => crate::effects::FilterStack::new(),
+            }
+        })
     }
 
     /// 预览实际渲染用的效果栈 = 已存效果 + 当前草稿(草稿覆盖同名项)。
@@ -12961,6 +12993,31 @@ mod tests {
         g.clear();
         g.get_or_compute("m1", key3, mk);
         assert_eq!(calls.get(), 5, "清空后重算");
+    }
+
+    #[test]
+    fn fx_cache_hits_until_gen_or_id_changes() {
+        let mut c = FxCache::new();
+        let mut loads = 0;
+        c.get(1, 7, || {
+            loads += 1;
+            crate::effects::FilterStack::new()
+        });
+        c.get(1, 7, || {
+            loads += 1;
+            crate::effects::FilterStack::new()
+        });
+        assert_eq!(loads, 1, "同 id 同代数应命中缓存");
+        c.get(1, 8, || {
+            loads += 1;
+            crate::effects::FilterStack::new()
+        });
+        assert_eq!(loads, 2, "代数变了要重读");
+        c.get(2, 8, || {
+            loads += 1;
+            crate::effects::FilterStack::new()
+        });
+        assert_eq!(loads, 3, "换照片要重读");
     }
 }
 

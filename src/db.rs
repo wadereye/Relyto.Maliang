@@ -57,6 +57,8 @@ pub struct Store {
     write_done: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 本次启动硬排除清理摘掉的行数(0 = 没动);缩略图 GC 的触发信号之一。
     pub hard_purged: std::sync::atomic::AtomicUsize,
+    /// 效果栈写代数:每次写 +1,供 UI 单条目缓存判失效。
+    filters_gen: std::sync::atomic::AtomicU64,
 }
 
 /// 统一配置文件名:数据目录定位([location] 节)与自动更新/模型下载
@@ -1703,6 +1705,7 @@ impl Store {
             write_tx: Mutex::new(None),
             write_done: Mutex::new(None),
             hard_purged: std::sync::atomic::AtomicUsize::new(0),
+            filters_gen: std::sync::atomic::AtomicU64::new(0),
         };
         // 启动时补齐缺失的 uid64。
         // 扫描路径会在 `store_insert` 里写,但**外部导入**(WiFi 接收、拖入)
@@ -2231,6 +2234,12 @@ impl Store {
         })
     }
 
+    /// 效果栈当前写代数(UI 缓存判失效用)。
+    pub fn filters_gen(&self) -> u64 {
+        self.filters_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// 写某张照片的效果栈(空串 = 无效果)。
     pub fn set_filters(&self, photo_id: i64, filters: &str) -> Result<()> {
         let f = filters.to_string();
@@ -2240,6 +2249,8 @@ impl Store {
                 rusqlite::params![photo_id, f],
             );
         });
+        self.filters_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -2247,7 +2258,7 @@ impl Store {
     pub fn set_filters_many(&self, ids: &[i64], filters: &str) -> Result<usize> {
         let ids = ids.to_vec();
         let f = filters.to_string();
-        self.write(move |conn| {
+        let n = self.write(move |conn| -> Result<usize> {
             let tx = conn.transaction()?;
             let mut n = 0;
             for id in &ids {
@@ -2258,7 +2269,10 @@ impl Store {
             }
             tx.commit()?;
             Ok(n)
-        })
+        })?;
+        self.filters_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(n)
     }
 
     /// 批量读效果栈(复制所有效果时取源照片)。
@@ -6967,6 +6981,25 @@ mod tests {
         assert_eq!(store.l2_cursor('C'), 0x1a2b_3c4d);
         assert_eq!(store.l2_cursor('D'), 7);
         assert_eq!(store.l2_cursor('E'), 0, "各卷互不串");
+    }
+
+    #[test]
+    fn filters_gen_bumps_on_writes() {
+        let store = Store::open_mem().unwrap();
+        {
+            let c = store.test_conn();
+            c.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'/x/a.jpg','/x',0,0)",
+                [],
+            )
+            .unwrap();
+        }
+        let g0 = store.filters_gen();
+        store.set_filters(1, "[]").unwrap();
+        let g1 = store.filters_gen();
+        assert!(g1 > g0, "写效果栈应推进代数");
+        store.set_filters_many(&[1], "[]").unwrap();
+        assert!(store.filters_gen() > g1, "批量写也应推进代数");
     }
 }
 
