@@ -2506,8 +2506,8 @@ impl TexCache {
     }
 }
 
-/// 网格布局缓存键:视图代数 + 格数 + 宽/行高/间距(按位比较)。
-type LayoutKey = (u64, usize, u32, u32, u32);
+/// 网格布局缓存键:视图代数 + 内容指纹 + 格数 + 宽/行高/间距(按位比较)。
+type LayoutKey = (u64, u64, usize, u32, u32, u32);
 
 /// 每个分组(salt)一份布局缓存:键没变就不重算行排布。
 struct GridLayouts {
@@ -11631,8 +11631,13 @@ impl App {
         let base = self.thumb_tier.size() as f32;
         let gap: f32 = 14.0;
         let avail = ui.available_width();
+        // 内容指纹:选择切换不走 rebuild,同长度不同成员必须失配。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash_slice(cells, &mut hasher);
+        let cells_fp = std::hash::Hasher::finish(&hasher);
         let key: LayoutKey = (
             self.rows_gen,
+            cells_fp,
             cells.len(),
             avail.to_bits(),
             base.to_bits(),
@@ -12910,7 +12915,7 @@ mod tests {
     #[test]
     fn tex_cache_retain_drops_dead_ids() {
         let ctx = egui::Context::default();
-        let mut c = TexCache::new(4);
+        let mut c = TexCache::new(2);
         c.put(1, dummy_tex(&ctx, "a"));
         c.put(2, dummy_tex(&ctx, "b"));
         c.mark_pending(3);
@@ -12919,8 +12924,17 @@ mod tests {
         assert!(!c.has(1));
         assert!(c.has(2));
         assert!(c.is_pending(3));
+        // 容量压力:重放 id 1 后再挤满,残留旧序会误淘汰它的新纹理。
         c.put(1, dummy_tex(&ctx, "c"));
         assert!(c.has(1), "淘汰账不能残留已删 id 的旧序");
+        c.put(3, dummy_tex(&ctx, "d"));
+        assert!(c.has(3));
+        assert!(!c.has(2), "最久存活者先淘汰");
+        assert!(c.has(1), "刚重放的 id 不该被旧序误淘汰");
+        c.put(4, dummy_tex(&ctx, "e"));
+        assert!(c.has(4));
+        assert!(c.has(3));
+        assert!(!c.has(1), "淘汰序应与访问序一致");
     }
 
     #[test]
@@ -12928,7 +12942,7 @@ mod tests {
         let mut g = GridLayouts::new();
         // Cell 计数:让闭包可复制,能多次按值传入
         let calls = std::cell::Cell::new(0);
-        let key: LayoutKey = (7, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
+        let key: LayoutKey = (7, 42, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
         let mk = || {
             calls.set(calls.get() + 1);
             vec![ThumbRow { cells: vec![(0, 10.0)], h: 120.0 }]
@@ -12936,14 +12950,17 @@ mod tests {
         g.get_or_compute("m1", key, mk);
         g.get_or_compute("m1", key, mk);
         assert_eq!(calls.get(), 1, "同键应命中缓存");
-        let key2: LayoutKey = (8, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
+        let key2: LayoutKey = (8, 42, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
         g.get_or_compute("m1", key2, mk);
         assert_eq!(calls.get(), 2, "视图代数变了要重算");
-        g.get_or_compute("m2", key2, mk);
-        assert_eq!(calls.get(), 3, "不同分组各算各的");
+        let key3: LayoutKey = (8, 43, 3, 100f32.to_bits(), 120f32.to_bits(), 14f32.to_bits());
+        g.get_or_compute("m1", key3, mk);
+        assert_eq!(calls.get(), 3, "同代数同格数但内容指纹变了要重算");
+        g.get_or_compute("m2", key3, mk);
+        assert_eq!(calls.get(), 4, "不同分组各算各的");
         g.clear();
-        g.get_or_compute("m1", key2, mk);
-        assert_eq!(calls.get(), 4, "清空后重算");
+        g.get_or_compute("m1", key3, mk);
+        assert_eq!(calls.get(), 5, "清空后重算");
     }
 }
 
