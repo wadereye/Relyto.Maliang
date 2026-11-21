@@ -138,7 +138,7 @@ const MODE_POLL: u8 = 1;
 
 /// 启动监听线程。`on` 开关控制是否扫描(关闭时清空基线,恢复后重建,避免惊群)。
 /// 返回消息接收端:有变化并完成增量扫描时发送汇总文案。
-pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
+pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>, ctx: egui::Context) -> Watcher {
     let (tx, rx) = mpsc::channel();
     let mode = Arc::new(AtomicU8::new(MODE_EVENT));
     let mode2 = mode.clone();
@@ -154,11 +154,16 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
             // 已监听的根目录集合(用于增删 watch)。
             let mut watched: Vec<PathBuf> = Vec::new();
             let mut base: HashMap<PathBuf, Vec<(String, i64, u64)>> = HashMap::new();
-            // 上次基线比对的时间(30s 周期)。
+            // 上次基线比对的时间(120s 周期)。
             let mut last_poll = std::time::Instant::now();
+            // 监听集合 5s 缓存:增删文件夹是低频操作,不必每秒查库。
+            let mut roots = store.list_watched();
+            let mut roots_at = std::time::Instant::now();
             loop {
-                // 同步监听集合(用户随时可能增删文件夹)。
-                let roots = store.list_watched();
+                if roots_at.elapsed() >= Duration::from_secs(5) {
+                    roots = store.list_watched();
+                    roots_at = std::time::Instant::now();
+                }
                 let (to_add, to_remove) = sync_plan(&watched, &roots);
                 // 新增:挂上 watch
                 for r in &to_add {
@@ -176,7 +181,7 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
 
                 // 等待事件(短超时,便于及时感知 watched 表变化;
                 // 变更检测是秒级的(约 1000ms 一次)。
-                // **基线比对兜底**仍按 30s 周期做(见下面的 poll 计时)。
+                // **基线比对兜底**仍按 120s 周期做(见下面的 poll 计时)。
                 match fsw.recv_batch(Duration::from_millis(1000)) {
                     Ok(items) => {
                         if !on.load(Ordering::SeqCst) {
@@ -229,16 +234,17 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                             ));
                         }
                         let _ = tx.send(msg);
+                        ctx.request_repaint();
                         last_poll = std::time::Instant::now();
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        // 1s 未收到事件 → 检查是否到了 30s 的基线比对周期。
+                        // 1s 未收到事件 → 检查是否到了 120s 的基线比对周期。
                         // (短暂超时是常态,不代表出问题了)
-                        if last_poll.elapsed() < Duration::from_secs(30) {
+                        if last_poll.elapsed() < Duration::from_secs(120) {
                             continue;
                         }
                         last_poll = std::time::Instant::now();
-                        // 30s 无事件:做一次基线比对,兜住漏掉的事件
+                        // 120s 无事件:做一次基线比对,兜住漏掉的事件
                         // (某些网络盘/虚拟文件系统不保证事件完整)。
                         if !on.load(Ordering::SeqCst) {
                             base.clear();
@@ -250,6 +256,7 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                                 "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询兜底)",
                                 &[("added", added.to_string()), ("modified", modified.to_string()), ("ndirs", ndirs.to_string())],
                             ));
+                            ctx.request_repaint();
                         }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -279,6 +286,7 @@ pub fn spawn(store: Arc<Store>, on: Arc<AtomicBool>) -> Watcher {
                         "监听:{added} 张新照片、{modified} 张变更,已增量扫描 {ndirs} 个目录(轮询模式)",
                         &[("added", added.to_string()), ("modified", modified.to_string()), ("ndirs", ndirs.to_string())],
                     ));
+                    ctx.request_repaint();
                 }
             }
         }

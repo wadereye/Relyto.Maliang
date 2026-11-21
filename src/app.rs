@@ -2952,7 +2952,7 @@ impl App {
         // 启动时静默导入新照片的 XMP sidecar(外部工具写的星标/标签,DB 权威不覆盖)
         self.start_xmp_import(false);
         // 监听文件夹(事件驱动 ReadDirectoryChangesW,不可用时自动降级轮询)
-        let w = crate::watch::spawn(self.store.clone(), self.watch_on.clone());
+        let w = crate::watch::spawn(self.store.clone(), self.watch_on.clone(), ctx.clone());
         self.watch_rx = Some(w.events);
         self.watch_mode = Some(w.mode);
         // 设备热插拔监听(WM_DEVICECHANGE 链路)。
@@ -13178,15 +13178,16 @@ impl eframe::App for App {
         if self.maint_rx.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        // 监听文件夹:收到变化汇总 → 刷新视图
+        // 监听文件夹:合并本帧积压消息,只重建一次(重绘由监听线程触发)。
+        let mut watch_msg = None;
         if let Some(rx) = &self.watch_rx {
-            if let Ok(msg) = rx.try_recv() {
-                self.status = msg;
-                self.rebuild();
+            while let Ok(msg) = rx.try_recv() {
+                watch_msg = Some(msg);
             }
         }
-        if self.watch_rx.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+        if let Some(msg) = watch_msg {
+            self.status = msg;
+            self.rebuild();
         }
         // OCR(M2b)结果轮询
         #[cfg(feature = "ai")]
