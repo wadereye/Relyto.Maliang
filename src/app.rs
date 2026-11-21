@@ -663,6 +663,8 @@ pub struct App {
     #[cfg(feature = "ai")]
     face_resume_done: bool,
     #[cfg(feature = "ai")]
+    face_version_checked: bool,
+    #[cfg(feature = "ai")]
     face_people: Vec<crate::faces::PeopleRow>,
     #[cfg(feature = "ai")]
     sel_cluster: Option<i64>,
@@ -2792,6 +2794,8 @@ impl App {
             face_scope_common,
             #[cfg(feature = "ai")]
             face_resume_done: false,
+            #[cfg(feature = "ai")]
+            face_version_checked: false,
             #[cfg(feature = "ai")]
             face_people: Vec::new(),
             #[cfg(feature = "ai")]
@@ -12788,6 +12792,11 @@ impl eframe::App for App {
                 }
             }
             self.model_prompt_window(ctx);
+            // 签名隔离警示启动即查,不等用户进人物页才发现检索停摆。
+            if !self.face_version_checked {
+                self.face_version_checked = true;
+                self.check_face_algo_version();
+            }
         }
         // 开机自动续扫:待办>0 且模型就位、非待重建、无在跑扫描时后台接着扫
         // (范围沿用已记住的选择);只查一次,模型缺失不弹下载窗。
