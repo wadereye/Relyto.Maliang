@@ -495,6 +495,12 @@ pub struct AiSched {
     stats: Mutex<Option<(Instant, Vec<StageStats>)>>,
 }
 
+/// 并发会话数 = 核数 / 每会话 intra 线程数(与 ai.rs 的 intra 口径一致)。
+fn session_permits(cores: usize) -> usize {
+    let intra = (cores / 2).max(1);
+    (cores / intra).max(1)
+}
+
 impl AiSched {
     /// 启动三阶段 worker;`enabled=false` 时先停在暂停态。
     pub fn spawn(store: Arc<Store>, enabled: bool) -> Self {
@@ -506,7 +512,7 @@ impl AiSched {
         let gate = Arc::new(Gate::new(!enabled));
         let quit = Arc::new(AtomicBool::new(false));
         let busy = Arc::new(Busy::new());
-        let permits = (crate::win::cpu_count() / 2).max(1);
+        let permits = session_permits(crate::win::cpu_count());
         let sem = Arc::new(Semaphore::new(permits));
         let mut handles = Vec::new();
         let mut releases = Vec::new();
@@ -706,5 +712,15 @@ mod tests {
             ),
             "文字类照片读不出图像时同样要立案,不能一直延后"
         );
+    }
+
+    #[test]
+    fn session_permits_match_intra_budget() {
+        assert_eq!(session_permits(1), 1);
+        assert_eq!(session_permits(2), 2);
+        assert_eq!(session_permits(3), 3);
+        assert_eq!(session_permits(4), 2);
+        assert_eq!(session_permits(8), 2);
+        assert_eq!(session_permits(16), 2);
     }
 }
