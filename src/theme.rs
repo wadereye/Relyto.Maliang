@@ -92,6 +92,12 @@ pub struct Palette {
     pub badge: Color32,
     /// 角标上「未加星」图形色(强调态直接用 `accent`)。
     pub badge_mute: Color32,
+    /// 警示文字(橙系,两主题各自保对比)。
+    pub warn: Color32,
+    /// 错误/危险文字(红系)。
+    pub danger: Color32,
+    /// 成功/新增文字(绿系)。
+    pub success: Color32,
     /// 是否为亮色方案(决定 egui 基线 visuals)。
     pub is_light: bool,
 }
@@ -120,6 +126,9 @@ impl Palette {
         shadow: Color32::from_rgba_premultiplied(0, 0, 0, 34),
         badge: Color32::from_rgba_premultiplied(255, 255, 255, 226),
         badge_mute: Color32::from_rgb(0x8A, 0x8A, 0x8A),
+        warn: Color32::from_rgb(0xB4, 0x53, 0x09),
+        danger: Color32::from_rgb(0xC0, 0x39, 0x2B),
+        success: Color32::from_rgb(0x2E, 0x7D, 0x32),
         is_light: true,
     };
 
@@ -146,6 +155,9 @@ impl Palette {
         shadow: Color32::from_rgba_premultiplied(0, 0, 0, 120),
         badge: Color32::from_rgba_premultiplied(0, 0, 0, 170),
         badge_mute: Color32::from_rgb(0xE1, 0xE1, 0xE1),
+        warn: Color32::from_rgb(0xF0, 0xB4, 0x3C),
+        danger: Color32::from_rgb(0xF0, 0x5A, 0x5A),
+        success: Color32::from_rgb(0x50, 0xC8, 0x78),
         is_light: false,
     };
 }
@@ -162,6 +174,12 @@ static CURRENT: AtomicU8 = AtomicU8::new(match DEFAULT_KIND {
 pub fn p() -> &'static Palette {
     let i = CURRENT.load(Ordering::Relaxed) as usize;
     &PALETTES[i.min(PALETTES.len() - 1)]
+}
+
+/// accent 底上的文字色:亮主题白字,暗主题深字。
+pub fn on_accent() -> Color32 {
+    let t = p();
+    if t.is_light { Color32::WHITE } else { t.bg }
 }
 
 pub fn kind() -> Kind {
@@ -213,6 +231,8 @@ pub fn apply(ctx: &egui::Context) {
     v.faint_bg_color = t.surface;
     v.code_bg_color = t.card;
     v.hyperlink_color = t.accent;
+    v.warn_fg_color = t.warn;
+    v.error_fg_color = t.danger;
     v.weak_text_color = Some(t.muted);
     v.selection.bg_fill = t.accent_soft;
     v.selection.stroke = Stroke::new(1.0_f32, t.accent);
@@ -310,4 +330,41 @@ pub fn section_title(ui: &mut egui::Ui, text: &str) {
             .strong(),
     );
     ui.add_space(4.0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lum(c: Color32) -> f32 {
+        let f = |v: u8| {
+            let s = v as f32 / 255.0;
+            if s <= 0.03928 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * f(c.r()) + 0.7152 * f(c.g()) + 0.0722 * f(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (l1, l2) = (lum(a), lum(b));
+        let (hi, lo) = if l1 > l2 { (l1, l2) } else { (l2, l1) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn semantic_colors_readable_on_both_themes() {
+        for pal in [&Palette::GRAY, &Palette::BLUE] {
+            for c in [pal.warn, pal.danger, pal.success] {
+                assert!(contrast(c, pal.surface) >= 3.0, "{:?} 语义色对 surface 对比不足", pal.kind);
+                assert!(contrast(c, pal.bg) >= 3.0, "{:?} 语义色对 bg 对比不足", pal.kind);
+            }
+        }
+    }
+
+    #[test]
+    fn on_accent_text_readable_on_both_themes() {
+        for pal in [&Palette::GRAY, &Palette::BLUE] {
+            let fg = if pal.is_light { Color32::WHITE } else { pal.bg };
+            assert!(contrast(fg, pal.accent) >= 4.5, "{:?} accent 底文字对比不足", pal.kind);
+        }
+    }
 }

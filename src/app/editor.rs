@@ -1001,7 +1001,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             if let Some(s) = info {
-                                ui.colored_label(egui::Color32::WHITE, s);
+                                ui.colored_label(crate::theme::on_accent(), s);
                             }
                             let msg = if self.fx_msg.is_empty() {
                                 self.status.clone()
@@ -1011,7 +1011,7 @@ impl App {
                             ui.with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
-                                    ui.colored_label(egui::Color32::WHITE, msg);
+                                    ui.colored_label(crate::theme::on_accent(), msg);
                                 },
                             );
                         });

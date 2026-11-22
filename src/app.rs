@@ -1515,7 +1515,7 @@ fn face_filter_row(
 #[cfg(feature = "ai")]
 fn face_wipe_warning(ui: &mut egui::Ui, action: &str) {
     ui.colored_label(
-        egui::Color32::LIGHT_RED,
+        ui.visuals().error_fg_color,
         t_with(
             "「{p1}」不可撤销:人物命名与合并/拆分判定会一并删除,需重新人工整理。",
             &[("p1", action.to_string())],
@@ -3695,7 +3695,7 @@ impl App {
             // ⚠ 字形默认字体里没有,用橙色加粗文字代替图标(项目里同口径)。
             ui.label(
                 egui::RichText::new(head)
-                    .color(egui::Color32::from_rgb(230, 145, 56))
+                    .color(ui.visuals().warn_fg_color)
                     .strong(),
             );
         });
@@ -8053,6 +8053,7 @@ impl App {
                                     egui::vec2(8.0, 8.0),
                                     egui::Sense::hover(),
                                 );
+                                ui.painter().rect_filled(rect.expand(1.0), 2.0, crate::theme::p().stroke_light);
                                 ui.painter().rect_filled(rect, 1.0, col);
                             }
                             if ui.small_button(format!("{t} ✕")).clicked() {
@@ -8215,6 +8216,7 @@ impl App {
                     if let Some(col) = col {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                        ui.painter().rect_filled(rect.expand(1.0), 2.0, crate::theme::p().stroke_light);
                         ui.painter().rect_filled(rect, 1.0, col);
                     }
                     if ui.small_button(&n).clicked() {
@@ -8829,7 +8831,7 @@ impl App {
                 ));
                 if total > ids.len() {
                     ui.colored_label(
-                        egui::Color32::YELLOW,
+                        ui.visuals().warn_fg_color,
                         t_with(
                             "仅显示前 {p1} 张,用库内检索可缩小范围。",
                             &[("p1", ids.len().to_string())],
@@ -8961,7 +8963,7 @@ impl App {
         {
             ui.horizontal(|ui| {
                 ui.colored_label(
-                    egui::Color32::from_rgb(230, 145, 56),
+                    ui.visuals().warn_fg_color,
                     t("部分模型未下载,对应索引不会运行。"),
                 );
                 if ui.small_button(t("去下载")).clicked() {
@@ -9143,7 +9145,7 @@ impl App {
                 ));
             }
         } else if let DlPhase::Failed(e) = &phase {
-            ui.colored_label(egui::Color32::LIGHT_RED, e);
+            ui.colored_label(ui.visuals().error_fg_color, e);
         }
         if !self.ai_models_msg.is_empty() {
             ui.small(self.ai_models_msg.clone());
@@ -10672,12 +10674,9 @@ impl App {
                     egui::Sense::hover(),
                 );
                 if real {
-                    ui.painter().rect_filled(
-                        rect,
-                        2.0,
-                        tag_color(color.as_deref())
-                            .unwrap_or_else(|| egui::Color32::from_gray(90)),
-                    );
+                    let col = tag_color(color.as_deref()).unwrap_or_else(|| crate::theme::p().faint);
+                    ui.painter().rect_filled(rect.expand(1.0), 3.0, crate::theme::p().stroke_light);
+                    ui.painter().rect_filled(rect, 2.0, col);
                 }
                 let text = if real {
                     t_with(
@@ -12882,6 +12881,7 @@ mod tests {
     #[cfg(feature = "ai")]
     fn face_wipe_warning_paints_red_with_action() {
         let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
         for action in ["清除并重新扫描", "切换并重建"] {
             let out = ui_frame(&ctx, vec![], |ui| {
                 face_wipe_warning(ui, action);
@@ -12899,7 +12899,7 @@ mod tests {
                             .job
                             .sections
                             .iter()
-                            .any(|s| s.format.color == egui::Color32::LIGHT_RED),
+                            .any(|s| s.format.color == crate::theme::p().danger),
                         "警示必须是红字: {text}"
                     );
                     found = true;
@@ -15218,7 +15218,7 @@ impl eframe::App for App {
                         ui.small(t_with("共 {p1} 台(便携 {p2} + 磁盘 {p3})", &[("p1", (self.import_devices.len()).to_string()), ("p2", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Portable(_))).count()).to_string()), ("p3", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Volume(_))).count()).to_string())]));
                     });
                     if !self.import_devices_err.is_empty() {
-                        ui.colored_label(egui::Color32::RED, self.import_devices_err.clone());
+                        ui.colored_label(ui.visuals().error_fg_color, self.import_devices_err.clone());
                     }
                     ui.separator();
                     if self.import_devices.is_empty() {
@@ -15360,10 +15360,10 @@ impl eframe::App for App {
                                     let t = format_ts(*ts);
                                     ui.monospace(t);
                                     let color = match action.as_str() {
-                                        "added" => egui::Color32::from_rgb(80, 200, 120),
-                                        "modified" => egui::Color32::from_rgb(240, 180, 60),
-                                        "removed" => egui::Color32::from_rgb(240, 90, 90),
-                                        _ => egui::Color32::GRAY,
+                                        "added" => crate::theme::p().success,
+                                        "modified" => crate::theme::p().warn,
+                                        "removed" => crate::theme::p().danger,
+                                        _ => crate::theme::p().muted,
                                     };
                                     ui.colored_label(color, action);
                                     ui.label(path);
@@ -15464,7 +15464,7 @@ impl eframe::App for App {
                         }
                         Some(Err(e)) => {
                             ui.separator();
-                            ui.colored_label(egui::Color32::from_rgb(240, 90, 90), e);
+                            ui.colored_label(ui.visuals().error_fg_color, e);
                         }
                         None => {}
                     }
