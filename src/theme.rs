@@ -325,16 +325,26 @@ pub fn side_frame() -> egui::Frame {
     })
 }
 
-/// 侧栏小标题:小号、弱色、加粗,替代大号 heading。
-pub fn section_title(ui: &mut egui::Ui, text: &str) {
-    ui.add_space(2.0);
+/// 小节标题文字:12px 弱色加粗,不带间距,可进 horizontal。
+pub fn section_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
             .size(12.0)
             .color(p().muted)
             .strong(),
     );
+}
+
+/// 侧栏小标题:小号、弱色、加粗,替代大号 heading。
+pub fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(2.0);
+    section_label(ui, text);
     ui.add_space(4.0);
+}
+
+/// 面板小节标题:14px heading(选项页与抽屉工具页共用)。
+pub fn panel_section(ui: &mut egui::Ui, text: &str) {
+    ui.heading(egui::RichText::new(text).size(14.0));
 }
 
 #[cfg(test)]

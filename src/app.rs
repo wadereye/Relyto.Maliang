@@ -1611,16 +1611,6 @@ fn same_dir(a: &Path, b: &Path) -> bool {
         .eq_ignore_ascii_case(nb.trim_end_matches(['\\', '/']))
 }
 
-/// 导入页左栏分组小标题(我的文件夹 / 设备 / 我的电脑)。
-fn muted_title(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .size(12.0)
-            .color(crate::theme::p().muted)
-            .strong(),
-    );
-}
-
 /// 导入源快捷行:图标 + 名称,选中态高亮,返回是否点击。
 fn import_source_row(
     ui: &mut egui::Ui,
@@ -5071,7 +5061,7 @@ impl App {
             .show(ui, |ui| {
                 // 我的文件夹:壳目录快捷入口,点一下直接设为导入源。
                 if !shell.is_empty() {
-                    muted_title(ui, t("我的文件夹"));
+                    crate::theme::section_title(ui, t("我的文件夹"));
                     for p in &shell {
                         let name = p
                             .file_name()
@@ -5084,7 +5074,7 @@ impl App {
                 }
                 // 设备:可移动卷(U 盘 / 相机卡)。
                 if !devs.is_empty() {
-                    muted_title(ui, t("设备"));
+                    crate::theme::section_title(ui, t("设备"));
                     for v in &devs {
                         let label = crate::win::volume_label(v)
                             .map(|l| format!("{l} ({})", v.display()))
@@ -5098,7 +5088,7 @@ impl App {
                     }
                 }
                 // 我的电脑:全盘目录树(盘根带硬盘图标,可逐级下探)。
-                muted_title(ui, t("我的电脑"));
+                crate::theme::section_title(ui, t("我的电脑"));
                 for r in roots {
                     self.walk_import_tree(ui, &r, 0, false);
                 }
@@ -5695,7 +5685,7 @@ impl App {
     #[cfg(feature = "ai")]
     fn face_options_ui(&mut self, ui: &mut egui::Ui) {
         // —— 识别方案(单选) ——
-        ui.heading(egui::RichText::new(t("识别方案")).size(14.0));
+        crate::theme::panel_section(ui, t("识别方案"));
         let cur = crate::faces::current_algo(&self.store);
         for (algo, note) in [
             (
@@ -5724,7 +5714,7 @@ impl App {
         // —— 模型文件(复选下载) ——
         let working =
             self.models.phase.working() || self.ai_dl.as_ref().is_some_and(|d| d.phase.working());
-        ui.heading(egui::RichText::new(t("模型文件")).size(14.0));
+        crate::theme::panel_section(ui, t("模型文件"));
         let catalog: [(&str, &str); 3] = [
             (
                 "face_det.onnx",
@@ -5780,7 +5770,7 @@ impl App {
         ui.separator();
 
         // —— 模型诊断(只读:核对生效路径/哈希/契约,不改写也不替换错放文件) ——
-        ui.heading(egui::RichText::new(t("模型诊断")).size(14.0));
+        crate::theme::panel_section(ui, t("模型诊断"));
         ui.small(t(
             "按当前方案核对生效的模型文件:路径、内容哈希与导出契约。只读,不会改写或替换任何文件。",
         ));
@@ -5818,7 +5808,7 @@ impl App {
         ui.separator();
 
         // —— 下载源(全局单选 + 测速) ——
-        ui.heading(egui::RichText::new(t("下载源")).size(14.0));
+        crate::theme::panel_section(ui, t("下载源"));
         let pref = crate::models::SourcePref::from_setting(
             &self
                 .store
@@ -6923,7 +6913,7 @@ impl App {
             let stored = self.fx_stack_for(id);
             self.fx_draft = stored.merged_adjust();
         }
-        ui.heading(t("效果"));
+        crate::theme::panel_section(ui, t("效果"));
         // 标签页(编辑面板按功能分页,不堆长列表)。
         ui.horizontal(|ui| {
             for (i, name) in [t("调整"), t("曲线"), t("一键"), t("裁剪"), t("维护")]
@@ -7078,7 +7068,7 @@ impl App {
     /// append-only、**无引用计数**,回收靠「写时重建」。
     /// 这个面板把内部状态暴露出来,并提供手动触发重建的入口。
     fn pool_maintenance_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(t("字符串池"));
+        crate::theme::panel_section(ui, t("字符串池"));
         ui.small(t(
             "每列一个去重池,行记录只存 32 位 id;池按旧 id 升序重建(写时重建,无引用计数)",
         ));
@@ -7245,7 +7235,7 @@ impl App {
                 .map(|it| it.curve_set())
                 .unwrap_or_default();
         }
-        ui.heading(t("色调曲线"));
+        crate::theme::panel_section(ui, t("色调曲线"));
         ui.small(t(
             "自然三次样条:Master 先算出公共值,RGB 三条曲线各自以同一值求值",
         ));
@@ -7315,7 +7305,7 @@ impl App {
     /// - `warm`/`cool`/`vignette`/`faded` 是本项目自主设计的调色 → 可用,
     ///   强度共用一个滑块(量程 0~100)。
     fn fx_oneclick_ui(&mut self, ui: &mut egui::Ui, id: i64) {
-        ui.heading(t("一键效果"));
+        crate::theme::panel_section(ui, t("一键效果"));
         ui.horizontal_wrapped(|ui| {
             for (label, key) in [
                 (t("黑白"), "bw"),
@@ -7492,7 +7482,7 @@ impl App {
                 }
             }
         }
-        ui.heading(t("视频裁剪"));
+        crate::theme::panel_section(ui, t("视频裁剪"));
         ui.small(t("起点 / 终点(秒)。内部以 100 纳秒为单位,此处按秒操作。"));
         let mut changed = false;
         changed |= ui
@@ -8579,7 +8569,7 @@ impl App {
 
     /// 选项 > 全盘快查:索引服务状态一览 + 启用意向 + 手动重建/卸载入口。
     fn options_svc_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading(egui::RichText::new(t("全盘快查(索引服务)")).size(14.0));
+        crate::theme::panel_section(ui, t("全盘快查(索引服务)"));
         let link = self.link.clone();
         let svc_text = match link.svc {
             crate::win::ServiceState::NotInstalled => t("未安装").to_string(),
@@ -9174,7 +9164,7 @@ impl App {
             None => (Vec::new(), 0),
         };
         ui.horizontal(|ui| {
-            ui.heading(egui::RichText::new(t("AI 模型槽位")).size(14.0));
+            crate::theme::panel_section(ui, t("AI 模型槽位"));
             ui.small(t_with(
                 "占用 {p1} MB(含旧版本与暂存)",
                 &[("p1", format!("{:.1}", disk as f64 / 1_048_576.0))],
@@ -9411,7 +9401,7 @@ impl App {
                         }
                         ui.separator();
                         // 配色:默认灰色;暗色方案为浅蓝点缀。切换即存。
-                        ui.heading(egui::RichText::new(t("配色")).size(14.0));
+                        crate::theme::panel_section(ui, t("配色"));
                         ui.horizontal(|ui| {
                             for k in [crate::theme::Kind::Gray, crate::theme::Kind::Blue] {
                                 if ui
@@ -9425,7 +9415,7 @@ impl App {
                         });
                         ui.separator();
                         // 界面语言:默认中文,可切英文。切换即存、立即生效。
-                        ui.heading(egui::RichText::new(t("界面语言")).size(14.0));
+                        crate::theme::panel_section(ui, t("界面语言"));
                         ui.horizontal(|ui| {
                             for l in crate::i18n::Lang::ALL {
                                 if ui
@@ -9439,7 +9429,7 @@ impl App {
                         });
                         ui.separator();
                         // 数据目录:防 C 盘写满 —— 库/索引/模型整体迁走。
-                        ui.heading(egui::RichText::new(t("数据目录")).size(14.0));
+                        crate::theme::panel_section(ui, t("数据目录"));
                         ui.small(crate::db::data_dir().to_string_lossy().to_string());
                         ui.horizontal(|ui| {
                             if ui.button(t("更改数据目录…")).clicked() {
@@ -9489,7 +9479,7 @@ impl App {
                         }
                         ui.separator();
                         // 缩略图缓存:库搬到大盘时缓存跟着走,不再默默写系统盘。
-                        ui.heading(egui::RichText::new(t("缩略图缓存")).size(14.0));
+                        crate::theme::panel_section(ui, t("缩略图缓存"));
                         let cdir = crate::db::cache_dir();
                         let sdir = crate::db::system_cache_dir();
                         ui.small(cdir.to_string_lossy().to_string());
@@ -10398,12 +10388,7 @@ impl App {
     /// 左栏「文件夹」抽屉明细:目录树 / 平铺列表。
     fn nav_folder_detail(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(t("文件夹"))
-                    .size(12.0)
-                    .color(crate::theme::p().muted)
-                    .strong(),
-            );
+            crate::theme::section_label(ui, &t("文件夹"));
             ui.with_layout(
                 egui::Layout::right_to_left(egui::Align::Center),
                 |ui| {
@@ -11098,7 +11083,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 ui.add(
-                    egui::Label::new(egui::RichText::new(t("最近更新")).size(17.0).strong())
+                    egui::Label::new(egui::RichText::new(t("最近更新")).size(18.0).strong())
                         .selectable(false),
                 );
                 ui.add(
@@ -11190,7 +11175,7 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
                 ui.add(
-                    egui::Label::new(egui::RichText::new(&name).size(17.0).strong())
+                    egui::Label::new(egui::RichText::new(&name).size(18.0).strong())
                         .selectable(false),
                 );
                 ui.add(
@@ -11293,7 +11278,7 @@ impl App {
             if show_all {
                 ui.label(
                     egui::RichText::new(t("铺开所有文件夹:选中左侧某个目录后可用过滤与明细视图。"))
-                        .size(11.0)
+                        .size(12.0)
                         .color(crate::theme::p().muted),
                 );
             }
@@ -11342,7 +11327,7 @@ impl App {
             };
             ui.label(
                 egui::RichText::new(label)
-                    .size(11.0)
+                    .size(12.0)
                     .color(crate::theme::p().muted),
             );
         });
@@ -14618,7 +14603,7 @@ impl eframe::App for App {
                             if self.recent_idxs.len() < 20 && !self.watched.is_empty() {
                                 ui.label(
                                     egui::RichText::new(t("首页只显示已纳入管理的文件夹里的照片;要收进更多目录,到「文件夹」视图里添加监听。"))
-                                    .size(11.0)
+                                    .size(12.0)
                                     .color(crate::theme::p().muted),
                                 );
                                 ui.add_space(4.0);
@@ -14652,7 +14637,7 @@ impl eframe::App for App {
                                         ("p2", (idxs.len()).to_string()),
                                     ],
                                 ))
-                                .size(13.0)
+                                .size(12.0)
                                 .color(crate::theme::p().muted)
                                 .strong(),
                             );
@@ -15055,7 +15040,7 @@ impl eframe::App for App {
                         if filtered {
                             ui.label(
                                 egui::RichText::new(t_with("文件名过滤:匹配 {p1} / 共 {p2} 张", &[("p1", (cells.len()).to_string()), ("p2", (idxs.len()).to_string())]))
-                                .size(11.5)
+                                .size(12.0)
                                 .color(crate::theme::p().muted),
                             );
                         }

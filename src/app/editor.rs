@@ -1067,7 +1067,7 @@ impl App {
             .frame(crate::theme::side_frame())
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(t("属性")).strong());
+                    crate::theme::panel_section(ui, &t("属性"));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("×").clicked() {
                             self.editor_props = false;
@@ -1185,7 +1185,7 @@ impl App {
                                 let c = ui.visuals().warn_fg_color;
                                 ui.add_space(4.0);
                                 ui.horizontal_wrapped(|ui| {
-                                    ui.label(egui::RichText::new(hint).size(10.5).color(c));
+                                    ui.label(egui::RichText::new(hint).size(12.0).color(c));
                                 });
                                 ui.add_space(6.0);
                             }
@@ -1211,7 +1211,7 @@ impl App {
                 for (i, tab) in EditorTab::ALL.iter().enumerate() {
                     let on = self.editor_tab == *tab;
                     let b = egui::Button::new(
-                        egui::RichText::new(format!("{} {}", tab.glyph(), tab.label())).size(11.0),
+                        egui::RichText::new(format!("{} {}", tab.glyph(), tab.label())).size(12.0),
                     )
                     .min_size(egui::vec2(w, 26.0))
                     .fill(if on { t.accent_soft } else { t.widget_bg });
@@ -1615,7 +1615,7 @@ impl App {
         if let Some(hint) = hint {
             let c = ui.visuals().warn_fg_color;
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(hint).size(11.0).color(c));
+                ui.label(egui::RichText::new(hint).size(12.0).color(c));
             });
         }
         let Some(t) = self.preview_tex(ctx) else {
