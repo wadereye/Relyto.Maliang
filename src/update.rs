@@ -1603,10 +1603,11 @@ pub fn cli_apply_update(
             let _ = save_state(&st);
             let _ = std::fs::remove_file(&p.path);
             format!(
-                "Result=ok\nToken={}\nVersion={}\nWarning={}\nMessage=更新已写入,重新启动程序后生效\n",
+                "Result=ok\nToken={}\nVersion={}\nWarning={}\nMessage={}\n",
                 token,
                 esc(&v.version),
-                esc(v.warning.as_deref().unwrap_or(""))
+                esc(v.warning.as_deref().unwrap_or("")),
+                esc(t("更新已写入,重新启动程序后生效"))
             )
         }
         Err(e) => {

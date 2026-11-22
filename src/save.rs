@@ -89,13 +89,13 @@ fn unique_backup(dir: &Path, stem: &str, ext: &str) -> Result<PathBuf> {
 pub fn bake(store: &Store, id: i64) -> Result<Baked> {
     let (path_s, rot) = photo(store, id)?;
     if rot == 1 {
-        return Err(anyhow!("图片已按 EXIF 方向摆正,无需烘培"));
+        return Err(anyhow!("图片已按 EXIF 方向摆正,无需烘焙"));
     }
     let src = Path::new(&path_s);
     // 只读速看预览的格式绝不进烘培:JPEG 重编码会把动画压成首帧、把多图层
     // 文档压平,还会用 JPEG 覆盖原路径。备份目录只保原始字节,不做这种事。
     if crate::scan::is_readonly_media(src) {
-        return Err(anyhow!("该格式只读预览,不参与旋转烘培: {path_s}"));
+        return Err(anyhow!("该格式只读预览,不参与旋转烘焙: {path_s}"));
     }
     let src_bytes = std::fs::read(src).with_context(|| format!("读取原图失败: {path_s}"))?;
     let mtime = src

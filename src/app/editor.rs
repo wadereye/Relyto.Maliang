@@ -743,7 +743,7 @@ impl App {
                         if ui
                             .add_enabled(
                                 !readonly,
-                                egui::Button::new(t("保存(烘培效果到原图)  F2")),
+                                egui::Button::new(t("保存(烘焙效果到原图)  F2")),
                             )
                             .clicked()
                         {
@@ -1380,7 +1380,7 @@ impl App {
             if super::icon_action(ui, "trash-2", &t("清除这张的所有效果"), true) {
                 self.editor_clear_effects(id);
             }
-            if super::icon_action(ui, "save", &t("保存(烘培效果到原图)"), true) {
+            if super::icon_action(ui, "save", &t("保存(烘焙效果到原图)"), true) {
                 self.start_bake(id);
             }
         });

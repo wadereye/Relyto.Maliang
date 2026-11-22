@@ -473,6 +473,7 @@ fn handle_cli(args: &[String]) -> bool {
                 ("--export-assets [路径]", t("导出资源包")),
                 ("--import-assets <路径>", t("导入资源包")),
             ] {
+                let cmd = t(cmd);
                 println!("  {cmd:<28} {desc}");
             }
             true

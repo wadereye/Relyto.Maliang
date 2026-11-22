@@ -5549,7 +5549,7 @@ impl App {
         }
         // 只读速看格式:即便 UI 上误触保存,也不启动会覆盖原文件的后台任务。
         if self.readonly_media(id) {
-            self.status = t("只读速看预览格式不参与保存烘培,原文件保持不变").into();
+            self.status = t("只读速看预览格式不参与保存烘焙,原文件保持不变").into();
             return;
         }
         let store = self.store.clone();
@@ -8795,7 +8795,7 @@ impl App {
             let q = self.ai_query.trim().to_string();
             if !q.is_empty() {
                 ui.heading(t_with(
-                    "库内检索 «{p1}» · {p2} 张",
+                    "库内检索 「{p1}」 · {p2} 张",
                     &[("p1", q), ("p2", (cells.len()).to_string())],
                 ));
                 if cells.is_empty() {
@@ -8818,7 +8818,7 @@ impl App {
                     crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
                 let total = crate::ai_tags::category_count(&self.store, &node, &ver);
                 ui.heading(t_with(
-                    "分类 «{p1}» · {p2} 张",
+                    "分类 「{p1}」 · {p2} 张",
                     &[("p1", t(name).to_string()), ("p2", total.to_string())],
                 ));
                 if total > ids.len() {
@@ -8843,7 +8843,7 @@ impl App {
                 ui.label(t("左侧选择一个标签,查看标有该标签的照片。"));
             }
             Some(tag) => {
-                ui.heading(t_with("标签 «{tag}» · {p1} 张", &[("tag", tag.to_string()), ("p1", (cells.len()).to_string())]));
+                ui.heading(t_with("标签 「{tag}」 · {p1} 张", &[("tag", tag.to_string()), ("p1", (cells.len()).to_string())]));
                 self.photo_grid(ui, "tags-grid", &cells);
             }
         }
@@ -10395,7 +10395,7 @@ impl App {
                     let tip = format!(
                         "{} — {}",
                         t("全部文件夹"),
-                        t("中间栏一次铺开所有文件夹(每组一个相册头)")
+                        t("中间栏一次铺开所有文件夹(每组一个相簿头)")
                     );
                     if icon_toggle(ui, "images", &tip, self.folder_show_all) {
                         self.folder_show_all = true;
@@ -10566,7 +10566,7 @@ impl App {
             let mut cancel = false;
             ui.horizontal(|ui| {
                 ui.label(t_with(
-                    "重命名 «{p1}»",
+                    "重命名 「{p1}」",
                     &[("p1", old.clone())],
                 ));
                 if let Some((_, input)) = self.tag_rename.as_mut() {
@@ -10618,7 +10618,7 @@ impl App {
             let mut cancel = false;
             ui.horizontal(|ui| {
                 ui.label(t_with(
-                    "确定删除标签 «{p1}»(含子标签)? 将同时从 {p2} 张照片上移除",
+                    "确定删除标签 「{p1}」(含子标签)? 将同时从 {p2} 张照片上移除",
                     &[("p1", name.clone()), ("p2", n.to_string())],
                 ));
                 confirm = ui.button(t("删除")).clicked();
@@ -11107,14 +11107,14 @@ impl App {
                 }
                 if ui
                     .add(tool_button("mail", false))
-                    .on_hover_text(t("以邮件发送本相册照片"))
+                    .on_hover_text(t("以邮件发送本相簿照片"))
                     .clicked()
                 {
                     act_mail = true;
                 }
                 if ui
                     .add(tool_button("play", false))
-                    .on_hover_text(t("放映本相册幻灯片"))
+                    .on_hover_text(t("放映本相簿幻灯片"))
                     .clicked()
                 {
                     act_play = true;
@@ -11845,7 +11845,7 @@ impl App {
                 if ui.button(label).clicked() {
                     if in_album {
                         let _ = self.store.album_remove_photo(aid, t.id);
-                        self.fx_msg = t_with("已移出相簿「{name}」", &[("name", name.to_string())]);
+                        self.fx_msg = t_with("已从相簿移除「{name}」", &[("name", name.to_string())]);
                     } else {
                         let _ = self.store.album_add_photo(aid, t.id);
                         self.fx_msg = t_with("已加入相簿「{name}」", &[("name", name.to_string())]);
@@ -13575,6 +13575,8 @@ impl eframe::App for App {
                 rot_ccw,
                 nav_back_k,
                 nav_fwd_k,
+                undo_k,
+                redo_k,
             ) = ctx.input(|i| {
                 let alt = i.modifiers.alt;
                 (
@@ -13591,6 +13593,8 @@ impl eframe::App for App {
                     i.modifiers.command && i.modifiers.shift && i.key_pressed(egui::Key::R),
                     alt && i.key_pressed(egui::Key::ArrowLeft),
                     alt && i.key_pressed(egui::Key::ArrowRight),
+                    i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
+                    i.modifiers.command && i.key_pressed(egui::Key::Y),
                 )
             });
             // 页面前后导航(Alt+← / Alt+→)。
@@ -13632,6 +13636,16 @@ impl eframe::App for App {
                         // 旋转命令按 Windows 图库惯例补
                         // Ctrl+R / Ctrl+Shift+R,只在预览窗生效。
                         self.preview_rotate(id, if rot_cw { 1 } else { 3 });
+                    }
+                }
+                if undo_k {
+                    if let Some(id) = self.preview {
+                        self.fx_undo_step(id);
+                    }
+                }
+                if redo_k {
+                    if let Some(id) = self.preview {
+                        self.fx_redo_step(id);
                     }
                 }
             }
@@ -14108,7 +14122,7 @@ impl eframe::App for App {
                         if ui.checkbox(&mut watching, t("监听文件夹变化")).clicked() {
                             self.watch_on.store(watching, Ordering::SeqCst);
                             self.status = if watching {
-                                t("已开启文件夹监听(事件驱动,不可用时自动降级轮询)").into()
+                                t("已启用文件夹监听(事件驱动,不可用时自动降级轮询)").into()
                             } else {
                                 t("已暂停文件夹监听").into()
                             };
@@ -14455,7 +14469,7 @@ impl eframe::App for App {
                     // 面板右半边留空;这里横向必须撑满。
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
-                        egui::CollapsingHeader::new(egui::RichText::new(t("相册")).strong())
+                        egui::CollapsingHeader::new(egui::RichText::new(t("相簿")).strong())
                             .default_open(true)
                             .open(if self.nav_open_drawer == Some("相册") { Some(true) } else { None })
                             .show(ui, |ui| {
@@ -15501,11 +15515,16 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label(t("Ctrl+A        全选当前视图的照片"));
                     ui.label(t("Ctrl+点击     选中 / 取消选中单张照片"));
-                    ui.label(t("F2            保存(烘培)当前预览照片"));
+                    ui.label(t("F2            保存(烘焙)当前预览照片"));
                     ui.label(t("Ctrl+R        预览中顺时针旋转 90°(自定)"));
                     ui.label(t("Ctrl+Shift+R  预览中逆时针旋转 90°(自定)"));
                     ui.label(t("← / →         预览上一张 / 下一张"));
-                    ui.label(t("Esc           关闭预览"));
+                    ui.label(t("Esc           取消扫描;无扫描时关闭预览"));
+                    ui.label(t("PageUp / PageDown  图库上一页 / 下一页"));
+                    ui.label(t("Home / End    跳到图库开头 / 末尾"));
+                    ui.label(t("Alt+← / Alt+→  后退 / 前进(视图历史)"));
+                    ui.label(t("Space         幻灯片暂停 / 继续"));
+                    ui.label(t("Ctrl+Z / Ctrl+Y  编辑视图撤销 / 重做"));
                     ui.label(t("右键          照片上下文菜单"));
                 });
             self.show_shortcuts = open;
