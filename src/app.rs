@@ -3763,14 +3763,14 @@ impl App {
                 ui.small(t_with("{letter}: 盘走兼容扫描,无实时快查({why})", &[("letter", letter.to_string()), ("why", why.to_string())]));
             }
             if self.link.entries == 0 {
-                ui.label(t("索引还是空的:服务正在扫第一轮全盘,建好后这里自动可用。"));
+                crate::theme::empty_state(ui, t("索引还是空的:服务正在扫第一轮全盘,建好后这里自动可用。"));
                 return;
             }
 
             // 输入框在顶部整条快速查找栏(gsearch),这里只出结果面板;
             // 即输即搜由 gsearch 的 changed() 触发,本页被动刷新。
             if self.name_query.trim().is_empty() {
-                ui.label(t("在上方搜索栏输入关键字开始查找(文件与文件夹都搜,大小写不敏感)"));
+                crate::theme::empty_state(ui, t("在上方搜索栏输入关键字开始查找(文件与文件夹都搜,大小写不敏感)"));
                 return;
             }
             if self.name_results.is_empty() {
@@ -3780,7 +3780,7 @@ impl App {
                         ui.label(t("正在检索…"));
                     });
                 } else {
-                    ui.label(t("没有命中的文件"));
+                    crate::theme::empty_state(ui, t("没有命中的文件"));
                 }
                 return;
             }
@@ -8240,7 +8240,7 @@ impl App {
         let tags = cached.clone();
         ui.small(t("AI 自动标签(点一下采纳为手动标签):"));
         if tags.is_empty() {
-            ui.small(t("(暂无自动标签:启用 AI 索引并等待处理完成)"));
+            crate::theme::empty_state(ui, t("暂无自动标签:启用 AI 索引并等待处理完成"));
             return;
         }
         ui.horizontal_wrapped(|ui| {
@@ -8831,7 +8831,7 @@ impl App {
                     );
                 }
                 if cells.is_empty() {
-                    ui.label(t("该分类下还没有照片。"));
+                    crate::theme::empty_state(ui, t("该分类下还没有照片。"));
                 }
                 self.photo_grid(ui, "category-grid", &cells);
                 return;
@@ -10932,8 +10932,10 @@ impl App {
             }
         }
         if self.clip_search_rx.is_some() {
-            ui.spinner();
-            ui.label(t("搜索中…"));
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label(t("搜索中…"));
+            });
         }
         ui.separator();
         // 索引语言单选(中英双模型;搜索按查询含 CJK 自动匹配)
@@ -14598,7 +14600,7 @@ impl eframe::App for App {
                         self.recent_header(ui);
                         ui.add_space(6.0);
                         if self.recent_idxs.is_empty() {
-                            ui.label(t("最近更新里还没有照片:缩略图生成后会自动收进来,也可到「文件夹」里点开一个目录。"));
+                            crate::theme::empty_state(ui, t("最近更新里还没有照片:缩略图生成后会自动收进来,也可到「文件夹」里点开一个目录。"));
                         } else {
                             if self.recent_idxs.len() < 20 && !self.watched.is_empty() {
                                 ui.label(
@@ -14982,7 +14984,7 @@ impl eframe::App for App {
                                 ui.add_space(16.0);
                             }
                             if self.rows.is_empty() {
-                                ui.label(t("图库里还没有照片,或当前过滤把照片都滤掉了。"));
+                                crate::theme::empty_state(ui, t("图库里还没有照片,或当前过滤把照片都滤掉了。"));
                             }
                             self.folder_groups.1 = groups;
                             return;
@@ -15212,7 +15214,7 @@ impl eframe::App for App {
                     }
                     ui.separator();
                     if self.import_devices.is_empty() {
-                        ui.label(t("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。"));
+                        crate::theme::empty_state(ui, t("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。"));
                         ui.small(t("提示:WPD 服务不可用时只显示盘符卷(WPD 设备枚举尽力而为)。"));
                     } else {
                         // 索引先行:避免闭包里同时借 self.import_devices 和 self.store
@@ -15342,7 +15344,7 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     if self.change_log.is_empty() {
-                        ui.label(t("(暂无变更记录 —— 扫描或监听到变化后会记录在这里)"));
+                        crate::theme::empty_state(ui, t("暂无变更记录 —— 扫描或监听到变化后会记录在这里"));
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for (ts, path, action) in &self.change_log {
@@ -15384,7 +15386,7 @@ impl eframe::App for App {
                     });
                     ui.separator();
                     if self.bad_media_rows.is_empty() {
-                        ui.label(t("(台账是空的 —— 派生连续失败 3 次的文件才会立案到这里)"));
+                        crate::theme::empty_state(ui, t("台账是空的 —— 派生连续失败 3 次的文件才会立案到这里"));
                     } else {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             for b in &self.bad_media_rows {

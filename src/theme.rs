@@ -347,6 +347,11 @@ pub fn panel_section(ui: &mut egui::Ui, text: &str) {
     ui.heading(egui::RichText::new(text).size(14.0));
 }
 
+/// 空态提示:小号弱色文字,各视图统一。
+pub fn empty_state(ui: &mut egui::Ui, text: &str) {
+    ui.small(egui::RichText::new(text).color(p().muted));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
