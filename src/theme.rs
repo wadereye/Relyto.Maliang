@@ -182,6 +182,11 @@ pub fn on_accent() -> Color32 {
     if t.is_light { Color32::WHITE } else { t.bg }
 }
 
+/// 主操作按钮:accent 填充,文字色随主题自适应。
+pub fn primary_button(text: &str) -> egui::Button<'static> {
+    egui::Button::new(egui::RichText::new(text.to_string()).color(on_accent())).fill(p().accent)
+}
+
 pub fn kind() -> Kind {
     p().kind
 }

@@ -4270,6 +4270,8 @@ impl App {
         };
         egui::Window::new(t("确认安装更新"))
             .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
             .default_width(440.0)
             .show(ctx, |ui| {
                 ui.label(t_with("即将安装 v{ver}。", &[("ver", ver.to_string())]));
@@ -4286,7 +4288,7 @@ impl App {
                 ));
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(t("开始安装")).clicked() {
+                    if ui.add(crate::theme::primary_button(&t("开始安装"))).clicked() {
                         yes = true;
                     }
                     if ui.button(t("取消")).clicked() {
@@ -6010,7 +6012,7 @@ impl App {
                 ui.checkbox(&mut never, t("不再提示(以后开机不再弹这个窗)"));
                 ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button(t("开始下载")).clicked() {
+                    if ui.add(crate::theme::primary_button(&t("开始下载"))).clicked() {
                         start = true;
                         dismissed = true;
                     }
@@ -15160,13 +15162,16 @@ impl eframe::App for App {
                     );
                     let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let name = self.album_input.trim().to_string();
-                    let ok = (ui.button(t("创建")).clicked() || enter) && !name.is_empty();
+                    let mut ok = enter && !name.is_empty();
                     ui.horizontal(|ui| {
-                        if n > 0 {
-                            ui.small(t_with("已选中 {n} 张", &[("n", n.to_string())]));
+                        if ui.add(crate::theme::primary_button(&t("创建"))).clicked() && !name.is_empty() {
+                            ok = true;
                         }
                         if ui.button(t("取消")).clicked() {
                             close = true;
+                        }
+                        if n > 0 {
+                            ui.small(t_with("已选中 {n} 张", &[("n", n.to_string())]));
                         }
                     });
                     if ok {
@@ -15754,7 +15759,7 @@ impl eframe::App for App {
                     ui.label(t("只移除索引记录,不会删除磁盘上的任何文件。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button(t("移除")).clicked() {
+                        if ui.add(crate::theme::primary_button(&t("移除"))).clicked() {
                             self.remove_folder_from_library(&folder);
                             self.confirm_folder_remove = None;
                         }
@@ -15789,7 +15794,7 @@ impl eframe::App for App {
                     ui.small(t("常用目录 = 我的文档/图片/视频/桌面 + 你导入的文件夹;其余照片保持未分析,以后选全盘可补扫。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button(t("切换并重建")).clicked() {
+                        if ui.add(crate::theme::primary_button(&t("切换并重建"))).clicked() {
                             decision = 1;
                         }
                         if ui.button(t("取消")).clicked() {
@@ -15845,7 +15850,7 @@ impl eframe::App for App {
                     ui.small(t("常用目录 = 我的文档/图片/视频/桌面 + 你导入的文件夹;其余照片保持未分析,以后选全盘可补扫。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button(t("清除并重新扫描")).clicked() {
+                        if ui.add(crate::theme::primary_button(&t("清除并重新扫描"))).clicked() {
                             match crate::faces::wipe_faces(&self.store) {
                                 Ok(()) => {
                                     let tag = crate::faces::algo_tag(&self.store);
@@ -16012,7 +16017,9 @@ impl eframe::App for App {
 
         // 编辑 > 从图库中移除(二次确认;只删索引,不删文件)
         if self.confirm_remove {
+            let mut open = true;
             egui::Window::new(t("从图库中移除"))
+                .open(&mut open)
                 .collapsible(false)
                 .default_width(400.0)
                 .show(ctx, |ui| {
@@ -16023,7 +16030,7 @@ impl eframe::App for App {
                     ui.label(t("只移除索引记录,不会删除磁盘上的原文件。"));
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
-                        if ui.button(t("移除")).clicked() {
+                        if ui.add(crate::theme::primary_button(&t("移除"))).clicked() {
                             self.remove_selection();
                             self.confirm_remove = false;
                         }
@@ -16032,6 +16039,9 @@ impl eframe::App for App {
                         }
                     });
                 });
+            if !open {
+                self.confirm_remove = false;
+            }
         }
     }
 }
