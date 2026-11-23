@@ -15,7 +15,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -1053,6 +1053,22 @@ CREATE TABLE IF NOT EXISTS contacts (
     display   TEXT NOT NULL DEFAULT '',
     last_used INTEGER NOT NULL DEFAULT 0
 );
+-- 照片备份集:一次快照一行;条目按快照时点的照片存大小与时间。
+CREATE TABLE IF NOT EXISTS backup_sets (
+    id          INTEGER PRIMARY KEY,
+    name        TEXT    NOT NULL,
+    dest        TEXT    NOT NULL,
+    created_ts  INTEGER NOT NULL DEFAULT 0,
+    last_run_ts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS backup_items (
+    set_id   INTEGER NOT NULL REFERENCES backup_sets(id) ON DELETE CASCADE,
+    photo_id INTEGER NOT NULL,
+    src_path TEXT    NOT NULL,
+    size     INTEGER NOT NULL,
+    mtime    INTEGER NOT NULL,
+    PRIMARY KEY (set_id, photo_id)
+);
 -- AI 待办:一个 (阶段, 照片) 一行,重复入队无副作用。
 CREATE TABLE IF NOT EXISTS ai_jobs (
     stage       TEXT    NOT NULL,
@@ -1350,6 +1366,68 @@ pub fn dir_under(child: &str, base: &str) -> bool {
 pub const HIDDEN_DIR_CLAUSE: &str = "NOT EXISTS (SELECT 1 FROM dir_hidden h \
      WHERE p.parent = h.path OR p.parent LIKE h.like_bs ESCAPE '\\' \
      OR p.parent LIKE h.like_sl ESCAPE '\\')";
+
+/// 备份目标路径:源路径的目录结构原样镜像到 `dest_root` 下(不压平)。
+/// Windows 的盘符/UNC 作为顶层一档,避免多盘同名互盖。
+#[must_use]
+pub fn backup_dest_path(src: &Path, dest_root: &Path) -> PathBuf {
+    let mut comps = src.components().peekable();
+    let mut out = dest_root.to_path_buf();
+    let disk = match comps.peek() {
+        Some(Component::Prefix(p)) => Some(
+            p.as_os_str()
+                .to_string_lossy()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect::<String>(),
+        ),
+        _ => None,
+    };
+    if let Some(tag) = disk {
+        if !tag.is_empty() {
+            out.push(tag);
+        }
+        comps.next();
+    }
+    for c in comps {
+        if let Component::Normal(s) = c {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// 目标盘实存读取(大小, 修改时间秒);读不到 = 不存在。
+#[must_use]
+fn target_stat(p: &Path) -> Option<(u64, u64)> {
+    let md = std::fs::metadata(p).ok()?;
+    let secs = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some((md.len(), secs))
+}
+
+/// 待复制清单:目标缺失,或大小/时间与源不符。
+/// 存在性查询注入,便于跨平台单测(纯函数,不碰文件系统)。
+#[must_use]
+pub fn backup_pending_diff(
+    entries: &[(PathBuf, u64, u64)],
+    dest_of: &dyn Fn(&Path) -> PathBuf,
+    exists_of: &dyn Fn(&Path) -> Option<(u64, u64)>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for (src, size, mtime) in entries {
+        let dst = dest_of(src.as_path());
+        match exists_of(dst.as_path()) {
+            Some((s, m)) if s == *size && m == *mtime => {}
+            _ => out.push(dst),
+        }
+    }
+    out
+}
 
 /// 目录子树的 LIKE 前缀:转义后的目录 + 一个分隔符 + `%`。
 fn like_prefix(dir: &str, sep: char) -> String {
@@ -4509,6 +4587,134 @@ impl Store {
         })
     }
 
+    /// 新建备份集:把当前库内全部照片按快照记入条目(不动任何文件)。
+    pub fn backup_set_create(&self, name: &str, dest: &Path) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("备份集名称为空");
+        }
+        if dest.as_os_str().is_empty() {
+            anyhow::bail!("备份目标目录未选择");
+        }
+        let name = name.to_string();
+        let dest = dest.to_string_lossy().into_owned();
+        let now = chrono::Utc::now().timestamp();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO backup_sets(name,dest,created_ts) VALUES(?1,?2,?3)",
+                rusqlite::params![name.as_str(), dest.as_str(), now],
+            )?;
+            let set_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO backup_items(set_id,photo_id,src_path,size,mtime)
+                 SELECT ?1, id, path, size, mtime FROM photos",
+                rusqlite::params![set_id],
+            )?;
+            Ok(set_id)
+        })
+    }
+
+    /// 备份集列表(id / 名称 / 目标 / 建立时间 / 上次运行 / 条目数)。
+    pub fn backup_set_list(&self) -> Vec<(i64, String, String, i64, i64, usize)> {
+        self.read(|conn| {
+            let mut st = match conn.prepare(
+                "SELECT s.id, s.name, s.dest, s.created_ts, s.last_run_ts,
+                        (SELECT COUNT(*) FROM backup_items i WHERE i.set_id = s.id)
+                 FROM backup_sets s ORDER BY s.id DESC",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)? as usize,
+                ))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
+        })
+    }
+
+    /// 目标目录(备份集登记的那一个)。
+    pub fn backup_set_dest(&self, set_id: i64) -> Option<String> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT dest FROM backup_sets WHERE id=?1",
+                rusqlite::params![set_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+    }
+
+    /// 待备份清单:快照条目按当前库内大小/时间与目标盘比对后的差集。
+    ///
+    /// 返回 `(photo_id, 源路径, 目标路径, 源大小)`;目标盘按实存文件判定
+    /// (缺失或大小/时间不符即待传)。
+    pub fn backup_set_pending(&self, set_id: i64) -> Result<Vec<(i64, PathBuf, PathBuf, u64)>> {
+        let Some(dest_root) = self.backup_set_dest(set_id) else {
+            anyhow::bail!("备份集不存在");
+        };
+        let dest_root = PathBuf::from(dest_root);
+        let rows: Vec<(i64, String, u64, u64)> = self.read(move |conn| {
+            let mut st = match conn.prepare(
+                "SELECT bi.photo_id, p.path, p.size, p.mtime
+                 FROM backup_items bi JOIN photos p ON p.id = bi.photo_id
+                 WHERE bi.set_id = ?1 ORDER BY p.path",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map(rusqlite::params![set_id], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, u64>(2)?,
+                    r.get::<_, u64>(3)?,
+                ))
+            })
+            .ok()
+            .map(|rs| rs.filter_map(|x| x.ok()).collect())
+            .unwrap_or_default()
+        });
+        let srcs: Vec<(PathBuf, u64, u64)> = rows
+            .iter()
+            .map(|(_, p, s, m)| (PathBuf::from(p), *s, *m))
+            .collect();
+        let dest_of = |p: &Path| backup_dest_path(p, &dest_root);
+        let need = backup_pending_diff(&srcs, &dest_of, &target_stat);
+        let mut by_dest: HashMap<PathBuf, (i64, PathBuf, u64)> = rows
+            .iter()
+            .map(|(id, p, s, _)| (dest_of(Path::new(p)), (*id, PathBuf::from(p), *s)))
+            .collect();
+        Ok(need
+            .iter()
+            .filter_map(|d| {
+                by_dest
+                    .remove(d)
+                    .map(|(id, src, size)| (id, src, d.clone(), size))
+            })
+            .collect())
+    }
+
+    /// 记一次备份运行时间。
+    pub fn backup_set_ran(&self, set_id: i64) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE backup_sets SET last_run_ts=?2 WHERE id=?1",
+                rusqlite::params![set_id, now],
+            )?;
+            Ok(())
+        })
+    }
+
     /// 全部隐藏目录(已归一,无尾分隔符)。
     pub fn hidden_dirs(&self) -> Vec<String> {
         self.read(|conn| {
@@ -6107,6 +6313,67 @@ mod tests {
         );
         s.unhide_dir("/pic/a").unwrap();
         assert!(s.hidden_dirs().is_empty());
+    }
+
+    #[test]
+    fn backup_pending_diff_skips_identical_and_updates_changed() {
+        let src = vec![
+            (PathBuf::from("/pic/a.jpg"), 10u64, 5u64),
+            (PathBuf::from("/pic/b.jpg"), 7, 9),
+            (PathBuf::from("/pic/c.jpg"), 4, 1),
+        ];
+        let dest_of = |p: &Path| PathBuf::from("/dst").join(p.file_name().unwrap());
+        let exists_of = |p: &Path| -> Option<(u64, u64)> {
+            match p.file_name().unwrap().to_str().unwrap() {
+                "a.jpg" => Some((10, 5)),
+                "b.jpg" => Some((7, 3)),
+                _ => None,
+            }
+        };
+        let got = backup_pending_diff(&src, &dest_of, &exists_of);
+        assert_eq!(
+            got,
+            vec![PathBuf::from("/dst/b.jpg"), PathBuf::from("/dst/c.jpg")],
+            "大小与时间都一致才跳过"
+        );
+    }
+
+    #[test]
+    fn backup_dest_path_mirrors_structure_under_a_top_bucket() {
+        let got = backup_dest_path(Path::new("/pic/a/b.jpg"), Path::new("/dst"));
+        assert_eq!(
+            got,
+            PathBuf::from("/dst").join("pic").join("a").join("b.jpg"),
+            "去掉根之后整段结构镜像过去"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            backup_dest_path(Path::new(r"D:\pic\a\b.jpg"), Path::new("/dst")),
+            PathBuf::from("/dst").join("D").join("pic").join("a").join("b.jpg"),
+            "盘符作顶层一档,不与其他盘同名互盖"
+        );
+        assert_eq!(
+            backup_dest_path(Path::new("/pic/a/b.jpg"), Path::new("/dst")),
+            got,
+            "同输入必同输出(可重放)"
+        );
+    }
+
+    #[test]
+    fn backup_snapshot_and_pending_are_photo_id_unique() {
+        let s = Store::open_mem().unwrap();
+        add_photo_in(&s, 1, "/p");
+        add_photo_in(&s, 2, "/p");
+        let dst = std::env::temp_dir().join(format!("maliang-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dst);
+        let set = s.backup_set_create("全库", &dst).unwrap();
+        assert_eq!(s.backup_set_pending(set).unwrap().len(), 2, "目标盘全空 → 全部待备");
+        let rows = s.backup_set_list();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].5, 2, "列表条目数按快照计");
+        s.backup_set_create("全库", &dst).unwrap();
+        assert_eq!(s.backup_set_list().len(), 2, "同名允许两份快照(时点不同)");
+        let _ = std::fs::remove_dir_all(&dst);
     }
 
     #[test]

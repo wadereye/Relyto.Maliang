@@ -40,8 +40,7 @@ fn free_target(dest: &Path, name: &str) -> PathBuf {
 
 /// 串行复制(paths 已是过滤后的图像列表)。
 /// 返回 (成功数, 失败详情)。失败不中断整体;目标目录必须已存在。
-pub fn copy_all(paths: &[PathBuf], dest: &Path) -> (usize, Vec<String>) {
-    let mut ok = 0;
+pub fn copy_all(paths: &[PathBuf], dest: &Path) -> (usize, Vec<String>) {    let mut ok = 0;
     let mut errs = Vec::new();
     for src in paths {
         if !src.is_file() {
@@ -138,9 +137,84 @@ fn render_with_stack(
     Ok(())
 }
 
+/// 备份复制:建父目录 → 写同名 `.tmp` → 改名,返回(成功数, 字节, 失败详情)。
+/// 失败记该条继续;源文件的属性与时间戳一律不动。
+pub fn backup_run(pending: &[(i64, PathBuf, PathBuf, u64)]) -> (usize, u64, Vec<String>) {
+    let mut ok = 0usize;
+    let mut bytes = 0u64;
+    let mut errs = Vec::new();
+    for (_, src, dst, _) in pending {
+        if let Some(parent) = dst.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                errs.push(format!("{}: {e}", dst.display()));
+                continue;
+            }
+        }
+        let tmp = tmp_path(dst);
+        match std::fs::copy(src, &tmp) {
+            Ok(copied) => {
+                bytes += copied;
+                if let Err(e) = std::fs::rename(&tmp, dst) {
+                    let _ = std::fs::remove_file(&tmp);
+                    errs.push(format!("{}: {e}", dst.display()));
+                } else {
+                    ok += 1;
+                }
+            }
+            Err(e) => errs.push(format!("{}: {e}", dst.display())),
+        }
+    }
+    (ok, bytes, errs)
+}
+
+/// 目标文件的临时名(写完改名,避免半截文件被当成已备份)。
+fn tmp_path(dst: &Path) -> PathBuf {
+    let name = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dst.with_file_name(format!("{name}.tmp"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_run_mirrors_and_leaves_source_alone() {
+        let root = std::env::temp_dir().join(format!("maliang-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src_dir = root.join("src/pic");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let a = src_dir.join("a.jpg");
+        let b = src_dir.join("b.jpg");
+        std::fs::write(&a, b"12345").unwrap();
+        std::fs::write(&b, b"abc").unwrap();
+        let dst_root = root.join("dst");
+        let pending = vec![
+            (
+                1i64,
+                a.clone(),
+                crate::db::backup_dest_path(&a, &dst_root),
+                5u64,
+            ),
+            (
+                2i64,
+                b.clone(),
+                crate::db::backup_dest_path(&b, &dst_root),
+                3u64,
+            ),
+        ];
+        let (ok, bytes, errs) = backup_run(&pending);
+        assert_eq!((ok, bytes), (2, 8), "两条都该复制成功: {errs:?}");
+        assert!(errs.is_empty());
+        assert_eq!(std::fs::read(&pending[0].2).unwrap(), b"12345");
+        assert!(tmp_path(&pending[0].2) != pending[0].2);
+        assert!(!tmp_path(&pending[0].2).exists(), "临时名不应留下");
+        // 源文件字节与大小未变(备份不改原图)。
+        assert_eq!(std::fs::read(&a).unwrap(), b"12345");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn free_target_suffixes_on_conflict() {

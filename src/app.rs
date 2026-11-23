@@ -395,6 +395,14 @@ pub struct App {
     watched: Vec<(String, usize)>,
     confirm_folder_remove: Option<String>,
     maint_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// 照片备份集窗口开关。
+    backup_win: bool,
+    /// 备份集列表(id / 名称 / 目标 / 建立 / 上次运行 / 条目数)。
+    backup_sets: Vec<(i64, String, String, i64, i64, usize)>,
+    /// 增量备份待确认 (备份集 id, 条数, 字节)。
+    backup_confirm: Option<(i64, usize, u64)>,
+    /// 与 `backup_confirm` 同批的待复制清单(确认后交给后台线程)。
+    backup_pending: Vec<(i64, PathBuf, PathBuf, u64)>,
     /// 变更历史窗口开关。
     show_changes: bool,
     /// 变更历史条目 (时间戳ms, 路径, 动作)。
@@ -2789,6 +2797,10 @@ impl App {
             watched: Vec::new(),
             confirm_folder_remove: None,
             maint_rx: None,
+            backup_win: false,
+            backup_sets: Vec::new(),
+            backup_confirm: None,
+            backup_pending: Vec::new(),
             show_changes: false,
             change_log: Vec::new(),
             show_bad_media: false,
@@ -10008,6 +10020,82 @@ impl App {
         });
     }
 
+    /// 新建照片备份集:选目标目录后按当前库做快照(不复制任何文件)。
+    fn backup_set_new(&mut self) {
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title(t("选择备份目标目录"))
+            .pick_folder()
+        else {
+            return;
+        };
+        let name = t_with(
+            "备份 {p1}",
+            &[("p1", chrono::Local::now().format("%Y-%m-%d").to_string())],
+        );
+        match self.store.backup_set_create(&name, &dir) {
+            Ok(id) => {
+                self.backup_sets = self.store.backup_set_list();
+                let n = self
+                    .backup_sets
+                    .iter()
+                    .find(|x| x.0 == id)
+                    .map(|x| x.5)
+                    .unwrap_or(0);
+                self.status = t_with(
+                    "已登记 {p1} 张照片,备份不修改原图",
+                    &[("p1", n.to_string())],
+                );
+            }
+            Err(e) => self.status = t_with("新建备份集失败: {e}", &[("e", e.to_string())]),
+        }
+    }
+
+    /// 算出待备份清单并停在确认步(确认后同一份清单交给后台线程)。
+    fn backup_ask_run(&mut self, set_id: i64) {
+        self.backup_confirm = None;
+        self.backup_pending.clear();
+        match self.store.backup_set_pending(set_id) {
+            Ok(list) => {
+                let bytes: u64 = list.iter().map(|(_, _, _, s)| *s).sum();
+                self.backup_pending = list;
+                self.backup_confirm = Some((set_id, self.backup_pending.len(), bytes));
+            }
+            Err(e) => self.status = t_with("读取待备份清单失败: {e}", &[("e", e.to_string())]),
+        }
+    }
+
+    /// 工具 > 图库维护 > 照片备份集 > 立即增量备份(后台线程复制)。
+    fn backup_start_run(&mut self) {
+        if self.maint_rx.is_some() {
+            self.status = t("维护操作进行中…").into();
+            return;
+        }
+        let Some((set_id, total, _)) = self.backup_confirm.take() else {
+            return;
+        };
+        let list = std::mem::take(&mut self.backup_pending);
+        let store = self.store.clone();
+        let (tx, rx) = mpsc::channel();
+        self.maint_rx = Some(rx);
+        self.status = t_with("正在备份 {p1} 个文件…", &[("p1", total.to_string())]);
+        std::thread::spawn(move || {
+            let (ok, bytes, errs) = crate::export::backup_run(&list);
+            let _ = store.backup_set_ran(set_id);
+            let mut msg = t_with(
+                "本次复制 {p1} 个文件 {p2} MB",
+                &[("p1", ok.to_string()), ("p2", (bytes / 1_048_576).to_string())],
+            );
+            if !errs.is_empty() {
+                msg.push(' ');
+                msg.push_str(&t_with(
+                    "{p1} 个文件复制失败",
+                    &[("p1", errs.len().to_string())],
+                ));
+            }
+            let _ = tx.send(Ok(msg));
+        });
+    }
+
     /// 工具 > 图库维护 > 压缩索引(VACUUM,后台线程)。
     fn start_compact(&mut self) {
         if self.maint_rx.is_some() {
@@ -14347,6 +14435,13 @@ impl eframe::App for App {
                                 self.start_compact();
                                 ui.close();
                             }
+                            if ui.button(t("照片备份集…")).clicked() {
+                                self.backup_sets = self.store.backup_set_list();
+                                self.backup_confirm = None;
+                                self.backup_pending.clear();
+                                self.backup_win = true;
+                                ui.close();
+                            }
                             if ui
                                 .add_enabled(
                                     self.maint_rx.is_none(),
@@ -15633,6 +15728,84 @@ impl eframe::App for App {
 
         // 坏文件台账:派生反复失败被立案的文件,不再每轮重试。
         // 这里给整批销案的出口 —— 网格右键只能一张一张来。
+        // 照片备份集窗口(工具 > 图库维护)。
+        if self.backup_win {
+            let mut open = self.backup_win;
+            egui::Window::new(t("照片备份集"))
+                .open(&mut open)
+                .default_width(720.0)
+                .show(ctx, |ui| {
+                    ui.small(t("备份只读取原图,按目录结构复制到选定目录;改名、时间戳与原文件都不动。"));
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.maint_rx.is_none(),
+                            crate::theme::primary_button(t("新建备份集…")),
+                        )
+                        .clicked()
+                    {
+                        self.backup_set_new();
+                    }
+                    ui.separator();
+                    let rows = self.backup_sets.clone();
+                    if rows.is_empty() {
+                        ui.small(t("还没有备份集。"));
+                    }
+                    for (id, name, dest, created, last, n) in rows {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{name}({n})"));
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} → {}",
+                                    update_time_text(created),
+                                    if last == 0 { t("未运行").to_string() } else { update_time_text(last) }
+                                ))
+                                .weak()
+                                .small(),
+                            );
+                            if ui
+                                .add_enabled(
+                                    self.maint_rx.is_none(),
+                                    egui::Button::new(t("立即增量备份")),
+                                )
+                                .clicked()
+                            {
+                                self.backup_ask_run(id);
+                            }
+                            if ui.button(t("打开目标目录")).clicked() {
+                                show_in_explorer(&dest);
+                            }
+                        });
+                        ui.label(egui::RichText::new(dest.as_str()).weak().small());
+                        if self.backup_confirm.map(|c| c.0) == Some(id) {
+                            let Some((_, cnt, bytes)) = self.backup_confirm else {
+                                continue;
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(t_with(
+                                    "待备份 {p1} 个文件({p2} MB)",
+                                    &[
+                                        ("p1", cnt.to_string()),
+                                        ("p2", format!("{:.1}", bytes as f64 / 1_048_576.0)),
+                                    ],
+                                ));
+                                if ui.button(t("开始备份")).clicked() {
+                                    self.backup_start_run();
+                                }
+                                if ui.button(t("取消")).clicked() {
+                                    self.backup_confirm = None;
+                                    self.backup_pending.clear();
+                                }
+                            });
+                        }
+                    }
+                    if self.maint_rx.is_some() {
+                        ui.small(t("备份进行中…(状态栏看结果)"));
+                    }
+                });
+            self.backup_win = open;
+        }
+
         if self.show_bad_media {
             let mut open = self.show_bad_media;
             egui::Window::new(t("坏文件台账"))
