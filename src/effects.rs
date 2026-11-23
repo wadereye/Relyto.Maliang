@@ -1342,6 +1342,28 @@ pub fn commit_adjust(store: &crate::db::Store, ids: &[i64], adj: &Adjust) -> any
     Ok(n)
 }
 
+/// 把绝对直角旋转角度提交给指定照片,返回写入条数。
+pub fn commit_rotate(store: &crate::db::Store, ids: &[i64], quarter: u32) -> anyhow::Result<usize> {
+    let quarter = quarter % 4;
+    if quarter == 0 {
+        return Ok(0);
+    }
+    let mut params = BTreeMap::new();
+    params.insert("quarter".into(), quarter.to_string());
+    let eff = Effect {
+        name: "rot".into(),
+        params,
+    };
+    let mut n = 0;
+    for id in ids {
+        let mut after = read_stack(store, *id);
+        after.push(eff.clone());
+        store.set_filters(*id, &after.serialize())?;
+        n += 1;
+    }
+    Ok(n)
+}
+
 /// 读某张照片的效果栈(`photos.filters` 列)。
 pub fn read_stack(store: &crate::db::Store, id: i64) -> FilterStack {
     match store.get_filters(id) {

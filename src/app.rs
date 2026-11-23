@@ -76,6 +76,134 @@ impl PageKind {
     }
 }
 
+/// 批量编辑面板的输入项。
+#[derive(Debug, Clone, Default)]
+pub struct BatchOps {
+    pub paste_stack: bool,
+    pub adj: crate::effects::Adjust,
+    pub star: Option<i32>,
+    pub add_tags: Vec<String>,
+    pub remove_tags: Vec<String>,
+    pub caption: Option<String>,
+    pub rotate: i32,
+}
+
+impl BatchOps {
+    /// 是否有至少一项有效改动。
+    pub fn is_noop(&self) -> bool {
+        self.touched() == 0
+    }
+
+    /// 统计非空改动类别,用于确认文案。
+    pub fn touched(&self) -> usize {
+        [
+            self.paste_stack,
+            !self.adj.is_identity(),
+            self.star.is_some(),
+            self.add_tags.iter().any(|s| !s.trim().is_empty()),
+            self.remove_tags.iter().any(|s| !s.trim().is_empty()),
+            self.caption.as_deref().is_some_and(|s| !s.trim().is_empty()),
+            self.rotate != 0,
+        ]
+        .into_iter()
+        .filter(|v| *v)
+        .count()
+    }
+}
+
+/// 批量编辑执行结果。
+#[derive(Debug, Default)]
+struct BatchReport {
+    changes: usize,
+    errors: Vec<String>,
+}
+
+/// 按固定顺序把批量编辑项应用到指定照片。
+fn apply_batch_ops(
+    store: &Store,
+    ids: &[i64],
+    ops: &BatchOps,
+    clipboard: Option<&crate::effects::FilterStack>,
+) -> BatchReport {
+    let mut report = BatchReport::default();
+    if ids.is_empty() {
+        return report;
+    }
+    if ops.paste_stack {
+        match clipboard {
+            Some(stack) => match crate::effects::paste_to(store, ids, stack) {
+                Ok(n) if n > 0 => report.changes += 1,
+                Ok(_) => {}
+                Err(e) => report.errors.push(e.to_string()),
+            },
+            None => report.errors.push(t("剪贴板里没有效果").to_string()),
+        }
+    }
+    if !ops.adj.is_identity() {
+        match crate::effects::commit_adjust(store, ids, &ops.adj) {
+            Ok(n) if n > 0 => report.changes += 1,
+            Ok(_) => {}
+            Err(e) => report.errors.push(e.to_string()),
+        }
+    }
+    if ops.rotate != 0 {
+        match crate::effects::commit_rotate(store, ids, ops.rotate as u32) {
+            Ok(n) if n > 0 => report.changes += 1,
+            Ok(_) => {}
+            Err(e) => report.errors.push(e.to_string()),
+        }
+    }
+    for tag in ops.add_tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mut ok = 0usize;
+        for &id in ids {
+            match timeline::add_tag(store, id, tag) {
+                Ok(()) => ok += 1,
+                Err(e) => report.errors.push(format!("{tag}: {e}")),
+            }
+        }
+        if ok > 0 {
+            report.changes += 1;
+        }
+    }
+    for tag in ops.remove_tags.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mut ok = 0usize;
+        for &id in ids {
+            match timeline::remove_tag(store, id, tag) {
+                Ok(()) => ok += 1,
+                Err(e) => report.errors.push(format!("{tag}: {e}")),
+            }
+        }
+        if ok > 0 {
+            report.changes += 1;
+        }
+    }
+    if let Some(star) = ops.star {
+        let mut ok = 0usize;
+        for &id in ids {
+            match timeline::set_star(store, id, star) {
+                Ok(()) => ok += 1,
+                Err(e) => report.errors.push(format!("{id}: {e}")),
+            }
+        }
+        if ok > 0 {
+            report.changes += 1;
+        }
+    }
+    if let Some(caption) = ops.caption.as_deref().filter(|s| !s.trim().is_empty()) {
+        let mut ok = 0usize;
+        for &id in ids {
+            match store.set_caption(id, caption) {
+                Ok(()) => ok += 1,
+                Err(e) => report.errors.push(format!("{id}: {e}")),
+            }
+        }
+        if ok > 0 {
+            report.changes += 1;
+        }
+    }
+    report
+}
+
 /// 导航历史的一站:后/前进按钮恢复的东西(整页 + 视图 + 左栏选中)。
 #[derive(Clone, PartialEq)]
 struct NavStop {
@@ -363,6 +491,9 @@ pub struct App {
     tag_batch_open: bool,
     tag_batch_input: String,
     tag_batch_ids: Vec<i64>,
+    /// 批量编辑面板开关与输入项。
+    batch_edit_open: bool,
+    batch_ops: BatchOps,
     /// AI 后台索引是否启用(设置页/工具栏开关同步)。
     #[cfg(feature = "ai")]
     ai_enabled: bool,
@@ -2888,6 +3019,8 @@ impl App {
             tag_batch_open: false,
             tag_batch_input: String::new(),
             tag_batch_ids: Vec::new(),
+            batch_edit_open: false,
+            batch_ops: BatchOps::default(),
             #[cfg(feature = "ai")]
             ai_enabled: false,
             #[cfg(feature = "ai")]
@@ -4700,6 +4833,18 @@ impl App {
                 .clicked()
             {
                 self.fx_panel = !self.fx_panel;
+            }
+            let can_batch = self.page == PageKind::Library && self.sel.len() >= 2;
+            if ui
+                .add_enabled(can_batch, tool_button("sliders-horizontal", self.batch_edit_open))
+                .on_hover_text(if can_batch {
+                    t("批量编辑…")
+                } else {
+                    t("先选中至少 2 张照片")
+                })
+                .clicked()
+            {
+                self.open_batch_edit();
             }
             // —— 右端成组控件:从右往左依次是 活动灯 → 搜索框 → 滑块 → 过滤开关 ——
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -8311,6 +8456,182 @@ impl App {
         self.tag_batch_open = false;
         self.tag_batch_input.clear();
         self.tag_batch_ids.clear();
+    }
+
+    /// 打开批量编辑面板并清空上次输入。
+    fn open_batch_edit(&mut self) {
+        if self.sel.len() < 2 {
+            self.status = t("先选中至少 2 张照片").into();
+            return;
+        }
+        self.batch_ops = BatchOps::default();
+        self.batch_ops.add_tags.push(String::new());
+        self.batch_ops.remove_tags.push(String::new());
+        self.batch_edit_open = true;
+    }
+
+    /// 绘制可增删的批量标签输入行。
+    fn batch_tag_editor(ui: &mut egui::Ui, tags: &mut Vec<String>) {
+        if tags.is_empty() {
+            tags.push(String::new());
+        }
+        let mut i = 0;
+        while i < tags.len() {
+            let mut remove = false;
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut tags[i]).desired_width(360.0));
+                remove = ui.small_button("×").clicked();
+            });
+            if remove {
+                tags.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        if ui.small_button("+").clicked() {
+            tags.push(String::new());
+        }
+    }
+
+    /// 批量编辑面板。
+    fn batch_edit_ui(&mut self, ctx: &egui::Context) {
+        if !self.batch_edit_open {
+            return;
+        }
+        let ids = self.sel.iter().copied().collect::<Vec<_>>();
+        let clipboard = self.fx_clipboard.clone();
+        let mut open = self.batch_edit_open;
+        let mut apply = false;
+        let mut cancel = false;
+        egui::Window::new(t("批量编辑"))
+            .open(&mut open)
+            .default_width(520.0)
+            .default_height(680.0)
+            .show(ctx, |ui| {
+                ui.label(t_with(
+                    "将对选中的 {p1} 张照片生效",
+                    &[("p1", ids.len().to_string())],
+                ));
+                let can_apply = !ids.is_empty() && !self.batch_ops.is_noop();
+                ui.add_enabled_ui(!ids.is_empty(), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("batch_edit_ops")
+                        .max_height(520.0)
+                        .show(ui, |ui| {
+                            crate::theme::panel_section(ui, t("效果"));
+                            ui.add_enabled(
+                                clipboard.is_some(),
+                                egui::Checkbox::new(
+                                    &mut self.batch_ops.paste_stack,
+                                    t("粘贴效果"),
+                                ),
+                            );
+                            if clipboard.is_none() {
+                                crate::theme::empty_state(ui, &t("先复制一张照片的效果"));
+                            }
+                            crate::theme::panel_section(ui, t("影调"));
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.batch_ops.adj.brightness,
+                                    -100.0..=100.0,
+                                )
+                                .text(t("亮度")),
+                            );
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.batch_ops.adj.contrast,
+                                    -100.0..=100.0,
+                                )
+                                .text(t("对比度")),
+                            );
+                            crate::theme::panel_section(ui, t("星级"));
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.batch_ops.star,
+                                    None,
+                                    t("不改"),
+                                );
+                                for star in 1..=5 {
+                                    ui.selectable_value(
+                                        &mut self.batch_ops.star,
+                                        Some(star),
+                                        star.to_string(),
+                                    );
+                                }
+                            });
+                            crate::theme::panel_section(ui, t("标签"));
+                            ui.label(t("加标签"));
+                            Self::batch_tag_editor(ui, &mut self.batch_ops.add_tags);
+                            ui.label(t("删标签"));
+                            Self::batch_tag_editor(ui, &mut self.batch_ops.remove_tags);
+                            crate::theme::panel_section(ui, t("标题"));
+                            let mut caption = self.batch_ops.caption.clone().unwrap_or_default();
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut caption)
+                                        .hint_text(t("空 = 不改")),
+                                )
+                                .changed()
+                            {
+                                self.batch_ops.caption = if caption.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(caption)
+                                };
+                            }
+                            crate::theme::panel_section(ui, t("旋转"));
+                            ui.horizontal(|ui| {
+                                ui.selectable_value(
+                                    &mut self.batch_ops.rotate,
+                                    0,
+                                    t("不改"),
+                                );
+                                for quarter in 1..=3 {
+                                    ui.selectable_value(
+                                        &mut self.batch_ops.rotate,
+                                        quarter,
+                                        format!("{}°", quarter * 90),
+                                    );
+                                }
+                            });
+                        });
+                });
+                ui.horizontal(|ui| {
+                    apply = ui
+                        .add_enabled(can_apply, egui::Button::new(t("应用")))
+                        .clicked();
+                    cancel = ui.button(t("取消")).clicked();
+                });
+            });
+        self.batch_edit_open = open && self.batch_edit_open;
+        if cancel || !open || !apply {
+            return;
+        }
+        let ops = self.batch_ops.clone();
+        let report = apply_batch_ops(&self.store, &ids, &ops, clipboard.as_ref());
+        let metadata = ops.star.is_some()
+            || ops.add_tags.iter().any(|s| !s.trim().is_empty())
+            || ops.remove_tags.iter().any(|s| !s.trim().is_empty())
+            || ops.caption.as_deref().is_some_and(|s| !s.trim().is_empty());
+        if metadata {
+            for id in &ids {
+                self.sync_sidecars(*id, self.star_of(*id));
+            }
+        }
+        self.rebuild();
+        self.batch_edit_open = false;
+        if let Some(error) = report.errors.first() {
+            self.status = t_with("批量编辑失败:{p1}", &[("p1", error.clone())]).into();
+        } else {
+            self.status = t_with(
+                "已处理 {p1} 项改动 × {p2} 张照片",
+                &[
+                    ("p1", report.changes.to_string()),
+                    ("p2", ids.len().to_string()),
+                ],
+            )
+            .into();
+        }
     }
 
     /// 标题编辑(失焦或回车即保存)。
@@ -12479,6 +12800,22 @@ impl App {
             self.tag_batch_open = true;
             ui.close();
         }
+        let can_batch = t.selected && self.sel.len() >= 2;
+        if ui
+            .add_enabled(
+                can_batch,
+                egui::Button::new(crate::i18n::t("批量编辑…")),
+            )
+            .on_hover_text(if can_batch {
+                crate::i18n::t("批量编辑…")
+            } else {
+                crate::i18n::t("先选中至少 2 张照片")
+            })
+            .clicked()
+        {
+            self.open_batch_edit();
+            ui.close();
+        }
         // 以图搜图(视频没有语义向量,不给入口)。
         #[cfg(feature = "ai")]
         if !t.movie && ui.button(crate::i18n::t("搜相似照片")).clicked() {
@@ -13195,6 +13532,68 @@ fn orient_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_ops_noop_and_counts() {
+        let mut o = BatchOps::default();
+        assert!(o.is_noop() && o.touched() == 0);
+        o.star = Some(3);
+        o.add_tags = vec!["猫".into()];
+        assert!(!o.is_noop());
+        assert_eq!(o.touched(), 2, "改动项数用于确认文案");
+    }
+
+    #[test]
+    fn batch_apply_touches_only_selected_ids() {
+        let s = Store::open_mem().unwrap();
+        for i in 1..=5 {
+            s.write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,'.',0,0)",
+                    rusqlite::params![i, format!("p{i}.jpg")],
+                )
+            })
+            .unwrap();
+        }
+        let clipboard = crate::effects::FilterStack {
+            items: vec![crate::effects::Effect {
+                name: "bw".into(),
+                params: Default::default(),
+            }],
+        };
+        let mut ops = BatchOps::default();
+        ops.paste_stack = true;
+        ops.adj.brightness = 20.0;
+        ops.rotate = 1;
+        ops.add_tags = vec!["猫".into()];
+        ops.star = Some(4);
+        ops.caption = Some("批量标题".into());
+        let report = apply_batch_ops(&s, &[1, 2, 3], &ops, Some(&clipboard));
+        assert_eq!(report.changes, 6);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        for id in 1..=3 {
+            let stack = crate::effects::read_stack(&s, id);
+            assert_eq!(
+                stack
+                    .items
+                    .iter()
+                    .map(|e| e.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["bw", "enhance", "rot"]
+            );
+            assert_eq!(timeline::tags_of(&s, id).unwrap(), ["猫"]);
+            assert_eq!(s.get_caption(id), "批量标题");
+            let star: i32 = s
+                .read(|conn| conn.query_row("SELECT star FROM photos WHERE id=?1", [id], |r| r.get(0)))
+                .unwrap();
+            assert_eq!(star, 4);
+        }
+        for id in 4..=5 {
+            assert_eq!(s.photo_filters(id), "");
+            assert!(timeline::tags_of(&s, id).unwrap().is_empty());
+            assert_eq!(s.get_caption(id), "");
+        }
+    }
 
     #[test]
     fn help_docs_are_complete_and_indexed() {
@@ -14555,6 +14954,7 @@ impl eframe::App for App {
                 self.options_ui(ctx);
             }
             self.tag_batch_window(ctx);
+            self.batch_edit_ui(ctx);
             // 编辑视图提前返回,通用提示窗仍要画(否则后台消息会一直憋到回图库)。
             self.update_window(ctx);
             self.update_confirm_window(ctx);
@@ -16479,6 +16879,7 @@ impl eframe::App for App {
             self.options_ui(ctx);
         }
         self.tag_batch_window(ctx);
+        self.batch_edit_ui(ctx);
 
         // 按 uid64 定位照片窗口(外部工具可用持久标识引用照片)。
         if self.show_uid_lookup {
