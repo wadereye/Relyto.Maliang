@@ -1643,6 +1643,15 @@ impl App {
         let avail = (ui.available_size() - egui::vec2(0.0, 34.0)).max(egui::vec2(240.0, 160.0));
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
+        match self.viewer_prefs.bg {
+            crate::viewer::ViewerBg::Theme => {}
+            crate::viewer::ViewerBg::Dark => {
+                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(16));
+            }
+            crate::viewer::ViewerBg::Light => {
+                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(245));
+            }
+        }
         let orig = if self.editor_compare != 0 {
             self.editor_orig_tex(ctx, id)
         } else {
@@ -1677,7 +1686,14 @@ impl App {
                 let sd = ui.input(|i| i.raw_scroll_delta.y);
                 if sd != 0.0 {
                     let z0 = self.preview_zoom;
-                    let z1 = (z0 * f32::exp(sd * 0.0022)).clamp(ZOOM_MIN, ZOOM_MAX);
+                    let dir = if sd > 0.0 { 1 } else { -1 };
+                    let z1 = crate::viewer::next_zoom(
+                        z0,
+                        self.viewer_prefs.zoom_step,
+                        dir,
+                        ZOOM_MAX,
+                    )
+                    .clamp(ZOOM_MIN, ZOOM_MAX);
                     if (z1 - z0).abs() > f32::EPSILON {
                         let c0 = egui::vec2(tw as f32 * fit_scale * z0, th as f32 * fit_scale * z0);
                         let img0 =
@@ -1699,12 +1715,21 @@ impl App {
                 self.preview_pan += resp.drag_delta();
             }
             if resp.double_clicked() {
-                if self.preview_zoom > 1.01 {
-                    self.preview_zoom = 1.0;
-                    self.preview_pan = egui::Vec2::ZERO;
-                } else {
-                    self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(ZOOM_MAX);
-                    self.preview_pan = egui::Vec2::ZERO;
+                match self.viewer_prefs.double_click {
+                    crate::viewer::DcAction::FitToggle => {
+                        if self.preview_zoom > 1.01 {
+                            self.preview_zoom = 1.0;
+                            self.preview_pan = egui::Vec2::ZERO;
+                        } else {
+                            self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(ZOOM_MAX);
+                            self.preview_pan = egui::Vec2::ZERO;
+                        }
+                    }
+                    crate::viewer::DcAction::ActualSize => {
+                        self.preview_zoom = (1.0 / fit_scale.max(1e-4)).min(ZOOM_MAX);
+                        self.preview_pan = egui::Vec2::ZERO;
+                    }
+                    crate::viewer::DcAction::OpenWith => self.open_with_system(id),
                 }
             }
             let base = fit_scale * self.preview_zoom;

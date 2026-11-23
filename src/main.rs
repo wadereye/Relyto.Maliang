@@ -38,6 +38,7 @@ mod thumbs;
 mod timeline;
 mod update;
 mod video;
+mod viewer;
 mod watch;
 mod win;
 mod wpd;

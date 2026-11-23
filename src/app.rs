@@ -542,6 +542,8 @@ pub struct App {
     show_ocr_boxes: bool,
     /// 预览叠框缓存(照片 id, 归一化框 + 标签)。
     preview_boxes: Option<(i64, Vec<((f32, f32, f32, f32), String)>)>,
+    /// 查看器双击、底色与缩放步进偏好。
+    viewer_prefs: crate::viewer::ViewerPrefs,
     // —— 预览缩放/平移(单图编辑视图:滚轮缩放、拖拽平移、
     // 双击切换适应窗口/100% 像素)——
     /// 缩放系数:1.0 = 适应窗口;上限 8 倍。
@@ -2655,6 +2657,7 @@ impl App {
         );
         filters.show_hidden = show_hidden;
         let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
+        let viewer_prefs = crate::viewer::ViewerPrefs::load(&store);
         // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
             store
@@ -2825,6 +2828,7 @@ impl App {
             show_face_boxes: true,
             show_ocr_boxes: true,
             preview_boxes: None,
+            viewer_prefs,
             preview_zoom: 1.0,
             preview_pan: egui::Vec2::ZERO,
             crop_mode: false,
@@ -9505,7 +9509,7 @@ impl App {
         }
     }
 
-    /// 选项窗口(常规 / 全盘快查 / 电子邮件 / 幻灯片 / AI 行为 / AI 模型 六页签,
+    /// 选项窗口(常规 / 全盘快查 / 电子邮件 / 幻灯片 / AI 行为 / AI 模型 / 查看器 七页签,
     /// 人脸方案与各 AI 槽位的下载合并在「AI 模型」页)。
     fn options_ui(&mut self, ctx: &egui::Context) {
         let mut opts_open = self.show_options;
@@ -9514,9 +9518,17 @@ impl App {
             .default_width(640.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (i, name) in [t("常规"), t("全盘快查"), t("电子邮件"), t("幻灯片"), t("AI 行为"), t("AI 模型")]
-                        .iter()
-                        .enumerate()
+                    for (i, name) in [
+                        t("常规"),
+                        t("全盘快查"),
+                        t("电子邮件"),
+                        t("幻灯片"),
+                        t("AI 行为"),
+                        t("AI 模型"),
+                        t("查看器"),
+                    ]
+                    .iter()
+                    .enumerate()
                     {
                         if ui.selectable_label(self.options_tab == i, *name).clicked() {
                             self.options_tab = i;
@@ -9742,6 +9754,51 @@ impl App {
                         if ui.checkbox(&mut lp, t("循环放映")).changed() {
                             let _ =
                                 self.store.set_setting("slideshow_loop", if lp { "1" } else { "0" });
+                        }
+                    }
+                    6 => {
+                        crate::theme::panel_section(ui, t("双击时"));
+                        ui.vertical(|ui| {
+                            for action in crate::viewer::DcAction::ALL {
+                                if ui
+                                    .selectable_label(
+                                        self.viewer_prefs.double_click == *action,
+                                        action.label(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.viewer_prefs.double_click = *action;
+                                    self.viewer_prefs.save(&self.store);
+                                }
+                            }
+                        });
+                        crate::theme::panel_section(ui, t("画布底色"));
+                        ui.horizontal(|ui| {
+                            for bg in crate::viewer::ViewerBg::ALL {
+                                if ui
+                                    .selectable_label(self.viewer_prefs.bg == *bg, bg.label())
+                                    .clicked()
+                                {
+                                    self.viewer_prefs.bg = *bg;
+                                    self.viewer_prefs.save(&self.store);
+                                }
+                            }
+                        });
+                        crate::theme::panel_section(ui, t("滚轮缩放步进"));
+                        let mut step = self.viewer_prefs.zoom_step;
+                        if ui
+                            .add(
+                                egui::Slider::new(
+                                    &mut step,
+                                    crate::viewer::MIN_ZOOM_STEP..=crate::viewer::MAX_ZOOM_STEP,
+                                )
+                                .step_by(0.05)
+                                .text(t("滚轮缩放步进")),
+                            )
+                            .changed()
+                        {
+                            self.viewer_prefs.zoom_step = step;
+                            self.viewer_prefs.save(&self.store);
                         }
                     }
                     #[cfg(feature = "ai")]
@@ -11691,6 +11748,16 @@ impl App {
             self.preview_failed = None;
             self.anim_reset();
             self.preview_reset_zoom();
+        }
+    }
+
+    /// 用系统关联程序打开当前照片。
+    fn open_with_system(&mut self, id: i64) {
+        if let Some(path) = self.photo_path(id) {
+            if !crate::win::shell_open(Path::new(&path)) {
+                self.status =
+                    t_with("无法打开:{path}(无关联程序)", &[("path", path.to_string())]);
+            }
         }
     }
 
