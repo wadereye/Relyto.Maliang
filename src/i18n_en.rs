@@ -1253,6 +1253,8 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("补光", "Fill light"),
 ("补光强度", "Fill light strength"),
 ("裁剪", "Crop"),
+("重新裁剪", "Re-crop"),
+("已载入现有裁剪框,拖动可重新裁剪", "Existing crop loaded — drag to re-crop"),
 ("裁剪区域太小", "Crop area too small"),
 ("裁剪尺寸异常 {cw}x{ch}", "Crop size abnormal {cw}x{ch}"),
 ("装裱卡纸", "Mat frame"),

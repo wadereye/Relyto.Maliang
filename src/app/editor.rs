@@ -623,6 +623,7 @@ impl App {
         self.editor_exif = None;
         self.crop_rect = None;
         self.crop_drag = None;
+        self.recrop_index = None;
         self.editor_zoom_cmd = 0;
         self.editor_ensure_drafts(id);
     }
@@ -1273,9 +1274,7 @@ impl App {
             Act::Page(tab) => {
                 self.editor_tab = tab;
                 if tab == EditorTab::Crop {
-                    self.crop_mode = true;
-                    self.crop_rect = None;
-                    self.crop_drag = None;
+                    self.set_crop_mode(id, true);
                 }
             }
             Act::Rotate(q) => self.preview_rotate(id, q),
@@ -1403,9 +1402,7 @@ impl App {
             .selectable_label(self.crop_mode, t("✂ 裁剪工具"))
             .clicked()
         {
-            self.crop_mode = !self.crop_mode;
-            self.crop_rect = None;
-            self.crop_drag = None;
+            self.set_crop_mode(id, !self.crop_mode);
         }
         let (tw, th) = self
             .preview_base
@@ -1455,9 +1452,7 @@ impl App {
                 self.commit_crop(id);
             }
             if super::icon_action(ui, "x", &t("取消"), true) {
-                self.crop_mode = false;
-                self.crop_rect = None;
-                self.crop_drag = None;
+                self.set_crop_mode(id, false);
             }
         });
         ui.label(t("自定义比例"));

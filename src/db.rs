@@ -2474,6 +2474,11 @@ impl Store {
         })
     }
 
+    /// 读照片效果栈,无记录或空值时返回空串。
+    pub fn photo_filters(&self, photo_id: i64) -> String {
+        self.get_filters(photo_id).unwrap_or_default()
+    }
+
     /// 效果栈当前写代数(UI 缓存判失效用)。
     pub fn filters_gen(&self) -> u64 {
         self.filters_gen
@@ -5878,9 +5883,11 @@ mod tests {
 
         // 无效果 → None
         assert_eq!(store.get_filters(1), None);
+        assert_eq!(store.photo_filters(1), "");
         let s = "enhance=brightness=10.0000,contrast=20.0000;";
         store.set_filters(1, &s).unwrap();
         assert_eq!(store.get_filters(1).as_deref(), Some(s));
+        assert_eq!(store.photo_filters(1), s);
 
         // 批量写(粘贴所有效果)
         let n = store.set_filters_many(&[2, 3], &s).unwrap();

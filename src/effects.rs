@@ -490,6 +490,16 @@ impl FilterStack {
         }
     }
 
+    /// 查找同名效果项的下标(大小写不敏感)。
+    pub fn find_index(&self, name: &str) -> Option<usize> {
+        self.items.iter().position(|it| it.name.eq_ignore_ascii_case(name))
+    }
+
+    /// 替换指定下标的效果项并保持栈顺序。
+    pub fn replace_at(&mut self, i: usize, e: Effect) {
+        self.items[i] = e;
+    }
+
     /// 移除一项(撤销单项的原子操作)。
     pub fn remove(&mut self, name: &str) -> Option<Effect> {
         let idx = self
@@ -566,6 +576,21 @@ impl FilterStack {
         }
         st
     }
+}
+
+/// 把裁剪参数还原为归一化矩形,非法或越界时返回 None。
+pub fn crop_rect_from_params(params: &BTreeMap<String, String>) -> Option<[f32; 4]> {
+    let value = |key: &str| params.get(key)?.parse::<f32>().ok();
+    let (x, y, w, h) = (value("x")?, value("y")?, value("w")?, value("h")?);
+    if ![x, y, w, h].iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 1.0)
+        || w <= 0.0
+        || h <= 0.0
+        || x + w > 1.0
+        || y + h > 1.0
+    {
+        return None;
+    }
+    Some([x, y, x + w, y + h])
 }
 
 /// 撤销/重做栈。
@@ -1436,6 +1461,69 @@ mod tests {
         }));
         assert_eq!(st.items.len(), 1);
         assert_eq!(st.items[0].adjust().brightness, 5.0);
+    }
+
+    #[test]
+    fn crop_params_roundtrip_to_rect() {
+        let mut params = BTreeMap::new();
+        for (k, v) in [("x", "0.1000"), ("y", "0.2000"), ("w", "0.5000"), ("h", "0.4000")] {
+            params.insert(k.into(), v.into());
+        }
+        let rect = crop_rect_from_params(&params).unwrap();
+        assert!((rect[0] - 0.1).abs() < 1e-6);
+        assert!((rect[1] - 0.2).abs() < 1e-6);
+        assert!((rect[2] - 0.6).abs() < 1e-6);
+        assert!((rect[3] - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn crop_rect_from_params_rejects_missing_or_bad() {
+        assert!(crop_rect_from_params(&BTreeMap::new()).is_none());
+        for bad in ["nan", "inf", "-0.1", "1.1", "abc"] {
+            let mut params = BTreeMap::new();
+            params.insert("x".into(), bad.into());
+            params.insert("y".into(), "0".into());
+            params.insert("w".into(), "0.5".into());
+            params.insert("h".into(), "0.5".into());
+            assert!(crop_rect_from_params(&params).is_none(), "坏 x 应拒绝: {bad}");
+        }
+        let mut params = BTreeMap::new();
+        params.insert("x".into(), "0.8".into());
+        params.insert("y".into(), "0".into());
+        params.insert("w".into(), "0.5".into());
+        params.insert("h".into(), "0.5".into());
+        assert!(crop_rect_from_params(&params).is_none(), "右边界越界应拒绝");
+    }
+
+    #[test]
+    fn replace_at_keeps_order_and_recrop_history() {
+        let mut st = FilterStack::new();
+        st.push(Effect::enhance(&Adjust::default()));
+        st.push(Effect::oneclick(
+            "crop",
+            [("x".into(), "0.1000".into()), ("y".into(), "0.1000".into()),
+             ("w".into(), "0.5000".into()), ("h".into(), "0.5000".into())]
+                .into_iter().collect(),
+        ));
+        st.push(Effect::oneclick("blur", BTreeMap::new()));
+        let before = st.clone();
+        let i = st.find_index("CROP").unwrap();
+        st.replace_at(i, Effect::oneclick(
+            "crop",
+            [("x".into(), "0.2000".into()), ("y".into(), "0.2000".into()),
+             ("w".into(), "0.4000".into()), ("h".into(), "0.4000".into())]
+                .into_iter().collect(),
+        ));
+        assert_eq!(st.items.len(), 3);
+        assert_eq!(st.items[1].name, "crop");
+        let back = FilterStack::parse(&st.serialize());
+        assert_eq!(back.items[1].params["x"], "0.2000");
+        let mut history = EditStack::new();
+        history.commit("重新裁剪", before.clone(), st.clone());
+        let (_, undone) = history.undo().unwrap();
+        assert_eq!(undone, before);
+        let (_, redone) = history.redo().unwrap();
+        assert_eq!(redone, st);
     }
 
     #[test]

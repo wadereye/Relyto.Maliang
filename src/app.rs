@@ -562,6 +562,8 @@ pub struct App {
     /// 全图解码已判失败的照片 id(大图 / 解码失败时不再每帧重发请求)。
     zoom_failed_for: Option<i64>,
     // —— 裁剪工具(编辑视图的 Crop;比例预设取经典图库常用宽高比清单)——
+    /// 待二次修改的裁剪项下标,None 表示新增裁剪。
+    recrop_index: Option<usize>,
     /// 裁剪框草稿(显示图像的归一化坐标 0..1;[x0, y0, x1, y1],用前归一)。
     crop_rect: Option<[f32; 4]>,
     /// 裁剪比例锁定(像素比 w / h;None = 自由)。
@@ -2843,6 +2845,7 @@ impl App {
             zoom_rx: None,
             zoom_pending: None,
             zoom_failed_for: None,
+            recrop_index: None,
             crop_rect: None,
             crop_ratio: None,
             crop_drag: None,
@@ -7718,7 +7721,11 @@ impl App {
         }
         let before = self.fx_stack_for(id);
         let mut after = before.clone();
-        after.push(eff);
+        if let Some(i) = after.find_index(&eff.name) {
+            after.replace_at(i, eff);
+        } else {
+            after.push(eff);
+        }
         if let Err(e) = self.store.set_filters(id, &after.serialize()) {
             self.fx_msg = t_with("写入失败: {e}", &[("e", e.to_string())]);
             return;
@@ -9935,6 +9942,26 @@ impl App {
             });
     }
 
+    /// 开关裁剪工具,开启时载入当前照片已有裁剪框。
+    fn set_crop_mode(&mut self, id: i64, enabled: bool) {
+        self.crop_mode = enabled;
+        self.crop_rect = None;
+        self.crop_drag = None;
+        self.recrop_index = None;
+        if !enabled {
+            return;
+        }
+        let stack = crate::effects::FilterStack::parse(&self.store.photo_filters(id));
+        let Some(i) = stack.find_index("crop") else {
+            return;
+        };
+        self.recrop_index = Some(i);
+        self.crop_rect = crate::effects::crop_rect_from_params(&stack.items[i].params);
+        if self.crop_rect.is_some() {
+            self.status = t("已载入现有裁剪框,拖动可重新裁剪").into();
+        }
+    }
+
     /// 应用裁剪(把归一化矩形写进效果链)。
     fn commit_crop(&mut self, id: i64) {
         let Some([ax, ay, bx, by]) = self.crop_rect.take() else {
@@ -9952,11 +9979,17 @@ impl App {
         params.insert("y".into(), format!("{y0:.4}"));
         params.insert("w".into(), format!("{w:.4}"));
         params.insert("h".into(), format!("{h:.4}"));
+        let label = if self.recrop_index.is_some() {
+            t("重新裁剪")
+        } else {
+            t("裁剪")
+        };
         self.crop_mode = false;
         self.crop_drag = None;
+        self.recrop_index = None;
         self.fx_commit_effect(
             id,
-            t("裁剪"),
+            label,
             crate::effects::Effect {
                 name: "crop".into(),
                 params,
@@ -10487,6 +10520,7 @@ impl App {
         // 裁剪框是相对当前照片的草稿,换图 / 关预览时必须一起丢掉。
         self.crop_rect = None;
         self.crop_drag = None;
+        self.recrop_index = None;
     }
 
     /// 中间栏按文件夹分组的缓存:`(文件夹, 行下标, 组头日期)`。
