@@ -380,6 +380,8 @@ pub struct App {
     /// 「关于」窗口里 Markdown 更新日志的渲染缓存(egui_commonmark)。
     about_cache: egui_commonmark::CommonMarkCache,
     show_shortcuts: bool,
+    show_license: bool,
+    eula_accepted: bool,
     /// 自动更新:后台检查/下载线程与「检查更新」窗口的状态快照。
     updater: crate::update::Updater,
     /// 安装更新的二次确认窗(UAC + 停服务前必须让用户点一次)。
@@ -2235,6 +2237,14 @@ const ICON_DARK: &[(&str, &[u8])] = &[
 /// 内置更新日志全文,「帮助 > 关于」里以 Markdown 渲染。
 const CHANGELOG_MD: &str = include_str!("../CHANGELOG.md");
 
+/// 内置许可协议全文,帮助窗口与首启确认共用。
+const LICENSE_TEXT: &str = include_str!("../LICENSE");
+
+/// 仅明确写入 1 时视为已同意许可协议。
+fn eula_accepted_of(v: Option<String>) -> bool {
+    v.as_deref() == Some("1")
+}
+
 /// 「关于」窗口用的更新日志:去掉文件头的 H1 标题与说明行(窗口里已另有
 /// 「更新日志」标题,避免重复显示),直接从第一个版本段开始。
 fn about_changelog_md() -> &'static str {
@@ -2666,6 +2676,7 @@ impl App {
             .get_setting("show_overflow")
             .map(|v| v == "1")
             .unwrap_or(false);
+        let eula_accepted = eula_accepted_of(store.get_setting("eula_accepted"));
         // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
             store
@@ -2801,6 +2812,8 @@ impl App {
             show_about: false,
             about_cache: Default::default(),
             show_shortcuts: false,
+            show_license: false,
+            eula_accepted,
             updater: crate::update::Updater::new(),
             update_confirm: false,
             #[cfg(feature = "ai")]
@@ -13033,6 +13046,27 @@ fn orient_rect(
 mod tests {
     use super::*;
 
+    #[test]
+    fn license_text_is_embedded_and_non_trivial() {
+        assert!(LICENSE_TEXT.len() > 1000, "许可正文应完整嵌入,当前 {} 字", LICENSE_TEXT.len());
+        assert_eq!(
+            LICENSE_TEXT
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty()),
+            Some("Apache License")
+        );
+    }
+
+    #[test]
+    fn eula_flag_parse_tolerates_missing_setting() {
+        assert!(!eula_accepted_of(None));
+        assert!(eula_accepted_of(Some("1".into())));
+        assert!(!eula_accepted_of(Some("0".into())));
+        assert!(!eula_accepted_of(Some("".into())));
+        assert!(!eula_accepted_of(Some("true".into())));
+    }
+
     /// 导入页清单三件事:
     /// 1) 子目录排最前(可下探),txt 之类不可入库的文件不列;
     /// 2) 已入库的文件带 `in_library` 标记,行上灰显;
@@ -13506,6 +13540,61 @@ mod tests {
             crate::effects::FilterStack::new()
         });
         assert_eq!(loads, 3, "换照片要重读");
+    }
+}
+
+impl App {
+    fn license_window(&mut self, ctx: &egui::Context, gated: bool) {
+        if !self.show_license {
+            return;
+        }
+        if gated {
+            egui::Modal::new(egui::Id::new("eula_accept_gate")).show(ctx, |_| {});
+        }
+        let title = t("许可协议");
+        let mut open = self.show_license;
+        let mut window = egui::Window::new(title)
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .default_width(720.0)
+            .default_height(600.0);
+        if gated {
+            window = window.resizable(false);
+        } else {
+            window = window.open(&mut open);
+        }
+        window.show(ctx, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("license_text")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.monospace(LICENSE_TEXT);
+                });
+            if gated {
+                ui.separator();
+                ui.label(t("请先阅读并同意许可协议"));
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(crate::theme::primary_button(&t("同意并继续")))
+                        .clicked()
+                    {
+                        if let Err(e) = self.store.set_setting("eula_accepted", "1") {
+                            self.status =
+                                t_with("保存失败: {e}", &[("e", e.to_string())]).into();
+                        } else {
+                            self.eula_accepted = true;
+                            self.show_license = false;
+                        }
+                    }
+                    if ui.button(t("退出")).clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+            }
+        });
+        if !gated {
+            self.show_license = open;
+        }
     }
 }
 
@@ -14758,6 +14847,10 @@ impl eframe::App for App {
                     ui.menu_button(t("帮助(H)"), |ui| {
                         if ui.button(t("键盘快捷键…")).clicked() {
                             self.show_shortcuts = true;
+                            ui.close();
+                        }
+                        if ui.button(t("许可协议…")).clicked() {
+                            self.show_license = true;
                             ui.close();
                         }
                         if ui.button(t("检查更新…")).clicked() {
@@ -16686,6 +16779,12 @@ impl eframe::App for App {
                 self.wizard_page = 0;
             }
         }
+
+        let eula_gate = !self.eula_accepted;
+        if eula_gate {
+            self.show_license = true;
+        }
+        self.license_window(ctx, eula_gate);
 
         // 编辑 > 从图库中移除(二次确认;只删索引,不删文件)
         if self.confirm_remove {
