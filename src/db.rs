@@ -1038,6 +1038,14 @@ CREATE TABLE IF NOT EXISTS bad_media (
     reason TEXT NOT NULL,
     since  INTEGER NOT NULL             -- Unix 毫秒
 );
+-- 目录隐藏台账:整棵子树不进视图(扫描侧一并跳过)。
+-- like_bs/like_sl 写入时按两种分隔符各存一份转义前缀,查询侧只引用列名。
+CREATE TABLE IF NOT EXISTS dir_hidden (
+    path    TEXT PRIMARY KEY,
+    like_bs TEXT NOT NULL,
+    like_sl TEXT NOT NULL,
+    ts      INTEGER NOT NULL DEFAULT 0
+);
 -- AI 待办:一个 (阶段, 照片) 一行,重复入队无副作用。
 CREATE TABLE IF NOT EXISTS ai_jobs (
     stage       TEXT    NOT NULL,
@@ -1313,6 +1321,36 @@ pub fn norm_dir(p: &str) -> String {
         return format!("{t}\\");
     }
     t.to_string()
+}
+
+/// `child` 是否**整级**落在 `base` 之内:相等,或 `base` 之后紧跟分隔符。
+/// 两种分隔符都认,ASCII 大小写不敏感(`D:\pic\ab` 不该被 `D:\pic\a` 罩住)。
+pub fn dir_under(child: &str, base: &str) -> bool {
+    let key = |s: &str| s.to_ascii_uppercase().replace('\\', "/");
+    let cut = |s: String| s.trim_end_matches('/').to_string();
+    let (c, b) = (cut(key(child)), cut(key(base)));
+    if b.is_empty() {
+        return false;
+    }
+    if c == b {
+        return true;
+    }
+    let (cb, bb) = (c.as_bytes(), b.as_bytes());
+    cb.len() > bb.len() && cb.starts_with(bb) && cb[bb.len()] == b'/'
+}
+
+/// 视图侧屏蔽隐藏子树的谓词:只引用列名,不把路径拼进 SQL。
+pub const HIDDEN_DIR_CLAUSE: &str = "NOT EXISTS (SELECT 1 FROM dir_hidden h \
+     WHERE p.parent = h.path OR p.parent LIKE h.like_bs ESCAPE '\\' \
+     OR p.parent LIKE h.like_sl ESCAPE '\\')";
+
+/// 目录子树的 LIKE 前缀:转义后的目录 + 一个分隔符 + `%`。
+fn like_prefix(dir: &str, sep: char) -> String {
+    let mut s = like_escape(dir);
+    s.push('\\');
+    s.push(sep);
+    s.push('%');
+    s
 }
 
 /// 从任意路径取卷根(`D:\Photos\a.jpg` → `Some("D:\\")`);无盘符前缀返回 None。
@@ -4388,6 +4426,65 @@ impl Store {
             .is_ok()
         })
     }
+
+    /// 隐藏整个目录子树(重复隐藏只刷新时间)。
+    pub fn hide_dir(&self, path: &str) -> Result<()> {
+        let p = norm_dir(path);
+        let bs = like_prefix(&p.replace('/', "\\"), '\\');
+        let sl = like_prefix(&p.replace('\\', "/"), '/');
+        let now = chrono::Utc::now().timestamp_millis();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO dir_hidden(path,like_bs,like_sl,ts) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(path) DO UPDATE SET like_bs=?2, like_sl=?3, ts=?4",
+                rusqlite::params![p, bs, sl, now],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 取消隐藏(只删登记,不动文件)。
+    pub fn unhide_dir(&self, path: &str) -> Result<()> {
+        let p = norm_dir(path);
+        self.write(move |conn| {
+            conn.execute("DELETE FROM dir_hidden WHERE path=?1", rusqlite::params![p])?;
+            Ok(())
+        })
+    }
+
+    /// 该目录本身是否被登记为隐藏。
+    pub fn is_dir_hidden(&self, path: &str) -> bool {
+        let p = norm_dir(path);
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT 1 FROM dir_hidden WHERE path=?1",
+                rusqlite::params![p],
+                |_| Ok(()),
+            )
+            .is_ok()
+        })
+    }
+
+    /// 该目录是否落在某个隐藏目录的整棵子树内。
+    pub fn subtree_hidden(&self, path: &str) -> bool {
+        self.hidden_dirs()
+            .iter()
+            .any(|h| dir_under(path, h))
+    }
+
+    /// 全部隐藏目录(已归一,无尾分隔符)。
+    pub fn hidden_dirs(&self) -> Vec<String> {
+        self.read(|conn| {
+            let mut st = match conn.prepare("SELECT path FROM dir_hidden ORDER BY path") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| r.get::<_, String>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+    }
 }
 
 /// `dir_intent` 一行 → [`DirIntent`](列序与 SELECT 一致)。
@@ -5944,6 +6041,41 @@ mod tests {
         assert_ne!(a1, a2, "不同人物不得共用一本");
         assert_eq!(s.album_name(a1).as_deref(), Some("同名"));
         assert_eq!(s.album_id_of_person(8), Some(a2));
+    }
+
+    /// 在指定目录插一张测试照片(返回 id)。
+    fn add_photo_in(store: &Store, id: i64, parent: &str) {
+        let c = store.test_conn();
+        c.execute(
+            "INSERT INTO photos(id,path,parent,mtime,size) VALUES(?1,?2,?3,0,0)",
+            rusqlite::params![id, format!("{parent}/{id}.jpg"), parent],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn hide_dir_hides_subtree_but_not_sibling_prefix() {
+        let s = Store::open_mem().unwrap();
+        add_photo_in(&s, 1, "/pic/a");
+        add_photo_in(&s, 2, "/pic/a/b");
+        add_photo_in(&s, 3, "/pic/ab");
+        s.hide_dir("/pic/a").unwrap();
+        assert!(s.is_dir_hidden("/pic/a"));
+        assert!(s.subtree_hidden("/pic/a/b"));
+        assert!(!s.subtree_hidden("/pic/ab"), "同级前缀目录不得被误判");
+        assert_eq!(s.hidden_dirs(), vec!["/pic/a".to_string()]);
+        s.unhide_dir("/pic/a").unwrap();
+        assert!(!s.subtree_hidden("/pic/a/b"));
+        assert!(s.hidden_dirs().is_empty());
+    }
+
+    #[test]
+    fn dir_under_is_level_exact_and_case_agnostic() {
+        assert!(dir_under(r"D:\pic\a\b", r"D:\pic\a"));
+        assert!(dir_under("/pic/a", "/pic/a"), "自身算在子树内");
+        assert!(dir_under(r"d:\PICTURES\x", r"D:\pictures"), "ASCII 大小写不敏感");
+        assert!(!dir_under(r"D:\pic\ab", r"D:\pic\a"), "同级前缀不算子树");
+        assert!(!dir_under(r"D:\other", ""), "空基名不罩任何东西");
     }
 
     #[test]

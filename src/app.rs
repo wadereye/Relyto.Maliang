@@ -577,6 +577,10 @@ pub struct App {
     caption_edit: Option<(i64, String)>,
     /// 缩略图下方显示标题(设置项 thumb_captions)。
     thumb_captions: bool,
+    /// 显示隐藏文件夹里的照片(设置项 show_hidden)。
+    show_hidden: bool,
+    /// 隐藏目录登记表(树节点打标记与右键菜单用,增删后刷新)。
+    hidden_dirs: Vec<String>,
     // —— 相簿(Album)——
     /// 当前查看的相簿。
     sel_album: Option<i64>,
@@ -2593,6 +2597,12 @@ impl App {
             .get_setting("thumb_captions")
             .map(|v| v != "0")
             .unwrap_or(false);
+        // 隐藏文件夹默认不进视图(设置项缺省按关)。
+        let show_hidden = store
+            .get_setting("show_hidden")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let hidden_dirs = store.hidden_dirs();
         // 缺省树形;显式选过平铺的库存的是 "0",不受影响。
         let folder_tree = store
             .get_setting("folder_tree")
@@ -2626,8 +2636,9 @@ impl App {
             .get_setting("sort_by")
             .and_then(|v| timeline::SortBy::from_key(&v))
             .unwrap_or_default();
-        let filters =
+        let mut filters =
             timeline::Filters::from_setting(&store.get_setting("view_filters").unwrap_or_default());
+        filters.show_hidden = show_hidden;
         let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
         // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
@@ -2816,6 +2827,8 @@ impl App {
             slide_loop: true,
             caption_edit: None,
             thumb_captions,
+            show_hidden,
+            hidden_dirs,
             sel_album: None,
             album_input: String::new(),
             album_desc: String::new(),
@@ -4658,6 +4671,16 @@ impl App {
             self.apply_view_state();
             ui.close();
         }
+        // 隐藏目录是「少显示」,不占过滤开关位,单独设置键。
+        if ui
+            .checkbox(&mut self.show_hidden, t("显示隐藏的文件夹"))
+            .changed()
+        {
+            let _ = self
+                .store
+                .set_setting("show_hidden", if self.show_hidden { "1" } else { "0" });
+            self.apply_view_state();
+        }
         ui.separator();
         for p in PeopleSort::ALL {
             if ui
@@ -4721,6 +4744,7 @@ impl App {
         let _ = self
             .store
             .set_setting("view_filters", &self.filters.as_setting());
+        self.filters.show_hidden = self.show_hidden;
         self.rebuild();
     }
 
@@ -10282,6 +10306,37 @@ impl App {
         }
     }
 
+    /// 该目录本身是否被直接登记为隐藏(不含从祖先继承)。
+    fn dir_hidden_exact(&self, path: &str) -> bool {
+        let key = crate::db::norm_dir(path).to_ascii_uppercase();
+        self.hidden_dirs
+            .iter()
+            .any(|h| h.to_ascii_uppercase() == key)
+    }
+
+    /// 隐藏整棵子树:登记后立即重建视图(扫描侧下一轮自然跳过)。
+    fn hide_this_dir(&mut self, path: &str) {
+        if let Err(e) = self.store.hide_dir(path) {
+            self.fx_msg = t_with("隐藏失败: {e}", &[("e", e.to_string())]);
+            return;
+        }
+        self.hidden_dirs = self.store.hidden_dirs();
+        self.fx_msg = t_with("已隐藏 {p1}", &[("p1", path.to_string())]);
+        self.rebuild();
+    }
+
+    /// 取消隐藏:删登记后补扫该目录,把此前跳过的文件请回视图。
+    fn unhide_this_dir(&mut self, path: &str) {
+        if let Err(e) = self.store.unhide_dir(path) {
+            self.fx_msg = t_with("取消隐藏失败: {e}", &[("e", e.to_string())]);
+            return;
+        }
+        self.hidden_dirs = self.store.hidden_dirs();
+        self.fx_msg = t_with("已取消隐藏 {p1}", &[("p1", path.to_string())]);
+        self.rebuild();
+        self.start_scan_roots(vec![PathBuf::from(path)], t("取消隐藏目录"));
+    }
+
     /// 左栏文件夹树入口:树本体按 rows_gen 缓存,逐帧只走可见节点。
     fn folder_tree_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if self.folder_tree_cache.gen != self.rows_gen {
@@ -10368,7 +10423,16 @@ impl App {
             // 树里每个节点都装着照片(至少子树里有),名字一律可选色;
             // 中间层与叶子的差别只在点击后的聚合范围。
             let text = egui::RichText::new(name.as_str()).color(crate::theme::p().text);
-            if ui.selectable_label(active, text).clicked() {
+            let row = ui.selectable_label(active, text);
+            if self
+                .hidden_dirs
+                .iter()
+                .any(|h| crate::db::dir_under(&path, h))
+                && self.show_hidden
+            {
+                ui.label(egui::RichText::new(t("已隐藏")).weak().small());
+            }
+            if row.clicked() {
                 match folder_index {
                     Some(fi) => {
                         self.selected_folder = fi;
@@ -10395,6 +10459,19 @@ impl App {
                     }
                 }
             }
+            // 右键:整棵子树隐藏 / 取消隐藏(只影响视图与扫描,不动文件)。
+            let menu_path = path.clone();
+            row.context_menu(|ui| {
+                if self.dir_hidden_exact(&menu_path) {
+                    if ui.button(t("取消隐藏此文件夹")).clicked() {
+                        self.unhide_this_dir(&menu_path);
+                        ui.close();
+                    }
+                } else if ui.button(t("隐藏此文件夹(不在视图显示)")).clicked() {
+                    self.hide_this_dir(&menu_path);
+                    ui.close();
+                }
+            });
         });
         if open {
             for k in kids {
@@ -14073,6 +14150,16 @@ impl eframe::App for App {
                             self.sort_rev = !self.sort_rev;
                             self.apply_view_state();
                             ui.close();
+                        }
+                        if ui
+                            .checkbox(&mut self.show_hidden, t("显示隐藏的文件夹"))
+                            .changed()
+                        {
+                            let _ = self.store.set_setting(
+                                "show_hidden",
+                                if self.show_hidden { "1" } else { "0" },
+                            );
+                            self.apply_view_state();
                         }
                         ui.menu_button(t("缩略图"), |ui| {
                             // 多档缩略图(四个视图尺寸菜单项)。

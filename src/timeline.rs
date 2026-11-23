@@ -92,6 +92,8 @@ pub struct Filters {
     /// 搜索框文本(带自动补全;空串 = 不过滤。
     /// 匹配路径 / 标题 / 标签名)。
     pub text: String,
+    /// 显示隐藏目录里的照片(默认关;不进 `as_setting`,单独设置键)。
+    pub show_hidden: bool,
 }
 
 impl SortBy {
@@ -217,6 +219,10 @@ pub fn load_query(
     if filters.geotagged {
         where_sql.push("p.lat IS NOT NULL AND p.lon IS NOT NULL");
     }
+    // 隐藏目录是「少显示」而非过滤开关,不进 as_setting/is_none。
+    if !filters.show_hidden {
+        where_sql.push(crate::db::HIDDEN_DIR_CLAUSE);
+    }
     // 搜索框文本:命中路径、标题或标签名任一即可(库内搜索范围)。
     let text = filters.text.trim();
     let has_text = !text.is_empty();
@@ -335,8 +341,9 @@ fn under_root(parent: &str, root: &str) -> bool {
 pub fn load_recent(store: &Store, roots: &[String], limit: usize) -> Result<Vec<i64>> {
     let sql = format!(
         "SELECT p.id, p.parent FROM photos p
-         WHERE p.thumb_ok = 1
-         ORDER BY {MTIME_SQL} DESC, p.id DESC"
+         WHERE p.thumb_ok = 1 AND {}
+         ORDER BY {MTIME_SQL} DESC, p.id DESC",
+        crate::db::HIDDEN_DIR_CLAUSE
     );
     store.read(|conn| -> Result<Vec<i64>> {
         let mut st = conn.prepare(&sql)?;
@@ -1364,6 +1371,76 @@ mod tests {
             .unwrap();
     }
 
+    /// 隐藏目录:默认整棵子树不进视图,勾「显示隐藏的文件夹」才放回。
+    #[test]
+    fn hidden_dir_subtree_is_excluded_unless_shown() {
+        let store = Store::open_mem().unwrap();
+        let hidden = insert_photo(
+            &store,
+            "/pic/a/1.jpg",
+            "/pic/a",
+            Some("2024-01-01T00:00:00"),
+            0,
+            0,
+            10,
+            100,
+            None,
+        );
+        let deep = insert_photo(
+            &store,
+            "/pic/a/b/2.jpg",
+            "/pic/a/b",
+            Some("2024-01-02T00:00:00"),
+            0,
+            0,
+            10,
+            100,
+            None,
+        );
+        let sibling = insert_photo(
+            &store,
+            "/pic/ab/3.jpg",
+            "/pic/ab",
+            Some("2024-01-03T00:00:00"),
+            0,
+            0,
+            10,
+            100,
+            None,
+        );
+        store.hide_dir("/pic/a").unwrap();
+        let ids = |f: &Filters| {
+            load_query(&store, SortBy::Name, false, f)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect::<Vec<i64>>()
+        };
+        assert_eq!(
+            ids(&Filters::default()),
+            vec![sibling],
+            "子树整棵不进视图,同级前缀目录不受影响"
+        );
+        let mut show = Filters::default();
+        show.show_hidden = true;
+        assert_eq!(ids(&show), vec![hidden, deep, sibling]);
+    }
+
+    /// 隐藏开关不占过滤设置串的位,谓词里也不得出现路径字面量。
+    #[test]
+    fn show_hidden_is_not_a_filter_flag() {
+        let mut f = Filters::default();
+        assert!(!f.show_hidden, "默认不显示隐藏目录");
+        assert!(f.is_none(), "无过滤时视图不过滤任何行");
+        f.show_hidden = true;
+        assert!(f.is_none(), "隐藏开关不算过滤");
+        assert_eq!(f.as_setting(), "0000", "隐藏开关不进设置串");
+        assert_eq!(Filters::from_setting(&f.as_setting()).as_setting(), "0000");
+        let clause = crate::db::HIDDEN_DIR_CLAUSE;
+        assert!(clause.contains("NOT EXISTS") && clause.contains("dir_hidden"));
+        assert!(!clause.contains('/'), "谓词里不得出现路径字面量");
+    }
+
     /// 工具栏四个过滤开关:各自精确圈定行,可叠加,全关时不过滤。
     /// 「只显示人物头像」必须忽略 `ignored=1` 的人脸(用户已忽略的不算)。
     #[test]
@@ -1849,6 +1926,7 @@ mod tests {
             movies: true,
             geotagged: false,
             text: String::new(),
+            show_hidden: false,
         };
         assert_eq!(f.as_setting(), "1010");
         assert_eq!(Filters::from_setting(&f.as_setting()), f);

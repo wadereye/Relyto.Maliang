@@ -700,6 +700,8 @@ pub fn scan_dir_ctrl(
     crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
 
     let excl = Exclusions::from_store(store);
+    // 用户隐藏的目录:快路在入库前 retain,慢路在遍历时整棵跳过。
+    let hidden = store.hidden_dirs();
     // 快速路径基线:库内已有指纹
     let prints = load_fingerprints(store);
     // MFT 快路的卷数据(索引在位才有;Linux/无索引为 None → walkdir)。
@@ -732,6 +734,14 @@ pub fn scan_dir_ctrl(
                         excluded_dirs += 1;
                         return false;
                     }
+                    if !hidden.is_empty()
+                        && hidden
+                            .iter()
+                            .any(|h| crate::db::dir_under(&e.path().to_string_lossy(), h))
+                    {
+                        excluded_dirs += 1;
+                        return false;
+                    }
                 }
                 true
             })
@@ -748,6 +758,13 @@ pub fn scan_dir_ctrl(
             }
             candidates.push(p);
         }
+    }
+    if !hidden.is_empty() {
+        candidates.retain(|p| {
+            !hidden.iter().any(|h| {
+                crate::db::dir_under(&p.parent().map(|d| d.to_string_lossy()).unwrap_or_default(), h)
+            })
+        });
     }
     let total = candidates.len();
     ctrl.set_total(total);
