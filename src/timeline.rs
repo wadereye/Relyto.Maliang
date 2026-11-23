@@ -210,6 +210,56 @@ impl Filters {
     }
 }
 
+/// F1–F8 快捷标签槽位。
+pub struct QuickTag {
+    pub key: String,
+    pub tag: String,
+}
+
+/// 解析快捷标签设置串,最多保留八槽并在首个空槽停止。
+pub fn parse_quick_tags(s: &str) -> Vec<QuickTag> {
+    s.split('|')
+        .take(8)
+        .map(str::trim)
+        .map(|slot| slot.split_once(':'))
+        .take_while(|slot| {
+            slot.is_some_and(|(key, tag)| !key.trim().is_empty() && !tag.trim().is_empty())
+        })
+        .map(|slot| {
+            let (key, tag) = slot.expect("空槽已提前终止");
+            QuickTag {
+                key: key.trim().into(),
+                tag: tag.trim().into(),
+            }
+        })
+        .collect()
+}
+
+/// 序列化快捷标签并省略空槽。
+pub fn serialize_quick_tags(tags: &[QuickTag]) -> String {
+    tags.iter()
+        .take(8)
+        .filter(|q| !q.key.trim().is_empty() && !q.tag.trim().is_empty())
+        .map(|q| format!("{}:{}", q.key.trim(), q.tag.trim()))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// 返回重复出现的键位,每个键只报告一次。
+pub fn dup_keys(tags: &[QuickTag]) -> Vec<String> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for q in tags {
+        *counts.entry(&q.key).or_default() += 1;
+    }
+    let mut seen = HashMap::new();
+    tags.iter()
+        .filter_map(|q| {
+            (counts[q.key.as_str()] > 1 && seen.insert(q.key.as_str(), ()).is_none())
+                .then(|| q.key.clone())
+        })
+        .collect()
+}
+
 /// 相机型号池名(与 `scan.rs` / `db.rs` 的 intern 调用保持一致)。
 pub const CAM_POOL: &str = "photos_cam";
 
@@ -1750,6 +1800,27 @@ mod tests {
             .map(|r| r.id)
             .collect();
         assert_eq!(ids, [id]);
+    }
+
+    /// 快捷标签序列化忽略空值并保留有效槽位。
+    #[test]
+    fn quick_tags_roundtrip_and_drop_empty_slots() {
+        let v = parse_quick_tags("F1:猫|F2:海边|:漏了键|F3:|F4:文档");
+        assert_eq!(
+            v.iter()
+                .map(|q| (q.key.as_str(), q.tag.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("F1", "猫"), ("F2", "海边")]
+        );
+        assert_eq!(serialize_quick_tags(&v), "F1:猫|F2:海边");
+        assert!(parse_quick_tags("").is_empty());
+    }
+
+    /// 快捷标签检测重复键位并报告首次重复顺序。
+    #[test]
+    fn quick_tags_detect_duplicate_keys() {
+        let v = parse_quick_tags("F1:猫|F1:狗|F2:海");
+        assert_eq!(dup_keys(&v), vec!["F1"]);
     }
 
     /// 类型排序按扩展名分组,空值参与组内路径排序。

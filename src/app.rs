@@ -603,6 +603,8 @@ pub struct App {
     thumb_captions: bool,
     /// 显示隐藏文件夹里的照片(设置项 show_hidden)。
     show_hidden: bool,
+    /// F1–F8 快捷标签配置(设置项 quick_tags)。
+    quick_tags: Vec<timeline::QuickTag>,
     /// 隐藏目录登记表(树节点打标记与右键菜单用,增删后刷新)。
     hidden_dirs: Vec<String>,
     // —— 相簿(Album)——
@@ -2289,7 +2291,7 @@ pub const HELP_DOCS: &[HelpDoc] = &[
     },
     HelpDoc {
         title: "快捷键",
-        keywords: &["快捷键", "F2", "Ctrl+R", "PageUp", "Alt", "Space", "撤销"],
+        keywords: &["快捷键", "F1", "F2", "Ctrl+R", "PageUp", "Alt", "Space", "撤销"],
         body: include_str!("../assets/help/07-快捷键.md"),
     },
     HelpDoc {
@@ -2703,6 +2705,21 @@ impl App {
             .map(|v| v == "1")
             .unwrap_or(false);
         let hidden_dirs = store.hidden_dirs();
+        let mut quick_tags = (1..=8)
+            .map(|i| timeline::QuickTag {
+                key: format!("F{i}"),
+                tag: String::new(),
+            })
+            .collect::<Vec<_>>();
+        for q in timeline::parse_quick_tags(&store.get_setting("quick_tags").unwrap_or_default()) {
+            let slot = quick_tags
+                .iter()
+                .position(|s| s.key == q.key && s.tag.is_empty())
+                .or_else(|| quick_tags.iter().position(|s| s.tag.is_empty()));
+            if let Some(i) = slot {
+                quick_tags[i] = q;
+            }
+        }
         // 缺省树形;显式选过平铺的库存的是 "0",不受影响。
         let folder_tree = store
             .get_setting("folder_tree")
@@ -2952,6 +2969,7 @@ impl App {
             caption_edit: None,
             thumb_captions,
             show_hidden,
+            quick_tags,
             hidden_dirs,
             sel_album: None,
             album_input: String::new(),
@@ -9891,6 +9909,62 @@ impl App {
                             );
                         }
                         ui.separator();
+                        crate::theme::panel_section(ui, t("快捷标签"));
+                        ui.label(t("给选中的照片加标签"));
+                        let duplicate_keys = timeline::dup_keys(&self.quick_tags);
+                        let mut quick_changed = false;
+                        egui::ScrollArea::vertical()
+                            .id_salt("quick_tag_options")
+                            .max_height(224.0)
+                            .show(ui, |ui| {
+                                for (i, q) in self.quick_tags.iter_mut().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        let selected = q.key.clone();
+                                        let before = q.key.clone();
+                                        ui.add_enabled_ui(
+                                            !duplicate_keys.contains(&q.key),
+                                            |ui| {
+                                                egui::ComboBox::from_id_salt(format!(
+                                                    "quick_tag_key_{i}"
+                                                ))
+                                                .width(64.0)
+                                                .selected_text(&selected)
+                                                .show_ui(ui, |ui| {
+                                                    for key in ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"] {
+                                                        if ui
+                                                            .selectable_label(q.key == key, key)
+                                                            .clicked()
+                                                        {
+                                                            q.key = key.into();
+                                                        }
+                                                    }
+                                                });
+                                            },
+                                        );
+                                        quick_changed |= q.key != before;
+                                        quick_changed |= ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut q.tag)
+                                                    .desired_width(280.0)
+                                                    .hint_text(t("标签名")),
+                                            )
+                                            .changed();
+                                    });
+                                }
+                            });
+                        if quick_changed {
+                            let _ = self.store.set_setting(
+                                "quick_tags",
+                                &timeline::serialize_quick_tags(&self.quick_tags),
+                            );
+                        }
+                        for key in duplicate_keys {
+                            ui.colored_label(
+                                crate::theme::p().warn,
+                                t_with("键位 {p1} 重复", &[("p1", key)]),
+                            );
+                        }
+                        ui.separator();
                         ui.small(t("排除规则、文件夹监听在「工具 > 文件夹管理器」里配置。"));
                         ui.small(t("索引备份 / 压缩在「工具 > 图库维护」里。"));
                     }
@@ -14327,6 +14401,7 @@ impl eframe::App for App {
                 nav_fwd_k,
                 undo_k,
                 redo_k,
+                quick,
             ) = ctx.input(|i| {
                 let alt = i.modifiers.alt;
                 (
@@ -14345,6 +14420,16 @@ impl eframe::App for App {
                     alt && i.key_pressed(egui::Key::ArrowRight),
                     i.modifiers.command && !i.modifiers.shift && i.key_pressed(egui::Key::Z),
                     i.modifiers.command && i.key_pressed(egui::Key::Y),
+                    [
+                        i.key_pressed(egui::Key::F1),
+                        i.key_pressed(egui::Key::F2),
+                        i.key_pressed(egui::Key::F3),
+                        i.key_pressed(egui::Key::F4),
+                        i.key_pressed(egui::Key::F5),
+                        i.key_pressed(egui::Key::F6),
+                        i.key_pressed(egui::Key::F7),
+                        i.key_pressed(egui::Key::F8),
+                    ],
                 )
             });
             // 页面前后导航(Alt+← / Alt+→)。
@@ -14357,9 +14442,44 @@ impl eframe::App for App {
             if sel_all {
                 self.sel = self.view_ids().into_iter().collect();
             }
-            if save && self.preview.is_some() && self.bake_rx.is_none() {
+            let f2_quick = quick[1]
+                && self
+                    .quick_tags
+                    .iter()
+                    .any(|q| q.key == "F2" && !q.tag.trim().is_empty());
+            if save && !f2_quick && self.preview.is_some() && self.bake_rx.is_none() {
                 if let Some(id) = self.preview {
                     self.start_bake(id);
+                }
+            }
+            if let Some((i, _)) = quick.iter().enumerate().find(|(_, pressed)| **pressed) {
+                let key = format!("F{}", i + 1);
+                let tags = self
+                    .quick_tags
+                    .iter()
+                    .filter(|q| q.key == key && !q.tag.trim().is_empty())
+                    .map(|q| q.tag.trim().to_string())
+                    .collect::<Vec<_>>();
+                if tags.len() > 1 {
+                    self.status =
+                        t_with("键位 {p1} 重复", &[("p1", key)]).into();
+                } else if let Some(tag) = tags.first() {
+                    if self.sel.is_empty() {
+                        self.status = t("没有选中的照片").into();
+                    } else {
+                        let mut ok = 0usize;
+                        for id in self.sel.iter().copied() {
+                            if timeline::add_tag(&self.store, id, tag).is_ok() {
+                                ok += 1;
+                            }
+                        }
+                        self.rebuild();
+                        self.status = t_with(
+                            "已给 {p1} 张照片加标签",
+                            &[("p1", ok.to_string())],
+                        )
+                        .into();
+                    }
                 }
             }
             if esc {
@@ -16440,7 +16560,8 @@ impl eframe::App for App {
                 .show(ctx, |ui| {
                     ui.label(t("Ctrl+A        全选当前视图的照片"));
                     ui.label(t("Ctrl+点击     选中 / 取消选中单张照片"));
-                    ui.label(t("F2            保存(烘焙)当前预览照片"));
+                    ui.label(t("F1–F8        快捷标签(可在选项中设置)"));
+                    ui.label(t("F2            未配置快捷标签时保存(烘焙)当前预览照片"));
                     ui.label(t("Ctrl+R        预览中顺时针旋转 90°(自定)"));
                     ui.label(t("Ctrl+Shift+R  预览中逆时针旋转 90°(自定)"));
                     ui.label(t("← / →         预览上一张 / 下一张"));
