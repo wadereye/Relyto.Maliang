@@ -544,6 +544,8 @@ pub struct App {
     preview_boxes: Option<(i64, Vec<((f32, f32, f32, f32), String)>)>,
     /// 查看器双击、底色与缩放步进偏好。
     viewer_prefs: crate::viewer::ViewerPrefs,
+    /// 平移时允许显示裁剪框外像素。
+    show_overflow: bool,
     // —— 预览缩放/平移(单图编辑视图:滚轮缩放、拖拽平移、
     // 双击切换适应窗口/100% 像素)——
     /// 缩放系数:1.0 = 适应窗口;上限 8 倍。
@@ -2658,6 +2660,10 @@ impl App {
         filters.show_hidden = show_hidden;
         let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
         let viewer_prefs = crate::viewer::ViewerPrefs::load(&store);
+        let show_overflow = store
+            .get_setting("show_overflow")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
         let email_size = crate::share::ShareSize::from_px(
             store
@@ -2829,6 +2835,7 @@ impl App {
             show_ocr_boxes: true,
             preview_boxes: None,
             viewer_prefs,
+            show_overflow,
             preview_zoom: 1.0,
             preview_pan: egui::Vec2::ZERO,
             crop_mode: false,
@@ -9784,6 +9791,15 @@ impl App {
                                 }
                             }
                         });
+                        if ui
+                            .checkbox(&mut self.show_overflow, t("平移可显示裁剪框外像素"))
+                            .changed()
+                        {
+                            let _ = self.store.set_setting(
+                                "show_overflow",
+                                if self.show_overflow { "1" } else { "0" },
+                            );
+                        }
                         crate::theme::panel_section(ui, t("滚轮缩放步进"));
                         let mut step = self.viewer_prefs.zoom_step;
                         if ui

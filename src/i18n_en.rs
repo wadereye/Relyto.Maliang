@@ -1661,4 +1661,5 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("深黑", "Dark"),
 ("浅白", "Light"),
 ("滚轮缩放步进", "Wheel zoom step"),
+("平移可显示裁剪框外像素", "Allow panning to reveal pixels outside the frame"),
 ];

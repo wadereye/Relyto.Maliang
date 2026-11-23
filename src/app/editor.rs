@@ -549,6 +549,15 @@ fn strength_label(name: &str) -> &'static str {
     }
 }
 
+/// 计算画布中心可平移的最大偏移。
+pub fn pan_bounds(content: egui::Vec2, rect_size: egui::Vec2, allow_overflow: bool) -> egui::Vec2 {
+    if allow_overflow {
+        (rect_size * 0.5 + content * 0.5).max(egui::Vec2::ZERO)
+    } else {
+        ((content - rect_size) * 0.5).max(egui::Vec2::ZERO)
+    }
+}
+
 impl App {
     /// 整页编辑视图。预览打开期间由 `update` 在常规面板之前接管。
     pub(super) fn editor_ui(&mut self, ctx: &egui::Context) {
@@ -1644,6 +1653,9 @@ impl App {
         let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
         match self.viewer_prefs.bg {
+            crate::viewer::ViewerBg::Theme if self.show_overflow => {
+                painter.rect_filled(rect, 0.0, ui.visuals().faint_bg_color);
+            }
             crate::viewer::ViewerBg::Theme => {}
             crate::viewer::ViewerBg::Dark => {
                 painter.rect_filled(rect, 0.0, egui::Color32::from_gray(16));
@@ -1734,7 +1746,7 @@ impl App {
             }
             let base = fit_scale * self.preview_zoom;
             let content = egui::vec2(tw as f32 * base, th as f32 * base);
-            let max_pan = ((content - rect.size()) * 0.5).max(egui::Vec2::ZERO);
+            let max_pan = pan_bounds(content, rect.size(), self.show_overflow);
             self.preview_pan = egui::Vec2::new(
                 self.preview_pan.x.clamp(-max_pan.x, max_pan.x),
                 self.preview_pan.y.clamp(-max_pan.y, max_pan.y),
@@ -1934,6 +1946,29 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pan_bounds_clamps_to_content_by_default() {
+        let content = egui::vec2(1000.0, 800.0);
+        let rect = egui::vec2(600.0, 600.0);
+        assert_eq!(pan_bounds(content, rect, false), egui::vec2(200.0, 100.0));
+        assert_eq!(
+            pan_bounds(egui::vec2(300.0, 300.0), rect, false),
+            egui::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn pan_bounds_opens_up_when_overflow_allowed() {
+        let content = egui::vec2(1000.0, 800.0);
+        let rect = egui::vec2(600.0, 600.0);
+        let bounds = pan_bounds(content, rect, true);
+        assert!(bounds.x > 200.0 && bounds.y > 100.0);
+        assert_eq!(
+            pan_bounds(egui::vec2(300.0, 300.0), rect, true),
+            egui::vec2(450.0, 450.0)
+        );
+    }
 
     #[test]
     fn histogram_counts_each_channel() {
