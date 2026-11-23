@@ -2650,6 +2650,9 @@ impl App {
             .unwrap_or_default();
         let mut filters =
             timeline::Filters::from_setting(&store.get_setting("view_filters").unwrap_or_default());
+        filters.tag_colors = timeline::Filters::colors_from_setting(
+            &store.get_setting("view_filter_colors").unwrap_or_default(),
+        );
         filters.show_hidden = show_hidden;
         let sort_rev = store.get_setting("sort_rev").as_deref() == Some("1");
         // 邮件默认尺寸从设置读(选项 > 电子邮件;默认 1024)。
@@ -4652,6 +4655,43 @@ impl App {
                         self.apply_view_state();
                     }
                 }
+                let dot = self
+                    .filters
+                    .tag_colors
+                    .first()
+                    .and_then(|c| tag_color(Some(c)))
+                    .unwrap_or_else(|| egui::Color32::from_gray(140));
+                let color_btn = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("●").color(dot))
+                            .small()
+                            .frame(false),
+                    )
+                    .on_hover_text(t("按标签色筛选"));
+                egui::Popup::from_toggle_button_response(&color_btn).show(|ui| {
+                    ui.set_width(140.0);
+                    if ui
+                        .selectable_label(self.filters.tag_colors.is_empty(), t("未选色(全部)"))
+                        .clicked()
+                    {
+                        self.filters.tag_colors.clear();
+                        self.apply_view_state();
+                        ui.close();
+                    }
+                    for (key, color) in TAG_COLORS {
+                        let selected = self.filters.tag_colors.iter().any(|c| c == key);
+                        let response = ui.selectable_label(selected, t(tag_color_name(key)));
+                        if response.clicked() {
+                            if selected {
+                                self.filters.tag_colors.retain(|c| c != key);
+                            } else {
+                                self.filters.tag_colors.push(key.to_string());
+                            }
+                            self.apply_view_state();
+                        }
+                        response.on_hover_text(egui::RichText::new("●").color(color));
+                    }
+                });
             });
         });
     }
@@ -4762,6 +4802,10 @@ impl App {
         let _ = self
             .store
             .set_setting("view_filters", &self.filters.as_setting());
+        let _ = self.store.set_setting(
+            "view_filter_colors",
+            &self.filters.colors_as_setting(),
+        );
         self.filters.show_hidden = self.show_hidden;
         self.rebuild();
     }

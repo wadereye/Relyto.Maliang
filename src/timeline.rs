@@ -93,6 +93,8 @@ pub struct Filters {
     /// 搜索框文本(带自动补全;空串 = 不过滤。
     /// 匹配路径 / 标题 / 标签名)。
     pub text: String,
+    /// 标签色集合(空=不过滤;独立设置,不进四位开关串)。
+    pub tag_colors: Vec<String>,
     /// 显示隐藏目录里的照片(默认关;不进 `as_setting`,单独设置键)。
     pub show_hidden: bool,
 }
@@ -150,6 +152,7 @@ impl Filters {
     /// 是否没有任何过滤(用于状态栏与 SQL 短路)。
     pub fn is_none(&self) -> bool {
         self.text.trim().is_empty()
+            && self.tag_colors.is_empty()
             && !(self.starred || self.faces || self.movies || self.geotagged)
     }
 
@@ -181,6 +184,20 @@ impl Filters {
             .collect()
     }
 
+    /// 标签色集合的独立设置串。
+    pub fn colors_as_setting(&self) -> String {
+        self.tag_colors.join(",")
+    }
+
+    /// 解析标签色设置串并忽略空槽。
+    pub fn colors_from_setting(s: &str) -> Vec<String> {
+        s.split(',')
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     /// 解析 `as_setting`;长度不符或含非 0/1 一律回退全关(宁可不带过滤,不炸启动)。
     pub fn from_setting(s: &str) -> Filters {
         let mut f = Filters::default();
@@ -203,6 +220,18 @@ pub fn load_all(store: &Store) -> Result<Vec<PhotoRow>> {
     load_query(store, SortBy::Date, false, &Filters::default())
 }
 
+/// 生成标签色筛选子句,占位符从指定序号开始。
+pub fn tag_color_clause(first: usize, count: usize) -> String {
+    let placeholders = (0..count)
+        .map(|i| format!("?{}", first + i))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "EXISTS (SELECT 1 FROM photo_tags pt JOIN tags t ON t.id=pt.tag_id
+         WHERE pt.photo_id=p.id AND t.color IN ({placeholders}))"
+    )
+}
+
 /// 带排序与过滤的加载。
 ///
 /// 过滤走 SQL 谓词(不是取回全表再在 UI 层筛):星标/视频/地理标记是
@@ -215,22 +244,24 @@ pub fn load_query(
     reverse: bool,
     filters: &Filters,
 ) -> Result<Vec<PhotoRow>> {
-    let mut where_sql: Vec<&'static str> = Vec::new();
+    let mut where_sql: Vec<String> = Vec::new();
     if filters.starred {
-        where_sql.push("p.star > 0");
+        where_sql.push("p.star > 0".into());
     }
     if filters.faces {
-        where_sql.push("EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id AND f.ignored = 0)");
+        where_sql.push(
+            "EXISTS (SELECT 1 FROM faces f WHERE f.photo_id = p.id AND f.ignored = 0)".into(),
+        );
     }
     if filters.movies {
-        where_sql.push("p.kind = 1");
+        where_sql.push("p.kind = 1".into());
     }
     if filters.geotagged {
-        where_sql.push("p.lat IS NOT NULL AND p.lon IS NOT NULL");
+        where_sql.push("p.lat IS NOT NULL AND p.lon IS NOT NULL".into());
     }
     // 隐藏目录是「少显示」而非过滤开关,不进 as_setting/is_none。
     if !filters.show_hidden {
-        where_sql.push(crate::db::HIDDEN_DIR_CLAUSE);
+        where_sql.push(crate::db::HIDDEN_DIR_CLAUSE.into());
     }
     // 搜索框文本:命中路径、标题或标签名任一即可(库内搜索范围)。
     let text = filters.text.trim();
@@ -239,8 +270,13 @@ pub fn load_query(
         where_sql.push(
             "(p.path LIKE ?2 ESCAPE '\\' OR COALESCE(p.caption,'') LIKE ?2 ESCAPE '\\'
               OR EXISTS (SELECT 1 FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id
-                         WHERE pt.photo_id = p.id AND t.name LIKE ?2 ESCAPE '\\'))",
+                         WHERE pt.photo_id = p.id AND t.name LIKE ?2 ESCAPE '\\'))"
+                .into(),
         );
+    }
+    if !filters.tag_colors.is_empty() {
+        let first = if has_text { 3 } else { 2 };
+        where_sql.push(tag_color_clause(first, filters.tag_colors.len()));
     }
     // 各模式的"自然方向"(反向开关再翻转):日期/更改新在前、大小大在前、名称升序。
     // 日期走 `time_key_sql`:没有 EXIF 的照片按文件时间落在自己该在的那个月,
@@ -285,13 +321,14 @@ pub fn load_query(
     // 字符串本体在 `string_pool` 里去重存一份(池化列)。
     // LEFT JOIN 保证:未池化的历史行(cam 有值、cam_id 为 NULL)仍能显示。
     let pat = format!("%{}%", like_escape(text));
-    // ?2 只在有搜索文本时出现在 SQL 里,参数也必须同步 —— 绑一个查询里
-    // 不存在的下标会被 SQLite 拒绝,所以按分支给参数。
-    let args: Vec<&dyn rusqlite::types::ToSql> = if has_text {
-        vec![&CAM_POOL, &pat]
-    } else {
-        vec![&CAM_POOL]
-    };
+    // 参数顺序须与文本和标签色子句的占位符一致。
+    let mut args: Vec<&dyn rusqlite::types::ToSql> = vec![&CAM_POOL];
+    if has_text {
+        args.push(&pat);
+    }
+    for color in &filters.tag_colors {
+        args.push(color);
+    }
     let rows: Vec<PhotoRow> = store.read(|conn| -> Result<Vec<PhotoRow>> {
         let mut st = conn.prepare(&sql)?;
         let rows: Vec<PhotoRow> = st
@@ -1649,6 +1686,72 @@ mod tests {
         );
     }
 
+    /// 标签色筛选按选中颜色取并集,未知颜色不命中。
+    #[test]
+    fn tag_color_filter_uses_union_and_unknown_color_matches_nothing() {
+        let store = Store::open_mem().unwrap();
+        let red = insert_photo(&store, "/p/1.jpg", "/p", None, 0, 0, 1, 1, None);
+        let blue = insert_photo(&store, "/p/2.jpg", "/p", None, 0, 0, 1, 1, None);
+        insert_photo(&store, "/p/3.jpg", "/p", None, 0, 0, 1, 1, None);
+        add_tag(&store, red, "猫").unwrap();
+        add_tag(&store, blue, "海").unwrap();
+        set_tag_color(&store, "猫", Some("red")).unwrap();
+        set_tag_color(&store, "海", Some("blue")).unwrap();
+        let ids = |colors: &[&str]| -> Vec<i64> {
+            let filters = Filters {
+                tag_colors: colors.iter().map(|c| (*c).to_string()).collect(),
+                ..Default::default()
+            };
+            load_query(&store, SortBy::Name, false, &filters)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids(&["red"]), [red]);
+        assert_eq!(ids(&["red", "blue"]), [red, blue]);
+        assert!(ids(&["nosuch"]).is_empty());
+    }
+
+    /// 标签色设置独立保存并忽略空槽。
+    #[test]
+    fn tag_color_setting_roundtrip_drops_empty_slots() {
+        let mut filters = Filters::default();
+        assert_eq!(filters.colors_as_setting(), "");
+        filters.tag_colors = vec!["red".into(), "green".into()];
+        assert_eq!(filters.colors_as_setting(), "red,green");
+        assert_eq!(
+            Filters::colors_from_setting(&filters.colors_as_setting()),
+            filters.tag_colors
+        );
+        assert_eq!(
+            Filters::colors_from_setting("red,,green"),
+            vec!["red".to_string(), "green".to_string()]
+        );
+        assert!(Filters::colors_from_setting("").is_empty());
+        assert!(!filters.is_none());
+    }
+
+    /// 标签色与文本组合筛选时,色名仍按参数绑定。
+    #[test]
+    fn tag_color_filter_binds_values_with_text_search() {
+        let store = Store::open_mem().unwrap();
+        let id = insert_photo(&store, "/p/one.jpg", "/p", None, 0, 0, 1, 1, None);
+        add_tag(&store, id, "odd").unwrap();
+        set_tag_color(&store, "odd", Some("red'%")).unwrap();
+        let filters = Filters {
+            text: "one".into(),
+            tag_colors: vec!["red'%".into()],
+            ..Default::default()
+        };
+        let ids: Vec<i64> = load_query(&store, SortBy::Name, false, &filters)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, [id]);
+    }
+
     /// 类型排序按扩展名分组,空值参与组内路径排序。
     #[test]
     fn sort_by_type_groups_extensions_and_handles_missing_values() {
@@ -1967,6 +2070,7 @@ mod tests {
             movies: true,
             geotagged: false,
             text: String::new(),
+            tag_colors: Vec::new(),
             show_hidden: false,
         };
         assert_eq!(f.as_setting(), "1010");
@@ -1980,7 +2084,7 @@ mod tests {
         // 搜索文本不进设置串:重启后开关保留、输入清空。
         let with_text = Filters {
             text: "海边".into(),
-            ..f
+            ..f.clone()
         };
         assert_eq!(with_text.as_setting(), "1010");
         assert_eq!(Filters::from_setting("1010"), f);
