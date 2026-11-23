@@ -582,6 +582,10 @@ pub struct App {
     sel_album: Option<i64>,
     /// 新建相簿输入框。
     album_input: String,
+    /// 相簿描述输入框(切换相簿时从库重载)。
+    album_desc: String,
+    /// album_desc 当前对应的相簿 id。
+    album_desc_id: Option<i64>,
     // —— 属性 / 选项窗口 ——
     show_props: bool,
     show_options: bool,
@@ -2812,6 +2816,8 @@ impl App {
             thumb_captions,
             sel_album: None,
             album_input: String::new(),
+            album_desc: String::new(),
+            album_desc_id: None,
             show_props: false,
             show_options: false,
             options_tab: 0,
@@ -10465,6 +10471,22 @@ impl App {
         }
         if let Some(a) = self.sel_album {
             ui.separator();
+            if self.album_desc_id != Some(a) {
+                self.album_desc = self.store.album_description(a).unwrap_or_default();
+                self.album_desc_id = Some(a);
+            }
+            crate::theme::section_label(ui, t("相簿描述"));
+            let desc_resp = ui.add(
+                egui::TextEdit::multiline(&mut self.album_desc)
+                    .hint_text(t("可留空"))
+                    .desired_rows(2),
+            );
+            if ui.button(t("保存描述")).clicked() || desc_resp.lost_focus() {
+                let _ = self
+                    .store
+                    .album_set_description(a, self.album_desc.trim());
+                self.fx_msg = t("描述已保存").into();
+            }
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.album_input)
@@ -13723,6 +13745,11 @@ impl eframe::App for App {
                             ui.close();
                         }
                         ui.separator();
+                        if ui.button(t("新建相簿…")).clicked() {
+                            self.album_input.clear();
+                            self.album_new_win = true;
+                            ui.close();
+                        }
                         if ui.button(t("添加文件夹到图库…")).clicked() {
                             self.add_folder_to_library();
                             ui.close();

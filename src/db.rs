@@ -1649,7 +1649,8 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS albums (
                 id INTEGER PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
-                ts INTEGER NOT NULL
+                ts INTEGER NOT NULL,
+                description TEXT NOT NULL DEFAULT ''
             );
             CREATE TABLE IF NOT EXISTS album_photos (
                 album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
@@ -1659,6 +1660,8 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS idx_album_photos_album ON album_photos(album_id, pos);",
         );
+        // 旧库相簿补描述列(列已存在时静默)。
+        let _ = conn.execute_batch("ALTER TABLE albums ADD COLUMN description TEXT NOT NULL DEFAULT '';");
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_cam_id ON photos(cam_id);
              CREATE TABLE IF NOT EXISTS string_pool (
@@ -2083,6 +2086,30 @@ impl Store {
             );
         });
         Ok(())
+    }
+
+    /// 相簿描述(相簿不存在返回 None)。
+    pub fn album_description(&self, album_id: i64) -> Option<String> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT description FROM albums WHERE id=?1",
+                [album_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok()
+        })
+    }
+
+    /// 写相簿描述(可为空串)。
+    pub fn album_set_description(&self, album_id: i64, desc: &str) -> Result<()> {
+        let desc = desc.to_string();
+        self.write(move |conn| {
+            conn.execute(
+                "UPDATE albums SET description=?2 WHERE id=?1",
+                rusqlite::params![album_id, desc],
+            )?;
+            Ok(())
+        })
     }
 
     /// 删除相簿(成员照片不动,ON DELETE CASCADE 清映射)。
@@ -5771,6 +5798,27 @@ mod tests {
             rusqlite::params![id, format!("/p/{id}.jpg"), cam_id],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn album_description_roundtrip_and_default() {
+        let s = Store::open_mem().unwrap();
+        let id = s.album_create("旅行").unwrap();
+        assert_eq!(s.album_description(id).as_deref(), Some(""));
+        s.album_set_description(id, "2026 春").unwrap();
+        assert_eq!(s.album_description(id).as_deref(), Some("2026 春"));
+        s.album_rename(id, "春日").unwrap();
+        assert_eq!(
+            s.album_description(id).as_deref(),
+            Some("2026 春"),
+            "改名不得清描述"
+        );
+    }
+
+    #[test]
+    fn album_missing_id_has_no_description() {
+        let s = Store::open_mem().unwrap();
+        assert_eq!(s.album_description(9999), None);
     }
 
     #[test]
