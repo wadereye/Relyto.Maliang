@@ -62,18 +62,19 @@ fn time_key_sql() -> String {
     )
 }
 
-/// 排序方式(工具栏「查看选项」> 排序;四个排序项:
-/// 按拍摄日期 / 最近 / 按尺寸 / 按名称)。
+/// 排序方式:拍摄日期、最近更改、大小、类型、名称。
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub enum SortBy {
-    /// 拍摄日期(`Sort by &Creation Date`,默认,新在前;没有 EXIF 时按文件修改时间)。
+    /// 拍摄日期,默认新在前,没有 EXIF 时按文件修改时间。
     #[default]
     Date,
-    /// 最近更改日期(`Sort by &Recent Changes`,新在前)。
+    /// 最近更改日期,新在前。
     Recent,
-    /// 文件大小(`Sort by &Size`,大在前)。
+    /// 文件大小,大在前。
     Size,
-    /// 文件名(`Sort by &Name`,升序)。
+    /// 文件类型,扩展名升序,空值排末。
+    Type,
+    /// 文件名,升序。
     Name,
 }
 
@@ -97,15 +98,22 @@ pub struct Filters {
 }
 
 impl SortBy {
-    /// 菜单顺序沿用「查看选项」:Date、Recent Changes、Size、Name。
-    pub const ALL: [SortBy; 4] = [SortBy::Date, SortBy::Recent, SortBy::Size, SortBy::Name];
+    /// 菜单顺序:日期、最近更改、大小、类型、名称。
+    pub const ALL: [SortBy; 5] = [
+        SortBy::Date,
+        SortBy::Recent,
+        SortBy::Size,
+        SortBy::Type,
+        SortBy::Name,
+    ];
 
-    /// 菜单文案(按拍摄日期 / 最近更改 / 大小 / 文件名)。
+    /// 菜单文案。
     pub fn label(self) -> &'static str {
         match self {
             SortBy::Date => t("按拍摄日期"),
             SortBy::Recent => t("按最近更改日期"),
             SortBy::Size => t("按大小"),
+            SortBy::Type => t("按类型"),
             SortBy::Name => t("按名称"),
         }
     }
@@ -116,6 +124,7 @@ impl SortBy {
             SortBy::Date => "date",
             SortBy::Recent => "recent",
             SortBy::Size => "size",
+            SortBy::Type => "type",
             SortBy::Name => "name",
         }
     }
@@ -241,6 +250,7 @@ pub fn load_query(
         SortBy::Date => format!("({tk} IS NULL), {tk} DESC"),
         SortBy::Recent => format!("{MTIME_SQL} DESC"),
         SortBy::Size => "p.size DESC".to_string(),
+        SortBy::Type => "(p.ext IS NULL OR p.ext = ''), COALESCE(p.ext, '') COLLATE NOCASE ASC, p.path COLLATE NOCASE ASC".to_string(),
         SortBy::Name => "p.path COLLATE NOCASE ASC".to_string(),
     };
     let order = if reverse {
@@ -248,6 +258,7 @@ pub fn load_query(
             SortBy::Date => format!("({tk} IS NULL), {tk} ASC"),
             SortBy::Recent => format!("{MTIME_SQL} ASC"),
             SortBy::Size => "p.size ASC".to_string(),
+            SortBy::Type => "(p.ext IS NOT NULL AND p.ext <> ''), COALESCE(p.ext, '') COLLATE NOCASE DESC, p.path COLLATE NOCASE DESC".to_string(),
             SortBy::Name => "p.path COLLATE NOCASE DESC".to_string(),
         }
     } else {
@@ -1638,6 +1649,35 @@ mod tests {
         );
     }
 
+    /// 类型排序按扩展名分组,空值参与组内路径排序。
+    #[test]
+    fn sort_by_type_groups_extensions_and_handles_missing_values() {
+        let store = Store::open_mem().unwrap();
+        for (path, ext) in [
+            ("/p/z.png", Some("png")),
+            ("/p/a.jpg", Some("jpg")),
+            ("/p/b.jpg", Some("jpg")),
+            ("/p/y", None),
+            ("/p/x", Some("")),
+        ] {
+            let id = insert_photo(&store, path, "/p", None, 0, 0, 1, 1, None);
+            store
+                .test_conn()
+                .execute("UPDATE photos SET ext=?2 WHERE id=?1", rusqlite::params![id, ext])
+                .unwrap();
+        }
+        let sort = SortBy::from_key("type").expect("类型排序应可通过设置键载入");
+        let ids = |reverse: bool| -> Vec<i64> {
+            load_query(&store, sort, reverse, &Filters::default())
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        assert_eq!(ids(false), [2, 3, 1, 5, 4]);
+        assert_eq!(ids(true), [4, 5, 1, 3, 2]);
+    }
+
     /// 四种排序方式 + 反向开关的方向。
     /// 「按拍摄日期」没有 EXIF 的那张按文件时间插进序列;
     /// 只有两种时间都没有的(mtime=0)恒排最后,反向也不提前。
@@ -1914,6 +1954,7 @@ mod tests {
     /// 视图状态存取(重启后保持上次的排序与过滤);脏值一律回退默认,不炸启动。
     #[test]
     fn sort_and_filters_setting_roundtrip() {
+        assert_eq!(SortBy::ALL.len(), 5);
         for s in SortBy::ALL {
             assert_eq!(SortBy::from_key(s.key()), Some(s));
         }

@@ -752,6 +752,7 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("按唯一标识(uid64)查找", "Find by unique ID (uid64)"),
 ("按唯一标识查找…", "Find by unique ID…"),
 ("按大小", "By size"),
+("按类型", "By type"),
 ("按姓名给人物排序", "Sort people by name"),
 ("按当前方案核对生效的模型文件:路径、内容哈希与导出契约。只读,不会改写或替换任何文件。", "Check the effective model files for the current scheme: path, content hash and export contract. Read-only; nothing is rewritten or replaced."),
 ("按拍摄日期", "By date taken"),
