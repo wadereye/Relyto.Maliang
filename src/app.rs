@@ -586,6 +586,8 @@ pub struct App {
     album_desc: String,
     /// album_desc 当前对应的相簿 id。
     album_desc_id: Option<i64>,
+    /// 已落库的描述,用于避免无改动时重复写。
+    album_desc_saved: String,
     // —— 属性 / 选项窗口 ——
     show_props: bool,
     show_options: bool,
@@ -2818,6 +2820,7 @@ impl App {
             album_input: String::new(),
             album_desc: String::new(),
             album_desc_id: None,
+            album_desc_saved: String::new(),
             show_props: false,
             show_options: false,
             options_tab: 0,
@@ -6192,6 +6195,40 @@ impl App {
         };
     }
 
+    /// 把当前人物的照片存成人物相簿(未命名人物不保存)。
+    #[cfg(feature = "ai")]
+    fn save_person_as_album(&mut self) {
+        let Some(pid) = self.sel_person else {
+            self.status = t("该人物还没有命名").into();
+            return;
+        };
+        let name = self
+            .face_people
+            .iter()
+            .find(|p| p.person_id == Some(pid))
+            .and_then(|p| p.person.clone())
+            .unwrap_or_default();
+        if name.trim().is_empty() {
+            self.status = t("该人物还没有命名").into();
+            return;
+        }
+        let ids: std::collections::BTreeSet<i64> =
+            self.face_hits.iter().map(|h| h.photo_id).collect();
+        match self.store.album_create_for_person(pid, &name) {
+            Ok(album) => {
+                for photo_id in ids {
+                    let _ = self.store.album_add_photo(album, photo_id);
+                }
+                let total = self.store.album_photo_ids(album).len();
+                self.status = t_with(
+                    "已保存为相簿 {p1}({p2} 张)",
+                    &[("p1", name), ("p2", total.to_string())],
+                );
+            }
+            Err(e) => self.status = t_with("保存失败: {e}", &[("e", e.to_string())]),
+        }
+    }
+
     /// 人脸管线签名检查:存在非当前签名模板时请用户确认重建,不自动覆盖人工数据。
     #[cfg(feature = "ai")]
     fn check_face_algo_version(&mut self) {
@@ -8377,6 +8414,9 @@ impl App {
                                 self.refresh_people_and_suggestions();
                                 self.status =
                                     t_with("已命名:{name}", &[("name", name.to_string())]);
+                                if let Some(pid) = f.person_id {
+                                    let _ = self.store.sync_person_album_name(pid, &name);
+                                }
                             }
                             Err(e) => {
                                 self.status = t_with("命名失败: {e}", &[("e", e.to_string())]);
@@ -10455,24 +10495,32 @@ impl App {
             }
         });
         ui.separator();
+        let person_albums = self.store.person_album_ids();
         for (aid, name, n) in albums {
-            if ui
-                .selectable_label(
-                    self.sel_album == Some(aid),
-                    t_with(
-                        "{name} · {n} 张",
-                        &[("name", name.to_string()), ("n", n.to_string())],
-                    ),
-                )
-                .clicked()
-            {
-                self.sel_album = Some(aid);
-            }
+            let is_person = person_albums.contains(&aid);
+            ui.horizontal(|ui| {
+                if ui
+                    .selectable_label(
+                        self.sel_album == Some(aid),
+                        t_with(
+                            "{name} · {n} 张",
+                            &[("name", name.to_string()), ("n", n.to_string())],
+                        ),
+                    )
+                    .clicked()
+                {
+                    self.sel_album = Some(aid);
+                }
+                if is_person {
+                    ui.label(egui::RichText::new(t("人物")).weak().small());
+                }
+            });
         }
         if let Some(a) = self.sel_album {
             ui.separator();
             if self.album_desc_id != Some(a) {
                 self.album_desc = self.store.album_description(a).unwrap_or_default();
+                self.album_desc_saved = self.album_desc.clone();
                 self.album_desc_id = Some(a);
             }
             crate::theme::section_label(ui, t("相簿描述"));
@@ -10481,10 +10529,11 @@ impl App {
                     .hint_text(t("可留空"))
                     .desired_rows(2),
             );
-            if ui.button(t("保存描述")).clicked() || desc_resp.lost_focus() {
-                let _ = self
-                    .store
-                    .album_set_description(a, self.album_desc.trim());
+            let want_save = ui.button(t("保存描述")).clicked() || desc_resp.lost_focus();
+            let draft = self.album_desc.trim().to_string();
+            if want_save && draft != self.album_desc_saved {
+                let _ = self.store.album_set_description(a, &draft);
+                self.album_desc_saved = draft;
                 self.fx_msg = t("描述已保存").into();
             }
             ui.horizontal(|ui| {
@@ -14834,6 +14883,11 @@ impl eframe::App for App {
                                                         "已命名:{name}",
                                                         &[("name", name.clone())],
                                                     );
+                                                    if let Some(pid) = self.sel_person {
+                                                        let _ = self
+                                                            .store
+                                                            .sync_person_album_name(pid, &name);
+                                                    }
                                                 }
                                                 Err(e) => {
                                                     self.status = t_with(
@@ -14844,6 +14898,21 @@ impl eframe::App for App {
                                             }
                                             self.refresh_people_and_suggestions();
                                         }
+                                    }
+                                });
+                                // 人物相簿:当前人物的照片集合存成相簿(重复点击不产生新簿)。
+                                ui.horizontal(|ui| {
+                                    if ui.button(t("保存为相簿")).clicked() {
+                                        self.save_person_as_album();
+                                    }
+                                    if self
+                                        .sel_person
+                                        .and_then(|pid| self.store.album_id_of_person(pid))
+                                        .is_some()
+                                    {
+                                        ui.label(
+                                            egui::RichText::new(t("已关联相簿")).weak().small(),
+                                        );
                                     }
                                 });
                                 // 忽略/恢复整组(跨簇身份的所有簇一并处理)。

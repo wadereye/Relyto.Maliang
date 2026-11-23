@@ -1650,7 +1650,8 @@ impl Store {
                 id INTEGER PRIMARY KEY,
                 name TEXT UNIQUE NOT NULL,
                 ts INTEGER NOT NULL,
-                description TEXT NOT NULL DEFAULT ''
+                description TEXT NOT NULL DEFAULT '',
+                person_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS album_photos (
                 album_id INTEGER NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
@@ -1662,6 +1663,9 @@ impl Store {
         );
         // 旧库相簿补描述列(列已存在时静默)。
         let _ = conn.execute_batch("ALTER TABLE albums ADD COLUMN description TEXT NOT NULL DEFAULT '';");
+        // 旧库相簿补人物关联列(列已存在时静默)。
+        let _ = conn.execute_batch("ALTER TABLE albums ADD COLUMN person_id INTEGER;");
+        let _ = conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_albums_person ON albums(person_id);");
         let _ = conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_photos_cam_id ON photos(cam_id);
              CREATE TABLE IF NOT EXISTS string_pool (
@@ -2108,6 +2112,92 @@ impl Store {
                 "UPDATE albums SET description=?2 WHERE id=?1",
                 rusqlite::params![album_id, desc],
             )?;
+            Ok(())
+        })
+    }
+
+    /// 人物相簿(已存在则复用 id,重名让位时追加人物号)。
+    pub fn album_create_for_person(&self, person_id: i64, name: &str) -> Result<i64> {
+        let name = name.trim().to_string();
+        self.write(move |conn| {
+            if let Some(id) = conn
+                .query_row(
+                    "SELECT id FROM albums WHERE person_id=?1",
+                    rusqlite::params![person_id],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+            {
+                return Ok(id);
+            }
+            let existing: Option<(i64, Option<i64>)> = conn
+                .query_row(
+                    "SELECT id, person_id FROM albums WHERE name=?1",
+                    rusqlite::params![name.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            let taken = matches!(existing, Some((_, Some(other))) if other != person_id);
+            let id = match existing {
+                Some((id, _)) if !taken => id,
+                _ => {
+                    let label = if taken {
+                        format!("{name} #{person_id}")
+                    } else {
+                        name.clone()
+                    };
+                    conn.execute(
+                        "INSERT INTO albums(name, ts) VALUES(?1, ?2)",
+                        rusqlite::params![label, chrono::Utc::now().timestamp_millis()],
+                    )?;
+                    conn.last_insert_rowid()
+                }
+            };
+            conn.execute(
+                "UPDATE albums SET person_id=?2 WHERE id=?1",
+                rusqlite::params![id, person_id],
+            )?;
+            Ok(id)
+        })
+    }
+
+    /// 人物对应的相簿 id(未建过返回 None)。
+    pub fn album_id_of_person(&self, person_id: i64) -> Option<i64> {
+        self.read(move |conn| {
+            conn.query_row(
+                "SELECT id FROM albums WHERE person_id=?1",
+                [person_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok()
+        })
+    }
+
+    /// 关联人物的相簿 id 列表(列表打「人物」标签用)。
+    pub fn person_album_ids(&self) -> Vec<i64> {
+        self.read(|conn| {
+            let mut st = match conn.prepare("SELECT id FROM albums WHERE person_id IS NOT NULL") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| r.get::<_, i64>(0))
+                .ok()
+                .map(|rows| rows.filter_map(|r| r.ok()).collect())
+                .unwrap_or_default()
+        })
+    }
+
+    /// 人物改名后同步相簿名(无相簿或重名则保持原样)。
+    pub fn sync_person_album_name(&self, person_id: i64, name: &str) -> Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+        self.write(move |conn| {
+            let _ = conn.execute(
+                "UPDATE albums SET name=?2 WHERE person_id=?1",
+                rusqlite::params![person_id, name],
+            );
             Ok(())
         })
     }
@@ -5819,6 +5909,41 @@ mod tests {
     fn album_missing_id_has_no_description() {
         let s = Store::open_mem().unwrap();
         assert_eq!(s.album_description(9999), None);
+    }
+
+    #[test]
+    fn person_album_is_reused_and_synced_on_rename() {
+        let s = Store::open_mem().unwrap();
+        let a1 = s.album_create_for_person(7, "小明").unwrap();
+        let a2 = s.album_create_for_person(7, "小明").unwrap();
+        assert_eq!(a1, a2, "同人物重复保存应复用同一相簿");
+        assert_eq!(s.album_id_of_person(7), Some(a1));
+        assert_eq!(s.album_id_of_person(8), None);
+        s.sync_person_album_name(7, "阿明").unwrap();
+        assert_eq!(s.album_name(a1).as_deref(), Some("阿明"));
+    }
+
+    #[test]
+    fn normal_album_has_no_person_link() {
+        let s = Store::open_mem().unwrap();
+        let id = s.album_create("随手拍").unwrap();
+        assert!(
+            s.person_album_ids().is_empty(),
+            "普通相簿不占人物关联"
+        );
+        let person_album = s.album_create_for_person(3, "甲").unwrap();
+        assert_eq!(s.person_album_ids(), vec![person_album]);
+        assert_eq!(s.album_id_of_person(id), None, "普通相簿查不到人物");
+    }
+
+    #[test]
+    fn person_album_avoids_name_collision_with_other_person() {
+        let s = Store::open_mem().unwrap();
+        let a1 = s.album_create_for_person(7, "同名").unwrap();
+        let a2 = s.album_create_for_person(8, "同名").unwrap();
+        assert_ne!(a1, a2, "不同人物不得共用一本");
+        assert_eq!(s.album_name(a1).as_deref(), Some("同名"));
+        assert_eq!(s.album_id_of_person(8), Some(a2));
     }
 
     #[test]
