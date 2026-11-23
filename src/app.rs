@@ -382,6 +382,10 @@ pub struct App {
     show_shortcuts: bool,
     show_license: bool,
     eula_accepted: bool,
+    help_open: bool,
+    help_topic: usize,
+    help_query: String,
+    help_cache: egui_commonmark::CommonMarkCache,
     /// 自动更新:后台检查/下载线程与「检查更新」窗口的状态快照。
     updater: crate::update::Updater,
     /// 安装更新的二次确认窗(UAC + 停服务前必须让用户点一次)。
@@ -2245,6 +2249,74 @@ fn eula_accepted_of(v: Option<String>) -> bool {
     v.as_deref() == Some("1")
 }
 
+pub struct HelpDoc {
+    pub title: &'static str,
+    pub keywords: &'static [&'static str],
+    pub body: &'static str,
+}
+
+/// 内置帮助主题及检索关键词。
+pub const HELP_DOCS: &[HelpDoc] = &[
+    HelpDoc {
+        title: "图库与扫描",
+        keywords: &["扫描", "文件夹", "排除", "隐藏", "导入", "监听", "单文件"],
+        body: include_str!("../assets/help/01-图库与扫描.md"),
+    },
+    HelpDoc {
+        title: "浏览与排序",
+        keywords: &["时间线", "相簿", "树形", "排序", "类型", "标签色", "筛选"],
+        body: include_str!("../assets/help/02-浏览与排序.md"),
+    },
+    HelpDoc {
+        title: "编辑与效果",
+        keywords: &["裁剪", "二次改框", "效果栈", "撤销", "重做", "一键效果", "批量粘贴"],
+        body: include_str!("../assets/help/03-编辑与效果.md"),
+    },
+    HelpDoc {
+        title: "查找与全盘索引",
+        keywords: &["MFT", "USN", "快速查找", "全盘索引", "类型", "授权", "服务"],
+        body: include_str!("../assets/help/04-查找与全盘索引.md"),
+    },
+    HelpDoc {
+        title: "人物标签与文字",
+        keywords: &["人脸", "人物", "标签", "图中文字", "OCR", "AI 分类", "模型"],
+        body: include_str!("../assets/help/05-人物标签与文字.md"),
+    },
+    HelpDoc {
+        title: "分享导出与备份",
+        keywords: &["导出", "邮件", "收件人", "礼品光盘", "备份集", "数据目录", "分享"],
+        body: include_str!("../assets/help/06-分享导出与备份.md"),
+    },
+    HelpDoc {
+        title: "快捷键",
+        keywords: &["快捷键", "F2", "Ctrl+R", "PageUp", "Alt", "Space", "撤销"],
+        body: include_str!("../assets/help/07-快捷键.md"),
+    },
+    HelpDoc {
+        title: "许可与隐私",
+        keywords: &["许可协议", "EULA", "隐私", "本地", "Apache", "上传", "首启"],
+        body: include_str!("../assets/help/08-许可与隐私.md"),
+    },
+];
+
+/// 按标题或关键词做忽略大小写的子串检索。
+pub fn help_search(q: &str) -> Vec<usize> {
+    let q = q.trim().to_lowercase();
+    HELP_DOCS
+        .iter()
+        .enumerate()
+        .filter(|(_, doc)| {
+            q.is_empty()
+                || doc.title.to_lowercase().contains(&q)
+                || doc
+                    .keywords
+                    .iter()
+                    .any(|keyword| keyword.to_lowercase().contains(&q))
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// 「关于」窗口用的更新日志:去掉文件头的 H1 标题与说明行(窗口里已另有
 /// 「更新日志」标题,避免重复显示),直接从第一个版本段开始。
 fn about_changelog_md() -> &'static str {
@@ -2814,6 +2886,10 @@ impl App {
             show_shortcuts: false,
             show_license: false,
             eula_accepted,
+            help_open: false,
+            help_topic: 0,
+            help_query: String::new(),
+            help_cache: Default::default(),
             updater: crate::update::Updater::new(),
             update_confirm: false,
             #[cfg(feature = "ai")]
@@ -13047,6 +13123,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn help_docs_are_complete_and_indexed() {
+        assert_eq!(HELP_DOCS.len(), 8, "帮助主题应覆盖八篇文档");
+        for d in HELP_DOCS {
+            assert!(!d.title.is_empty());
+            assert!(d.keywords.len() >= 3, "{}:关键词太少", d.title);
+            assert!(d.body.len() > 200, "{}:正文过短", d.title);
+            assert!(d.body.starts_with('#'), "{}:正文须以标题行开头", d.title);
+            assert!(d.body.lines().count() <= 120, "{}:正文超过 120 行", d.title);
+        }
+    }
+
+    #[test]
+    fn help_search_matches_title_keyword_case_insensitively() {
+        assert!(!help_search("MFT").is_empty());
+        assert!(!help_search("人脸").is_empty());
+        assert!(help_search("zzz-不存在").is_empty());
+        assert_eq!(help_search("").len(), HELP_DOCS.len(), "空查询应列全部主题");
+    }
+
+    #[test]
     fn license_text_is_embedded_and_non_trivial() {
         assert!(LICENSE_TEXT.len() > 1000, "许可正文应完整嵌入,当前 {} 字", LICENSE_TEXT.len());
         assert_eq!(
@@ -13544,6 +13640,72 @@ mod tests {
 }
 
 impl App {
+    fn help_ui(&mut self, ctx: &egui::Context) {
+        let hits = help_search(&self.help_query);
+        if let Some(&first) = hits.first() {
+            if hits.len() < 3 || !hits.contains(&self.help_topic) {
+                self.help_topic = first;
+            }
+        }
+        let mut open = self.help_open;
+        egui::Window::new(t("帮助内容"))
+            .open(&mut open)
+            .default_width(860.0)
+            .default_height(620.0)
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_width(220.0);
+                        ui.label(t("搜索主题"));
+                        ui.add_sized(
+                            egui::vec2(212.0, 24.0),
+                            egui::TextEdit::singleline(&mut self.help_query)
+                                .hint_text(t("搜索主题")),
+                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("help_topics")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if hits.is_empty() {
+                                    ui.label(t("没有匹配的主题"));
+                                } else {
+                                    for &i in &hits {
+                                        if ui
+                                            .selectable_label(
+                                                self.help_topic == i,
+                                                t(HELP_DOCS[i].title),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.help_topic = i;
+                                        }
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.set_width((ui.available_width() - 8.0).max(320.0));
+                        egui::ScrollArea::vertical()
+                            .id_salt("help_body")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                if hits.is_empty() {
+                                    ui.label(t("没有匹配的主题"));
+                                } else {
+                                    egui_commonmark::CommonMarkViewer::new().show(
+                                        ui,
+                                        &mut self.help_cache,
+                                        HELP_DOCS[self.help_topic].body,
+                                    );
+                                }
+                            });
+                    });
+                });
+            });
+        self.help_open = open;
+    }
+
     fn license_window(&mut self, ctx: &egui::Context, gated: bool) {
         if !self.show_license {
             return;
@@ -14845,6 +15007,10 @@ impl eframe::App for App {
                     });
                     // —— 帮助 ——
                     ui.menu_button(t("帮助(H)"), |ui| {
+                        if ui.button(t("帮助内容…")).clicked() {
+                            self.help_open = true;
+                            ui.close();
+                        }
                         if ui.button(t("键盘快捷键…")).clicked() {
                             self.show_shortcuts = true;
                             ui.close();
@@ -16288,6 +16454,8 @@ impl eframe::App for App {
                 });
             self.show_shortcuts = open;
         }
+
+        self.help_ui(ctx);
 
         // 帮助 > 关于
         if self.show_about {
