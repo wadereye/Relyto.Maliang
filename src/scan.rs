@@ -80,6 +80,32 @@ pub fn is_indexable(p: &Path) -> bool {
     is_image(p) || crate::video::is_video(p)
 }
 
+/// 选择单文件的可纳入父目录,隐藏目录、硬排除或非媒体文件返回 None。
+pub fn pick_adoptable_parent(
+    file: &str,
+    hard_excluded: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let path = Path::new(file);
+    if !is_indexable(path) {
+        return None;
+    }
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty()
+        || parent.ancestors().any(|dir| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with('.'))
+        })
+    {
+        return None;
+    }
+    let parent = parent.to_string_lossy().into_owned();
+    if hard_excluded(&parent) {
+        return None;
+    }
+    Some(parent)
+}
+
 /// 是否 RAW 格式(决定缩略图是否走 Shell 扩展)。
 pub fn is_raw(p: &Path) -> bool {
     p.extension()
@@ -1089,6 +1115,18 @@ fn store_insert_gated(store: &Store, records: &[Record], gate: &crate::db::Scope
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_file_add_accepts_only_media_under_adoptable_dir() {
+        assert_eq!(
+            pick_adoptable_parent("/pic/2024/a.jpg", &|_| false),
+            Some("/pic/2024".into())
+        );
+        assert_eq!(pick_adoptable_parent("/pic/.hidden/a.jpg", &|_| false), None);
+        assert_eq!(pick_adoptable_parent("/pic/.hidden/sub/a.jpg", &|_| false), None);
+        assert_eq!(pick_adoptable_parent("/pic/a.jpg", &|p| p == "/pic"), None);
+        assert_eq!(pick_adoptable_parent("/pic/a.txt", &|_| false), None);
+    }
 
     /// 删除对账:消失的行被移出、在盘的保留;离线根与根外路径一律不碰。
     #[test]

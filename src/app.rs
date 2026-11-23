@@ -5506,21 +5506,30 @@ impl App {
             self.status = t("没有待导入的勾选(已入库的会跳过)").into();
             return;
         }
-        if self.scan_busy.swap(true, Ordering::SeqCst) {
-            self.status = t("已有扫描在跑,请等它结束后再导入所选").into();
-            return;
-        }
         let Some(dir) = self.import_src.clone() else {
-            self.scan_busy.store(false, Ordering::SeqCst);
             return;
         };
-        let _ = self.store.upsert_watched(&dir);
-        // 用户挑中的这几张 = 它所在的目录该出缩略图。
-        self.include_dir(
-            &dir.display().to_string(),
-            crate::db::INTENT_IMPORTED,
-            crate::db::SRC_IMPORT,
-        );
+        self.ingest_files(paths, vec![dir]);
+    }
+
+    /// 登记父目录后逐文件入库,不遍历父目录中的其他文件。
+    fn ingest_files(&mut self, paths: Vec<PathBuf>, dirs: Vec<PathBuf>) -> bool {
+        if paths.is_empty() {
+            self.status = t("没有待导入的勾选(已入库的会跳过)").into();
+            return false;
+        }
+        if self.scan_busy.swap(true, Ordering::SeqCst) {
+            self.status = t("已有扫描在跑,请等它结束后再导入所选").into();
+            return false;
+        }
+        for dir in dirs {
+            let _ = self.store.upsert_watched(&dir);
+            self.include_dir(
+                &dir.display().to_string(),
+                crate::db::INTENT_IMPORTED,
+                crate::db::SRC_IMPORT,
+            );
+        }
         let store = self.store.clone();
         let busy = self.scan_busy.clone();
         let scope = t_with("所选 {p1} 张", &[("p1", (paths.len()).to_string())]);
@@ -5565,6 +5574,72 @@ impl App {
             };
             let _ = tx.send(msg);
         });
+        true
+    }
+
+    /// 文件 > 添加文件到图库:只索引用户选中的文件。
+    fn add_files_to_library(&mut self) {
+        let Some(files) = rfd::FileDialog::new()
+            .set_title(t("添加文件到图库…"))
+            .add_filter(
+                "图片",
+                &["jpg", "jpeg", "png", "webp", "heic", "tif", "tiff", "bmp", "dng", "cr2", "nef", "arw", "raf"],
+            )
+            .add_filter("所有文件", &["*"])
+            .pick_files()
+        else {
+            return;
+        };
+        let mut accepted = Vec::new();
+        let mut parents = Vec::new();
+        let mut rejected = Vec::new();
+        let exclusions = crate::scan::Exclusions::from_store(&self.store);
+        for path in files {
+            let Some(parent) = crate::scan::pick_adoptable_parent(
+                &path.to_string_lossy(),
+                &|dir| {
+                    matches!(
+                        exclusions.exclude_layer_dir(Path::new(dir)),
+                        Some(crate::scan::ExcludeLayer::Hard)
+                    )
+                },
+            ) else {
+                rejected.push(path);
+                continue;
+            };
+            if !self.store.adoptable_dir(&parent, true) {
+                rejected.push(path);
+                continue;
+            }
+            let parent = PathBuf::from(parent);
+            if !parents.contains(&parent) {
+                parents.push(parent.clone());
+            }
+            accepted.push(path);
+        }
+        if accepted.is_empty() {
+            if let Some(path) = rejected.first() {
+                self.status = t_with(
+                    "{p1} 所在目录被排除",
+                    &[("p1", path.display().to_string())],
+                );
+            }
+            return;
+        }
+        if self.ingest_files(accepted.clone(), parents) {
+            let mut status = t_with(
+                "已提交 {p1} 个文件入库",
+                &[("p1", accepted.len().to_string())],
+            );
+            if let Some(path) = rejected.first() {
+                status.push_str("; ");
+                status.push_str(&t_with(
+                    "{p1} 所在目录被排除",
+                    &[("p1", path.display().to_string())],
+                ));
+            }
+            self.status = status;
+        }
     }
 
     /// 文件 > 添加文件夹到图库:选目录 → 记入 watched → 只扫该目录。
@@ -14152,6 +14227,10 @@ impl eframe::App for App {
                             self.album_new_win = true;
                             ui.close();
                         }
+                        if ui.button(t("添加文件到图库…")).clicked() {
+                            self.add_files_to_library();
+                            ui.close();
+                        }
                         if ui.button(t("添加文件夹到图库…")).clicked() {
                             self.add_folder_to_library();
                             ui.close();
@@ -14178,6 +14257,11 @@ impl eframe::App for App {
                             // 导入页:整页面板(选源 → 看清单 → 入库 → 返回)。
                             if ui.button(t("导入页(选源入库)…")).clicked() {
                                 self.go_page(PageKind::Import);
+                                ui.close();
+                            }
+                            // 直接挑文件的一次性入口(不开页面)。
+                            if ui.button(t("添加文件到图库…")).clicked() {
+                                self.add_files_to_library();
                                 ui.close();
                             }
                             // 直接挑文件夹的一次性入口(不开页面)。
