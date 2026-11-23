@@ -475,6 +475,10 @@ pub struct App {
     /// 邮件发送窗口开关 + 尺寸档。
     email_win: bool,
     email_size: crate::share::ShareSize,
+    /// 邮件收件人(已选地址)。
+    email_to: Vec<String>,
+    /// 邮件窗内新地址输入框草稿。
+    email_new: String,
     /// 礼品光盘窗口开关 + 尺寸档。
     cd_win: bool,
     cd_size: crate::share::ShareSize,
@@ -2707,6 +2711,8 @@ impl App {
             export_with_effects: false,
             email_win: false,
             email_size,
+            email_to: Vec::new(),
+            email_new: String::new(),
             cd_win: false,
             cd_size: crate::share::ShareSize::Px800,
             share_rx: None,
@@ -6541,6 +6547,8 @@ impl App {
         }
         let size = self.email_size;
         let dir = std::env::temp_dir().join("maliang_email");
+        let to = crate::share::normalize_recipients(&self.email_to);
+        let store = self.store.clone();
         let (tx, rx) = mpsc::channel();
         self.share_rx = Some(rx);
         self.status = t_with(
@@ -6550,7 +6558,10 @@ impl App {
         std::thread::spawn(move || {
             let res = (|| -> anyhow::Result<String> {
                 let files = crate::share::stage_jpegs(&items, size.px(), &dir)?;
-                crate::share::send_email(t("Maliang 照片分享"), &files)?;
+                crate::share::send_email(t("Maliang 照片分享"), &files, &to)?;
+                for addr in &to {
+                    let _ = store.touch_contact(addr, "");
+                }
                 Ok(t_with(
                     "邮件已交给系统邮件客户端(附件 {p1} 张)",
                     &[("p1", (files.len()).to_string())],
@@ -6558,6 +6569,22 @@ impl App {
             })();
             let _ = tx.send(res.map_err(|e| e.to_string()));
         });
+    }
+
+    /// 新地址入收件人并落库;非法输入只提示不改草稿以外的状态。
+    fn add_email_contact(&mut self) {
+        let draft = std::mem::take(&mut self.email_new);
+        let list = crate::share::normalize_recipients(std::slice::from_ref(&draft));
+        let Some(addr) = list.first().cloned() else {
+            self.email_new = draft;
+            self.status = t("请输入完整邮箱地址").into();
+            return;
+        };
+        if !self.email_to.iter().any(|a| *a == addr) {
+            self.email_to.push(addr.clone());
+        }
+        let _ = self.store.touch_contact(&addr, "");
+        self.status = t_with("已添加收件人 {p1}", &[("p1", addr)]);
     }
 
     /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
@@ -15463,6 +15490,44 @@ impl eframe::App for App {
                     for s in crate::share::ShareSize::ALL {
                         ui.radio_value(&mut self.email_size, s, t(s.label()));
                     }
+                    ui.separator();
+                    ui.label(t("收件人:"));
+                    let contacts = self.store.contacts();
+                    ui.horizontal_wrapped(|ui| {
+                        for (id, addr, _display) in &contacts {
+                            let on = self.email_to.iter().any(|a| a == addr);
+                            let row = ui.selectable_label(on, addr.as_str());
+                            if row.clicked() {
+                                if on {
+                                    self.email_to.retain(|a| a != addr);
+                                } else {
+                                    self.email_to.push(addr.clone());
+                                }
+                            }
+                            row.context_menu(|ui| {
+                                if ui.button(t("删除该联系人")).clicked() {
+                                    self.email_to.retain(|a| a != addr);
+                                    let _ = self.store.delete_contact(*id);
+                                    self.status = t("联系人已删除").into();
+                                    ui.close();
+                                }
+                            });
+                        }
+                        if contacts.is_empty() {
+                            ui.small(t("还没有历史联系人"));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.email_new)
+                                .hint_text(t("+ 新地址…"))
+                                .desired_width(220.0),
+                        );
+                        if ui.button(t("添加")).clicked() {
+                            self.add_email_contact();
+                        }
+                    });
+                    ui.small(t("留空则由邮件客户端补全收件人"));
                     ui.separator();
                     let n = self.view_ids().len();
                     if ui

@@ -1046,6 +1046,13 @@ CREATE TABLE IF NOT EXISTS dir_hidden (
     like_sl TEXT NOT NULL,
     ts      INTEGER NOT NULL DEFAULT 0
 );
+-- 邮件分享联系人:地址小写入库作唯一键,展示名另存。
+CREATE TABLE IF NOT EXISTS contacts (
+    id        INTEGER PRIMARY KEY,
+    address   TEXT NOT NULL UNIQUE,
+    display   TEXT NOT NULL DEFAULT '',
+    last_used INTEGER NOT NULL DEFAULT 0
+);
 -- AI 待办:一个 (阶段, 照片) 一行,重复入队无副作用。
 CREATE TABLE IF NOT EXISTS ai_jobs (
     stage       TEXT    NOT NULL,
@@ -4452,24 +4459,54 @@ impl Store {
         })
     }
 
-    /// 该目录本身是否被登记为隐藏。
-    pub fn is_dir_hidden(&self, path: &str) -> bool {
-        let p = norm_dir(path);
-        self.read(move |conn| {
-            conn.query_row(
-                "SELECT 1 FROM dir_hidden WHERE path=?1",
-                rusqlite::params![p],
-                |_| Ok(()),
-            )
-            .is_ok()
+    /// 联系人清单(按最近使用倒序,同值按 id 稳定)。
+    pub fn contacts(&self) -> Vec<(i64, String, String)> {
+        self.read(|conn| {
+            let mut st = match conn.prepare(
+                "SELECT id, address, display FROM contacts
+                 ORDER BY last_used DESC, id",
+            ) {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
+            st.query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
+            .ok()
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
         })
     }
 
-    /// 该目录是否落在某个隐藏目录的整棵子树内。
-    pub fn subtree_hidden(&self, path: &str) -> bool {
-        self.hidden_dirs()
-            .iter()
-            .any(|h| dir_under(path, h))
+    /// 记一次地址使用(地址小写入库,已存在则刷新展示名与时间)。
+    pub fn touch_contact(&self, address: &str, display: &str) -> Result<i64> {
+        let addr = address.trim().to_ascii_lowercase();
+        if addr.is_empty() {
+            anyhow::bail!("地址为空");
+        }
+        let disp = display.trim().to_string();
+        let now = chrono::Utc::now().timestamp_millis();
+        self.write(move |conn| {
+            conn.execute(
+                "INSERT INTO contacts(address,display,last_used) VALUES(?1,?2,?3)
+                 ON CONFLICT(address) DO UPDATE SET display=?2, last_used=?3",
+                rusqlite::params![addr.as_str(), disp.as_str(), now],
+            )?;
+            let id: i64 = conn.query_row(
+                "SELECT id FROM contacts WHERE address=?1",
+                rusqlite::params![addr.as_str()],
+                |r| r.get(0),
+            )?;
+            Ok(id)
+        })
+    }
+
+    /// 删除联系人。
+    pub fn delete_contact(&self, id: i64) -> Result<()> {
+        self.write(move |conn| {
+            conn.execute("DELETE FROM contacts WHERE id=?1", rusqlite::params![id])?;
+            Ok(())
+        })
     }
 
     /// 全部隐藏目录(已归一,无尾分隔符)。
@@ -6060,13 +6097,30 @@ mod tests {
         add_photo_in(&s, 2, "/pic/a/b");
         add_photo_in(&s, 3, "/pic/ab");
         s.hide_dir("/pic/a").unwrap();
-        assert!(s.is_dir_hidden("/pic/a"));
-        assert!(s.subtree_hidden("/pic/a/b"));
-        assert!(!s.subtree_hidden("/pic/ab"), "同级前缀目录不得被误判");
-        assert_eq!(s.hidden_dirs(), vec!["/pic/a".to_string()]);
+        let hidden = s.hidden_dirs();
+        assert_eq!(hidden, vec!["/pic/a".to_string()]);
+        assert!(hidden.iter().any(|h| dir_under("/pic/a", h)));
+        assert!(hidden.iter().any(|h| dir_under("/pic/a/b", h)));
+        assert!(
+            !hidden.iter().any(|h| dir_under("/pic/ab", h)),
+            "同级前缀目录不得被误判"
+        );
         s.unhide_dir("/pic/a").unwrap();
-        assert!(!s.subtree_hidden("/pic/a/b"));
         assert!(s.hidden_dirs().is_empty());
+    }
+
+    #[test]
+    fn contacts_touch_is_case_insensitive_unique() {
+        let s = Store::open_mem().unwrap();
+        let a = s.touch_contact("A@X.COM", "小明").unwrap();
+        let b = s.touch_contact("a@x.com", "阿明").unwrap();
+        assert_eq!(a, b, "同一地址大小写不同不应重复建");
+        let list = s.contacts();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].1, "a@x.com", "入库地址一律小写");
+        assert_eq!(list[0].2, "阿明", "后一次展示名覆盖前一次");
+        s.delete_contact(a).unwrap();
+        assert!(s.contacts().is_empty());
     }
 
     #[test]

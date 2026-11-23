@@ -20,6 +20,26 @@ use crate::i18n::{t, t_with};
 use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
+/// 收件人清洗:去空白、去空项、必须含 `@`、大小写不敏感去重并保序。
+#[must_use]
+pub fn normalize_recipients(raw: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for item in raw {
+        let addr = item.trim();
+        if addr.is_empty() || !addr.contains('@') {
+            continue;
+        }
+        let key = addr.to_ascii_lowercase();
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        out.push(addr.to_string());
+    }
+    out
+}
+
 /// 邮件/光盘尺寸档(8 档列表
 /// `160|320|480|640|800|1024|1200|1600`;默认 1024 像素)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,13 +218,11 @@ mod win {
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
     };
 
-    /// Simple MAPI 收件人描述(MapiRecipDescW,SDK 字段逐一对齐)。
+    /// Simple MAPI 收件人描述(MapiRecipDescW,字段顺序与宽度按 SDK 声明)。
     #[repr(C)]
-    #[allow(dead_code)]
     struct MapiRecipDescW {
         ul_reserved: u32,
-        fl_flags: u32,
-        n_position: u32,
+        ul_recip_class: u32,
         lpsz_name: PWSTR,
         lpsz_address: PWSTR,
         ul_eid_size: u32,
@@ -246,10 +264,11 @@ mod win {
     /// `mapi32.dll` 动态加载(MAPI 动态加载)+
     /// 发送 flags=9(邮件发送,`MAPI_LOGON_UI|MAPI_DIALOG`)。
     /// 用 Unicode 导出 `MAPISendMailW`(中文路径不丢字)。
-    pub fn send_email(subject: &str, files: &[PathBuf]) -> Result<()> {
+    pub fn send_email(subject: &str, files: &[PathBuf], to: &[String]) -> Result<()> {
         if files.is_empty() {
             return Err(anyhow!(t("没有附件")));
         }
+        let addrs = super::normalize_recipients(to);
         unsafe {
             // mapi32.dll 句柄不 FreeLibrary,进程退出由系统回收。
             let lib = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("MAPI32.DLL"))
@@ -286,6 +305,19 @@ mod win {
                     lp_file_type: std::ptr::null_mut(),
                 })
                 .collect();
+            // 收件人按 MAPI_TO 填写,地址缓冲同样活到调用结束
+            let mut addr_bufs: Vec<Vec<u16>> = addrs.iter().map(|a| wide(a)).collect();
+            let mut recips: Vec<MapiRecipDescW> = addr_bufs
+                .iter_mut()
+                .map(|buf| MapiRecipDescW {
+                    ul_reserved: 0,
+                    ul_recip_class: 1,
+                    lpsz_name: PWSTR::null(),
+                    lpsz_address: PWSTR(buf.as_mut_ptr()),
+                    ul_eid_size: 0,
+                    lp_entry_id: std::ptr::null_mut(),
+                })
+                .collect();
             let mut msg = MapiMessageW {
                 ul_reserved: 0,
                 lpsz_subject: PWSTR(subject_buf.as_mut_ptr()),
@@ -295,8 +327,12 @@ mod win {
                 lpsz_conversation_id: PWSTR::null(),
                 fl_flags: 0,
                 lp_originator: std::ptr::null_mut(),
-                n_recip_count: 0,
-                lp_recips: std::ptr::null_mut(),
+                n_recip_count: recips.len() as u32,
+                lp_recips: if recips.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    recips.as_mut_ptr()
+                },
                 n_file_count: files.len() as u32,
                 lp_files: file_descs.as_mut_ptr(),
             };
@@ -418,7 +454,7 @@ mod win {
 pub use win::{burn_folder, send_email};
 
 #[cfg(not(windows))]
-pub fn send_email(_subject: &str, _files: &[PathBuf]) -> Result<()> {
+pub fn send_email(_subject: &str, _to: &[String], _files: &[PathBuf]) -> Result<()> {
     Err(anyhow!(t("邮件发送仅支持 Windows(Simple MAPI)")))
 }
 
@@ -430,6 +466,24 @@ pub fn burn_folder(_staging: &Path, _label: &str, _client: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recipients_are_trimmed_deduped_and_validated() {
+        let raw = [
+            "  A@X.COM ".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "no-at-sign".to_string(),
+            "a@x.com".to_string(),
+            "b@y.com".to_string(),
+        ];
+        assert_eq!(
+            normalize_recipients(&raw),
+            vec!["A@X.COM".to_string(), "b@y.com".to_string()],
+            "去空白、缺 @ 丢弃、大小写去重且保序"
+        );
+        assert!(normalize_recipients(&[]).is_empty());
+    }
 
     #[test]
     fn share_size_px_matches_original_strings() {
