@@ -11,7 +11,6 @@ mod editor;
 use editor::{EditorTab, Histogram};
 
 /// 视图模式(视图菜单:最近更新/时间线/人物/标签/文件夹)。
-/// Faces/Semantic 仅 ai 构建的菜单会构造;无 ai 时变体存在但无人构造,允许死代码。
 #[derive(PartialEq, Clone, Copy)]
 enum ViewKind {
     /// 首页虚拟相册「最近更新」:成员有上限、只收已有落盘缩略图的那批。
@@ -21,13 +20,28 @@ enum ViewKind {
     Duplicates,
     /// 相簿:照片的命名集合,不动文件。
     Albums,
-    #[allow(dead_code)]
     Faces,
     Tags,
-    #[allow(dead_code)]
     Semantic,
     /// 快速查找:全盘文件名索引检索(USN/MFT,Windows 提权子进程产出)。
     Search,
+}
+
+#[cfg(not(feature = "ai"))]
+fn ai_disabled_copy(view: ViewKind) -> Option<(&'static str, &'static str, &'static str)> {
+    match view {
+        ViewKind::Faces => Some((
+            "人物",
+            "本版本未启用 AI 管线(编译时未带 ai 特性)。",
+            "如需人脸/语义检索,请使用带 AI 的发行版或重新编译时启用 ai 特性",
+        )),
+        ViewKind::Semantic => Some((
+            "语义搜索",
+            "本版本未启用 AI 管线(编译时未带 ai 特性)。",
+            "如需人脸/语义检索,请使用带 AI 的发行版或重新编译时启用 ai 特性",
+        )),
+        _ => None,
+    }
 }
 
 /// 视图所属的左栏抽屉键(切换视图时顺势展开对应抽屉)。
@@ -6963,7 +6977,7 @@ impl App {
                     .collect()
             }
             #[cfg(not(feature = "ai"))]
-            ViewKind::Faces => Vec::new(),
+            ViewKind::Faces => Vec::new(), // 无 ai 构建下人物视图恒空。
             ViewKind::Tags => self.tags_scope(),
             #[cfg(feature = "ai")]
             ViewKind::Semantic => {
@@ -10687,6 +10701,16 @@ impl App {
         self.show_options = opts_open && self.show_options;
     }
 
+    #[cfg(not(feature = "ai"))]
+    fn ai_disabled_ui(&self, ui: &mut egui::Ui) {
+        let Some((title, message, guidance)) = ai_disabled_copy(self.view) else {
+            return;
+        };
+        crate::theme::panel_section(ui, t(title));
+        crate::theme::empty_state(ui, t(message));
+        ui.label(t(guidance));
+    }
+
     /// 幻灯片全屏渲染(接管整帧;空格暂停、Esc 退出、点击前进)。
     fn slideshow_ui(&mut self, ctx: &egui::Context) {
         let ids = self.view_ids();
@@ -13823,6 +13847,28 @@ fn orient_rect(
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "ai"))]
+    #[test]
+    fn ai_views_map_to_disabled_copy() {
+        assert_eq!(
+            ai_disabled_copy(ViewKind::Faces),
+            Some((
+                "人物",
+                "本版本未启用 AI 管线(编译时未带 ai 特性)。",
+                "如需人脸/语义检索,请使用带 AI 的发行版或重新编译时启用 ai 特性",
+            ))
+        );
+        assert_eq!(
+            ai_disabled_copy(ViewKind::Semantic),
+            Some((
+                "语义搜索",
+                "本版本未启用 AI 管线(编译时未带 ai 特性)。",
+                "如需人脸/语义检索,请使用带 AI 的发行版或重新编译时启用 ai 特性",
+            ))
+        );
+        assert_eq!(ai_disabled_copy(ViewKind::Timeline), None);
+    }
+
     #[test]
     fn batch_ops_noop_and_counts() {
         let mut o = BatchOps::default();
@@ -15484,7 +15530,6 @@ impl eframe::App for App {
                             self.set_view(ViewKind::Albums);
                             ui.close();
                         }
-                        #[cfg(feature = "ai")]
                         if ui
                             .selectable_label(self.view == ViewKind::Faces, t("人物"))
                             .clicked()
@@ -15492,7 +15537,6 @@ impl eframe::App for App {
                             self.set_view(ViewKind::Faces);
                             ui.close();
                         }
-                        #[cfg(feature = "ai")]
                         if ui
                             .selectable_label(self.view == ViewKind::Semantic, t("语义搜索"))
                             .clicked()
@@ -16548,12 +16592,7 @@ impl eframe::App for App {
                             }
                         }
                         #[cfg(not(feature = "ai"))]
-                        {
-                            ui.heading(t("人物"));
-                            ui.label(
-                                t("人脸功能未编译进当前构建(构建时用了 --no-default-features)。"),
-                            );
-                        }
+                        self.ai_disabled_ui(ui);
                     }
                     ViewKind::Tags => self.tags_view(ui),
                     ViewKind::Semantic => {
@@ -16599,12 +16638,7 @@ impl eframe::App for App {
                             }
                         }
                         #[cfg(not(feature = "ai"))]
-                        {
-                            ui.heading(t("语义搜索"));
-                            ui.label(
-                                t("语义搜索未编译进当前构建(构建时用了 --no-default-features)。"),
-                            );
-                        }
+                        self.ai_disabled_ui(ui);
                     }
                     ViewKind::Folder => {
                         if self.folder_show_all {
