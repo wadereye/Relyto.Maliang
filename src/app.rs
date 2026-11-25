@@ -6009,26 +6009,15 @@ impl App {
         self.start_scan_roots(vec![dir], &scope);
     }
 
-    /// 星标/标签变更后写 XMP sidecar + picasa.ini(M3 互操作),不复制不移动原图。
-    ///
-    /// 数据库是权威源,XMP 只是 DB 的镜像输出。**首次导入**由
-    /// `timeline::import_xmp_batch` 一次性完成(`xmp_imported` 标记,之后不再回灌),
-    /// 否则删除标签后,旧标签会被 XMP 残留"复活"回数据库。
-    fn sync_sidecars(&mut self, id: i64, star: i32) {
+    /// 星标/标签变更后镜像到 XMP，不复制、移动或改写原图。
+    fn sync_xmp(&mut self, id: i64, star: i32) {
         let path = match self.rows.iter().find(|r| r.id == id) {
             Some(r) => r.path.clone(),
             None => return,
         };
-        let photo = Path::new(&path);
         let tags = timeline::tags_of(&self.store, id).unwrap_or_default();
         let meta = crate::xmp::Meta { star, tags };
-        let _ = crate::xmp::write(photo, &meta);
-        let folder = folder_of(&path);
-        let name = photo
-            .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let _ = crate::picasa::upsert(Path::new(&folder), &name, Some(star != 0), None);
+        let _ = crate::xmp::write(Path::new(&path), &meta);
         // 标签增删后刷新视图 > 标签 的左侧列表面板
         self.tags = timeline::all_tags(&self.store).unwrap_or_default();
     }
@@ -6048,7 +6037,7 @@ impl App {
             if let Some(r) = self.rows.iter_mut().find(|r| r.id == id) {
                 r.star = star;
             }
-            self.sync_sidecars(id, star);
+            self.sync_xmp(id, star);
         }
     }
 
@@ -8751,7 +8740,7 @@ impl App {
         for id in ids {
             if timeline::add_tag(&self.store, id, &name).is_ok() {
                 let star = self.star_of(id);
-                self.sync_sidecars(id, star);
+                self.sync_xmp(id, star);
                 ok += 1;
             }
         }
@@ -8919,7 +8908,7 @@ impl App {
             || ops.caption.as_deref().is_some_and(|s| !s.trim().is_empty());
         if metadata {
             for id in &ids {
-                self.sync_sidecars(*id, self.star_of(*id));
+                self.sync_xmp(*id, self.star_of(*id));
             }
         }
         self.rebuild();
@@ -8994,14 +8983,14 @@ impl App {
                 let t = std::mem::take(&mut self.input_tag);
                 if !t.is_empty() {
                     let _ = timeline::add_tag(&self.store, id, &t);
-                    self.sync_sidecars(id, self.star_of(id));
+                    self.sync_xmp(id, self.star_of(id));
                 }
             }
             if ui.button(t("添加")).clicked() {
                 let t = std::mem::take(&mut self.input_tag);
                 if !t.is_empty() {
                     let _ = timeline::add_tag(&self.store, id, &t);
-                    self.sync_sidecars(id, self.star_of(id));
+                    self.sync_xmp(id, self.star_of(id));
                 }
             }
         });
@@ -9025,7 +9014,7 @@ impl App {
                             }
                             if ui.small_button(format!("{t} ✕")).clicked() {
                                 let _ = timeline::remove_tag(&self.store, id, &t);
-                                self.sync_sidecars(id, self.star_of(id));
+                                self.sync_xmp(id, self.star_of(id));
                             }
                         });
                     }
@@ -9059,7 +9048,7 @@ impl App {
         if let Some(&idx) = self.id_row.get(&id) {
             self.rows[idx].star = new;
         }
-        self.sync_sidecars(id, new);
+        self.sync_xmp(id, new);
     }
 
     /// 抽屉作用的照片:优先单图预览里那张,其次第一个选中项。
@@ -9188,7 +9177,7 @@ impl App {
                     }
                     if ui.small_button(&n).clicked() {
                         let _ = timeline::add_tag(&self.store, id, &n);
-                        self.sync_sidecars(id, self.star_of(id));
+                        self.sync_xmp(id, self.star_of(id));
                     }
                 });
             }
@@ -9222,7 +9211,7 @@ impl App {
             for (_, score, name) in tags {
                 if ui.small_button(format!("{name} {score:.2}")).clicked() {
                     let _ = timeline::add_tag(&self.store, id, &name);
-                    self.sync_sidecars(id, self.star_of(id));
+                    self.sync_xmp(id, self.star_of(id));
                 }
             }
         });
@@ -11880,7 +11869,7 @@ impl App {
                         }
                         for id in ids {
                             let star = self.star_of(id);
-                            self.sync_sidecars(id, star);
+                            self.sync_xmp(id, star);
                         }
                         self.tags = timeline::all_tags(&self.store)
                             .unwrap_or_default();
@@ -11921,7 +11910,7 @@ impl App {
                         }
                         for id in ids {
                             let star = self.star_of(id);
-                            self.sync_sidecars(id, star);
+                            self.sync_xmp(id, star);
                         }
                         self.tags = timeline::all_tags(&self.store)
                             .unwrap_or_default();

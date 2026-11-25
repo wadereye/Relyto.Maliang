@@ -805,7 +805,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn picasa_luma_weights_are_not_rec709() {
+    fn luma_weights_are_not_rec709() {
         // 纯红:0.3086 → 与 Rec.709 的 0.2126 不同
         let y = luma(255.0, 0.0, 0.0);
         assert!((y - 255.0 * 0.3086).abs() < 1e-3, "got {y}");

@@ -394,7 +394,7 @@ without importing first**, **a fully revamped gallery page**, and an
 
 ## 0.1.0 (2026-10-31)
 
-First public release: a Picasa-style local photo manager. The full feature
+First public release: a desktop-first local photo manager. The full feature
 list is in [README.md](./README.md).
 
 - Photo indexing & browsing: timeline / folders / albums, multi-level
@@ -403,7 +403,7 @@ list is in [README.md](./README.md).
   / grain, plus dozens of one-click effects and style filters.
 - AI (enabled by default): OCR text recognition, face clustering & naming,
   CLIP semantic search in Chinese and English.
-- Color labels & star ratings with classic `picasa.ini` interoperability,
-  duplicate photo detection, EXIF / GPS with KML export.
+- Color labels & star ratings with XMP metadata mirroring, duplicate photo
+  detection, EXIF / GPS with KML export.
 - WiFi phone import, device import, export & bake-to-save.
 - Fully local, no network access.

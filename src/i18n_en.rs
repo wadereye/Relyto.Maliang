@@ -702,7 +702,7 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("已设为不再提示:开机不再弹人脸模型窗,下载入口在 选项 > AI 模型", "Set to not ask again: no face-model prompt at launch; download entry in Options > AI models"),
 ("已设为不再提示:开机不再弹人脸模型窗,下载入口留在 选项 > AI 模型", "Set to not ask again: no face-model prompt at launch; download entry stays in Options > AI models"),
 ("已设为桌面壁纸", "Set as desktop wallpaper"),
-("已请求索引服务全量重建(进度见下方状态)", "Asked the index service to rebuild everything (progress below)"),
+("已请求索引服务全量重建(进度见下方状态)", "Asked the index service to rebuild the entire index (progress below)"),
 ("已请求索引服务把内存索引落盘", "Asked the index service to flush its in-memory index to disk"),
 ("已跳过 v{version},以后不再提示这个版本", "Skipped v{version}; this version won't prompt again"),
 ("已选 {p1} 张", "{p1} selected"),

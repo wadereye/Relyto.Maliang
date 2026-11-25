@@ -22,7 +22,6 @@ mod mft;
 mod nameidx;
 mod net;
 mod oneclick;
-mod picasa;
 mod pool;
 mod psd_preview;
 mod rec;

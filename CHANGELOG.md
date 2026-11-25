@@ -273,11 +273,11 @@ English version: [CHANGELOG.en.md](./CHANGELOG.en.md)。
 
 ## 0.1.0（2026-10-31）
 
-首个公开版本：Picasa 风格的本地照片管理器。全量能力清单见 [README.zh-CN.md](./README.zh-CN.md)。
+首个公开版本：面向桌面端的本地照片管理器。全量能力清单见 [README.zh-CN.md](./README.zh-CN.md)。
 
 - 照片索引与浏览：时间线 / 文件夹 / 相簿，多级缩略图，幻灯片放映。
 - 编辑与效果：曲线 / 曝光 / 黑白 / 颗粒等预览编辑，数十种一键效果与风格滤镜。
 - AI（默认启用）：OCR 文字识别、人脸聚类与命名、CLIP 中英语义搜索。
-- 标签星标与 `picasa.ini` 互通、重复照片检测、EXIF / GPS 与 KML 导出。
+- 标签星标与 XMP 元数据镜像、重复照片检测、EXIF / GPS 与 KML 导出。
 - WiFi 手机导入、设备导入、导出与烘焙保存。
 - 全本地、无联网。

@@ -52,7 +52,7 @@ pub fn write(photo: &Path, meta: &Meta) -> Result<()> {
 }
 
 /// 解析 sidecar;缺失时返回全零默认。
-/// 当前写路径以数据库为权威(见 app::sync_sidecars),此读取能力预留给
+/// 当前写路径以数据库为权威(见 app::sync_xmp),此读取能力预留给
 /// 未来的 XMP 导入(把外部工具写的标签/星标读入索引)。
 #[allow(dead_code)]
 pub fn read(photo: &Path) -> Meta {

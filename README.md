@@ -7,9 +7,9 @@
 
 **Official website & download**: <https://www.nicexm.com/maliang/>
 
-**Why this project exists.** Google Picasa was a truly great photo management and editing app — fast, simple, and a joy to use. Sadly, Google discontinued it in 2016; many photo tools have appeared since, but I never found one I truly liked. That's why Maliang (神笔马良) was born: written independently in Rust and released as open source, to carry that classic experience forward and add the capabilities the old tool never had.
+**Why this project exists.** Maliang (神笔马良) was built around a simple goal: make local photo management fast, calm, and private, while keeping everyday browsing, organizing, and editing within reach.
 
-Maliang (神笔马良) is a desktop-first local photo management tool that aims to modernize the classic Picasa 3 experience: smoother browsing, smarter organization, and native, offline, privacy-first AI capabilities. All of your data stays on your own machine — nothing is uploaded to the cloud, and your private photos are never scanned and sent anywhere.
+Maliang (神笔马良) is a desktop-first local photo management tool focused on smoother browsing, smarter organization, and native, offline, privacy-first AI capabilities. All of your data stays on your own machine — nothing is uploaded to the cloud, and your private photos are never scanned and sent anywhere.
 
 If Maliang is useful to you, please consider giving the repo a [⭐ Star](https://github.com/wadereye/Relyto.Maliang/stargazers);
 
@@ -43,7 +43,7 @@ For feature requests or to join the community group, you can email me, or scan m
 ### Editing & Effects
 
 - **Preview editing**: rotate, crop, zoom & pan, curves, exposure, contrast, color temperature, tint, sharpen, blur, grain, vignette, and more — all non-destructive; changes are only baked to disk via F2 save.
-- **One-click effects**: auto contrast / auto color / warm tone / cool tone / positive film / LOMO / backlight compensation and dozens more, aligned with the original Picasa's behavior.
+- **One-click effects**: auto contrast / auto color / warm tone / cool tone / positive film / LOMO / backlight compensation and dozens more, designed for quick and consistent adjustments.
 - **Style filters**: dozens of grouped recipes — film grain, toy camera, instant photo, cinemascope, sixties, pencil sketch, cross process, two-tone, neon, night vision, mat board, rounded corners…
 - **Shader effects**: hexagonal cells, block ripples, circular splatter, crystallize, waterfall, per-channel HSL.
 
@@ -62,8 +62,8 @@ For feature requests or to join the community group, you can email me, or scan m
 
 ### Management & Interoperability
 
-- **Duplicate photo detection**: perceptual hashing finds visually similar photos (beyond the original's capabilities).
-- **Color labels / star ratings**: reads and writes the classic `picasa.ini`, interoperable with the original Picasa.
+- **Duplicate photo detection**: perceptual hashing finds visually similar photos across large libraries.
+- **Color labels / star ratings**: organize and filter photos without touching original files.
 - **XMP mirroring**: edits and metadata are mirrored to XMP for interoperability with other tools.
 - **EXIF / GPS**: reads capture parameters and coordinates, with KML geotag export.
 - **Folder manager**: add/remove watched directories, rescan each one, and clean up missing files.
@@ -76,9 +76,9 @@ For feature requests or to join the community group, you can email me, or scan m
 - Right info drawer: properties / tags / people / places.
 - **Fully local: no network access, no telemetry.**
 
-### Intentionally Not Planned (present in the original Picasa, but not planned for now)
+### Intentionally Not Planned
 
-Advanced retouching workflows (retouch / picnik), collage / poster / CD burning, online sharing (Picasa Web / social platforms / email / printing), TWAIN camera scanning, cloud album sync, and Picasa2 migration.
+Advanced retouching workflows, collage / poster creation, CD burning, online sharing, TWAIN camera scanning, cloud album sync, and legacy photo-library migration.
 
 ## Preview-only formats
 
@@ -292,9 +292,7 @@ If the pack is corrupted, the app automatically falls back to the embedded copy 
 
 ## Trademark & Disclaimer
 
-Picasa is a trademark of Google LLC. This project is an **independent open source implementation** with no affiliation to, and no authorization, sponsorship, or endorsement from, Google LLC.
-
-Maliang is an independently written implementation in Rust; this repository contains and distributes no Google source code, binaries, or asset files. Similarities in interface and interaction design are intended to preserve a familiar experience and to support data interoperability with Picasa (such as the classic `picasa.ini` file format).
+Maliang is an independently developed application. Product and format names are used only to describe compatibility and do not imply affiliation, authorization, sponsorship, or endorsement.
 
 Adobe and Photoshop are trademarks or registered trademarks of Adobe Inc. Mentioning PSD / PSB here describes file-format compatibility only and implies no affiliation, authorization, sponsorship, or endorsement, and makes no claim of Adobe compatibility certification.
 

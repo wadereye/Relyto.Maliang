@@ -124,12 +124,12 @@ pub fn is_media_ext(ext: &str) -> bool {
         || crate::video::MOVIE_EXTS.contains(&ext)
 }
 
-/// 初始化时依次入集的 4 条排除,**不可关**。
+/// 初始化时依次入集的 3 条排除,**不可关**。
 ///
-/// 单独成组而不是混进 [`Exclusions::default`]:这 4 条是硬编码口径,
+/// 单独成组而不是混进 [`Exclusions::default`]:这 3 条是硬编码口径,
 /// 用户设置只能往上加、不能减;把它们命名出来,快路(MFT 展开)与慢路
 /// (walkdir)才可能共用同一份判定而不各自抄一遍。
-pub const HARD_EXCLUDES: [&str; 4] = ["thumbs", "RECYCLER", "Originals", ".picasaoriginals"];
+pub const HARD_EXCLUDES: [&str; 3] = ["thumbs", "RECYCLER", "Originals"];
 
 /// 本项目扩充的**硬**排除:按定义里面不会有用户的照片,任何入口都不放行,
 /// 而且**根本不进库**(见 `db::Store::purge_hard_excluded_once`)。
@@ -179,7 +179,7 @@ pub enum ExcludeLayer {
 
 /// 扫描排除规则(目录名匹配,大小写不敏感)。
 ///
-/// 默认排除列表只有 4 项(见 [`HARD_EXCLUDES`])。
+/// 默认排除列表只有 3 项(见 [`HARD_EXCLUDES`])。
 /// 它不踩系统目录的真正原因是**默认扫描范围极窄**(只登记
 /// 我的文档 / 图片 / 桌面三个壳目录,见 `db::default_roots` 注释),
 /// 而非靠排除规则拦截。
