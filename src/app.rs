@@ -130,6 +130,11 @@ enum WpdEvent {
         /// 用户所选目标目录。
         dir: PathBuf,
     },
+    /// WIA/TWAIN 导入完成(`acq::import_wia` 拿到的落盘路径)。
+    AcqFiles {
+        /// 落盘路径列表或失败原因。
+        result: Result<Vec<PathBuf>, String>,
+    },
 }
 
 /// 批量编辑面板的输入项。
@@ -717,12 +722,16 @@ pub struct App {
     pool_probe_id: i64,
     /// 从设备导入窗口开关。
     show_import_devices: bool,
+    /// Projector Mode(全屏+始终最上)。
+    projector_mode: bool,
     /// 统一设备列表。
     import_devices: Vec<crate::wpd::DeviceEntry>,
     /// 设备枚举提示或失败原因。
     import_devices_err: String,
     /// 设备枚举进行中。
     import_devices_busy: bool,
+    /// 从设备导入窗口:TWAIN 设备名单(尽力而为,避免每帧查询)。
+    import_twain_names: Vec<String>,
     /// WPD 后台事件通道。
     wpd_rx: Option<mpsc::Receiver<WpdEvent>>,
     /// 当前浏览的设备 ID。
@@ -3069,9 +3078,11 @@ impl App {
             fx_trim_id: None,
             pool_probe_id: 0,
             show_import_devices: false,
+            projector_mode: false,
             import_devices: Vec::new(),
             import_devices_err: String::new(),
             import_devices_busy: false,
+            import_twain_names: Vec::new(),
             wpd_rx: None,
             import_device_id: None,
             import_pictures: Vec::new(),
@@ -7179,7 +7190,60 @@ impl App {
     /// 打开统一设备列表窗口并异步刷新。
     fn open_import_devices(&mut self) {
         self.show_import_devices = true;
+        self.import_twain_names = crate::acq::twain_device_names();
         self.refresh_import_devices();
+    }
+
+    /// 切换 Projector Mode(全屏 + 始终最上,可再次点击或 Esc 退出)。
+    fn toggle_projector(&mut self, ctx: &egui::Context) {
+        self.projector_mode = !self.projector_mode;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.projector_mode));
+        let level = if self.projector_mode {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        self.status = if self.projector_mode {
+            t("Projector Mode 已开启,再次点击或按 Esc 退出").into()
+        } else {
+            t("Projector Mode 已关闭").into()
+        };
+    }
+
+    /// Esc 在 Projector Mode 时关闭(由 update 顶部调用)。
+    fn maybe_leave_projector(&mut self, ctx: &egui::Context) {
+        if self.projector_mode && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.toggle_projector(ctx);
+        }
+    }
+
+    /// 从 WIA 扫描器/相机导入照片(后台线程调用系统对话框)。
+    fn acq_import_wia(&mut self) {
+        if self.wpd_rx.is_some() {
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title(t("选择导入目标目录"))
+            .pick_folder()
+        else {
+            return;
+        };
+        self.import_devices_err.clear();
+        let (tx, rx) = mpsc::channel();
+        self.wpd_rx = Some(rx);
+        self.import_devices_busy = true;
+        std::thread::spawn(move || {
+            let r = crate::acq::import_wia(&dir).map_err(|e| e.to_string());
+            let _ = tx.send(WpdEvent::AcqFiles { result: r });
+        });
+    }
+
+    /// TWAIN 导入:系统确认暂未实现,此处只给出诚实提示。
+    fn acq_twain_notice(&mut self) {
+        if let Err(e) = crate::acq::import_twain(std::path::Path::new(".")) {
+            self.import_devices_err = e.to_string();
+        }
     }
 
     /// 后台枚举 WPD 设备与可移动卷。
@@ -7380,6 +7444,22 @@ impl App {
                             ],
                         )
                     };
+                }
+                WpdEvent::AcqFiles { result } => {
+                    self.import_devices_busy = false;
+                    self.wpd_rx = None;
+                    match result {
+                        Ok(paths) if !paths.is_empty() => {
+                            self.import_devices_err.clear();
+                            self.start_scan_roots(paths, t("设备导入"));
+                        }
+                        Ok(_) => {
+                            self.status = t("未导入任何照片(取消或无照片)").into();
+                        }
+                        Err(e) => {
+                            self.import_devices_err = e;
+                        }
+                    }
                 }
             }
         }
@@ -14579,6 +14659,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.maybe_leave_projector(ctx);
         // 先给整帧铺一层底色:面板之间万一留出空隙,也不会露出窗口的黑色清屏色。
         // 这一层画在最底层,所有面板照常盖在上面。
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
@@ -15734,6 +15815,17 @@ impl eframe::App for App {
                         ui.separator();
                         if ui.button(t("文件夹管理器…")).clicked() {
                             self.open_folder_mgr();
+                            ui.close();
+                        }
+                        if ui
+                            .button(if self.projector_mode {
+                                t("退出 Projector Mode")
+                            } else {
+                                t("Projector Mode")
+                            })
+                            .clicked()
+                        {
+                            self.toggle_projector(ui.ctx());
                             ui.close();
                         }
                         let mut watching = self.watch_on.load(Ordering::SeqCst);
@@ -16921,6 +17013,29 @@ impl eframe::App for App {
                             self.start_scan_roots(vec![root], t("设备导入"));
                             self.show_import_devices = false;
                         }
+                    }
+                    // WIA/TWAIN 扫描器段:WIA 用系统对话框 + 落盘扫描;TWAIN 目前诚实提示未实现。
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.wpd_rx.is_none(),
+                                egui::Button::new(t("从 WIA 导入照片…")),
+                            )
+                            .clicked()
+                        {
+                            self.acq_import_wia();
+                        }
+                        if ui.button(t("TWAIN 导入…")).clicked() {
+                            self.acq_twain_notice();
+                        }
+                    });
+                    if !self.import_twain_names.is_empty() {
+                        let names = self.import_twain_names.clone();
+                        ui.small(t_with(
+                            "已注册 TWAIN 扫描仪:{p1}",
+                            &[("p1", names.join("、"))],
+                        ));
                     }
                     if let Some(device_id) = self.import_device_id.clone() {
                         ui.separator();
