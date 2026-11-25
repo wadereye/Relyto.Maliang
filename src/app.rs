@@ -76,6 +76,48 @@ impl PageKind {
     }
 }
 
+/// WPD 后台工作线程返回给 UI 的事件。
+enum WpdEvent {
+    /// 设备枚举完成。
+    Devices(Result<Vec<crate::wpd::DeviceEntry>, String>),
+    /// 指定设备的照片枚举完成。
+    Pictures {
+        /// 请求对应的设备 ID。
+        device_id: String,
+        /// 照片列表或失败原因。
+        result: Result<Vec<crate::wpd::WpdObject>, String>,
+    },
+    /// 开始复制一张照片。
+    ImportStarted {
+        /// 从 1 开始的序号。
+        index: usize,
+        /// 本次选中总数。
+        total: usize,
+        /// 设备文件名。
+        name: String,
+    },
+    /// 一张照片复制结束。
+    Imported {
+        /// 从 1 开始的序号。
+        index: usize,
+        /// 本次选中总数。
+        total: usize,
+        /// 设备文件名。
+        name: String,
+        /// 最终路径或失败原因。
+        result: Result<PathBuf, String>,
+    },
+    /// 全部选中照片已逐条处理。
+    ImportFinished {
+        /// 成功数量。
+        imported: usize,
+        /// 失败数量。
+        failed: usize,
+        /// 用户所选目标目录。
+        dir: PathBuf,
+    },
+}
+
 /// 批量编辑面板的输入项。
 #[derive(Debug, Clone, Default)]
 pub struct BatchOps {
@@ -659,10 +701,38 @@ pub struct App {
     fx_trim_id: Option<i64>,
     /// 字符串池诊断用的探针 id(配合 `pool_maintenance_ui` 的查询按钮)。
     pool_probe_id: i64,
-    /// 从设备导入窗口开关 + 统一设备列表(懒枚举,打开窗口时刷新)。
+    /// 从设备导入窗口开关。
     show_import_devices: bool,
+    /// 统一设备列表。
     import_devices: Vec<crate::wpd::DeviceEntry>,
+    /// 设备枚举提示或失败原因。
     import_devices_err: String,
+    /// 设备枚举进行中。
+    import_devices_busy: bool,
+    /// WPD 后台事件通道。
+    wpd_rx: Option<mpsc::Receiver<WpdEvent>>,
+    /// 当前浏览的设备 ID。
+    import_device_id: Option<String>,
+    /// 当前设备的照片列表。
+    import_pictures: Vec<crate::wpd::WpdObject>,
+    /// 已勾选照片的下标。
+    import_selected: BTreeSet<usize>,
+    /// 照片枚举进行中。
+    import_pictures_busy: bool,
+    /// 照片枚举失败原因。
+    import_pictures_err: String,
+    /// 用户选定的导入目录。
+    import_dest: Option<PathBuf>,
+    /// 逐条复制进行中。
+    import_transfer_busy: bool,
+    /// 当前进度与总数。
+    import_progress: Option<(usize, usize)>,
+    /// 当前正在复制的文件名。
+    import_current: String,
+    /// 本次已成功数量。
+    import_imported: usize,
+    /// 本次逐条失败的文件名与原因。
+    import_failures: Vec<(String, String)>,
     #[cfg(feature = "ai")]
     ocr_rx: Option<mpsc::Receiver<Result<(i64, Vec<crate::ai::ocr::Txt>), String>>>,
     #[cfg(feature = "ai")]
@@ -2987,6 +3057,19 @@ impl App {
             show_import_devices: false,
             import_devices: Vec::new(),
             import_devices_err: String::new(),
+            import_devices_busy: false,
+            wpd_rx: None,
+            import_device_id: None,
+            import_pictures: Vec::new(),
+            import_selected: BTreeSet::new(),
+            import_pictures_busy: false,
+            import_pictures_err: String::new(),
+            import_dest: None,
+            import_transfer_busy: false,
+            import_progress: None,
+            import_current: String::new(),
+            import_imported: 0,
+            import_failures: Vec::new(),
             status: t("就绪").into(),
             dups: Vec::new(),
             dups_dirty: true,
@@ -7090,20 +7173,227 @@ impl App {
         }
     }
 
-    /// 文件 > 导入 > 从设备(相机/手机):打开统一设备列表窗口。
-    ///
-    /// WPD 设备 + 可移动卷合成一个统一列表。
-    /// 枚举在**打开时**做一次(懒),之后靠热插拔事件失效缓存。
+    /// 打开统一设备列表窗口并异步刷新。
     fn open_import_devices(&mut self) {
-        self.refresh_import_devices();
         self.show_import_devices = true;
+        self.refresh_import_devices();
     }
 
-    /// 重新枚举设备(WPD 失败不中断 —— 只清标志,继续用盘符卷通道)。
+    /// 后台枚举 WPD 设备与可移动卷。
     fn refresh_import_devices(&mut self) {
-        let out = crate::wpd::devices_unified();
-        self.import_devices_err = String::new();
-        self.import_devices = out;
+        if self.wpd_rx.is_some() {
+            return;
+        }
+        self.import_devices_busy = true;
+        self.import_devices_err.clear();
+        let (tx, rx) = mpsc::channel();
+        self.wpd_rx = Some(rx);
+        std::thread::spawn(move || {
+            let _ = tx.send(WpdEvent::Devices(Ok(crate::wpd::devices_unified())));
+        });
+    }
+
+    /// 后台读取一台便携设备的照片列表。
+    fn browse_import_device(&mut self, device_id: String) {
+        if self.wpd_rx.is_some() {
+            return;
+        }
+        self.import_device_id = Some(device_id.clone());
+        self.import_pictures.clear();
+        self.import_selected.clear();
+        self.import_pictures_busy = true;
+        self.import_pictures_err.clear();
+        self.import_dest = None;
+        self.import_imported = 0;
+        self.import_failures.clear();
+        let (tx, rx) = mpsc::channel();
+        self.wpd_rx = Some(rx);
+        std::thread::spawn(move || {
+            let result = crate::wpd::list_pictures(&device_id).map_err(|e| e.to_string());
+            let _ = tx.send(WpdEvent::Pictures {
+                device_id,
+                result,
+            });
+        });
+    }
+
+    /// 后台逐条复制已选照片,单条失败不中断。
+    fn start_wpd_import(&mut self, dir: PathBuf) {
+        if self.wpd_rx.is_some() || self.import_transfer_busy {
+            return;
+        }
+        let Some(device_id) = self.import_device_id.clone() else {
+            return;
+        };
+        let pictures: Vec<crate::wpd::WpdObject> = self
+            .import_selected
+            .iter()
+            .filter_map(|index| self.import_pictures.get(*index).cloned())
+            .collect();
+        if pictures.is_empty() {
+            return;
+        }
+        let total = pictures.len();
+        self.import_dest = Some(dir.clone());
+        self.import_transfer_busy = true;
+        self.import_progress = Some((0, total));
+        self.import_current.clear();
+        self.import_imported = 0;
+        self.import_failures.clear();
+        self.status = t_with(
+            "正在从设备导入 {p1} 张照片…",
+            &[("p1", total.to_string())],
+        );
+        let (tx, rx) = mpsc::channel();
+        self.wpd_rx = Some(rx);
+        std::thread::spawn(move || {
+            let mut imported = 0usize;
+            let mut failed = 0usize;
+            for (offset, picture) in pictures.into_iter().enumerate() {
+                let index = offset + 1;
+                let _ = tx.send(WpdEvent::ImportStarted {
+                    index,
+                    total,
+                    name: picture.name.clone(),
+                });
+                let result = crate::wpd::fetch(&device_id, &picture.id, &dir)
+                    .map_err(|e| e.to_string());
+                match &result {
+                    Ok(_) => imported += 1,
+                    Err(_) => failed += 1,
+                }
+                let _ = tx.send(WpdEvent::Imported {
+                    index,
+                    total,
+                    name: picture.name,
+                    result,
+                });
+            }
+            let _ = tx.send(WpdEvent::ImportFinished {
+                imported,
+                failed,
+                dir,
+            });
+        });
+    }
+
+    /// 消化 WPD 后台事件并请求下一次重绘。
+    fn pump_wpd(&mut self, ctx: &egui::Context) {
+        let mut events = Vec::new();
+        let mut disconnected = false;
+        if let Some(rx) = &self.wpd_rx {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => events.push(event),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        let had_events = !events.is_empty();
+        for event in events {
+            match event {
+                WpdEvent::Devices(result) => {
+                    self.import_devices_busy = false;
+                    self.wpd_rx = None;
+                    match result {
+                        Ok(devices) => {
+                            self.import_devices = devices;
+                            self.import_devices_err = if self.import_devices.is_empty() {
+                                t("未发现便携设备(请确认手机已切换「传输照片」模式)").into()
+                            } else {
+                                String::new()
+                            };
+                        }
+                        Err(e) => self.import_devices_err = e,
+                    }
+                }
+                WpdEvent::Pictures { device_id, result } => {
+                    self.import_pictures_busy = false;
+                    self.wpd_rx = None;
+                    if self.import_device_id.as_deref() != Some(device_id.as_str()) {
+                        continue;
+                    }
+                    match result {
+                        Ok(pictures) => self.import_pictures = pictures,
+                        Err(e) => {
+                            self.import_pictures.clear();
+                            self.import_pictures_err = e.clone();
+                            self.status = t_with("读取设备照片失败: {e}", &[("e", e)]);
+                        }
+                    }
+                }
+                WpdEvent::ImportStarted { index, total, name } => {
+                    self.import_progress = Some((index, total));
+                    self.import_current = name;
+                }
+                WpdEvent::Imported {
+                    index,
+                    total,
+                    name,
+                    result,
+                } => {
+                    self.import_progress = Some((index, total));
+                    self.import_current.clear();
+                    match result {
+                        Ok(_) => self.import_imported += 1,
+                        Err(e) => self.import_failures.push((name, e)),
+                    }
+                }
+                WpdEvent::ImportFinished { imported, failed, dir } => {
+                    self.import_transfer_busy = false;
+                    self.import_progress = None;
+                    self.import_current.clear();
+                    self.wpd_rx = None;
+                    self.import_imported = imported;
+                    if imported > 0 {
+                        let path = dir.to_string_lossy().into_owned();
+                        if self.include_dir(
+                            &path,
+                            crate::db::INTENT_IMPORTED,
+                            crate::db::SRC_IMPORT,
+                        ) {
+                            self.start_scan_roots(vec![dir.clone()], t("设备导入"));
+                        }
+                    }
+                    self.status = if failed == 0 {
+                        t_with(
+                            "已导入 {p1} 张到 {p2}",
+                            &[
+                                ("p1", imported.to_string()),
+                                ("p2", dir.display().to_string()),
+                            ],
+                        )
+                    } else {
+                        t_with(
+                            "已导入 {p1} 张到 {p2};{p3} 个文件传输失败",
+                            &[
+                                ("p1", imported.to_string()),
+                                ("p2", dir.display().to_string()),
+                                ("p3", failed.to_string()),
+                            ],
+                        )
+                    };
+                }
+            }
+        }
+        if disconnected && self.wpd_rx.is_some() {
+            self.wpd_rx = None;
+            self.import_devices_busy = false;
+            self.import_pictures_busy = false;
+            self.import_transfer_busy = false;
+            self.import_progress = None;
+            self.import_pictures_err = t("WPD 后台任务意外中断").into();
+        }
+        if had_events {
+            ctx.request_repaint();
+        }
+        if self.wpd_rx.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
+        }
     }
 
     /// 工具 > 文件夹管理器:打开窗口并刷新列表。
@@ -14348,6 +14638,7 @@ impl eframe::App for App {
                 }
             }
         }
+        self.pump_wpd(ctx);
         // 轮询扫描结果
         if let Some(rx) = &self.scan_rx {
             if let Ok(r) = rx.try_recv() {
@@ -16539,59 +16830,209 @@ impl eframe::App for App {
         // 从设备导入窗口(统一设备列表)。
         if self.show_import_devices {
             let mut open = self.show_import_devices;
+            let mut browse_request: Option<String> = None;
+            let mut import_request: Option<PathBuf> = None;
             egui::Window::new(t("从设备导入"))
                 .open(&mut open)
-                .default_width(520.0)
+                .default_width(620.0)
                 .show(ctx, |ui| {
-                    ui.small(
-                        t("WPD 便携设备(相机/手机)+ 可移动磁盘统一列表"),
-                    );
+                    ui.small(t("WPD 便携设备(相机/手机)+ 可移动磁盘统一列表"));
                     ui.horizontal(|ui| {
-                        if ui.button(t("刷新")).clicked() {
+                        if ui
+                            .add_enabled(
+                                self.wpd_rx.is_none(),
+                                egui::Button::new(t("刷新")),
+                            )
+                            .clicked()
+                        {
                             self.refresh_import_devices();
                         }
                         ui.small(t_with("共 {p1} 台(便携 {p2} + 磁盘 {p3})", &[("p1", (self.import_devices.len()).to_string()), ("p2", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Portable(_))).count()).to_string()), ("p3", (self.import_devices.iter().filter(|d| matches!(d, crate::wpd::DeviceEntry::Volume(_))).count()).to_string())]));
                     });
+                    if self.import_devices_busy {
+                        ui.small(t("正在读取设备清单…"));
+                    }
                     if !self.import_devices_err.is_empty() {
-                        ui.colored_label(ui.visuals().error_fg_color, self.import_devices_err.clone());
+                        ui.colored_label(
+                            ui.visuals().error_fg_color,
+                            self.import_devices_err.clone(),
+                        );
                     }
                     ui.separator();
-                    if self.import_devices.is_empty() {
+                    if self.import_devices.is_empty() && !self.import_devices_busy {
                         crate::theme::empty_state(ui, t("未发现设备。接入相机/手机(U 盘、SD 卡读卡器也可以),或点「刷新」重新枚举。"));
                         ui.small(t("提示:WPD 服务不可用时只显示盘符卷(WPD 设备枚举尽力而为)。"));
                     } else {
-                        // 索引先行:避免闭包里同时借 self.import_devices 和 self.store
                         let entries: Vec<crate::wpd::DeviceEntry> = self.import_devices.clone();
-                        // 用户点「扫描此卷」先记下来,循环结束后再执行
-                        // (egui 闭包里不能同时借列表与 &mut self)。
-                        let mut scan_request: Option<std::path::PathBuf> = None;
-                        egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
-                            for d in &entries {
-                                ui.horizontal(|ui| {
-                                    ui.small(d.kind());
-                                    ui.label(d.display_name());
-                                    match d {
-                                        crate::wpd::DeviceEntry::Portable(w) => {
-                                            ui.small(w.device_id.clone());
-                                        }
-                                        crate::wpd::DeviceEntry::Volume(p) => {
-                                            if ui.button(t("扫描此卷")).clicked() {
-                                                scan_request = Some(p.clone());
+                        let mut scan_request: Option<PathBuf> = None;
+                        egui::ScrollArea::vertical()
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for device in &entries {
+                                    ui.horizontal(|ui| {
+                                        ui.small(device.kind());
+                                        ui.label(device.display_name());
+                                        match device {
+                                            crate::wpd::DeviceEntry::Portable(wpd) => {
+                                                ui.small(wpd.device_id.clone());
+                                                if ui
+                                                    .add_enabled(
+                                                        self.wpd_rx.is_none(),
+                                                        egui::Button::new(t("浏览照片…")),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    browse_request = Some(wpd.device_id.clone());
+                                                }
+                                            }
+                                            crate::wpd::DeviceEntry::Volume(path) => {
+                                                if ui.button(t("扫描此卷")).clicked() {
+                                                    scan_request = Some(path.clone());
+                                                }
                                             }
                                         }
-                                    }
-                                });
-                            }
-                        });
+                                    });
+                                }
+                            });
                         if let Some(root) = scan_request {
                             self.start_scan_roots(vec![root], t("设备导入"));
                             self.show_import_devices = false;
                         }
+                    }
+                    if let Some(device_id) = self.import_device_id.clone() {
                         ui.separator();
-                        ui.small(t("便携设备(MTP/PTP)的照片传输需 WPD 对象流,当前版本未实现—— U 盘/读卡器请用「扫描此卷」。"));
+                        ui.strong(t_with("设备照片:{p1}", &[("p1", device_id)]));
+                        if self.import_pictures_busy {
+                            ui.small(t("正在读取设备照片…"));
+                        }
+                        if !self.import_pictures_err.is_empty() {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                self.import_pictures_err.clone(),
+                            );
+                        }
+                        if self.import_pictures.is_empty()
+                            && !self.import_pictures_busy
+                            && self.import_pictures_err.is_empty()
+                        {
+                            crate::theme::empty_state(ui, t("设备中未发现照片"));
+                        }
+                        if !self.import_pictures.is_empty() {
+                            let pictures = self.import_pictures.clone();
+                            ui.horizontal(|ui| {
+                                if ui.button(t("全选")).clicked() {
+                                    self.import_selected = pictures
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, picture)| picture.is_image)
+                                        .map(|(index, _)| index)
+                                        .collect();
+                                }
+                                if ui.button(t("清除选择")).clicked() {
+                                    self.import_selected.clear();
+                                }
+                                ui.small(t_with(
+                                    "已选 {p1}/{p2} 张",
+                                    &[
+                                        ("p1", self.import_selected.len().to_string()),
+                                        ("p2", pictures.len().to_string()),
+                                    ],
+                                ));
+                            });
+                            egui::ScrollArea::vertical()
+                                .max_height(240.0)
+                                .show(ui, |ui| {
+                                    for (index, picture) in pictures.iter().enumerate() {
+                                        let mut selected = self.import_selected.contains(&index);
+                                        ui.horizontal(|ui| {
+                                            if ui.checkbox(&mut selected, &picture.name).changed() {
+                                                if selected {
+                                                    self.import_selected.insert(index);
+                                                } else {
+                                                    self.import_selected.remove(&index);
+                                                }
+                                            }
+                                            ui.small(format!(
+                                                "{:.1} MiB",
+                                                picture.size as f64 / (1024.0 * 1024.0)
+                                            ));
+                                        });
+                                    }
+                                });
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        self.wpd_rx.is_none() && !self.import_selected.is_empty(),
+                                        egui::Button::new(t("导入到文件夹…")),
+                                    )
+                                    .clicked()
+                                {
+                                    if let Some(dir) = rfd::FileDialog::new()
+                                        .set_title(t("选择设备照片导入目录"))
+                                        .pick_folder()
+                                    {
+                                        import_request = Some(dir);
+                                    }
+                                }
+                                if let Some(dir) = &self.import_dest {
+                                    ui.small(t_with(
+                                        "目标文件夹:{p1}",
+                                        &[("p1", dir.display().to_string())],
+                                    ));
+                                }
+                            });
+                        }
+                        if self.import_transfer_busy {
+                            if let Some((done, total)) = self.import_progress {
+                                ui.small(t_with(
+                                    "正在导入 {p1}/{p2}: {p3}",
+                                    &[
+                                        ("p1", done.to_string()),
+                                        ("p2", total.to_string()),
+                                        ("p3", self.import_current.clone()),
+                                    ],
+                                ));
+                            }
+                        } else if self.import_dest.is_some()
+                            && (self.import_imported > 0 || !self.import_failures.is_empty())
+                        {
+                            ui.small(t_with(
+                                "已导入 {p1} 张到 {p2}",
+                                &[
+                                    ("p1", self.import_imported.to_string()),
+                                    ("p2", self
+                                        .import_dest
+                                        .as_ref()
+                                        .map(|p| p.display().to_string())
+                                        .unwrap_or_default()),
+                                ],
+                            ));
+                        }
+                        if !self.import_failures.is_empty() {
+                            ui.colored_label(
+                                ui.visuals().error_fg_color,
+                                t_with(
+                                    "{p1} 个文件传输失败",
+                                    &[("p1", self.import_failures.len().to_string())],
+                                ),
+                            );
+                            egui::ScrollArea::vertical()
+                                .max_height(80.0)
+                                .show(ui, |ui| {
+                                    for (name, error) in &self.import_failures {
+                                        ui.small(format!("{name}: {error}"));
+                                    }
+                                });
+                        }
                     }
                 });
             self.show_import_devices = open;
+            if let Some(device_id) = browse_request {
+                self.browse_import_device(device_id);
+            }
+            if let Some(dir) = import_request {
+                self.start_wpd_import(dir);
+            }
         }
 
         // 邮件发送窗口(尺寸档 1600/1024/800)。

@@ -89,6 +89,7 @@ mod ai_caption;
 
 use crate::i18n::{t, t_with};
 use eframe::egui;
+use std::path::Path;
 use std::sync::Arc;
 
 /// 起服务前同步机器级标记;写不动只警告不拦启动(口径同安装时)。
@@ -413,6 +414,80 @@ fn handle_cli(args: &[String]) -> bool {
             }
             true
         }
+        // WPD 通路探针:不带设备 ID 时列设备,带上时列照片对象。
+        "--wpd-list" => {
+            let devices = match crate::wpd::portable_devices() {
+                Ok(devices) => devices,
+                Err(e) => {
+                    eprintln!("{}", t_with("WPD 设备枚举失败:{e}", &[("e", e.to_string())]));
+                    std::process::exit(1);
+                }
+            };
+            if devices.is_empty() {
+                eprintln!("{}", t("未发现便携设备(请确认手机已切换「传输照片」模式)"));
+                std::process::exit(1);
+            }
+            if let Some(device_id) = args.get(1) {
+                if !devices.iter().any(|d| d.device_id == *device_id) {
+                    eprintln!("{}", t("未发现便携设备(请确认手机已切换「传输照片」模式)"));
+                    std::process::exit(1);
+                }
+                let pictures = match crate::wpd::list_pictures(device_id) {
+                    Ok(pictures) => pictures,
+                    Err(e) => {
+                        eprintln!("{}", t_with("WPD 照片枚举失败:{e}", &[("e", e.to_string())]));
+                        std::process::exit(1);
+                    }
+                };
+                println!(
+                    "{}",
+                    t_with(
+                        "设备:{p1}\n照片数:{p2}",
+                        &[("p1", device_id.clone()), ("p2", pictures.len().to_string())]
+                    )
+                );
+                for picture in pictures {
+                    println!("{}\t{}\t{}", picture.id, picture.name, picture.size);
+                }
+            } else {
+                println!(
+                    "{}",
+                    t_with("便携设备数:{p1}", &[("p1", devices.len().to_string())])
+                );
+                for device in devices {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        device.device_id, device.friendly_name, device.manufacturer, device.description
+                    );
+                }
+            }
+            true
+        }
+        // WPD 通路探针:把单个照片对象复制到指定目录。
+        "--wpd-get" => {
+            let (Some(device_id), Some(object_id), Some(dest)) =
+                (args.get(1), args.get(2), args.get(3))
+            else {
+                eprintln!("{}", t("用法:--wpd-get <设备 ID> <对象 ID> <目标目录>"));
+                std::process::exit(1);
+            };
+            let path = match crate::wpd::fetch(device_id, object_id, Path::new(dest)) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("{}", t_with("WPD 照片复制失败:{e}", &[("e", e.to_string())]));
+                    std::process::exit(1);
+                }
+            };
+            let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "{}",
+                t_with(
+                    "已复制 {p1} 字节 -> {p2}",
+                    &[("p1", bytes.to_string()), ("p2", path.display().to_string())]
+                )
+            );
+            true
+        }
         // 人工验证更新配置:只查清单、不下载、不改程序文件。
         "--check-update" => {
             if let Err(e) = update::cli_check() {
@@ -462,6 +537,8 @@ fn handle_cli(args: &[String]) -> bool {
                 ("--help / -h", t("显示本帮助")),
                 ("--check-update", t("检查更新")),
                 ("--download-update", t("下载更新包")),
+                ("--wpd-list [设备 ID]", t("枚举便携设备或照片")),
+                ("--wpd-get <设备 ID> <对象 ID> <目录>", t("复制单张设备照片")),
                 ("--install-service", t("安装索引服务")),
                 ("--uninstall-service", t("卸载索引服务")),
                 ("--start-service", t("启动索引服务")),
@@ -511,13 +588,15 @@ fn main() -> eframe::Result {
     #[cfg(feature = "ai")]
     crate::ai::pre_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // 更新相关的子命令都不碰数据库,没必要先做分钟级的数据目录迁移。
-    let is_update_helper = matches!(
+    // 更新与 WPD 探针不访问图库,跳过数据目录迁移。
+    let skip_data_migration = matches!(
         args.first().map(String::as_str),
         Some("--apply-update")
             | Some("--restore-service")
             | Some("--check-update")
             | Some("--download-update")
+            | Some("--wpd-list")
+            | Some("--wpd-get")
             | Some("--version")
             | Some("--help")
             | Some("-h")
@@ -527,7 +606,7 @@ fn main() -> eframe::Result {
     // 否则 --check-update 会在迁移前读到空配置。
     crate::db::migrate_legacy_configs();
     // 数据目录 pending 迁移必须先于一切打开库/索引的动作(包括命令行子命令)。
-    if !is_update_helper {
+    if !skip_data_migration {
         crate::db::migrate_pending_data();
     }
     // 服务模式由 SCM 在 session 0 拉起:那里没有父终端可挂,日志走数据目录下的
