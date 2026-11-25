@@ -450,22 +450,319 @@ mod win {
     }
 }
 
+/// 按固定优先级选择可用的邮件客户端。
+#[cfg(any(not(windows), test))]
+pub fn pick_launcher(lookup: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+    ["xdg-email", "thunderbird", "geary"]
+        .into_iter()
+        .find(|name| lookup(name))
+}
+
+/// 按固定优先级选择可用的光盘写入工具。
+#[cfg(any(not(windows), test))]
+pub fn pick_burn_tool(lookup: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+    ["growisofs", "wodim", "xorriso"]
+        .into_iter()
+        .find(|name| lookup(name))
+}
+
+#[cfg(any(not(windows), test))]
+fn percent_encode(value: &str, preserve_slash: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(byte, b'-' | b'_' | b'.' | b'~' | b'@')
+            || (preserve_slash && *byte == b'/')
+        {
+            out.push(char::from(*byte));
+        } else {
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
+}
+
+#[cfg(any(not(windows), test))]
+fn mailto_uri(to: &[String], subject: &str) -> String {
+    let mut uri = format!("mailto:{}", to.join(",").replace('\'', "%27"));
+    if !subject.is_empty() {
+        uri.push_str("?subject=");
+        uri.push_str(&percent_encode(subject, false));
+    }
+    uri
+}
+
+/// 生成邮件客户端参数,保留收件人、主题与附件。
+#[cfg(any(not(windows), test))]
+pub fn build_mail_args(
+    cmd: &str,
+    to: &[String],
+    subject: &str,
+    files: &[PathBuf],
+) -> Vec<String> {
+    match cmd {
+        "xdg-email" => {
+            let mut args = vec!["--utf8".to_string(), "--subject".to_string(), subject.to_string()];
+            for file in files {
+                args.push("--attach".to_string());
+                args.push(file.to_string_lossy().into_owned());
+            }
+            if !to.is_empty() {
+                args.push("--".to_string());
+                args.extend(to.iter().cloned());
+            }
+            args
+        }
+        "thunderbird" if files.is_empty() => vec![mailto_uri(to, subject)],
+        "thunderbird" => {
+            let mut compose = format!(
+                "to='{}',subject='{}'",
+                to.join(",").replace('\'', "%27"),
+                percent_encode(subject, false)
+            );
+            if !files.is_empty() {
+                let attachments = files
+                    .iter()
+                    .map(|file| {
+                        format!(
+                            "file://{}",
+                            percent_encode(&file.to_string_lossy(), true)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                compose.push_str(&format!(",attachment='{attachments}'"));
+            }
+            vec!["-compose".to_string(), compose]
+        }
+        "geary" => vec![mailto_uri(to, subject)],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(any(not(windows), test))]
+fn ensure_mail_attachments_supported(cmd: &str, files: &[PathBuf]) -> Result<()> {
+    if cmd == "geary" && !files.is_empty() {
+        return Err(anyhow!(t("Geary 不支持命令行附件,请改用其他邮件客户端")));
+    }
+    Ok(())
+}
+
+#[cfg(any(not(windows), test))]
+fn ensure_burn_source_supported(tool: &str, iso_or_dir: &Path) -> Result<()> {
+    if tool == "wodim" && iso_or_dir.is_dir() {
+        return Err(anyhow!(t(
+            "wodim 只能写入 ISO 镜像,请安装 growisofs 或 xorriso"
+        )));
+    }
+    Ok(())
+}
+
+/// 生成光盘写入工具参数,目录由支持该模式的工具直接写入。
+#[cfg(any(not(windows), test))]
+pub fn build_burn_args(tool: &str, iso_or_dir: &Path, device: &str) -> Vec<String> {
+    let path = iso_or_dir.to_string_lossy();
+    match tool {
+        "growisofs" if iso_or_dir.is_dir() => vec![
+            "-Z".to_string(),
+            device.to_string(),
+            "-R".to_string(),
+            "-J".to_string(),
+            path.into_owned(),
+        ],
+        "growisofs" => vec!["-Z".to_string(), format!("{device}={path}")],
+        "wodim" => vec![
+            "-v".to_string(),
+            format!("dev={device}"),
+            path.into_owned(),
+        ],
+        "xorriso" if iso_or_dir.is_dir() => vec![
+            "-outdev".to_string(),
+            device.to_string(),
+            "-blank".to_string(),
+            "as_needed".to_string(),
+            "-map".to_string(),
+            path.into_owned(),
+            "/".to_string(),
+            "-commit".to_string(),
+        ],
+        "xorriso" => vec![
+            "-as".to_string(),
+            "cdrecord".to_string(),
+            "-v".to_string(),
+            format!("dev={device}"),
+            "blank=as_needed".to_string(),
+            path.into_owned(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
 #[cfg(windows)]
 pub use win::{burn_folder, send_email};
 
 #[cfg(not(windows))]
-pub fn send_email(_subject: &str, _to: &[String], _files: &[PathBuf]) -> Result<()> {
-    Err(anyhow!(t("邮件发送仅支持 Windows(Simple MAPI)")))
+fn which_in_path(name: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths).any(|dir| dir.join(name).is_file())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(not(windows))]
-pub fn burn_folder(_staging: &Path, _label: &str, _client: &str) -> Result<()> {
-    Err(anyhow!(t("刻录仅支持 Windows(IMAPI2)")))
+pub fn send_email(subject: &str, files: &[PathBuf], to: &[String]) -> Result<()> {
+    if files.is_empty() {
+        return Err(anyhow!(t("没有附件")));
+    }
+    let addrs = normalize_recipients(to);
+    let Some(cmd) = pick_launcher(&which_in_path) else {
+        return Err(anyhow!(t(
+            "未找到邮件客户端(需 xdg-email / thunderbird / geary)"
+        )));
+    };
+    ensure_mail_attachments_supported(cmd, files)?;
+    std::process::Command::new(cmd)
+        .args(build_mail_args(cmd, &addrs, subject, files))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow!(
+                "{}",
+                t_with(
+                    "启动邮件客户端失败:{cmd}: {e}",
+                    &[("cmd", cmd.to_string()), ("e", e.to_string())]
+                )
+            )
+        })
+}
+
+#[cfg(not(windows))]
+pub fn burn_folder(staging: &Path, _label: &str, _client: &str) -> Result<()> {
+    let Some(tool) = pick_burn_tool(&which_in_path) else {
+        return Err(anyhow!(t(
+            "未找到光盘写入工具(growisofs / wodim / xorriso)"
+        )));
+    };
+    ensure_burn_source_supported(tool, staging)?;
+    let device = std::env::var_os("CDR_DEVICE")
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/dev/sr0".to_string());
+    std::process::Command::new(tool)
+        .args(build_burn_args(tool, staging, &device))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            anyhow!(
+                "{}",
+                t_with(
+                    "启动光盘写入工具失败:{cmd}: {e}",
+                    &[("cmd", tool.to_string()), ("e", e.to_string())]
+                )
+            )
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_candidates_are_ordered_and_arg_sets_differ() {
+        assert_eq!(pick_launcher(&|n| n == "thunderbird"), Some("thunderbird"));
+        assert_eq!(pick_launcher(&|_| false), None);
+        let a = build_mail_args(
+            "xdg-email",
+            &["x@y.z".into()],
+            "副 本",
+            &[PathBuf::from("/t/1.jpg")],
+        );
+        assert_eq!(
+            a,
+            vec![
+                "--utf8",
+                "--subject",
+                "副 本",
+                "--attach",
+                "/t/1.jpg",
+                "--",
+                "x@y.z",
+            ]
+        );
+        let b = build_mail_args("thunderbird", &["x@y.z".into()], "副本", &[]);
+        assert!(b.iter().any(|s| s == "mailto:x@y.z?subject=%E5%89%AF%E6%9C%AC"));
+    }
+
+    #[test]
+    fn thunderbird_compose_keeps_attachments_and_geary_reports_limit() {
+        let args = build_mail_args(
+            "thunderbird",
+            &["x@y.z".into(), "a@b.c".into()],
+            "副 本",
+            &[PathBuf::from("/t/1.jpg"), PathBuf::from("/t/2.jpg")],
+        );
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "-compose");
+        assert_eq!(
+            args[1],
+            "to='x@y.z,a@b.c',subject='%E5%89%AF%20%E6%9C%AC',attachment='file:///t/1.jpg,file:///t/2.jpg'"
+        );
+        let err = ensure_mail_attachments_supported("geary", &[PathBuf::from("/t/1.jpg")])
+            .unwrap_err();
+        assert!(err.to_string().contains("Geary"));
+        assert!(ensure_mail_attachments_supported("geary", &[]).is_ok());
+    }
+
+    #[test]
+    fn burn_tool_prefers_growisofs_and_builds_documented_args() {
+        assert_eq!(
+            pick_burn_tool(&|n| n == "wodim" || n == "growisofs"),
+            Some("growisofs")
+        );
+        assert_eq!(pick_burn_tool(&|_| false), None);
+        assert_eq!(
+            build_burn_args("growisofs", Path::new("."), "/dev/sr0"),
+            vec!["-Z", "/dev/sr0", "-R", "-J", "."]
+        );
+        assert_eq!(
+            build_burn_args("growisofs", Path::new("/t/image.iso"), "/dev/sr0"),
+            vec!["-Z", "/dev/sr0=/t/image.iso"]
+        );
+        assert_eq!(
+            build_burn_args("wodim", Path::new("/t/image.iso"), "/dev/dvd"),
+            vec!["-v", "dev=/dev/dvd", "/t/image.iso"]
+        );
+        let err = ensure_burn_source_supported("wodim", Path::new(".")).unwrap_err();
+        assert!(err.to_string().contains("ISO"));
+        assert!(ensure_burn_source_supported("growisofs", Path::new(".")).is_ok());
+        assert!(ensure_burn_source_supported("xorriso", Path::new(".")).is_ok());
+        assert_eq!(
+            build_burn_args("xorriso", Path::new("/t/image.iso"), "/dev/cdrom"),
+            vec![
+                "-as",
+                "cdrecord",
+                "-v",
+                "dev=/dev/cdrom",
+                "blank=as_needed",
+                "/t/image.iso",
+            ]
+        );
+        assert_eq!(
+            build_burn_args("xorriso", Path::new("."), "/dev/cdrom"),
+            vec![
+                "-outdev",
+                "/dev/cdrom",
+                "-blank",
+                "as_needed",
+                "-map",
+                ".",
+                "/",
+                "-commit",
+            ]
+        );
+    }
 
     #[test]
     fn recipients_are_trimmed_deduped_and_validated() {

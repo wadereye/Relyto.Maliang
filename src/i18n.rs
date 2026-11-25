@@ -297,6 +297,12 @@ mod tests {
             "未发现便携设备(请确认手机已切换「传输照片」模式)",
             "正在读取设备清单…",
             "正在从设备导入 {p1} 张照片…",
+            "未找到邮件客户端(需 xdg-email / thunderbird / geary)",
+            "未找到光盘写入工具(growisofs / wodim / xorriso)",
+            "Geary 不支持命令行附件,请改用其他邮件客户端",
+            "启动邮件客户端失败:{cmd}: {e}",
+            "启动光盘写入工具失败:{cmd}: {e}",
+            "wodim 只能写入 ISO 镜像,请安装 growisofs 或 xorriso",
         ] {
             assert_ne!(t(k), k, "缺英文译文: {k}");
         }
