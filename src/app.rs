@@ -522,6 +522,14 @@ pub struct App {
     preview_missing: Option<i64>,
     /// 预览后台解码失败(非"文件不存在"):同样要终止"生成中"状态。
     preview_failed: Option<i64>,
+    /// 应用内视频播放器(仅视频帧;音频未接入)。与 preview 同属编辑视图。
+    video_player: Option<crate::video_player::VideoPlayer>,
+    video_player_id: Option<i64>,
+    video_playing: bool,
+    video_tex: Option<egui::TextureHandle>,
+    video_frame: Option<(Vec<u8>, u32, u32)>,
+    video_last_frame: Option<std::time::Instant>,
+    video_err: Option<String>,
     /// 待移出图库的 (id, 路径, 首次发现缺失的时刻)。预览路径发现,
     /// 统一在下一帧预 UI 阶段清理 —— 不能在预览窗闭包里直接重建 rows
     /// (闭包捕获的行索引会失效)。等一小段确认期再删,避免网络盘/移动盘
@@ -3108,6 +3116,13 @@ impl App {
             preview_bg: None,
             preview_missing: None,
             preview_failed: None,
+            video_player: None,
+            video_player_id: None,
+            video_playing: false,
+            video_tex: None,
+            video_frame: None,
+            video_last_frame: None,
+            video_err: None,
             pending_missing: Vec::new(),
             bake_rx: None,
             input_tag: String::new(),
@@ -8601,6 +8616,13 @@ impl App {
         self.id_row.get(&id).map(|&idx| self.rows[idx].path.clone())
     }
 
+    fn is_video_id(&self, id: i64) -> bool {
+        self.id_row
+            .get(&id)
+            .map(|&idx| self.rows[idx].kind == crate::video::kind::MOVIE)
+            .unwrap_or(false)
+    }
+
     /// 属性详情:名称 / 位置 / 大小+修改日期 + Property-Value 两列清单。
     /// 浮动属性窗与右栏抽屉「属性」页共用(属性详情部分)。
     fn props_detail_ui(&mut self, ui: &mut egui::Ui, id: i64) {
@@ -12725,21 +12747,23 @@ impl App {
         self.sel_anchor = Some(id);
     }
 
-    /// 双击打开(双击 = 进单图编辑视图;视频不进库内渲染,
-    /// 交给系统关联播放器)。与快速查找页双击同一套状态复位。
+    /// 双击打开(双击 = 进单图编辑视图;视频走应用内播放器,失败时回退系统播放器)。
+    /// 与快速查找页双击同一套状态复位。
     fn open_photo_editor(&mut self, id: i64, movie: bool) {
         if movie {
-            if let Some(p) = self.photo_path(id) {
-                if !crate::win::shell_open(Path::new(&p)) {
-                    self.status = t_with("无法打开视频(无关联播放器):{p}", &[("p", p.to_string())]);
-                }
-            }
+            self.preview = Some(id);
+            self.preview_tex = None;
+            self.preview_failed = None;
+            self.anim_reset();
+            self.preview_reset_zoom();
+            self.video_open(id);
         } else {
             self.preview = Some(id);
             self.preview_tex = None;
             self.preview_failed = None;
             self.anim_reset();
             self.preview_reset_zoom();
+            self.video_close();
         }
     }
 
@@ -13591,6 +13615,99 @@ impl App {
         self.anim = None;
         self.anim_rx = None;
         self.anim_req_for = None;
+    }
+
+    fn video_close(&mut self) {
+        self.video_player = None;
+        self.video_player_id = None;
+        self.video_playing = false;
+        self.video_tex = None;
+        self.video_frame = None;
+        self.video_last_frame = None;
+        self.video_err = None;
+    }
+
+    fn video_open(&mut self, id: i64) {
+        self.video_close();
+        self.video_player_id = Some(id);
+        let Some(path) = self.photo_path(id) else {
+            self.video_err = Some(t("找不到视频路径").into());
+            return;
+        };
+        match crate::video_player::VideoPlayer::open(std::path::Path::new(&path)) {
+            Ok(mut p) => {
+                match p.read_frame() {
+                    Ok(Some(frame)) => {
+                        self.video_frame = Some(frame);
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.video_err = Some(e),
+                }
+                self.video_player = Some(p);
+                self.video_playing = self.video_err.is_none();
+                self.video_last_frame = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                self.video_err = Some(e);
+            }
+        }
+    }
+
+    fn video_ensure_tex(&mut self, ctx: &egui::Context, id: i64) {
+        if let Some((rgba, w, h)) = self.video_frame.take() {
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            self.video_tex = Some(ctx.load_texture(
+                format!("video-{id}"),
+                color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+
+    fn video_tick(&mut self, ctx: &egui::Context, id: i64) {
+        if self.video_player_id != Some(id) {
+            return;
+        }
+        if !self.video_playing {
+            return;
+        }
+        let (ended, fd) = match self.video_player.as_ref() {
+            Some(p) => (p.ended(), p.frame_duration()),
+            None => return,
+        };
+        if ended {
+            self.video_playing = false;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .video_last_frame
+            .map(|t| now.duration_since(t) >= fd)
+            .unwrap_or(true);
+        if !due {
+            ctx.request_repaint_after(fd);
+            return;
+        }
+        self.video_last_frame = Some(now);
+        let result = match self.video_player.as_mut() {
+            Some(p) => p.read_frame(),
+            None => return,
+        };
+        match result {
+            Ok(Some(frame)) => {
+                self.video_frame = Some(frame);
+                self.video_ensure_tex(ctx, id);
+            }
+            Ok(None) => {
+                self.video_playing = false;
+            }
+            Err(e) => {
+                self.video_err = Some(e);
+                self.video_playing = false;
+            }
+        }
+        ctx.request_repaint_after(fd);
     }
 
     /// 收后台解码结果;换图后的滞后结果直接丢弃。
