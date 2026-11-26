@@ -1742,4 +1742,10 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("浅白", "Light"),
 ("滚轮缩放步进", "Wheel zoom step"),
 ("平移可显示裁剪框外像素", "Allow panning to reveal pixels outside the frame"),
+("地址为空", "Address is empty"),
+("备份集名称为空", "Backup set name is empty"),
+("备份目标目录未选择", "Backup destination folder not selected"),
+("备份集不存在", "Backup set not found"),
+("图片已按 EXIF 方向摆正,无需烘焙", "Image is already rotated per EXIF; nothing to bake"),
+("该格式只读预览,不参与旋转烘焙:{p1}", "This format is read-only preview and is excluded from rotation baking: {p1}"),
 ];

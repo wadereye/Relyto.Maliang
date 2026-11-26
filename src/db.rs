@@ -12,6 +12,7 @@
 //!
 //! 备份/压缩前调 [`Store::flush`] 等异步队列排干。
 
+use crate::i18n::t;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -4565,7 +4566,7 @@ impl Store {
     pub fn touch_contact(&self, address: &str, display: &str) -> Result<i64> {
         let addr = address.trim().to_ascii_lowercase();
         if addr.is_empty() {
-            anyhow::bail!("地址为空");
+            anyhow::bail!("{}", t("地址为空"));
         }
         let disp = display.trim().to_string();
         let now = chrono::Utc::now().timestamp_millis();
@@ -4596,10 +4597,10 @@ impl Store {
     pub fn backup_set_create(&self, name: &str, dest: &Path) -> Result<i64> {
         let name = name.trim();
         if name.is_empty() {
-            anyhow::bail!("备份集名称为空");
+            anyhow::bail!("{}", t("备份集名称为空"));
         }
         if dest.as_os_str().is_empty() {
-            anyhow::bail!("备份目标目录未选择");
+            anyhow::bail!("{}", t("备份目标目录未选择"));
         }
         let name = name.to_string();
         let dest = dest.to_string_lossy().into_owned();
@@ -4664,7 +4665,7 @@ impl Store {
     /// (缺失或大小/时间不符即待传)。
     pub fn backup_set_pending(&self, set_id: i64) -> Result<Vec<(i64, PathBuf, PathBuf, u64)>> {
         let Some(dest_root) = self.backup_set_dest(set_id) else {
-            anyhow::bail!("备份集不存在");
+            anyhow::bail!("{}", t("备份集不存在"));
         };
         let dest_root = PathBuf::from(dest_root);
         let rows: Vec<(i64, String, u64, u64)> = self.read(move |conn| {
