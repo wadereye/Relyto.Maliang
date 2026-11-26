@@ -491,37 +491,55 @@ pub fn set_wallpaper(path: &Path) -> bool {
 
 /// 用系统关联程序打开文件。
 ///
-/// 视频播放路径:库内不内嵌视频渲染管线,交给系统默认播放器打开 ——
-/// 以最简体量实现「能看」的目标。
+/// 视频默认走应用内播放器;此入口用于「用系统播放器打开」的回退路径,
+/// 以及图片/文档等交给系统关联程序。
 ///
 /// 返回是否成功(ShellExecuteW 返回值 > 32 视为成功)。
 pub fn shell_open(path: &Path) -> bool {
     #[cfg(windows)]
     {
-        use windows::core::PCWSTR;
-        use windows::Win32::UI::Shell::ShellExecuteW;
-        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-        let wide = to_wide(&path.to_string_lossy().into_owned());
-        // SAFETY: 参数均为合法 NUL 结尾宽字符串;动词 "open" 为静态常量。
-        let ret = unsafe {
-            ShellExecuteW(
-                None,
-                windows::core::w!("open"),
-                PCWSTR(wide.as_ptr()),
-                None,
-                None,
-                SW_SHOWNORMAL,
-            )
-        };
-        // ShellExecuteW 约定:返回值 > 32 表示成功;<= 32 是 SE_ERR_* 错误码。
-        (ret.0 as isize) > 32
+        shell_execute(&path.to_string_lossy())
     }
     #[cfg(not(windows))]
     {
         let _ = path;
         false
     }
+}
+
+/// 用系统默认处理程序打开 URI(如 `ms-settings:defaultapps`)。
+pub fn shell_open_uri(uri: &str) -> bool {
+    #[cfg(windows)]
+    {
+        shell_execute(uri)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = uri;
+        false
+    }
+}
+
+#[cfg(windows)]
+fn shell_execute(target: &str) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let wide = to_wide(target);
+    // SAFETY: 参数均为合法 NUL 结尾宽字符串;动词 "open" 为静态常量。
+    let ret = unsafe {
+        ShellExecuteW(
+            None,
+            windows::core::w!("open"),
+            PCWSTR(wide.as_ptr()),
+            None,
+            None,
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW 约定:返回值 > 32 表示成功;<= 32 是 SE_ERR_* 错误码。
+    (ret.0 as isize) > 32
 }
 
 /// ShellExecuteExW + runas:提权拉起一个程序,窗口一律 SW_HIDE(不留黑框)。

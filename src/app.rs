@@ -16023,6 +16023,41 @@ impl eframe::App for App {
                             self.toggle_projector(ui.ctx());
                             ui.close();
                         }
+                        // 默认照片查看器:Windows 不允许程序静默抢默认关联,
+                        // 只能把用户送到系统「默认应用」页自己选。
+                        if ui.button(t("默认照片查看器设置…")).clicked() {
+                            #[cfg(windows)]
+                            {
+                                let _ = crate::win::shell_open_uri("ms-settings:defaultapps");
+                                self.status = t("已打开系统「默认应用」设置:把图片格式的默认程序选为 Maliang 即可。").into();
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                self.status = t("仅 Windows 支持设置默认照片查看器").into();
+                            }
+                            ui.close();
+                        }
+                        // 屏保设置:Windows 屏保由系统 .scr 机制托管,这里打开系统设置页。
+                        if ui.button(t("屏保设置…")).clicked() {
+                            #[cfg(windows)]
+                            {
+                                match std::process::Command::new("control.exe")
+                                    .arg("desk.cpl,,@screensaver")
+                                    .spawn()
+                                {
+                                    Ok(_) => self.status = t("已打开 Windows 屏保设置。").into(),
+                                    Err(e) => {
+                                        self.status =
+                                            t_with("打开屏保设置失败: {e}", &[("e", e.to_string())])
+                                    }
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                self.status = t("仅 Windows 支持系统屏保设置").into();
+                            }
+                            ui.close();
+                        }
                         let mut watching = self.watch_on.load(Ordering::SeqCst);
                         if ui.checkbox(&mut watching, t("监听文件夹变化")).clicked() {
                             self.watch_on.store(watching, Ordering::SeqCst);
