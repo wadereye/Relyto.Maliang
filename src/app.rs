@@ -473,7 +473,7 @@ pub struct App {
     thumb_bg: Option<crate::thumbs::ThumbWorker>,
     /// AI 队列调度骨架:三阶段 worker 与暂停闸门。
     #[cfg(feature = "ai")]
-    ai_sched: Option<crate::ai_sched::AiSched>,
+    ai_sched: Option<Arc<crate::ai_sched::AiSched>>,
     /// 预览提级去重:同一张只入队一次。
     #[cfg(feature = "ai")]
     ai_preview_for: Option<i64>,
@@ -3463,7 +3463,10 @@ impl App {
                 .map(|v| v != "0")
                 .unwrap_or(false);
             self.ai_enabled = enabled;
-            self.ai_sched = Some(crate::ai_sched::AiSched::spawn(self.store.clone(), enabled));
+            self.ai_sched = Some(Arc::new(crate::ai_sched::AiSched::spawn(
+                self.store.clone(),
+                enabled,
+            )));
         }
         // 首启补图顺序:先把常用目录(我的文档/我的图片/桌面)铺出来,
         // 排空后才按「最新照片优先」兜底其余全库 —— 即使向导答的是
@@ -6109,9 +6112,17 @@ impl App {
             Some(r) => r.path.clone(),
             None => return,
         };
-        let tags = timeline::tags_of(&self.store, id).unwrap_or_default();
+        let tags = match timeline::tags_of(&self.store, id) {
+            Ok(tags) => tags,
+            Err(e) => {
+                self.status = t_with("读取标签失败:{e}", &[("e", e.to_string())]);
+                return;
+            }
+        };
         let meta = crate::xmp::Meta { star, tags };
-        let _ = crate::xmp::write(Path::new(&path), &meta);
+        if let Err(e) = crate::xmp::write(Path::new(&path), &meta) {
+            self.status = t_with("写入 XMP 失败:{e}", &[("e", e.to_string())]);
+        }
         // 标签增删后刷新视图 > 标签 的左侧列表面板
         self.tags = timeline::all_tags(&self.store).unwrap_or_default();
     }
@@ -9650,14 +9661,15 @@ impl App {
     #[cfg(feature = "ai")]
     fn drawer_auto_tags_ui(&mut self, ui: &mut egui::Ui, id: i64) {
         let ver = crate::ai_queue::stage_version(&self.store, crate::ai_queue::Stage::Tags);
-        let key = format!("{ver}|{:?}", crate::i18n::lang());
+        let done = crate::ai_tags::completion_ts(&self.store, id, &ver);
+        let key = format!("{ver}|{:?}|{done:?}", crate::i18n::lang());
         let stale = self
             .drawer_auto_tags
             .as_ref()
-            .map(|(kid, kver, tags)| *kid != id || kver != &key || tags.is_empty())
+            .map(|(kid, kver, _)| *kid != id || kver != &key)
             .unwrap_or(true);
         if stale {
-            let tags = crate::ai_tags::photo_tags(&self.store, id, &ver);
+            let tags = crate::ai_tags::completed_photo_tags(&self.store, id, &ver);
             self.drawer_auto_tags = Some((id, key, tags));
         }
         let Some((_, _, cached)) = &self.drawer_auto_tags else {
@@ -9670,10 +9682,14 @@ impl App {
             return;
         }
         ui.horizontal_wrapped(|ui| {
-            for (_, score, name) in tags {
-                if ui.small_button(format!("{name} {score:.2}")).clicked() {
-                    let _ = timeline::add_tag(&self.store, id, &name);
-                    self.sync_xmp(id, self.star_of(id));
+            for (_, _, name) in tags {
+                if ui.small_button(&name).clicked() {
+                    match timeline::add_tag(&self.store, id, &name) {
+                        Ok(()) => self.sync_xmp(id, self.star_of(id)),
+                        Err(e) => {
+                            self.status = t_with("添加标签失败:{e}", &[("e", e.to_string())]);
+                        }
+                    }
                 }
             }
         });
@@ -10293,13 +10309,22 @@ impl App {
     #[cfg(feature = "ai")]
     fn enqueue_stage_ai(&mut self, stage: crate::ai_queue::Stage) {
         let store = self.store.clone();
+        let sched = self.ai_sched.clone();
         self.status = t_with(
             "已在后台把全库排入{p1}队列",
             &[("p1", (stage.label()).to_string())],
         );
         std::thread::spawn(move || {
             crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
-            let _ = crate::ai_queue::enqueue_all_for(&store, stage);
+            let out = match &sched {
+                Some(s) => s.maintain(&[stage], || {
+                    crate::ai_queue::enqueue_all_for(&store, stage).map_err(|e| e.to_string())
+                }),
+                None => crate::ai_queue::enqueue_all_for(&store, stage).map_err(|e| e.to_string()),
+            };
+            if let Err(e) = out {
+                eprintln!("AI 入队维护失败: {e}");
+            }
         });
     }
 
@@ -10311,6 +10336,7 @@ impl App {
             return;
         }
         let store = self.store.clone();
+        let sched = self.ai_sched.clone();
         self.status = if kind == 1 {
             t_with(
                 "已重新安排 {p1} 的失败项",
@@ -10324,11 +10350,21 @@ impl App {
         };
         std::thread::spawn(move || {
             crate::win::set_current_thread_priority(crate::win::Priority::BelowNormal);
-            let _ = if kind == 1 {
-                crate::ai_queue::retry_failed(&store, stage)
-            } else {
-                crate::ai_queue::rebuild_stage(&store, stage)
+            let action = || {
+                if kind == 1 {
+                    crate::ai_queue::retry_failed(&store, stage)
+                } else {
+                    crate::ai_queue::rebuild_stage(&store, stage)
+                }
+                .map_err(|e| e.to_string())
             };
+            let out = match &sched {
+                Some(s) => s.maintain(&[stage], action),
+                None => action(),
+            };
+            if let Err(e) = out {
+                eprintln!("AI 队列维护失败: {e}");
+            }
         });
     }
 
@@ -14741,6 +14777,14 @@ mod tests {
             .unwrap()
         });
         crate::ai_tags::save(&store, 2, &ver, &[(cat, 0.9)]).unwrap();
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES(2,'tags',?1,1)",
+                    [&ver],
+                )
+            })
+            .unwrap();
         timeline::add_tag(&store, 3, "旅行").unwrap();
 
         assert!(tags_scope_ids(&store, "", &[], None, None).is_empty());

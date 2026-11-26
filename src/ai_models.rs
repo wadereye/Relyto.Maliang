@@ -44,7 +44,7 @@ pub const SLOTS: [SlotSpec; 8] = [
         manual: false,
         files: &["text.onnx", "merges.txt"],
         legacy: &["clip_text.onnx", "clip_merges.txt"],
-        stage: Some(Stage::Clip),
+        stage: Some(Stage::Tags),
     },
     SlotSpec {
         key: "mt_zh_en",
@@ -487,7 +487,7 @@ pub fn slot_sig(store: &Store, slot: &str) -> String {
 /// 某阶段依赖的槽位(标签阶段复用语义向量模型)。
 pub fn stage_slots(stage: Stage) -> &'static [&'static str] {
     match stage {
-        Stage::Clip => &["clip_vision", "clip_text"],
+        Stage::Clip => &["clip_vision"],
         Stage::Tags => &["clip_vision", "clip_text"],
         Stage::Ocr => &["ocr_det", "ocr_cls", "ocr_rec"],
     }
@@ -516,11 +516,14 @@ pub fn stage_ready(store: &Store, stage: Stage) -> bool {
         Stage::Clip => {
             // 只认新链路的产物文件名,旧平铺模型不算就绪。
             file_path(store, "clip_vision", "vision.onnx").is_some()
+        }
+        Stage::Tags => {
+            stage_ready(store, Stage::Clip)
                 && file_path(store, "clip_text", "text.onnx").is_some()
                 && (file_path(store, "clip_text", "merges.txt").is_some()
                     || file_path(store, "clip_text", "clip_merges.txt").is_some())
+                && crate::ai_tags::label_count(store) > 0
         }
-        Stage::Tags => stage_ready(store, Stage::Clip) && crate::ai_tags::label_count(store) > 0,
         Stage::Ocr => resolve(store, "ocr_det").is_some() && resolve(store, "ocr_rec").is_some(),
     }
 }
@@ -839,24 +842,19 @@ pub fn replace_model(
         // 标签由语义向量派生,换模型时必须一起停、释放会话并重排失败项。
         stages.push(Stage::Tags);
     }
-    sched.pause();
-    for s in &stages {
-        sched.drain(*s);
-    }
-    for s in &stages {
-        sched.release(*s);
-    }
-    let out = activate(store, slot, version)
-        .and_then(|_| {
-            for s in stages.iter().skip(1) {
-                crate::ai_queue::retry_failed(store, *s).map_err(|e| e.to_string())?;
+    sched.maintain(&stages, || {
+        for s in &stages {
+            sched.release(*s);
+        }
+        activate(store, slot, version).and_then(|_| {
+            for &s in &stages {
+                crate::ai_queue::retry_failed(store, s).map_err(|e| e.to_string())?;
             }
             crate::ai_queue::enqueue_all_for(store, stage)
                 .map(|_| ())
                 .map_err(|e| e.to_string())
-        });
-    sched.resume();
-    out
+        })
+    })
 }
 
 /// 槽位展示状态。
@@ -1282,9 +1280,91 @@ mod tests {
 
     #[test]
     fn stage_slots_cover_dependencies() {
-        assert_eq!(stage_slots(Stage::Clip).len(), 2);
+        assert_eq!(stage_slots(Stage::Clip), &["clip_vision"]);
         assert_eq!(stage_slots(Stage::Tags).len(), 2, "标签复用语义模型");
         assert!(stage_slots(Stage::Ocr).contains(&"ocr_det"));
+    }
+
+    #[test]
+    fn text_model_change_does_not_invalidate_clip_vectors() {
+        let store = mem();
+        let install = |slot: &str, version: &str| {
+            let spec = super::spec(slot).unwrap();
+            let root = root().unwrap();
+            let dir = version_dir(&root, slot, version);
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in spec.files {
+                std::fs::write(dir.join(file), b"x").unwrap();
+            }
+            activate(&store, slot, version).unwrap();
+        };
+        install("clip_vision", "sig-v1");
+        install("clip_text", "sig-v1");
+        let clip_v1 = stage_signature(&store, Stage::Clip).unwrap();
+        let tags_v1 = stage_signature(&store, Stage::Tags).unwrap();
+        install("clip_text", "sig-v2");
+        assert_eq!(stage_signature(&store, Stage::Clip).unwrap(), clip_v1);
+        assert_ne!(stage_signature(&store, Stage::Tags).unwrap(), tags_v1);
+    }
+
+    #[test]
+    fn text_model_replacement_requeues_only_tags() {
+        let store = Arc::new(mem());
+        let root = root().unwrap();
+        for (slot, version) in [
+            ("clip_vision", "replace-vision-v1"),
+            ("clip_text", "replace-text-v1"),
+            ("clip_text", "replace-text-v2"),
+        ] {
+            let spec = super::spec(slot).unwrap();
+            let dir = version_dir(&root, slot, version);
+            std::fs::create_dir_all(&dir).unwrap();
+            for file in spec.files {
+                std::fs::write(dir.join(file), b"x").unwrap();
+            }
+        }
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0)",
+                    [],
+                )
+            })
+            .unwrap();
+        activate(&store, "clip_vision", "replace-vision-v1").unwrap();
+        activate(&store, "clip_text", "replace-text-v1").unwrap();
+        let sched = crate::ai_sched::AiSched::spawn(store.clone(), false);
+        replace_model(&store, &sched, "clip_text", "replace-text-v2").unwrap();
+        let jobs = store.read(|conn| -> Vec<(String, String)> {
+            let mut st = conn
+                .prepare("SELECT stage, model_ver FROM ai_jobs ORDER BY stage")
+                .unwrap();
+            let rows = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap();
+            rows.flatten().collect()
+        });
+        assert_eq!(
+            jobs,
+            vec![(
+                Stage::Tags.as_str().into(),
+                crate::ai_queue::stage_version(&store, Stage::Tags)
+            )]
+        );
+    }
+
+    #[test]
+    fn clip_stage_runs_without_text_model() {
+        let store = mem();
+        let spec = super::spec("clip_vision").unwrap();
+        let root = root().unwrap();
+        let dir = version_dir(&root, "clip_vision", "ready-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(spec.files[0]), b"x").unwrap();
+        activate(&store, "clip_vision", "ready-v1").unwrap();
+        crate::ai_tags::seed_labels(&store).unwrap();
+        assert!(stage_ready(&store, Stage::Clip));
+        assert!(!stage_ready(&store, Stage::Tags));
     }
 
     #[test]

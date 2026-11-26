@@ -124,13 +124,19 @@ pub fn seed_priority_rules(store: &Store) -> Result<()> {
     })
 }
 
-/// 单条入队;重复入队不改已有行的优先级。
+/// 单条入队;重复入队保留优先级,版本变化时重置任务。
 pub fn enqueue(store: &Store, stage: Stage, photo_id: i64, priority: i32) -> Result<()> {
+    let ver = stage_version(store, stage);
     store.write(|conn| -> Result<()> {
         conn.execute(
-            "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
-             VALUES(?1, ?2, ?3, ?4, 0)",
-            params![stage.as_str(), photo_id, priority, now_ms()],
+            "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+             VALUES(?1, ?2, ?3, ?4, 0, ?5)
+             ON CONFLICT(stage, photo_id) DO UPDATE SET
+                 model_ver=excluded.model_ver,
+                 attempts=0,
+                 enqueued_ts=excluded.enqueued_ts
+              WHERE ai_jobs.model_ver IS NOT excluded.model_ver",
+            params![stage.as_str(), photo_id, priority, now_ms(), ver],
         )?;
         Ok(())
     })
@@ -138,16 +144,22 @@ pub fn enqueue(store: &Store, stage: Stage, photo_id: i64, priority: i32) -> Res
 
 /// 把照片提级到当前查看,三个阶段各入队一次。
 pub fn enqueue_current(store: &Store, photo_id: i64) {
-    for stage in Stage::ALL {
-        let _ = enqueue(store, stage, photo_id, P_CURRENT);
-    }
-    // 被延后的任务重新可见,打开预览时不用等下一轮重试。
+    let versions = Stage::ALL.map(|stage| stage_version(store, stage));
+    let ts = now_ms();
     let _ = store.write(|conn| -> Result<()> {
-        conn.execute(
-            "UPDATE ai_jobs SET enqueued_ts=?1
-              WHERE photo_id=?2 AND enqueued_ts > ?1",
-            params![now_ms(), photo_id],
+        let mut st = conn.prepare(
+            "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+             VALUES(?1, ?2, ?3, ?4, 0, ?5)
+             ON CONFLICT(stage, photo_id) DO UPDATE SET
+                 priority=excluded.priority,
+                 enqueued_ts=excluded.enqueued_ts,
+                 attempts=CASE WHEN ai_jobs.model_ver IS NOT excluded.model_ver
+                               THEN 0 ELSE ai_jobs.attempts END,
+                 model_ver=excluded.model_ver",
         )?;
+        for (stage, ver) in Stage::ALL.into_iter().zip(versions) {
+            st.execute(params![stage.as_str(), photo_id, P_CURRENT, ts, ver])?;
+        }
         Ok(())
     });
 }
@@ -158,14 +170,20 @@ pub fn enqueue_for_ids(store: &Store, stage: Stage, ids: &[i64]) {
         return;
     }
     let ids = ids.to_vec();
+    let ver = stage_version(store, stage);
     store.write_async(move |conn| {
         let rules = rules_from_conn(conn);
         let Ok(tx) = conn.transaction() else {
             return;
         };
         let Ok(mut st) = tx.prepare(
-            "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
-             VALUES(?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+             VALUES(?1, ?2, ?3, ?4, 0, ?5)
+             ON CONFLICT(stage, photo_id) DO UPDATE SET
+                 model_ver=excluded.model_ver,
+                 attempts=0,
+                 enqueued_ts=excluded.enqueued_ts
+              WHERE ai_jobs.model_ver IS NOT excluded.model_ver",
         ) else {
             return;
         };
@@ -178,7 +196,7 @@ pub fn enqueue_for_ids(store: &Store, stage: Stage, ids: &[i64]) {
                 continue;
             };
             let prio = priority_with_rules(&rules, &path);
-            let _ = st.execute(params![stage.as_str(), id, prio, ts]);
+            let _ = st.execute(params![stage.as_str(), id, prio, ts, ver]);
         }
         drop(st);
         let _ = tx.commit();
@@ -227,8 +245,8 @@ pub fn enqueue_all(store: &Store) -> Result<usize> {
             let mut n = 0usize;
             {
                 let mut st = tx.prepare(
-                    "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
-                     SELECT ?1, ?2, ?3, ?4, 0
+                    "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+                     SELECT ?1, ?2, ?3, ?4, 0, ?5
                       WHERE NOT EXISTS(
                           SELECT 1 FROM ai_state s
                            WHERE s.photo_id = ?2 AND s.stage = ?1 AND s.model_ver = ?5
@@ -236,7 +254,12 @@ pub fn enqueue_all(store: &Store) -> Result<usize> {
                         AND NOT EXISTS(
                           SELECT 1 FROM ai_failed f
                            WHERE f.photo_id = ?2 AND f.stage = ?1
-                      )",
+                      )
+                     ON CONFLICT(stage, photo_id) DO UPDATE SET
+                         model_ver=excluded.model_ver,
+                         attempts=0,
+                         enqueued_ts=excluded.enqueued_ts
+                      WHERE ai_jobs.model_ver IS NOT excluded.model_ver",
                 )?;
                 for (id, path) in &rows {
                     let prio = priority_with_rules(&rules, path);
@@ -273,7 +296,8 @@ pub fn pick_batch(store: &Store, stage: Stage, model_ver: &str, limit: usize) ->
                FROM ai_jobs j
                LEFT JOIN ai_state s
                  ON s.photo_id = j.photo_id AND s.stage = j.stage
-              WHERE j.stage = ?1 AND (s.model_ver IS NULL OR s.model_ver <> ?2)
+              WHERE j.stage = ?1 AND (j.model_ver IS NULL OR j.model_ver = ?2)
+                AND (s.model_ver IS NULL OR s.model_ver <> ?2)
                 AND j.enqueued_ts <= ?4
               ORDER BY j.priority, j.enqueued_ts, j.photo_id
               LIMIT ?3",
@@ -297,20 +321,21 @@ pub fn pick_batch(store: &Store, stage: Stage, model_ver: &str, limit: usize) ->
     })
 }
 
-/// 提交一批结果:成功写台账并出队,失败计次或移入隔离表。
+/// 提交一批结果:仅处理仍属于该版本的任务,返回实际完成项。
 pub fn commit_batch(
     store: &Store,
     stage: Stage,
     model_ver: &str,
     ok: &[i64],
     failed: &[(i64, i32, String)],
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     if ok.is_empty() && failed.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let ts = now_ms();
-    store.write(|conn| -> Result<()> {
+    store.write(|conn| -> Result<Vec<i64>> {
         let tx = conn.transaction()?;
+        let mut committed = Vec::new();
         {
             let mut state = tx.prepare(
                 "INSERT INTO ai_state(photo_id, stage, model_ver, done_ts)
@@ -318,13 +343,23 @@ pub fn commit_batch(
                  ON CONFLICT(photo_id, stage)
                  DO UPDATE SET model_ver=excluded.model_ver, done_ts=excluded.done_ts",
             )?;
-            let mut del = tx.prepare("DELETE FROM ai_jobs WHERE stage=?1 AND photo_id=?2")?;
+            let mut del = tx.prepare(
+                "DELETE FROM ai_jobs
+                  WHERE stage=?1 AND photo_id=?2 AND (model_ver=?3 OR model_ver IS NULL)",
+            )?;
+            let mut clear_failed =
+                tx.prepare("DELETE FROM ai_failed WHERE stage=?1 AND photo_id=?2")?;
             for id in ok {
-                state.execute(params![id, stage.as_str(), model_ver, ts])?;
-                del.execute(params![stage.as_str(), id])?;
+                if del.execute(params![stage.as_str(), id, model_ver])? > 0 {
+                    state.execute(params![id, stage.as_str(), model_ver, ts])?;
+                    clear_failed.execute(params![stage.as_str(), id])?;
+                    committed.push(*id);
+                }
             }
-            let mut bump =
-                tx.prepare("UPDATE ai_jobs SET attempts=?3 WHERE stage=?1 AND photo_id=?2")?;
+            let mut bump = tx.prepare(
+                "UPDATE ai_jobs SET attempts=?3
+                  WHERE stage=?1 AND photo_id=?2 AND (model_ver=?4 OR model_ver IS NULL)",
+            )?;
             let mut isolate = tx.prepare(
                 "INSERT INTO ai_failed(photo_id, stage, err, attempts, ts)
                  VALUES(?1, ?2, ?3, ?4, ?5)
@@ -333,20 +368,21 @@ pub fn commit_batch(
             )?;
             for (id, attempts, err) in failed {
                 if *attempts >= FAIL_THRESHOLD {
-                    isolate.execute(params![id, stage.as_str(), err, attempts, ts])?;
-                    del.execute(params![stage.as_str(), id])?;
+                    if del.execute(params![stage.as_str(), id, model_ver])? > 0 {
+                        isolate.execute(params![id, stage.as_str(), err, attempts, ts])?;
+                    }
                 } else {
-                    bump.execute(params![stage.as_str(), id, attempts])?;
+                    bump.execute(params![stage.as_str(), id, attempts, model_ver])?;
                 }
             }
         }
         tx.commit()?;
-        Ok(())
+        Ok(committed)
     })
 }
 
 /// 把依赖暂不满足的任务延后,不在队列里反复空转。
-pub fn defer_batch(store: &Store, stage: Stage, ids: &[i64]) -> Result<()> {
+pub fn defer_batch(store: &Store, stage: Stage, ids: &[i64], model_ver: &str) -> Result<()> {
     if ids.is_empty() {
         return Ok(());
     }
@@ -356,10 +392,10 @@ pub fn defer_batch(store: &Store, stage: Stage, ids: &[i64]) -> Result<()> {
         {
             let mut st = tx.prepare(
                 "UPDATE ai_jobs SET enqueued_ts=?3
-                  WHERE stage=?1 AND photo_id=?2",
+                  WHERE stage=?1 AND photo_id=?2 AND (model_ver=?4 OR model_ver IS NULL)",
             )?;
             for id in ids {
-                st.execute(params![stage.as_str(), id, until])?;
+                st.execute(params![stage.as_str(), id, until, model_ver])?;
             }
         }
         tx.commit()?;
@@ -429,8 +465,8 @@ pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
             let mut n = 0usize;
             {
                 let mut st = tx.prepare(
-                    "INSERT OR IGNORE INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
-                     SELECT ?1, ?2, ?3, ?4, 0
+                    "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+                     SELECT ?1, ?2, ?3, ?4, 0, ?5
                       WHERE NOT EXISTS(
                           SELECT 1 FROM ai_state s
                            WHERE s.photo_id = ?2 AND s.stage = ?1 AND s.model_ver = ?5
@@ -438,7 +474,12 @@ pub fn enqueue_all_for(store: &Store, stage: Stage) -> Result<usize> {
                         AND NOT EXISTS(
                           SELECT 1 FROM ai_failed f
                            WHERE f.photo_id = ?2 AND f.stage = ?1
-                      )",
+                      )
+                     ON CONFLICT(stage, photo_id) DO UPDATE SET
+                         model_ver=excluded.model_ver,
+                         attempts=0,
+                         enqueued_ts=excluded.enqueued_ts
+                      WHERE ai_jobs.model_ver IS NOT excluded.model_ver",
                 )?;
                 for (id, path) in &rows {
                     if stage == Stage::Ocr && !text_ids.contains(id) {
@@ -463,18 +504,20 @@ pub fn continue_stage(store: &Store, stage: Stage) -> Result<usize> {
 /// 重试失败:把该阶段隔离的失败项放回队列并清零重试次数。
 pub fn retry_failed(store: &Store, stage: Stage) -> Result<usize> {
     let ts = now_ms();
+    let ver = stage_version(store, stage);
     store.write(|conn| -> Result<usize> {
         let tx = conn.transaction()?;
         let n = {
             let mut st = tx.prepare(
-                "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts)
-                 SELECT ?1, f.photo_id, ?2, ?3, 0
+                "INSERT INTO ai_jobs(stage, photo_id, priority, enqueued_ts, attempts, model_ver)
+                 SELECT ?1, f.photo_id, ?2, ?3, 0, ?4
                    FROM ai_failed f JOIN photos p ON p.id = f.photo_id
                   WHERE f.stage = ?1
                  ON CONFLICT(stage, photo_id)
-                 DO UPDATE SET attempts=0, enqueued_ts=excluded.enqueued_ts",
+                 DO UPDATE SET attempts=0, enqueued_ts=excluded.enqueued_ts,
+                     model_ver=excluded.model_ver",
             )?;
-            st.execute(params![stage.as_str(), P_DEFAULT, ts])?
+            st.execute(params![stage.as_str(), P_DEFAULT, ts, ver])?
         };
         tx.execute("DELETE FROM ai_failed WHERE stage=?1", [stage.as_str()])?;
         tx.commit()?;
@@ -566,6 +609,86 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_current_promotes_existing_job() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        enqueue(&store, Stage::Clip, 1, 6).unwrap();
+        enqueue_current(&store, 1);
+        let prio = store.read(|conn| {
+            conn.query_row(
+                "SELECT priority FROM ai_jobs WHERE stage='clip' AND photo_id=1",
+                [],
+                |r| r.get::<_, i32>(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(prio, P_CURRENT, "打开预览应立即提升已有任务");
+    }
+
+    #[test]
+    fn old_batch_commit_keeps_new_version_job() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        store.set_setting("ai_active:clip", "v0").unwrap();
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        assert_eq!(pick_batch(&store, Stage::Clip, "v0", BATCH_LIMIT).len(), 1);
+        store.set_setting("ai_active:clip", "v1").unwrap();
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        commit_batch(&store, Stage::Clip, "v0", &[1], &[]).unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM ai_jobs WHERE stage='clip' AND photo_id=1"),
+            1,
+            "旧批次提交不能删除新版本任务"
+        );
+        assert_eq!(pick_batch(&store, Stage::Clip, "v1", BATCH_LIMIT).len(), 1);
+    }
+
+    #[test]
+    fn old_batch_defer_keeps_new_version_job_ready() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        store.set_setting("ai_active:clip", "v0").unwrap();
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        store.set_setting("ai_active:clip", "v1").unwrap();
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        let before: i64 = store.read(|conn| {
+            conn.query_row(
+                "SELECT enqueued_ts FROM ai_jobs WHERE stage='clip' AND photo_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        defer_batch(&store, Stage::Clip, &[1], "v0").unwrap();
+        let after: i64 = store.read(|conn| {
+            conn.query_row(
+                "SELECT enqueued_ts FROM ai_jobs WHERE stage='clip' AND photo_id=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        assert_eq!(after, before, "旧批次延后不能推迟新版本任务");
+        assert_eq!(pick_batch(&store, Stage::Clip, "v1", BATCH_LIMIT).len(), 1);
+    }
+
+    #[test]
+    fn successful_retry_clears_isolated_failure() {
+        let store = mem();
+        add_photo(&store, 1, r"C:\docs\a.jpg");
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        commit_batch(&store, Stage::Clip, "v0", &[], &[(1, 3, "decode".into())]).unwrap();
+        assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_failed"), 1);
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
+        commit_batch(&store, Stage::Clip, "v0", &[1], &[]).unwrap();
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM ai_failed WHERE stage='clip' AND photo_id=1"),
+            0,
+            "成功后不能继续显示旧失败记录"
+        );
+    }
+
+    #[test]
     fn priority_uses_longest_prefix() {
         let rules = vec![
             (norm(r"C:\Users\me\Documents"), 1),
@@ -608,6 +731,8 @@ mod tests {
         // 同版本再次入队会被取批逻辑跳过(台账已存在)。
         enqueue(&store, Stage::Ocr, 1, 1).unwrap();
         assert!(pick_batch(&store, Stage::Ocr, "v0", BATCH_LIMIT).is_empty());
+        store.set_setting("ai_active:ocr", "v1").unwrap();
+        enqueue(&store, Stage::Ocr, 1, 1).unwrap();
         assert!(!pick_batch(&store, Stage::Ocr, "v1", BATCH_LIMIT).is_empty());
     }
 
@@ -698,6 +823,7 @@ mod tests {
         let store = mem();
         add_photo(&store, 1, r"C:\a\1.jpg");
         add_photo(&store, 2, r"C:\a\2.jpg");
+        enqueue(&store, Stage::Clip, 1, 1).unwrap();
         commit_batch(&store, Stage::Clip, "v0", &[1], &[]).unwrap();
         enqueue(&store, Stage::Ocr, 2, 1).unwrap();
         commit_batch(&store, Stage::Ocr, "v0", &[], &[(2, 3, "decode".into())]).unwrap();
@@ -784,6 +910,8 @@ mod tests {
         add_photo(&store, 1, r"C:\docs\a.jpg");
         add_photo(&store, 2, r"C:\docs\b.jpg");
         let ver = stage_version(&store, Stage::Tags);
+        enqueue(&store, Stage::Tags, 1, P_DEFAULT).unwrap();
+        enqueue(&store, Stage::Tags, 2, P_DEFAULT).unwrap();
         commit_batch(&store, Stage::Tags, &ver, &[1, 2], &[]).unwrap();
         store
             .write(|conn| {
@@ -815,6 +943,7 @@ mod tests {
         add_photo(&store, 1, r"C:\docs\a.jpg");
         add_photo(&store, 2, r"C:\docs\b.jpg");
         let ver = stage_version(&store, Stage::Clip);
+        enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
         commit_batch(&store, Stage::Clip, &ver, &[1], &[]).unwrap();
         continue_stage(&store, Stage::Clip).unwrap();
         assert_eq!(count(&store, "SELECT COUNT(*) FROM ai_state WHERE stage='clip'"), 1);
@@ -828,7 +957,7 @@ mod tests {
         add_photo(&store, 1, r"C:\docs\a.jpg");
         enqueue(&store, Stage::Clip, 1, P_DEFAULT).unwrap();
         assert_eq!(pick_batch(&store, Stage::Clip, "v0", BATCH_LIMIT).len(), 1);
-        defer_batch(&store, Stage::Clip, &[1]).unwrap();
+        defer_batch(&store, Stage::Clip, &[1], "v0").unwrap();
         assert!(
             pick_batch(&store, Stage::Clip, "v0", BATCH_LIMIT).is_empty(),
             "延后期间不该反复空转取到同一条"

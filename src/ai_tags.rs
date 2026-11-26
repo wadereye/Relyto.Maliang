@@ -2,7 +2,7 @@
 
 use crate::db::Store;
 use anyhow::Result;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use std::collections::HashMap;
 
 /// 一条标签定义。
@@ -543,14 +543,14 @@ pub fn sync_people_tags(store: &Store, photo_ids: &[i64], ver: &str) -> Result<u
                 1 => portrait.map(|id| (id, conf)),
                 _ => group.map(|id| (id, conf)),
             };
-            let prev: Option<(i64, f64)> = tx
-                .query_row(
+            let prev: Vec<(i64, f64)> = {
+                let mut st = tx.prepare(
                     "SELECT t.label_id, t.score FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
                       WHERE t.photo_id=?1 AND t.model_ver=?2 AND (l.node='人物' OR l.node LIKE '人物/%')",
-                    params![pid, ver],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .optional()?;
+                )?;
+                let rows = st.query_map(params![pid, ver], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.flatten().collect()
+            };
             let mut keep: Vec<(i64, f64)> = Vec::new();
             {
                 let mut st = tx.prepare(
@@ -562,9 +562,11 @@ pub fn sync_people_tags(store: &Store, photo_ids: &[i64], ver: &str) -> Result<u
                 let rows = st.query_map(params![pid, ver], |r| Ok((r.get(0)?, r.get(1)?)))?;
                 keep.extend(rows.flatten());
             }
-            let same = match (prev, people) {
-                (None, None) => true,
-                (Some(a), Some(b)) => a.0 == b.0 && (a.1 - b.1).abs() < 1e-6,
+            let same = match (prev.as_slice(), people) {
+                ([], None) => true,
+                ([(id, score)], Some((wanted, conf))) => {
+                    *id == wanted && (*score - conf).abs() < 1e-6
+                }
                 _ => false,
             };
             if same && keep.len() + usize::from(people.is_some()) <= 6 {
@@ -596,14 +598,36 @@ pub fn sync_people_tags(store: &Store, photo_ids: &[i64], ver: &str) -> Result<u
 
 /// 读取某张照片当前版本的标签(标签 id, 分数, 当前界面语言的名称)。
 pub fn photo_tags(store: &Store, photo_id: i64, ver: &str) -> Vec<(i64, f32, String)> {
+    photo_tags_inner(store, photo_id, ver, false)
+}
+
+/// 只读取已完成当前版本任务的标签。
+pub fn completed_photo_tags(store: &Store, photo_id: i64, ver: &str) -> Vec<(i64, f32, String)> {
+    photo_tags_inner(store, photo_id, ver, true)
+}
+
+fn photo_tags_inner(
+    store: &Store,
+    photo_id: i64,
+    ver: &str,
+    completed_only: bool,
+) -> Vec<(i64, f32, String)> {
     let en = crate::i18n::lang() == crate::i18n::Lang::En;
+    let state_filter = if completed_only {
+        "AND EXISTS(SELECT 1 FROM ai_state s
+                     WHERE s.photo_id=t.photo_id AND s.stage='tags' AND s.model_ver=t.model_ver)"
+    } else {
+        ""
+    };
     store.read(|conn| {
         let mut out = Vec::new();
-        let Ok(mut st) = conn.prepare(
+        let sql = format!(
             "SELECT t.label_id, t.score, l.name_zh, l.name_en FROM auto_tags t
                JOIN tag_labels l ON l.id = t.label_id
-              WHERE t.photo_id=?1 AND t.model_ver=?2 ORDER BY t.score DESC",
-        ) else {
+              WHERE t.photo_id=?1 AND t.model_ver=?2 {state_filter}
+              ORDER BY t.score DESC"
+        );
+        let Ok(mut st) = conn.prepare(&sql) else {
             return out;
         };
         if let Ok(rows) = st.query_map(params![photo_id, ver], |r| {
@@ -620,6 +644,18 @@ pub fn photo_tags(store: &Store, photo_id: i64, ver: &str) -> Vec<(i64, f32, Str
     })
 }
 
+/// 当前版本标签任务的完成时间。
+pub fn completion_ts(store: &Store, photo_id: i64, ver: &str) -> Option<i64> {
+    store.read(|conn| {
+        conn.query_row(
+            "SELECT done_ts FROM ai_state WHERE photo_id=?1 AND stage='tags' AND model_ver=?2",
+            params![photo_id, ver],
+            |r| r.get(0),
+        )
+        .ok()
+    })
+}
+
 /// 某分类下的照片 id。
 pub fn category_ids(store: &Store, category: &str, ver: &str, limit: usize) -> Vec<i64> {
     store.read(|conn| {
@@ -627,6 +663,7 @@ pub fn category_ids(store: &Store, category: &str, ver: &str, limit: usize) -> V
         let Ok(mut st) = conn.prepare(
             "SELECT DISTINCT t.photo_id FROM auto_tags t
                JOIN tag_labels l ON l.id = t.label_id
+               JOIN ai_state s ON s.photo_id=t.photo_id AND s.stage='tags' AND s.model_ver=t.model_ver
               WHERE t.model_ver=?1 AND (l.node=?2 OR l.node LIKE ?3)
               ORDER BY t.photo_id LIMIT ?4",
         ) else {
@@ -648,6 +685,7 @@ pub fn category_count(store: &Store, category: &str, ver: &str) -> usize {
         conn.query_row(
             "SELECT COUNT(DISTINCT t.photo_id) FROM auto_tags t
                JOIN tag_labels l ON l.id = t.label_id
+               JOIN ai_state s ON s.photo_id=t.photo_id AND s.stage='tags' AND s.model_ver=t.model_ver
               WHERE t.model_ver=?1 AND (l.node=?2 OR l.node LIKE ?3)",
             params![ver, category, format!("{category}/%")],
             |r| r.get::<_, i64>(0),
@@ -666,6 +704,7 @@ pub fn category_counts(store: &Store, ver: &str) -> Vec<(&'static str, usize)> {
                          ELSE l.node END AS cat,
                     COUNT(DISTINCT t.photo_id)
                FROM auto_tags t JOIN tag_labels l ON l.id=t.label_id
+               JOIN ai_state s ON s.photo_id=t.photo_id AND s.stage='tags' AND s.model_ver=t.model_ver
               WHERE t.model_ver=?1 GROUP BY cat",
         ) else {
             return;
@@ -838,6 +877,31 @@ mod tests {
     }
 
     #[test]
+    fn select_caps_at_six_and_breaks_ties_by_id() {
+        let labels: Vec<Label> = (1..=8)
+            .map(|id| label(id, &format!("类别{id}"), &format!("标签{id}"), &format!("tag {id}")))
+            .collect();
+        let scores: Vec<(i64, f32)> = (1..=8).map(|id| (id, 0.9)).collect();
+        let got = select(&scores, &labels, 0.2, 0.05);
+        assert_eq!(got.into_iter().map(|(id, _)| id).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn select_ignores_non_finite_scores() {
+        let labels = vec![
+            label(1, "动物/猫", "猫", "cat"),
+            label(2, "动物/狗", "狗", "dog"),
+        ];
+        let got = select(
+            &[(1, f32::NAN), (2, f32::INFINITY), (1, 0.9)],
+            &labels,
+            0.2,
+            0.05,
+        );
+        assert_eq!(got, vec![(1, 0.9)]);
+    }
+
+    #[test]
     fn cosine_handles_mismatched_lengths() {
         assert_eq!(cosine(&[1.0, 0.0], &[1.0]), 0.0);
         assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
@@ -855,13 +919,39 @@ mod tests {
                      INSERT INTO tag_labels(id,node,name_zh,name_en,prompt_en,builtin,ver)
                          VALUES(2,'人物/合影','合影','group','a group',1,'v1');
                      INSERT INTO auto_tags(photo_id,label_id,score,model_ver)
-                         VALUES(1,2,0.9,'v1');",
+                         VALUES(1,2,0.9,'v1');
+                     INSERT INTO ai_state(photo_id,stage,model_ver,done_ts)
+                         VALUES(1,'tags','v1',1);",
                 )
             })
             .unwrap();
         assert_eq!(category_ids(&store, "人物", "v1", 10), vec![1]);
         assert!(category_ids(&store, "动物", "v1", 10).is_empty());
         assert!(category_ids(&store, "人物", "v0", 10).is_empty());
+    }
+
+    #[test]
+    fn category_queries_hide_unfinished_tags() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let cat = node_id(&store, "动物/猫");
+        for id in 1..=2 {
+            add_photo(&store, id);
+        }
+        save(&store, 1, "v1", &[(cat, 0.9)]).unwrap();
+        save(&store, 2, "v1", &[(cat, 0.8)]).unwrap();
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES(1,'tags','v1',1)",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(category_ids(&store, "动物", "v1", 10), vec![1]);
+        assert_eq!(category_count(&store, "动物", "v1"), 1);
+        let counts = category_counts(&store, "v1");
+        assert_eq!(counts.iter().find(|(n, _)| *n == "动物").unwrap().1, 1);
     }
 
     /// 分类计数与 id 口径一致:同图多标签只算一张,展示上限不影响总数。
@@ -872,7 +962,7 @@ mod tests {
         let cat = node_id(&store, "动物/猫");
         let dog = node_id(&store, "动物/狗");
         let shot = node_id(&store, "文档票据/截图");
-        for id in 1..=3 {
+        for id in 1..=4 {
             add_photo(&store, id);
         }
         store
@@ -881,7 +971,10 @@ mod tests {
                     "INSERT INTO auto_tags(photo_id,label_id,score,model_ver) VALUES
                        (1,{cat},0.5,'v1'),(1,{dog},0.4,'v1'),
                        (2,{cat},0.6,'v1'),(3,{shot},0.7,'v1'),
-                       (2,{cat},0.9,'v0');"
+                       (4,{cat},0.9,'v0');
+                     INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES
+                       (1,'tags','v1',1),(2,'tags','v1',1),(3,'tags','v1',1),
+                       (4,'tags','v0',1);"
                 ))
                 .unwrap();
             });
@@ -920,6 +1013,37 @@ mod tests {
         }
         let _g = crate::i18n::LangGuard::to(crate::i18n::Lang::En);
         assert_eq!(photo_tags(&store, 1, "v1")[0].2, "cat");
+    }
+
+    #[test]
+    fn completed_photo_tags_require_matching_state() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        let cat = node_id(&store, "动物/猫");
+        add_photo(&store, 1);
+        save(&store, 1, "v1", &[(cat, 0.9)]).unwrap();
+        assert_eq!(photo_tags(&store, 1, "v1").len(), 1);
+        assert!(completed_photo_tags(&store, 1, "v1").is_empty());
+        assert_eq!(completion_ts(&store, 1, "v1"), None);
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES(1,'tags','v0',10)",
+                    [],
+                )
+            })
+            .unwrap();
+        assert!(completed_photo_tags(&store, 1, "v1").is_empty());
+        store
+            .write(|c| {
+                c.execute(
+                    "UPDATE ai_state SET model_ver='v1',done_ts=11 WHERE photo_id=1 AND stage='tags'",
+                    [],
+                )
+            })
+            .unwrap();
+        assert_eq!(completed_photo_tags(&store, 1, "v1").len(), 1);
+        assert_eq!(completion_ts(&store, 1, "v1"), Some(11));
     }
 
     fn node_id(store: &Store, node: &str) -> i64 {
@@ -1025,7 +1149,37 @@ mod tests {
         assert_eq!(photo_tags(&store, 3, "v1")[0].0, group);
         assert!(photo_tags(&store, 4, "v1").is_empty(), "已忽略的人脸不计数");
         assert_eq!(sync_people_tags(&store, &[1, 2, 3, 4], "v1").unwrap(), 0, "重复同步不改写");
+        store
+            .write(|c| {
+                c.execute_batch(
+                    "INSERT INTO ai_state(photo_id,stage,model_ver,done_ts) VALUES
+                       (1,'tags','v1',1),(2,'tags','v1',1),(3,'tags','v1',1),(4,'tags','v1',1);",
+                )
+            })
+            .unwrap();
         assert_eq!(category_ids(&store, "人物", "v1", 10), vec![2, 3]);
+    }
+
+    #[test]
+    fn people_sync_removes_additional_stale_labels() {
+        let store = Store::open_mem().unwrap();
+        seed_labels(&store).unwrap();
+        add_photo(&store, 1);
+        store
+            .write(|c| {
+                c.execute(
+                    "INSERT INTO faces(id,photo_id,score,ignored) VALUES(1,1,0.9,0)",
+                    [],
+                )
+            })
+            .unwrap();
+        let portrait = node_id(&store, "人物/人像");
+        let group = node_id(&store, "人物/合影");
+        save(&store, 1, "v1", &[(portrait, 0.9), (group, 0.8)]).unwrap();
+        sync_people_tags(&store, &[1], "v1").unwrap();
+        let got = photo_tags(&store, 1, "v1");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, portrait);
     }
 
     #[test]

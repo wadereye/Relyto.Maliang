@@ -1077,6 +1077,7 @@ CREATE TABLE IF NOT EXISTS ai_jobs (
     priority    INTEGER NOT NULL,
     enqueued_ts INTEGER NOT NULL,
     attempts    INTEGER NOT NULL DEFAULT 0,
+    model_ver   TEXT,
     PRIMARY KEY (stage, photo_id)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_ai_jobs_pick
@@ -1709,6 +1710,7 @@ impl Store {
             .context("开启外键约束")?;
         conn.execute_batch(SCHEMA)?;
         // 旧库迁移:按需补列(列已存在时静默)
+        let _ = conn.execute_batch("ALTER TABLE ai_jobs ADD COLUMN model_ver TEXT;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN dhash INTEGER;");
         let _ = conn.execute_batch("ALTER TABLE photos ADD COLUMN baked INTEGER;");
         let _ =
@@ -6718,6 +6720,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!(val, "Nikon D850");
+    }
+
+    #[test]
+    fn open_migrates_legacy_ai_jobs_with_model_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE photos(
+                 id INTEGER PRIMARY KEY,
+                 path TEXT UNIQUE NOT NULL,
+                 parent TEXT NOT NULL,
+                 mtime INTEGER NOT NULL,
+                 size INTEGER NOT NULL,
+                 taken_utc TEXT,
+                 cam TEXT,
+                 rot INTEGER NOT NULL DEFAULT 0,
+                 thumb_ok INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE ai_jobs(
+                 stage TEXT NOT NULL,
+                 photo_id INTEGER NOT NULL,
+                 priority INTEGER NOT NULL,
+                 enqueued_ts INTEGER NOT NULL,
+                 attempts INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY(stage, photo_id)
+             ) WITHOUT ROWID;
+             INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0);
+             INSERT INTO ai_jobs(stage,photo_id,priority,enqueued_ts,attempts)
+                 VALUES('clip',1,6,0,0);",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        let c = store.test_conn();
+        let has_model_ver: bool = c
+            .prepare("PRAGMA table_info(ai_jobs)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .flatten()
+            .any(|name| name == "model_ver");
+        assert!(has_model_ver, "旧队列应补上任务版本列");
+        let n: i64 = c
+            .query_row("SELECT COUNT(*) FROM ai_jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "迁移不能丢已有任务");
     }
 
     #[test]

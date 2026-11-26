@@ -44,12 +44,17 @@ struct GateState {
     maintenance: bool,
 }
 
-struct Maintenance<'a>(&'a Gate);
+struct Maintenance<'a> {
+    gate: &'a Gate,
+    paused: bool,
+}
 
 impl Drop for Maintenance<'_> {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().maintenance = false;
-        self.0.cv.notify_all();
+        let mut state = self.gate.state.lock().unwrap();
+        state.maintenance = false;
+        state.paused = self.paused;
+        self.gate.cv.notify_all();
     }
 }
 
@@ -61,15 +66,7 @@ impl Gate {
         }
     }
 
-    /// 等到暂停和维护都结束。
-    fn wait(&self) {
-        let mut state = self.state.lock().unwrap();
-        while state.paused || state.maintenance {
-            state = self.cv.wait(state).unwrap();
-        }
-    }
-
-    fn enter(&self, busy: &Busy, quit: &AtomicBool) -> bool {
+    fn enter(&self, busy: &Busy, stage: Stage, quit: &AtomicBool) -> bool {
         let mut state = self.state.lock().unwrap();
         while (state.paused || state.maintenance) && !quit.load(Ordering::Relaxed) {
             state = self.cv.wait(state).unwrap();
@@ -77,7 +74,7 @@ impl Gate {
         if quit.load(Ordering::Relaxed) {
             return false;
         }
-        busy.enter();
+        busy.enter(stage);
         true
     }
 
@@ -86,8 +83,11 @@ impl Gate {
         if state.maintenance {
             return Err(crate::i18n::t("已有 AI 维护任务正在运行").into());
         }
+        let paused = state.paused;
         state.maintenance = true;
-        Ok(Maintenance(self))
+        state.paused = true;
+        self.cv.notify_all();
+        Ok(Maintenance { gate: self, paused })
     }
 
     fn set(&self, paused: bool) {
@@ -102,40 +102,55 @@ impl Gate {
 
 /// 批次占用计数(换模型前等待归零)。
 struct Busy {
-    active: Mutex<usize>,
+    active: Mutex<[usize; 3]>,
     cv: Condvar,
 }
 
 impl Busy {
     fn new() -> Self {
         Busy {
-            active: Mutex::new(0),
+            active: Mutex::new([0; 3]),
             cv: Condvar::new(),
         }
     }
 
-    fn enter(&self) {
-        *self.active.lock().unwrap() += 1;
+    fn enter(&self, stage: Stage) {
+        let idx = match stage {
+            Stage::Clip => 0,
+            Stage::Tags => 1,
+            Stage::Ocr => 2,
+        };
+        self.active.lock().unwrap()[idx] += 1;
     }
 
-    fn leave(&self) {
-        let mut n = self.active.lock().unwrap();
-        *n = n.saturating_sub(1);
+    fn leave(&self, stage: Stage) {
+        let idx = match stage {
+            Stage::Clip => 0,
+            Stage::Tags => 1,
+            Stage::Ocr => 2,
+        };
+        let mut active = self.active.lock().unwrap();
+        active[idx] = active[idx].saturating_sub(1);
         self.cv.notify_all();
     }
 
-    fn wait_idle(&self, timeout: Duration) -> bool {
+    fn wait_idle(&self, stage: Stage, timeout: Duration) -> bool {
+        let idx = match stage {
+            Stage::Clip => 0,
+            Stage::Tags => 1,
+            Stage::Ocr => 2,
+        };
         let deadline = Instant::now() + timeout;
-        let mut n = self.active.lock().unwrap();
-        while *n > 0 {
+        let mut active = self.active.lock().unwrap();
+        while active[idx] > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
-            let (guard, _) = self.cv.wait_timeout(n, left).unwrap();
-            n = guard;
+            let (guard, _) = self.cv.wait_timeout(active, left).unwrap();
+            active = guard;
         }
-        *n == 0
+        active[idx] == 0
     }
 }
 
@@ -276,7 +291,8 @@ fn execute_clip(store: &Store, runner: &mut Runner, photo_id: i64, ver: &str) ->
 fn execute_tags(store: &Store, runner: &mut Runner, photo_id: i64, tag_ver: &str) -> Outcome {
     let clip_ver = ai_queue::stage_version(store, Stage::Clip);
     let emb = match crate::ai_search::load_vec(store, photo_id, &clip_ver) {
-        Some(v) => v,
+        Some(v) if !v.is_empty() => v,
+        Some(_) => return Outcome::Fail("语义向量为空".into()),
         None => return Outcome::Skip("缺语义向量".into()),
     };
     let (threshold, margin) = crate::ai_tags::thresholds(crate::ai_tags::sensitivity(store));
@@ -285,9 +301,18 @@ fn execute_tags(store: &Store, runner: &mut Runner, photo_id: i64, tag_ver: &str
             Ok(v) => v,
             Err(e) => return Outcome::Fail(e),
         };
+        if labels.is_empty() {
+            return Outcome::Fail("标签向量为空".into());
+        }
+        if let Some((id, v)) = labels.iter().find(|(_, v)| v.len() != emb.len()) {
+            return Outcome::Fail(format!(
+                "标签向量维度不一致:标签 {id} 为 {} 维,图像向量为 {} 维",
+                v.len(),
+                emb.len()
+            ));
+        }
         let s: Vec<(i64, f32)> = labels
             .iter()
-            .filter(|(_, v)| v.len() == emb.len())
             .map(|(id, v)| (*id, crate::ai_tags::cosine(&emb, v)))
             .collect();
         let catalog = crate::ai_tags::labels(store);
@@ -438,8 +463,7 @@ fn worker(
         if quit.load(Ordering::Relaxed) {
             break;
         }
-        gate.wait();
-        if quit.load(Ordering::Relaxed) {
+        if !gate.enter(&busy, stage, &quit) {
             break;
         }
         if release.swap(false, Ordering::AcqRel) {
@@ -447,15 +471,16 @@ fn worker(
         }
         if !crate::ai_models::stage_ready(&store, stage) {
             runner.clear();
+            busy.leave(stage);
             std::thread::sleep(NOT_READY_SLEEP);
             continue;
         }
         let ver = ai_queue::stage_version(&store, stage);
+        runner.prepare(ver.clone());
         let _ = ai_queue::purge_done(&store, stage, &ver);
-        busy.enter();
         let batch = ai_queue::pick_batch(&store, stage, &ver, ai_queue::BATCH_LIMIT);
         if batch.is_empty() {
-            busy.leave();
+            busy.leave(stage);
             std::thread::sleep(IDLE_SLEEP);
             continue;
         }
@@ -478,10 +503,9 @@ fn worker(
                 Outcome::Fail(e) => failed.push((job.photo_id, job.attempts + 1, e)),
             }
         }
-        let _ = ai_queue::defer_batch(&store, stage, &skipped);
+        let _ = ai_queue::defer_batch(&store, stage, &skipped, &ver);
         let _ = ai_queue::commit_batch(&store, stage, &ver, &ok, &failed);
-        busy.leave();
-        gate.wait();
+        busy.leave(stage);
     }
 }
 
@@ -557,9 +581,25 @@ impl AiSched {
         self.gate.is_paused()
     }
 
-    /// 等待所有阶段当前批结束(不阻塞超过 10 秒)。
-    pub fn drain(&self, _stage: Stage) {
-        self.busy.wait_idle(DRAIN_TIMEOUT);
+    /// 等待指定阶段当前批结束(不阻塞超过 10 秒)。
+    pub fn drain(&self, stage: Stage) -> Result<(), String> {
+        if self.busy.wait_idle(stage, DRAIN_TIMEOUT) {
+            Ok(())
+        } else {
+            Err(crate::i18n::t("等待 AI 批次结束超时").into())
+        }
+    }
+
+    /// 暂停取批并等待指定阶段空闲,维护结束恢复原暂停状态。
+    pub fn maintain<F, R>(&self, stages: &[Stage], action: F) -> Result<R, String>
+    where
+        F: FnOnce() -> Result<R, String>,
+    {
+        let _guard = self.gate.maintain()?;
+        for &stage in stages {
+            self.drain(stage)?;
+        }
+        action()
     }
 
     /// 请求该阶段丢弃模型会话(下一轮生效)。
@@ -611,13 +651,19 @@ mod tests {
     #[test]
     fn gate_blocks_and_resumes() {
         let gate = Arc::new(Gate::new(true));
+        let busy = Arc::new(Busy::new());
+        let quit = Arc::new(AtomicBool::new(false));
         assert!(gate.is_paused());
         let g = gate.clone();
+        let b = busy.clone();
+        let q = quit.clone();
         let done = Arc::new(AtomicBool::new(false));
         let d = done.clone();
         let h = std::thread::spawn(move || {
-            g.wait();
-            d.store(true, Ordering::Relaxed);
+            if g.enter(&b, Stage::Clip, &q) {
+                d.store(true, Ordering::Relaxed);
+                b.leave(Stage::Clip);
+            }
         });
         std::thread::sleep(Duration::from_millis(80));
         assert!(!done.load(Ordering::Relaxed));
@@ -650,23 +696,68 @@ mod tests {
     #[test]
     fn busy_tracks_batches() {
         let b = Busy::new();
-        b.enter();
-        b.enter();
-        b.leave();
-        b.wait_idle(Duration::from_millis(1));
-        assert_eq!(*b.active.lock().unwrap(), 1);
-        b.leave();
-        b.wait_idle(Duration::from_millis(20));
-        assert_eq!(*b.active.lock().unwrap(), 0);
+        b.enter(Stage::Clip);
+        b.enter(Stage::Clip);
+        b.leave(Stage::Clip);
+        assert!(!b.wait_idle(Stage::Clip, Duration::from_millis(1)));
+        assert!(b.wait_idle(Stage::Ocr, Duration::from_millis(1)));
+        b.leave(Stage::Clip);
+        assert!(b.wait_idle(Stage::Clip, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn maintenance_preserves_pause_state() {
+        let store = Arc::new(Store::open_mem().unwrap());
+        let sched = AiSched::spawn(store, false);
+        sched.maintain(&[Stage::Clip], || Ok(())).unwrap();
+        assert!(sched.is_paused(), "维护前暂停时应保持暂停");
+        sched.resume();
+        sched.maintain(&[Stage::Tags], || Ok(())).unwrap();
+        assert!(!sched.is_paused(), "维护前运行时应自动恢复");
+    }
+
+    #[test]
+    fn maintenance_waits_for_selected_stage() {
+        let store = Arc::new(Store::open_mem().unwrap());
+        let sched = Arc::new(AiSched::spawn(store, false));
+        sched.busy.enter(Stage::Clip);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = {
+            let sched = sched.clone();
+            std::thread::spawn(move || {
+                let out = sched.maintain(&[Stage::Clip], || {
+                    tx.send(()).unwrap();
+                    Ok(())
+                });
+                out.unwrap();
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+        sched.busy.leave(Stage::Clip);
+        worker.join().unwrap();
+        rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    }
+
+    #[test]
+    fn drain_reports_only_the_busy_stage() {
+        let store = Arc::new(Store::open_mem().unwrap());
+        let sched = AiSched::spawn(store, false);
+        sched.busy.enter(Stage::Ocr);
+        assert!(sched.drain(Stage::Clip).is_ok());
+        assert!(sched.drain(Stage::Ocr).is_err());
+        sched.busy.leave(Stage::Ocr);
+        assert!(sched.drain(Stage::Ocr).is_ok());
     }
 
     #[test]
     fn replace_model_is_ordered() {
         let store = Arc::new(Store::open_mem().unwrap());
         let sched = AiSched::spawn(store.clone(), false);
-        // 无模型时 drain/release 不应阻塞,失败后调度器应恢复可用状态。
+        // 无模型时维护不应阻塞,失败后保持原来的暂停状态。
         assert!(crate::ai_models::replace_model(&store, &sched, "ocr_det", "v1").is_err());
-        assert!(!sched.is_paused(), "替换失败也必须解除暂停");
+        assert!(sched.is_paused(), "替换失败不能改变原暂停状态");
+        sched.resume();
+        assert!(!sched.is_paused());
     }
 
     /// 读不出图像要立案失败:无限延后会让待办永远清不完,worker 每 30 秒空转一轮。
@@ -712,6 +803,80 @@ mod tests {
             ),
             "文字类照片读不出图像时同样要立案,不能一直延后"
         );
+    }
+
+    #[test]
+    fn tag_dimension_mismatch_fails_without_saving_empty_result() {
+        let store = Store::open_mem().unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0)",
+                    [],
+                )
+            })
+            .unwrap();
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let label: i64 = store.read(|conn| {
+            conn.query_row(
+                "SELECT id FROM tag_labels WHERE node='动物/猫'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        let clip_ver = ai_queue::stage_version(&store, Stage::Clip);
+        let tag_ver = ai_queue::stage_version(&store, Stage::Tags);
+        crate::ai_search::save_vec(&store, 1, &clip_ver, &[1.0, 0.0]).unwrap();
+        let mut runner = Runner::default();
+        runner.model_sig = "test".into();
+        let cache_ver = format!("test|{}", crate::ai_tags::vocab_version(&store));
+        runner.label_vecs = Some((cache_ver, vec![(label, vec![1.0])]));
+        assert!(matches!(
+            execute_tags(&store, &mut runner, 1, &tag_ver),
+            Outcome::Fail(_)
+        ));
+        let saved: i64 = store
+            .read(|conn| conn.query_row("SELECT COUNT(*) FROM auto_tags", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(saved, 0, "维度错误不能伪装成成功的空标签");
+    }
+
+    #[test]
+    fn tag_empty_image_vector_fails_without_saving_empty_result() {
+        let store = Store::open_mem().unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO photos(id,path,parent,mtime,size) VALUES(1,'a.jpg','.',0,0)",
+                    [],
+                )
+            })
+            .unwrap();
+        crate::ai_tags::seed_labels(&store).unwrap();
+        let label: i64 = store.read(|conn| {
+            conn.query_row(
+                "SELECT id FROM tag_labels WHERE node='动物/猫'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        });
+        let clip_ver = ai_queue::stage_version(&store, Stage::Clip);
+        let tag_ver = ai_queue::stage_version(&store, Stage::Tags);
+        crate::ai_search::save_vec(&store, 1, &clip_ver, &[]).unwrap();
+        let mut runner = Runner::default();
+        runner.model_sig = "test".into();
+        let cache_ver = format!("test|{}", crate::ai_tags::vocab_version(&store));
+        runner.label_vecs = Some((cache_ver, vec![(label, vec![1.0])]));
+        assert!(matches!(
+            execute_tags(&store, &mut runner, 1, &tag_ver),
+            Outcome::Fail(_)
+        ));
+        let saved: i64 = store
+            .read(|conn| conn.query_row("SELECT COUNT(*) FROM auto_tags", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(saved, 0);
     }
 
     #[test]
