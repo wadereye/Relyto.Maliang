@@ -105,6 +105,30 @@ struct FaceRec {
     emb: Vec<f32>,
 }
 
+/// 滤掉同图内贴边截断、过窄或远小于主脸的疑似误检框。
+fn filter_spurious(mut faces: Vec<FaceRec>, iw: f32, ih: f32) -> Vec<FaceRec> {
+    if faces.len() < 2 {
+        return faces;
+    }
+    let area = |f: &FaceRec| (f.x2 - f.x1).max(0.0) * (f.y2 - f.y1).max(0.0);
+    let max_area = faces.iter().map(area).fold(0.0f32, f32::max);
+    if max_area <= 0.0 {
+        return faces;
+    }
+    let edge = 1.0f32;
+    faces.retain(|f| {
+        let (w, h) = (f.x2 - f.x1, f.y2 - f.y1);
+        if w <= 0.0 || h <= 0.0 {
+            return false;
+        }
+        let aspect = w / h;
+        let rel = area(f) / max_area;
+        let touches = f.x1 <= edge || f.y1 <= edge || f.x2 >= iw - edge || f.y2 >= ih - edge;
+        aspect >= 0.55 && !(touches && rel < 0.85) && rel >= 0.2
+    });
+    faces
+}
+
 /// 当前人脸方案(选项 > 常规 选择,默认 YuNet + SFace)。
 pub fn current_algo(store: &Store) -> crate::ai::face::FaceAlgo {
     crate::ai::face::FaceAlgo::from_key(&store.get_setting("face_algo").unwrap_or_default())
@@ -2235,19 +2259,34 @@ fn scan_batch_inner(
         };
         // 库里存未旋转原图坐标;检测框从摆正后的图映射回去。
         let (rw, rh) = (img.width() as f32, img.height() as f32);
-        let recs: Vec<FaceRec> = res
-            .iter()
+        let kept = filter_spurious(
+            res.iter()
+                .map(|f| FaceRec {
+                    x1: f.det.x0,
+                    y1: f.det.y0,
+                    x2: f.det.x1,
+                    y2: f.det.y1,
+                    score: f.det.score,
+                    quality: face_quality(&img, &f.det),
+                    emb: f.emb.clone(),
+                })
+                .collect(),
+            rw,
+            rh,
+        );
+        let recs: Vec<FaceRec> = kept
+            .into_iter()
             .map(|f| {
-                let (ax, ay) = map_unorient(f.det.x0, f.det.y0, rw, rh, orient);
-                let (bx, by) = map_unorient(f.det.x1, f.det.y1, rw, rh, orient);
+                let (ax, ay) = map_unorient(f.x1, f.y1, rw, rh, orient);
+                let (bx, by) = map_unorient(f.x2, f.y2, rw, rh, orient);
                 FaceRec {
                     x1: ax.min(bx),
                     y1: ay.min(by),
                     x2: ax.max(bx),
                     y2: ay.max(by),
-                    score: f.det.score,
-                    quality: face_quality(&img, &f.det),
-                    emb: f.emb.clone(),
+                    score: f.score,
+                    quality: f.quality,
+                    emb: f.emb,
                 }
             })
             .collect();
@@ -4725,5 +4764,38 @@ mod tests {
         assert_eq!(store.album_create_for_person(9, "张三").unwrap(), 1);
         wipe_faces(&store).unwrap();
         assert!(store.person_album_ids().is_empty(), "旧身份相簿应解绑");
+    }
+
+    fn rec(x1: f32, y1: f32, x2: f32, y2: f32) -> FaceRec {
+        FaceRec {
+            x1,
+            y1,
+            x2,
+            y2,
+            score: 0.9,
+            quality: 0.8,
+            emb: vec![1.0],
+        }
+    }
+
+    #[test]
+    fn filter_spurious_drops_edge_and_tiny_faces() {
+        let main = rec(80.0, 60.0, 180.0, 195.0); // 100×135 主脸
+        let edge = rec(-1.0, 66.0, 77.0, 191.0); // 贴边半脸
+        let narrow = rec(29.0, 58.0, 46.0, 77.0); // 极窄误检
+        let tiny = rec(203.0, 156.0, 224.0, 180.0); // 极小误检
+        let kept = filter_spurious(vec![main, edge, narrow, tiny], 250.0, 250.0);
+        assert_eq!(kept.len(), 1, "只保留主脸");
+        assert_eq!(kept[0].x1, 80.0);
+    }
+
+    #[test]
+    fn filter_spurious_keeps_single_and_normal_group() {
+        let one = rec(10.0, 10.0, 110.0, 145.0);
+        assert_eq!(filter_spurious(vec![one], 250.0, 250.0).len(), 1);
+        // 合影里两张大小相近、都不贴边的脸应都保留。
+        let a = rec(20.0, 40.0, 120.0, 175.0);
+        let b = rec(130.0, 45.0, 225.0, 170.0);
+        assert_eq!(filter_spurious(vec![a, b], 250.0, 250.0).len(), 2);
     }
 }
