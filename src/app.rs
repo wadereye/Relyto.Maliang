@@ -9297,16 +9297,27 @@ impl App {
                     .small_button(if f.ignored { t("恢复") } else { t("忽略") })
                     .clicked()
                 {
-                    let _ =
-                        crate::faces::set_ignored(&self.store, &[f.face_id], !f.ignored);
-                    self.face_show_ignored = true;
-                    self.refresh_people_and_suggestions();
+                    match crate::faces::set_ignored(&self.store, &[f.face_id], !f.ignored) {
+                        Ok(_) => {
+                            self.face_show_ignored = true;
+                            self.refresh_people_and_suggestions();
+                        }
+                        Err(e) => {
+                            self.status = t_with("操作失败: {e}", &[("e", e.to_string())]);
+                        }
+                    }
                 }
                 if let Some(cluster) = f.cluster {
                     if !f.ignored && ui.small_button(t("忽略此组")).clicked() {
-                        let _ = crate::faces::ignore_cluster(&self.store, cluster, true);
-                        self.face_show_ignored = true;
-                        self.refresh_people_and_suggestions();
+                        match crate::faces::ignore_cluster(&self.store, cluster, true) {
+                            Ok(()) => {
+                                self.face_show_ignored = true;
+                                self.refresh_people_and_suggestions();
+                            }
+                            Err(e) => {
+                                self.status = t_with("操作失败: {e}", &[("e", e.to_string())]);
+                            }
+                        }
                     }
                 }
             });
@@ -15025,9 +15036,10 @@ impl eframe::App for App {
             if let Ok(res) = rx.try_recv() {
                 self.recluster_rx = None;
                 match res {
-                    Ok(n) => {
+                    Ok(_) => {
+                        let n = crate::faces::people_overview(&self.store).len();
                         self.status = t_with(
-                            "重新聚类完成:共 {n} 簇",
+                            "重新聚类完成:共 {n} 组",
                             &[("n", n.to_string())],
                         );
                     }
@@ -16475,17 +16487,43 @@ impl eframe::App for App {
                                 // 忽略/恢复整组(跨簇身份的所有簇一并处理)。
                                 ui.horizontal(|ui| {
                                     if ui.button(t("忽略此组")).clicked() {
+                                        let mut err: Option<anyhow::Error> = None;
                                         for cid in &clusters {
-                                            let _ = crate::faces::ignore_cluster(&self.store, *cid, true);
+                                            if let Err(e) =
+                                                crate::faces::ignore_cluster(&self.store, *cid, true)
+                                            {
+                                                err = Some(e);
+                                                break;
+                                            }
                                         }
-                                        self.face_show_ignored = true;
-                                        self.refresh_people_and_suggestions();
+                                        match err {
+                                            None => {
+                                                self.face_show_ignored = true;
+                                                self.refresh_people_and_suggestions();
+                                            }
+                                            Some(e) => {
+                                                self.status =
+                                                    t_with("操作失败: {e}", &[("e", e.to_string())]);
+                                            }
+                                        }
                                     }
                                     if ui.button(t("恢复此组")).clicked() {
+                                        let mut err: Option<anyhow::Error> = None;
                                         for cid in &clusters {
-                                            let _ = crate::faces::ignore_cluster(&self.store, *cid, false);
+                                            if let Err(e) =
+                                                crate::faces::ignore_cluster(&self.store, *cid, false)
+                                            {
+                                                err = Some(e);
+                                                break;
+                                            }
                                         }
-                                        self.refresh_people_and_suggestions();
+                                        match err {
+                                            None => self.refresh_people_and_suggestions(),
+                                            Some(e) => {
+                                                self.status =
+                                                    t_with("操作失败: {e}", &[("e", e.to_string())]);
+                                            }
+                                        }
                                     }
                                 });
                                 ui.add_space(8.0);
@@ -16516,7 +16554,15 @@ impl eframe::App for App {
                                             && in_this.contains(&b);
                                         ui.label(t_with("{kind}: 人脸 {a} ↔ {b}{p1}", &[("kind", kind.to_string()), ("a", a.to_string()), ("b", b.to_string()), ("p1", (if clash { t("(已同簇,需拆分)") } else { "" }).to_string())]));
                                         if ui.small_button(t("删除")).clicked() {
-                                            let _ = crate::ai_review::remove(&self.store, a, b);
+                                            match crate::ai_review::remove(&self.store, a, b) {
+                                                Ok(()) => self.refresh_people_and_suggestions(),
+                                                Err(e) => {
+                                                    self.status = t_with(
+                                                        "操作失败: {e}",
+                                                        &[("e", e.to_string())],
+                                                    );
+                                                }
+                                            }
                                         }
                                     });
                                 }
@@ -16573,8 +16619,17 @@ impl eframe::App for App {
                                     })
                                     .map(|h| h.face_id);
                                     if let Some(of) = other {
-                                        let _ = crate::ai_review::add(&self.store, cf, of, kind);
-                                        self.status = t_with("已记录约束:簇 {c} ↔ 簇 {t}", &[("c", c.to_string()), ("t", t.to_string())]);
+                                        match crate::ai_review::add(&self.store, cf, of, kind) {
+                                            Ok(()) => {
+                                                self.status = t_with("已记录约束:簇 {c} ↔ 簇 {t}", &[("c", c.to_string()), ("t", t.to_string())]);
+                                            }
+                                            Err(e) => {
+                                                self.status = t_with(
+                                                    "操作失败: {e}",
+                                                    &[("e", e.to_string())],
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                                 ui.small(t("约束在点「重新聚类」后生效;「不同人」只阻止合并。"));

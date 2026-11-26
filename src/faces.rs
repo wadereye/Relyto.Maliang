@@ -198,13 +198,15 @@ fn legacy_scanned(store: &Store) -> bool {
     store.get_setting("face_algo_version").map(|v| v == algo_tag(store)).unwrap_or(false)
 }
 
-/// 待处理照片的公共条件:当前签名未成功、也未失败(失败需手动重试)。
+/// 待处理条件:成功记录的文件快照过期则重扫,失败需手动重试,旧库标记只兜底无状态行。
 const TODO_WHERE: &str = "p.kind = 0
      AND NOT EXISTS (SELECT 1 FROM face_scan s
-                      WHERE s.photo_id = p.id AND s.sig = ?1 AND s.state = 2)
+                      WHERE s.photo_id = p.id AND s.sig = ?1 AND s.state = 2
+                        AND s.mtime = p.mtime AND s.size = p.size)
      AND NOT EXISTS (SELECT 1 FROM face_scan s
                       WHERE s.photo_id = p.id AND s.sig = ?1 AND s.state = 3)
-     AND NOT (p.face_done = 1 AND ?2 = 1)";
+     AND NOT (p.face_done = 1 AND ?2 = 1
+              AND NOT EXISTS (SELECT 1 FROM face_scan s WHERE s.photo_id = p.id))";
 
 pub fn photos_todo(store: &Store, cap: usize) -> Vec<(i64, String)> {
     let sig = effective_sig(store);
@@ -1073,11 +1075,12 @@ fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         return Ok(0);
     }
     let dim = emb_dim(store);
-    let (mut clusters, named, mut members, mut photos): (
+    let (mut clusters, mut named, mut members, mut photos, mut cluster_pid): (
         HashMap<i64, ClusterMem>,
         HashSet<i64>,
         HashMap<i64, Vec<i64>>,
         HashMap<i64, Vec<i64>>,
+        HashMap<i64, i64>,
     ) = store.read(|conn| -> Result<_> {
         let mut st = conn.prepare(
             "SELECT f.id, f.cluster, f.photo_id, t.vec, COALESCE(f.quality,0.5),
@@ -1125,7 +1128,27 @@ fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         while let Some(r) = rows.next()? {
             named.insert(r.get::<_, i64>(0)?);
         }
-        Ok((acc, named, members, photos))
+        let mut votes: HashMap<i64, (i64, i64)> = HashMap::new();
+        let mut st = conn.prepare(
+            "SELECT cluster, person_id, COUNT(*) FROM faces
+             WHERE cluster IS NOT NULL AND person_id IS NOT NULL AND ignored=0
+             GROUP BY cluster, person_id",
+        )?;
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            let cid: i64 = r.get(0)?;
+            let pid: i64 = r.get(1)?;
+            let n: i64 = r.get(2)?;
+            let better = votes
+                .get(&cid)
+                .map(|(p, c)| n > *c || (n == *c && pid < *p))
+                .unwrap_or(true);
+            if better {
+                votes.insert(cid, (pid, n));
+            }
+        }
+        let cluster_pid = votes.into_iter().map(|(c, (p, _))| (c, p)).collect();
+        Ok((acc, named, members, photos, cluster_pid))
     })?;
     if clusters.len() < 2 {
         return Ok(0);
@@ -1144,7 +1167,7 @@ fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     }
     // 内存里反复并当前最像的一对,直到没有合格对;簇号直接指向最终归宿
     // (被并的簇即刻移出,后续只会再并入仍存活的簇,不会出现链式改号)。
-    let mut merges: Vec<(i64, i64)> = Vec::new(); // (被并掉的簇, 保留方)
+    let mut merges: Vec<(i64, i64, Option<i64>)> = Vec::new(); // (被并簇, 保留方, 统一身份)
     loop {
         // 质心已缓存,每轮只取簇号;排序让同分时的取舍可复现。
         let mut cids: Vec<i64> = clusters.keys().copied().collect();
@@ -1232,7 +1255,18 @@ fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
         if let Some(ps) = photos.remove(&drop) {
             photos.get_mut(&keep).unwrap().extend(ps);
         }
-        merges.push((drop, keep));
+        let keep_pid = cluster_pid
+            .get(&keep)
+            .or_else(|| cluster_pid.get(&drop))
+            .copied();
+        if let Some(p) = keep_pid {
+            cluster_pid.insert(keep, p);
+        }
+        cluster_pid.remove(&drop);
+        if named.remove(&drop) {
+            named.insert(keep);
+        }
+        merges.push((drop, keep, keep_pid));
     }
     if merges.is_empty() {
         return Ok(0);
@@ -1242,9 +1276,15 @@ fn merge_similar_clusters(store: &Store, thr: f32) -> Result<usize> {
     store.write(move |conn| -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         {
-            let mut st = tx.prepare_cached("UPDATE faces SET cluster=?1 WHERE cluster=?2")?;
-            for (drop, keep) in &merges {
-                st.execute(params![keep, drop])?;
+            let mut st = tx.prepare_cached(
+                "UPDATE faces SET cluster=?1,
+                    person_id=CASE WHEN ?2 IS NULL THEN person_id ELSE ?2 END,
+                    assign_src=CASE WHEN ?2 IS NOT NULL AND assign_src IS NULL THEN 'auto'
+                                    ELSE assign_src END
+                 WHERE cluster=?3",
+            )?;
+            for (drop, keep, pid) in &merges {
+                st.execute(params![keep, pid, drop])?;
             }
         }
         tx.commit()?;
@@ -2036,6 +2076,7 @@ pub fn wipe_faces(store: &Store) -> Result<()> {
         tx.execute("DELETE FROM face_constraints", [])?;
         tx.execute("DELETE FROM faces", [])?;
         tx.execute("DELETE FROM people", [])?;
+        tx.execute("UPDATE albums SET person_id=NULL WHERE person_id IS NOT NULL", [])?;
         tx.execute("DELETE FROM face_scan", [])?;
         tx.execute(
             "DELETE FROM auto_tags WHERE label_id IN
@@ -2483,7 +2524,18 @@ fn recluster_locked(store: &Store, thr: f32) -> Result<usize> {
             }
         }
     }
-    let mut used: HashSet<i64> = HashSet::new();
+    // 被忽略的脸不参与重聚类,其簇号保留,避免恢复时并进新分组。
+    let mut used: HashSet<i64> = store.read(|conn| -> Result<HashSet<i64>> {
+        let mut st = conn.prepare(
+            "SELECT DISTINCT cluster FROM faces WHERE ignored=1 AND cluster IS NOT NULL",
+        )?;
+        let mut out = HashSet::new();
+        let mut rows = st.query([])?;
+        while let Some(r) = rows.next()? {
+            out.insert(r.get::<_, i64>(0)?);
+        }
+        Ok(out)
+    })?;
     let mut writes: Vec<(i64, i64, Option<i64>)> = Vec::with_capacity(faces.len());
     for (gi, g) in final_groups.iter().enumerate() {
         if g.is_empty() {
@@ -3046,7 +3098,7 @@ mod tests {
             .unwrap();
         }
         conn.execute(
-            "INSERT INTO face_scan(photo_id,sig,state) VALUES(2,?1,2)",
+            "INSERT INTO face_scan(photo_id,sig,state,mtime,size) VALUES(2,?1,2,0,1)",
             params![sig],
         )
         .unwrap();
@@ -3793,9 +3845,19 @@ mod tests {
         assert_eq!(merged, 1, "应并掉一簇");
         assert_eq!(people_rows(&store), before, "并簇不得增删人物档案");
         let rows = people_overview(&store);
-        assert_eq!(rows.len(), 2, "并簇只改簇号,两个身份仍各自成行");
-        assert_eq!(rows.iter().map(|r| r.count).sum::<usize>(), 5);
-        assert!(rows.iter().all(|r| r.clusters == vec![1]));
+        assert_eq!(rows.len(), 1, "同人并回一簇后只留一个身份");
+        assert_eq!(rows[0].count, 5);
+        assert_eq!(rows[0].clusters, vec![1]);
+        let pids = store.read(|conn| {
+            let mut st = conn
+                .prepare("SELECT DISTINCT person_id FROM faces WHERE cluster=1")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, Option<i64>>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(pids, vec![Some(1)], "并簇后身份应统一: {pids:?}");
         assert_eq!(
             faces_for_cluster(&store, 1, false, 0.0).len(),
             5,
@@ -3859,14 +3921,21 @@ mod tests {
         assert_eq!(merged, 1);
         assert_eq!(people_rows(&store), before, "并簇只改簇号");
         let rows = people_overview(&store);
-        assert_eq!(rows.len(), 2, "并簇不改身份,两行各留各的身份");
-        let named = rows
-            .iter()
-            .find(|r| r.person.is_some())
-            .expect("名字应保留");
+        assert_eq!(rows.len(), 1, "并簇后同一身份只成一组");
+        let named = &rows[0];
         assert_eq!(named.person.as_deref(), Some("李四"));
         assert_eq!(named.person_id, Some(2));
-        assert_eq!(named.count, 2);
+        assert_eq!(named.count, 5, "被并簇的脸归入同一身份");
+        let pids = store.read(|conn| {
+            let mut st = conn
+                .prepare("SELECT DISTINCT person_id FROM faces WHERE cluster=2")
+                .unwrap();
+            st.query_map([], |r| r.get::<_, Option<i64>>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(pids, vec![Some(2)], "被并簇身份应归入保留方: {pids:?}");
         assert_eq!(
             faces_for_cluster(&store, 2, false, 0.0).len(),
             5,
@@ -4578,5 +4647,83 @@ mod tests {
         assert_eq!(crate::ai_tags::photo_tags(&store, 1, &ver).len(), 1);
         wipe_faces(&store).unwrap();
         assert!(crate::ai_tags::photo_tags(&store, 1, &ver).is_empty());
+    }
+
+    /// 文件改动或处理中残留的照片必须重入队,旧库标记不盖过逐照片状态。
+    #[test]
+    fn photos_todo_repicks_changed_and_interrupted() {
+        let store = test_store();
+        let sig = algo_tag(&store);
+        store.set_setting("face_algo_version", &sig).unwrap();
+        store.flush();
+        let conn = store.test_conn();
+        for (id, done) in [(1, 0), (2, 1), (3, 1)] {
+            conn.execute(
+                "INSERT INTO photos(id,path,parent,mtime,size,kind,face_done)
+                 VALUES(?1,?2,'.',100,200,0,?3)",
+                params![id, format!("p{id}.jpg"), done],
+            )
+            .unwrap();
+        }
+        for id in [1, 2] {
+            conn.execute(
+                "INSERT INTO face_scan(photo_id,sig,state,mtime,size) VALUES(?1,?2,2,100,200)",
+                params![id, sig],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO face_scan(photo_id,sig,state,mtime,size) VALUES(3,?1,1,100,200)",
+            params![sig],
+        )
+        .unwrap();
+        conn.execute("UPDATE photos SET mtime=999,size=888 WHERE id IN (1,2)", [])
+            .unwrap();
+        drop(conn);
+        let ids: Vec<i64> = photos_todo(&store, 10).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "改动与中断都要重扫: {ids:?}");
+        assert_eq!(remaining_count(&store), 3);
+    }
+
+    /// 合并簇时身份随保留方统一,同一人物不在列表里拆成两组。
+    #[test]
+    fn merge_similar_clusters_unifies_person_id() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let a = insert_face_with(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(10), Some(1));
+        let b = insert_face_with(&store, 2, &[0.99, 0.01, 0.0], 1.0, Some(20), Some(2));
+        rename_person(&store, 1, "张三").unwrap();
+        assert_eq!(merge_similar_clusters(&store, 0.6).unwrap(), 1);
+        assert_eq!(cluster_of(&store, a), cluster_of(&store, b));
+        assert_eq!(person_of(&store, b), Some(1), "被并簇身份应归入保留方");
+        let rows = people_overview(&store);
+        let snapshot: Vec<_> = rows.iter().map(|r| (r.person_id, r.count)).collect();
+        assert_eq!(rows.len(), 1, "同簇不得拆成两个人物组: {snapshot:?}");
+        assert_eq!(rows[0].count, 2);
+    }
+
+    /// 重聚类不得复用被忽略脸占用的簇号,恢复后才不会混入新人物。
+    #[test]
+    fn recluster_does_not_reuse_ignored_cluster() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg", "b.jpg"]);
+        let hidden = insert_face_with(&store, 1, &[1.0, 0.0, 0.0], 1.0, Some(5), Some(5));
+        let live = insert_face_with(&store, 2, &[1.0, 0.0, 0.0], 1.0, Some(5), Some(5));
+        set_ignored(&store, &[hidden], true).unwrap();
+        recluster_all(&store, 0.6).unwrap();
+        assert_ne!(cluster_of(&store, live), Some(5), "忽略簇号应隔离");
+    }
+
+    /// 清空人物时一并解绑人物相簿,避免悬挂旧身份。
+    #[test]
+    fn wipe_faces_unlinks_person_albums() {
+        let _g = test_serial();
+        let store = test_store();
+        insert_photos(&store, &["a.jpg"]);
+        assert_eq!(store.album_create_for_person(9, "张三").unwrap(), 1);
+        wipe_faces(&store).unwrap();
+        assert!(store.person_album_ids().is_empty(), "旧身份相簿应解绑");
     }
 }

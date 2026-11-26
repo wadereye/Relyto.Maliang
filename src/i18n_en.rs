@@ -1467,7 +1467,7 @@ pub static EN_TABLE: &[(&str, &str)] = &[
 ("重新枚举可移动卷 → 新出现的卷自动扫描", "Re-enumerate removable volumes → newly appearing volumes are scanned automatically"),
 ("重新聚类", "Recluster"),
 ("重新聚类失败: {e}", "Recluster failed: {e}"),
-("重新聚类完成:共 {n} 簇", "Recluster done: {n} clusters total"),
+("重新聚类完成:共 {n} 组", "Recluster done: {n} groups total"),
 ("重置", "Reset"),
 ("重试连接", "Retry connection"),
 ("铅笔素描", "Pencil sketch"),
