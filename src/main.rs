@@ -5,6 +5,7 @@
 
 mod acq;
 mod contacts;
+mod geo;
 mod video_player;
 mod anim;
 mod app;

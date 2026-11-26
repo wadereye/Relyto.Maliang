@@ -697,6 +697,15 @@ pub struct App {
     toolbar_hidden: BTreeSet<String>,
     /// 「配置工具栏按钮」窗口开关。
     toolbar_cfg_open: bool,
+    /// 地理标记地图窗与瓦片状态。
+    geo_map_open: bool,
+    geo_zoom: u8,
+    geo_center: Option<(f64, f64)>,
+    geo_tiles: HashMap<(u8, u32, u32), egui::TextureHandle>,
+    geo_pending: HashSet<(u8, u32, u32)>,
+    geo_failed: HashSet<(u8, u32, u32)>,
+    geo_tiles_zoom: Option<u8>,
+    geo_loader: Option<crate::geo::TileLoader>,
     /// 系统通讯簿选择窗(打开状态 / 过滤词 / 缓存清单)。
     contact_pick_open: bool,
     contact_pick_filter: String,
@@ -3099,6 +3108,14 @@ impl App {
             email_new: String::new(),
             toolbar_hidden,
             toolbar_cfg_open: false,
+            geo_map_open: false,
+            geo_zoom: 4,
+            geo_center: None,
+            geo_tiles: HashMap::new(),
+            geo_pending: HashSet::new(),
+            geo_failed: HashSet::new(),
+            geo_tiles_zoom: None,
+            geo_loader: None,
             contact_pick_open: false,
             contact_pick_filter: String::new(),
             contact_pick_list: Vec::new(),
@@ -7168,6 +7185,275 @@ impl App {
         }
         let _ = self.store.touch_contact(&c.email, &c.display);
         self.status = t_with("已添加收件人 {p1}", &[("p1", c.email.clone())]);
+    }
+
+    /// 打开地理标记地图窗;首次打开时按当前视图/预览照片定位。
+    fn open_geo_map(&mut self) {
+        self.geo_map_open = true;
+        if self.geo_center.is_none() {
+            self.geo_focus();
+        }
+        if self.geo_loader.is_none() {
+            self.geo_loader = Some(crate::geo::TileLoader::spawn(
+                crate::db::data_dir().join("map_tiles"),
+            ));
+        }
+    }
+
+    /// 把地图中心对准预览照片(有 GPS)或当前视图全部 GPS 点的平均位置。
+    fn geo_focus(&mut self) {
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        if let Some(id) = self.preview {
+            if let Some(&idx) = self.id_row.get(&id) {
+                let r = &self.rows[idx];
+                if let (Some(lat), Some(lon)) = (r.lat, r.lon) {
+                    pts.push((lat, lon));
+                }
+            }
+        }
+        if pts.is_empty() {
+            pts = self.rows.iter().filter_map(|r| r.lat.zip(r.lon)).collect();
+        }
+        if pts.is_empty() {
+            self.geo_center = None;
+            return;
+        }
+        let n = pts.len() as f64;
+        let lat = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let lon = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        self.geo_center = Some((lat, lon));
+        // 粗略按经度跨度选一个能看全的缩放档;单点给 12 级(城市尺度)。
+        let (min_lon, max_lon) = pts.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(a, b), p| (a.min(p.1), b.max(p.1)),
+        );
+        let span = (max_lon - min_lon).max(0.02);
+        self.geo_zoom = ((360.0 / span).log2().floor() as i32).clamp(2, 15) as u8;
+    }
+
+    /// 回收后台瓦片下载结果并转纹理。
+    fn geo_pump(&mut self, ctx: &egui::Context) {
+        let Some(loader) = &self.geo_loader else {
+            return;
+        };
+        let got = loader.poll();
+        for f in got {
+            let key = (f.z, f.x, f.y);
+            self.geo_pending.remove(&key);
+            match f.result {
+                Ok(bytes) => match image::load_from_memory(&bytes) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color =
+                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        let tex = ctx.load_texture(
+                            format!("map-{}-{}-{}", f.z, f.x, f.y),
+                            color,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.geo_tiles.insert(key, tex);
+                    }
+                    Err(_) => {
+                        self.geo_failed.insert(key);
+                    }
+                },
+                Err(_) => {
+                    self.geo_failed.insert(key);
+                }
+            }
+        }
+    }
+
+    /// 地理标记地图窗:OSM 瓦片 + 当前视图 GPS 点;可拖动平移、调缩放。
+    fn geo_map_ui(&mut self, ctx: &egui::Context) {
+        if !self.geo_map_open {
+            return;
+        }
+        self.geo_pump(ctx);
+        let mut open = self.geo_map_open;
+        egui::Window::new(t("地图(地理标记)"))
+            .open(&mut open)
+            .default_size([780.0, 580.0])
+            .show(ctx, |ui| {
+                let total = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.lat.is_some() && r.lon.is_some())
+                    .count();
+                ui.horizontal(|ui| {
+                    ui.label(t("缩放"));
+                    ui.add(
+                        egui::Slider::new(&mut self.geo_zoom, 2..=18)
+                            .show_value(true)
+                            .text(t("级")),
+                    );
+                    if ui.button(t("以当前视图居中")).clicked() {
+                        self.geo_focus();
+                    }
+                    ui.label(t_with(
+                        "带 GPS {n} 张",
+                        &[("n", total.to_string())],
+                    ));
+                });
+                ui.separator();
+                let Some((clat, clon)) = self.geo_center else {
+                    ui.label(t("当前视图没有带 GPS 坐标的照片。"));
+                    return;
+                };
+                let z = self.geo_zoom;
+                if self.geo_tiles_zoom != Some(z) {
+                    self.geo_tiles.clear();
+                    self.geo_pending.clear();
+                    self.geo_failed.clear();
+                    self.geo_tiles_zoom = Some(z);
+                }
+                let avail = ui.available_size();
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(avail.x.max(200.0), (avail.y - 24.0).max(200.0)),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(36));
+
+                let cx = crate::geo::tile_x(clon, z);
+                let cy = crate::geo::tile_y(clat, z);
+                let left = cx - (rect.width() as f64 / 2.0) / crate::geo::TILE;
+                let top = cy - (rect.height() as f64 / 2.0) / crate::geo::TILE;
+                let tx0 = left.floor() as i64;
+                let ty0 = top.floor() as i64;
+                let tx1 = (left + rect.width() as f64 / crate::geo::TILE).ceil() as i64;
+                let ty1 = (top + rect.height() as f64 / crate::geo::TILE).ceil() as i64;
+
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        let Some((_, wx, wy)) = crate::geo::clamp_tile(z, tx, ty) else {
+                            continue;
+                        };
+                        let key = (z, wx, wy);
+                        let pos = egui::pos2(
+                            rect.min.x
+                                + ((tx as f64 - left) * crate::geo::TILE) as f32,
+                            rect.min.y
+                                + ((ty as f64 - top) * crate::geo::TILE) as f32,
+                        );
+                        let tile_rect = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(
+                                crate::geo::TILE as f32,
+                                crate::geo::TILE as f32,
+                            ),
+                        );
+                        if let Some(tex) = self.geo_tiles.get(&key) {
+                            painter.image(
+                                tex.id(),
+                                tile_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            painter.rect_stroke(
+                                tile_rect,
+                                0.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(64)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if !self.geo_pending.contains(&key)
+                                && !self.geo_failed.contains(&key)
+                            {
+                                if let Some(loader) = &self.geo_loader {
+                                    loader.request(z, wx, wy);
+                                }
+                                self.geo_pending.insert(key);
+                            }
+                        }
+                    }
+                }
+
+                // 收集落在视口内的 GPS 点(先收集再画,避免边借 rows 边改状态)。
+                let mut pins: Vec<(i64, String, f32, f32)> = Vec::new();
+                for r in &self.rows {
+                    let (Some(lat), Some(lon)) = (r.lat, r.lon) else {
+                        continue;
+                    };
+                    let px = rect.min.x
+                        + ((crate::geo::tile_x(lon, z) - left) * crate::geo::TILE) as f32;
+                    let py = rect.min.y
+                        + ((crate::geo::tile_y(lat, z) - top) * crate::geo::TILE) as f32;
+                    if rect.contains(egui::pos2(px, py)) {
+                        let name = r
+                            .path
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .unwrap_or(&r.path)
+                            .to_string();
+                        pins.push((r.id, name, px, py));
+                    }
+                }
+                let mut hovered: Option<usize> = None;
+                if let Some(p) = resp.hover_pos() {
+                    let mut best = f32::MAX;
+                    for (i, (_, _, px, py)) in pins.iter().enumerate() {
+                        let d = ((p.x - px).powi(2) + (p.y - py).powi(2)).sqrt();
+                        if d < 12.0 && d < best {
+                            best = d;
+                            hovered = Some(i);
+                        }
+                    }
+                }
+                for (i, (id, name, px, py)) in pins.iter().enumerate() {
+                    let selected = self.sel.contains(id);
+                    let radius = if hovered == Some(i) { 7.0 } else { 5.0 };
+                    painter.circle_filled(
+                        egui::pos2(*px, *py),
+                        radius + 1.5,
+                        egui::Color32::from_black_alpha(160),
+                    );
+                    painter.circle_filled(
+                        egui::pos2(*px, *py),
+                        radius,
+                        if selected {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            egui::Color32::from_rgb(220, 70, 60)
+                        },
+                    );
+                    if hovered == Some(i) {
+                        painter.text(
+                            egui::pos2(*px + 10.0, *py - 10.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            name,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                if resp.clicked() {
+                    if let (Some(i), Some(_)) = (hovered, resp.interact_pointer_pos()) {
+                        let (id, name, _, _) = &pins[i];
+                        self.sel.clear();
+                        self.sel.insert(*id);
+                        self.sel_anchor = Some(*id);
+                        self.status = t_with("已选中 {p1}", &[("p1", name.clone())]);
+                    }
+                }
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    let left2 = left - d.x as f64 / crate::geo::TILE;
+                    let top2 = top - d.y as f64 / crate::geo::TILE;
+                    let cx2 = left2 + rect.width() as f64 / 2.0 / crate::geo::TILE;
+                    let cy2 = top2 + rect.height() as f64 / 2.0 / crate::geo::TILE;
+                    self.geo_center = Some((
+                        crate::geo::lat_of_tile_y(cy2, z),
+                        crate::geo::lon_of_tile_x(cx2, z),
+                    ));
+                }
+                ui.small(t("地图数据 © OpenStreetMap contributors(需联网;瓦片缓存在数据目录)"));
+            });
+        self.geo_map_open = open;
     }
 
     /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
@@ -16166,6 +16452,10 @@ impl eframe::App for App {
                                 ui.spinner();
                             }
                         });
+                        if ui.button(t("地图(地理标记)…")).clicked() {
+                            self.open_geo_map();
+                            ui.close();
+                        }
                         if ui.button(t("导出地理标记(KML)…")).clicked() {
                             self.export_kml();
                             ui.close();
@@ -17576,6 +17866,9 @@ impl eframe::App for App {
             }
             self.toolbar_cfg_open = open;
         }
+
+        // 地理标记地图窗(OSM 瓦片 + 当前视图 GPS 点)。
+        self.geo_map_ui(ctx);
 
         // 礼品光盘窗口(IMAPI2 刻录)。
         if self.cd_win {
