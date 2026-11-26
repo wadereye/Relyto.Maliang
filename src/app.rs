@@ -130,6 +130,11 @@ enum WpdEvent {
         /// 用户所选目标目录。
         dir: PathBuf,
     },
+    /// WIA/TWAIN 导入完成(`acq::import_wia` 拿到的落盘路径)。
+    AcqFiles {
+        /// 落盘路径列表或失败原因。
+        result: Result<Vec<PathBuf>, String>,
+    },
 }
 
 /// 批量编辑面板的输入项。
@@ -517,6 +522,14 @@ pub struct App {
     preview_missing: Option<i64>,
     /// 预览后台解码失败(非"文件不存在"):同样要终止"生成中"状态。
     preview_failed: Option<i64>,
+    /// 应用内视频播放器(仅视频帧;音频未接入)。与 preview 同属编辑视图。
+    video_player: Option<crate::video_player::VideoPlayer>,
+    video_player_id: Option<i64>,
+    video_playing: bool,
+    video_tex: Option<egui::TextureHandle>,
+    video_frame: Option<(Vec<u8>, u32, u32)>,
+    video_last_frame: Option<std::time::Instant>,
+    video_err: Option<String>,
     /// 待移出图库的 (id, 路径, 首次发现缺失的时刻)。预览路径发现,
     /// 统一在下一帧预 UI 阶段清理 —— 不能在预览窗闭包里直接重建 rows
     /// (闭包捕获的行索引会失效)。等一小段确认期再删,避免网络盘/移动盘
@@ -680,6 +693,24 @@ pub struct App {
     email_to: Vec<String>,
     /// 邮件窗内新地址输入框草稿。
     email_new: String,
+    /// 工具栏按钮配置:被隐藏按钮的 key(空 = 全部显示)。
+    toolbar_hidden: BTreeSet<String>,
+    /// 「配置工具栏按钮」窗口开关。
+    toolbar_cfg_open: bool,
+    /// 地理标记地图窗与瓦片状态。
+    geo_map_open: bool,
+    geo_zoom: u8,
+    geo_center: Option<(f64, f64)>,
+    geo_tiles: HashMap<(u8, u32, u32), egui::TextureHandle>,
+    geo_pending: HashSet<(u8, u32, u32)>,
+    geo_failed: HashSet<(u8, u32, u32)>,
+    geo_tiles_zoom: Option<u8>,
+    geo_loader: Option<crate::geo::TileLoader>,
+    /// 系统通讯簿选择窗(打开状态 / 过滤词 / 缓存清单)。
+    contact_pick_open: bool,
+    contact_pick_filter: String,
+    contact_pick_list: Vec<crate::contacts::Contact>,
+    contact_pick_loaded: bool,
     /// 礼品光盘窗口开关 + 尺寸档。
     cd_win: bool,
     cd_size: crate::share::ShareSize,
@@ -717,12 +748,16 @@ pub struct App {
     pool_probe_id: i64,
     /// 从设备导入窗口开关。
     show_import_devices: bool,
+    /// Projector Mode(全屏+始终最上)。
+    projector_mode: bool,
     /// 统一设备列表。
     import_devices: Vec<crate::wpd::DeviceEntry>,
     /// 设备枚举提示或失败原因。
     import_devices_err: String,
     /// 设备枚举进行中。
     import_devices_busy: bool,
+    /// 从设备导入窗口:TWAIN 设备名单(尽力而为,避免每帧查询)。
+    import_twain_names: Vec<String>,
     /// WPD 后台事件通道。
     wpd_rx: Option<mpsc::Receiver<WpdEvent>>,
     /// 当前浏览的设备 ID。
@@ -1704,6 +1739,19 @@ const MISSING_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
 /// 缩略图纹理缓存上限。每张 256×256 RGBA 纹理约 256KB,
 /// 768 张 ≈ 192MB 显存,取一个既能覆盖常见滚动范围又不会撑爆的量。
 const TEX_CACHE_CAP: usize = 768;
+
+/// 工具栏可配置按钮:(key, 显示名)。
+/// key 同时是 `toolbar_hidden` 设置串里的项名,改 key 会让旧配置失效。
+const TOOLBAR_BUTTONS: &[(&str, &str)] = &[
+    ("nav", "前进 / 后退"),
+    ("import", "导入"),
+    ("device", "从设备导入"),
+    ("album", "新建相簿"),
+    ("slideshow", "幻灯片放映"),
+    ("folderview", "平铺 / 树形视图"),
+    ("effects", "效果面板"),
+    ("batch", "批量编辑"),
+];
 
 /// 10 色彩色标签(color:red..gray)。
 const TAG_COLORS: [(&str, egui::Color32); 10] = [
@@ -2988,6 +3036,14 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024),
         );
+        // 工具栏按钮显隐(逗号分隔的隐藏 key;空 = 全部显示)。
+        let toolbar_hidden: BTreeSet<String> = store
+            .get_setting("toolbar_hidden")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         #[cfg(feature = "ai")]
         let face_scope_common = crate::faces::scan_scope_common(&store);
         Self {
@@ -3050,6 +3106,20 @@ impl App {
             email_size,
             email_to: Vec::new(),
             email_new: String::new(),
+            toolbar_hidden,
+            toolbar_cfg_open: false,
+            geo_map_open: false,
+            geo_zoom: 4,
+            geo_center: None,
+            geo_tiles: HashMap::new(),
+            geo_pending: HashSet::new(),
+            geo_failed: HashSet::new(),
+            geo_tiles_zoom: None,
+            geo_loader: None,
+            contact_pick_open: false,
+            contact_pick_filter: String::new(),
+            contact_pick_list: Vec::new(),
+            contact_pick_loaded: false,
             cd_win: false,
             cd_size: crate::share::ShareSize::Px800,
             share_rx: None,
@@ -3069,9 +3139,11 @@ impl App {
             fx_trim_id: None,
             pool_probe_id: 0,
             show_import_devices: false,
+            projector_mode: false,
             import_devices: Vec::new(),
             import_devices_err: String::new(),
             import_devices_busy: false,
+            import_twain_names: Vec::new(),
             wpd_rx: None,
             import_device_id: None,
             import_pictures: Vec::new(),
@@ -3097,6 +3169,13 @@ impl App {
             preview_bg: None,
             preview_missing: None,
             preview_failed: None,
+            video_player: None,
+            video_player_id: None,
+            video_playing: false,
+            video_tex: None,
+            video_frame: None,
+            video_last_frame: None,
+            video_err: None,
             pending_missing: Vec::new(),
             bake_rx: None,
             input_tag: String::new(),
@@ -4848,75 +4927,88 @@ impl App {
 
     /// 顶部工具条,左→右:
     /// 导入 · 新建相簿 · 放映 · 平铺/树形 · 查看选项 ▾ …… 过滤四开关 · 尺寸滑块 · 搜索框 · 活动灯。
+    /// 工具栏按钮是否显示(「配置工具栏按钮」里勾掉的不显示)。
+    fn toolbar_show(&self, key: &str) -> bool {
+        !self.toolbar_hidden.contains(key)
+    }
+
     fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             // 前后导航(浏览器式历史;Alt+←/→ 同一条路)。
-            if ui
-                .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
-                .on_hover_text(t("后退(Alt+←)"))
-                .clicked()
-            {
-                self.nav_back();
-            }
-            if ui
-                .add_enabled(
-                    self.nav_at + 1 < self.nav_hist.len(),
-                    tool_button("arrow-right", false),
-                )
-                .on_hover_text(t("前进(Alt+→)"))
-                .clicked()
-            {
-                self.nav_forward();
+            if self.toolbar_show("nav") {
+                if ui
+                    .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
+                    .on_hover_text(t("后退(Alt+←)"))
+                    .clicked()
+                {
+                    self.nav_back();
+                }
+                if ui
+                    .add_enabled(
+                        self.nav_at + 1 < self.nav_hist.len(),
+                        tool_button("arrow-right", false),
+                    )
+                    .on_hover_text(t("前进(Alt+→)"))
+                    .clicked()
+                {
+                    self.nav_forward();
+                }
             }
             ui.separator();
             // 主「导入」按钮开的是整页导入面板(选源 → 看清单 → 入库),
             // 直接挑文件夹的一次性入口仍在 文件 菜单里。
             let on_import = self.page == PageKind::Import;
-            if ui
-                .add(tool_button("folder-plus", on_import))
-                .on_hover_text(t("导入(打开导入页:选源 → 看清单 → 入库)"))
-                .clicked()
+            if self.toolbar_show("import")
+                && ui
+                    .add(tool_button("folder-plus", on_import))
+                    .on_hover_text(t("导入(打开导入页:选源 → 看清单 → 入库)"))
+                    .clicked()
             {
                 self.go_page(PageKind::Import);
             }
-            if ui
-                .add(tool_button("smartphone", false))
-                .on_hover_text(t("从设备导入…"))
-                .clicked()
+            if self.toolbar_show("device")
+                && ui
+                    .add(tool_button("smartphone", false))
+                    .on_hover_text(t("从设备导入…"))
+                    .clicked()
             {
                 self.open_import_devices();
             }
-            if ui
-                .add(tool_button("image-plus", false))
-                .on_hover_text(t("新建相簿(有选中照片则一并放入)"))
-                .clicked()
+            if self.toolbar_show("album")
+                && ui
+                    .add(tool_button("image-plus", false))
+                    .on_hover_text(t("新建相簿(有选中照片则一并放入)"))
+                    .clicked()
             {
                 self.album_input.clear();
                 self.album_new_win = true;
             }
             ui.separator();
-            if ui
-                .add(tool_button("images", false))
-                .on_hover_text(t("幻灯片放映(选中照片;未选中则放映当前视图)"))
-                .clicked()
+            if self.toolbar_show("slideshow")
+                && ui
+                    .add(tool_button("images", false))
+                    .on_hover_text(t("幻灯片放映(选中照片;未选中则放映当前视图)"))
+                    .clicked()
             {
                 self.start_slideshow();
             }
             ui.separator();
-            if ui
-                .add(tool_button("layout-grid", !self.folder_tree))
-                .on_hover_text(t("平铺文件夹视图"))
-                .clicked()
-            {
-                self.set_folder_tree(false);
-            }
-            if ui
-                .add(tool_button("list-tree", self.folder_tree))
-                .on_hover_text(t("树形视图(只显示有照片的目录)"))
-                .clicked()
-            {
-                self.set_folder_tree(true);
+            if self.toolbar_show("folderview") {
+                if ui
+                    .add(tool_button("layout-grid", !self.folder_tree))
+                    .on_hover_text(t("平铺文件夹视图"))
+                    .clicked()
+                {
+                    self.set_folder_tree(false);
+                }
+                if ui
+                    .add(tool_button("list-tree", self.folder_tree))
+                    .on_hover_text(t("树形视图(只显示有照片的目录)"))
+                    .clicked()
+                {
+                    self.set_folder_tree(true);
+                }
             }
             ui.menu_button(toolbar_icon("sliders-horizontal"), |ui| {
                 self.view_options_menu(ui)
@@ -4924,22 +5016,24 @@ impl App {
             .response
             .on_hover_text(t("查看选项"));
             ui.separator();
-            if ui
-                .add(tool_button("wand-sparkles", self.fx_panel))
-                .on_hover_text(t("效果面板"))
-                .clicked()
+            if self.toolbar_show("effects")
+                && ui
+                    .add(tool_button("wand-sparkles", self.fx_panel))
+                    .on_hover_text(t("效果面板"))
+                    .clicked()
             {
                 self.fx_panel = !self.fx_panel;
             }
             let can_batch = self.page == PageKind::Library && self.sel.len() >= 2;
-            if ui
-                .add_enabled(can_batch, tool_button("sliders-horizontal", self.batch_edit_open))
-                .on_hover_text(if can_batch {
-                    t("批量编辑…")
-                } else {
-                    t("先选中至少 2 张照片")
-                })
-                .clicked()
+            if self.toolbar_show("batch")
+                && ui
+                    .add_enabled(can_batch, tool_button("sliders-horizontal", self.batch_edit_open))
+                    .on_hover_text(if can_batch {
+                        t("批量编辑…")
+                    } else {
+                        t("先选中至少 2 张照片")
+                    })
+                    .clicked()
             {
                 self.open_batch_edit();
             }
@@ -7070,6 +7164,298 @@ impl App {
         self.status = t_with("已添加收件人 {p1}", &[("p1", addr)]);
     }
 
+    /// 打开系统通讯簿(Windows Contacts)选择窗;读取失败时给明确提示。
+    fn open_contact_picker(&mut self) {
+        self.contact_pick_list = crate::contacts::load_system_contacts();
+        self.contact_pick_loaded = true;
+        self.contact_pick_open = true;
+        if self.contact_pick_list.is_empty() {
+            self.status = if crate::contacts::contacts_dir().is_some() {
+                t("系统通讯簿里没有可用的邮箱地址").into()
+            } else {
+                t("未找到系统通讯簿(Windows 联系人)目录").into()
+            };
+        }
+    }
+
+    /// 通讯簿条目入收件人并刷新最近使用时间(已存在只刷新)。
+    fn add_picked_contact(&mut self, c: &crate::contacts::Contact) {
+        if !self.email_to.iter().any(|a| a == &c.email) {
+            self.email_to.push(c.email.clone());
+        }
+        let _ = self.store.touch_contact(&c.email, &c.display);
+        self.status = t_with("已添加收件人 {p1}", &[("p1", c.email.clone())]);
+    }
+
+    /// 打开地理标记地图窗;首次打开时按当前视图/预览照片定位。
+    fn open_geo_map(&mut self) {
+        self.geo_map_open = true;
+        if self.geo_center.is_none() {
+            self.geo_focus();
+        }
+        if self.geo_loader.is_none() {
+            self.geo_loader = Some(crate::geo::TileLoader::spawn(
+                crate::db::data_dir().join("map_tiles"),
+            ));
+        }
+    }
+
+    /// 把地图中心对准预览照片(有 GPS)或当前视图全部 GPS 点的平均位置。
+    fn geo_focus(&mut self) {
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        if let Some(id) = self.preview {
+            if let Some(&idx) = self.id_row.get(&id) {
+                let r = &self.rows[idx];
+                if let (Some(lat), Some(lon)) = (r.lat, r.lon) {
+                    pts.push((lat, lon));
+                }
+            }
+        }
+        if pts.is_empty() {
+            pts = self.rows.iter().filter_map(|r| r.lat.zip(r.lon)).collect();
+        }
+        if pts.is_empty() {
+            self.geo_center = None;
+            return;
+        }
+        let n = pts.len() as f64;
+        let lat = pts.iter().map(|p| p.0).sum::<f64>() / n;
+        let lon = pts.iter().map(|p| p.1).sum::<f64>() / n;
+        self.geo_center = Some((lat, lon));
+        // 粗略按经度跨度选一个能看全的缩放档;单点给 12 级(城市尺度)。
+        let (min_lon, max_lon) = pts.iter().fold(
+            (f64::INFINITY, f64::NEG_INFINITY),
+            |(a, b), p| (a.min(p.1), b.max(p.1)),
+        );
+        let span = (max_lon - min_lon).max(0.02);
+        self.geo_zoom = ((360.0 / span).log2().floor() as i32).clamp(2, 15) as u8;
+    }
+
+    /// 回收后台瓦片下载结果并转纹理。
+    fn geo_pump(&mut self, ctx: &egui::Context) {
+        let Some(loader) = &self.geo_loader else {
+            return;
+        };
+        let got = loader.poll();
+        for f in got {
+            let key = (f.z, f.x, f.y);
+            self.geo_pending.remove(&key);
+            match f.result {
+                Ok(bytes) => match image::load_from_memory(&bytes) {
+                    Ok(img) => {
+                        let rgba = img.to_rgba8();
+                        let size = [rgba.width() as usize, rgba.height() as usize];
+                        let color =
+                            egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                        let tex = ctx.load_texture(
+                            format!("map-{}-{}-{}", f.z, f.x, f.y),
+                            color,
+                            egui::TextureOptions::LINEAR,
+                        );
+                        self.geo_tiles.insert(key, tex);
+                    }
+                    Err(_) => {
+                        self.geo_failed.insert(key);
+                    }
+                },
+                Err(_) => {
+                    self.geo_failed.insert(key);
+                }
+            }
+        }
+    }
+
+    /// 地理标记地图窗:OSM 瓦片 + 当前视图 GPS 点;可拖动平移、调缩放。
+    fn geo_map_ui(&mut self, ctx: &egui::Context) {
+        if !self.geo_map_open {
+            return;
+        }
+        self.geo_pump(ctx);
+        let mut open = self.geo_map_open;
+        egui::Window::new(t("地图(地理标记)"))
+            .open(&mut open)
+            .default_size([780.0, 580.0])
+            .show(ctx, |ui| {
+                let total = self
+                    .rows
+                    .iter()
+                    .filter(|r| r.lat.is_some() && r.lon.is_some())
+                    .count();
+                ui.horizontal(|ui| {
+                    ui.label(t("缩放"));
+                    ui.add(
+                        egui::Slider::new(&mut self.geo_zoom, 2..=18)
+                            .show_value(true)
+                            .text(t("级")),
+                    );
+                    if ui.button(t("以当前视图居中")).clicked() {
+                        self.geo_focus();
+                    }
+                    ui.label(t_with(
+                        "带 GPS {n} 张",
+                        &[("n", total.to_string())],
+                    ));
+                });
+                ui.separator();
+                let Some((clat, clon)) = self.geo_center else {
+                    ui.label(t("当前视图没有带 GPS 坐标的照片。"));
+                    return;
+                };
+                let z = self.geo_zoom;
+                if self.geo_tiles_zoom != Some(z) {
+                    self.geo_tiles.clear();
+                    self.geo_pending.clear();
+                    self.geo_failed.clear();
+                    self.geo_tiles_zoom = Some(z);
+                }
+                let avail = ui.available_size();
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(avail.x.max(200.0), (avail.y - 24.0).max(200.0)),
+                    egui::Sense::click_and_drag(),
+                );
+                let painter = ui.painter_at(rect);
+                painter.rect_filled(rect, 0.0, egui::Color32::from_gray(36));
+
+                let cx = crate::geo::tile_x(clon, z);
+                let cy = crate::geo::tile_y(clat, z);
+                let left = cx - (rect.width() as f64 / 2.0) / crate::geo::TILE;
+                let top = cy - (rect.height() as f64 / 2.0) / crate::geo::TILE;
+                let tx0 = left.floor() as i64;
+                let ty0 = top.floor() as i64;
+                let tx1 = (left + rect.width() as f64 / crate::geo::TILE).ceil() as i64;
+                let ty1 = (top + rect.height() as f64 / crate::geo::TILE).ceil() as i64;
+
+                for ty in ty0..=ty1 {
+                    for tx in tx0..=tx1 {
+                        let Some((_, wx, wy)) = crate::geo::clamp_tile(z, tx, ty) else {
+                            continue;
+                        };
+                        let key = (z, wx, wy);
+                        let pos = egui::pos2(
+                            rect.min.x
+                                + ((tx as f64 - left) * crate::geo::TILE) as f32,
+                            rect.min.y
+                                + ((ty as f64 - top) * crate::geo::TILE) as f32,
+                        );
+                        let tile_rect = egui::Rect::from_min_size(
+                            pos,
+                            egui::vec2(
+                                crate::geo::TILE as f32,
+                                crate::geo::TILE as f32,
+                            ),
+                        );
+                        if let Some(tex) = self.geo_tiles.get(&key) {
+                            painter.image(
+                                tex.id(),
+                                tile_rect,
+                                egui::Rect::from_min_max(
+                                    egui::pos2(0.0, 0.0),
+                                    egui::pos2(1.0, 1.0),
+                                ),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            painter.rect_stroke(
+                                tile_rect,
+                                0.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(64)),
+                                egui::StrokeKind::Inside,
+                            );
+                            if !self.geo_pending.contains(&key)
+                                && !self.geo_failed.contains(&key)
+                            {
+                                if let Some(loader) = &self.geo_loader {
+                                    loader.request(z, wx, wy);
+                                }
+                                self.geo_pending.insert(key);
+                            }
+                        }
+                    }
+                }
+
+                // 收集落在视口内的 GPS 点(先收集再画,避免边借 rows 边改状态)。
+                let mut pins: Vec<(i64, String, f32, f32)> = Vec::new();
+                for r in &self.rows {
+                    let (Some(lat), Some(lon)) = (r.lat, r.lon) else {
+                        continue;
+                    };
+                    let px = rect.min.x
+                        + ((crate::geo::tile_x(lon, z) - left) * crate::geo::TILE) as f32;
+                    let py = rect.min.y
+                        + ((crate::geo::tile_y(lat, z) - top) * crate::geo::TILE) as f32;
+                    if rect.contains(egui::pos2(px, py)) {
+                        let name = r
+                            .path
+                            .rsplit(['\\', '/'])
+                            .next()
+                            .unwrap_or(&r.path)
+                            .to_string();
+                        pins.push((r.id, name, px, py));
+                    }
+                }
+                let mut hovered: Option<usize> = None;
+                if let Some(p) = resp.hover_pos() {
+                    let mut best = f32::MAX;
+                    for (i, (_, _, px, py)) in pins.iter().enumerate() {
+                        let d = ((p.x - px).powi(2) + (p.y - py).powi(2)).sqrt();
+                        if d < 12.0 && d < best {
+                            best = d;
+                            hovered = Some(i);
+                        }
+                    }
+                }
+                for (i, (id, name, px, py)) in pins.iter().enumerate() {
+                    let selected = self.sel.contains(id);
+                    let radius = if hovered == Some(i) { 7.0 } else { 5.0 };
+                    painter.circle_filled(
+                        egui::pos2(*px, *py),
+                        radius + 1.5,
+                        egui::Color32::from_black_alpha(160),
+                    );
+                    painter.circle_filled(
+                        egui::pos2(*px, *py),
+                        radius,
+                        if selected {
+                            egui::Color32::from_rgb(255, 200, 60)
+                        } else {
+                            egui::Color32::from_rgb(220, 70, 60)
+                        },
+                    );
+                    if hovered == Some(i) {
+                        painter.text(
+                            egui::pos2(*px + 10.0, *py - 10.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            name,
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+                if resp.clicked() {
+                    if let (Some(i), Some(_)) = (hovered, resp.interact_pointer_pos()) {
+                        let (id, name, _, _) = &pins[i];
+                        self.sel.clear();
+                        self.sel.insert(*id);
+                        self.sel_anchor = Some(*id);
+                        self.status = t_with("已选中 {p1}", &[("p1", name.clone())]);
+                    }
+                }
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    let left2 = left - d.x as f64 / crate::geo::TILE;
+                    let top2 = top - d.y as f64 / crate::geo::TILE;
+                    let cx2 = left2 + rect.width() as f64 / 2.0 / crate::geo::TILE;
+                    let cy2 = top2 + rect.height() as f64 / 2.0 / crate::geo::TILE;
+                    self.geo_center = Some((
+                        crate::geo::lat_of_tile_y(cy2, z),
+                        crate::geo::lon_of_tile_x(cx2, z),
+                    ));
+                }
+                ui.small(t("地图数据 © OpenStreetMap contributors(需联网;瓦片缓存在数据目录)"));
+            });
+        self.geo_map_open = open;
+    }
+
     /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
     fn start_gift_cd(&mut self) {
         if self.share_rx.is_some() {
@@ -7179,7 +7565,60 @@ impl App {
     /// 打开统一设备列表窗口并异步刷新。
     fn open_import_devices(&mut self) {
         self.show_import_devices = true;
+        self.import_twain_names = crate::acq::twain_device_names();
         self.refresh_import_devices();
+    }
+
+    /// 切换 Projector Mode(全屏 + 始终最上,可再次点击或 Esc 退出)。
+    fn toggle_projector(&mut self, ctx: &egui::Context) {
+        self.projector_mode = !self.projector_mode;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.projector_mode));
+        let level = if self.projector_mode {
+            egui::viewport::WindowLevel::AlwaysOnTop
+        } else {
+            egui::viewport::WindowLevel::Normal
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(level));
+        self.status = if self.projector_mode {
+            t("Projector Mode 已开启,再次点击或按 Esc 退出").into()
+        } else {
+            t("Projector Mode 已关闭").into()
+        };
+    }
+
+    /// Esc 在 Projector Mode 时关闭(由 update 顶部调用)。
+    fn maybe_leave_projector(&mut self, ctx: &egui::Context) {
+        if self.projector_mode && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.toggle_projector(ctx);
+        }
+    }
+
+    /// 从 WIA 扫描器/相机导入照片(后台线程调用系统对话框)。
+    fn acq_import_wia(&mut self) {
+        if self.wpd_rx.is_some() {
+            return;
+        }
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title(t("选择导入目标目录"))
+            .pick_folder()
+        else {
+            return;
+        };
+        self.import_devices_err.clear();
+        let (tx, rx) = mpsc::channel();
+        self.wpd_rx = Some(rx);
+        self.import_devices_busy = true;
+        std::thread::spawn(move || {
+            let r = crate::acq::import_wia(&dir).map_err(|e| e.to_string());
+            let _ = tx.send(WpdEvent::AcqFiles { result: r });
+        });
+    }
+
+    /// TWAIN 导入:系统确认暂未实现,此处只给出诚实提示。
+    fn acq_twain_notice(&mut self) {
+        if let Err(e) = crate::acq::import_twain(std::path::Path::new(".")) {
+            self.import_devices_err = e.to_string();
+        }
     }
 
     /// 后台枚举 WPD 设备与可移动卷。
@@ -7380,6 +7819,22 @@ impl App {
                             ],
                         )
                     };
+                }
+                WpdEvent::AcqFiles { result } => {
+                    self.import_devices_busy = false;
+                    self.wpd_rx = None;
+                    match result {
+                        Ok(paths) if !paths.is_empty() => {
+                            self.import_devices_err.clear();
+                            self.start_scan_roots(paths, t("设备导入"));
+                        }
+                        Ok(_) => {
+                            self.status = t("未导入任何照片(取消或无照片)").into();
+                        }
+                        Err(e) => {
+                            self.import_devices_err = e;
+                        }
+                    }
                 }
             }
         }
@@ -8519,6 +8974,13 @@ impl App {
     /// 本张照片的文件路径(不在当前视图时 None)。
     fn photo_path(&self, id: i64) -> Option<String> {
         self.id_row.get(&id).map(|&idx| self.rows[idx].path.clone())
+    }
+
+    fn is_video_id(&self, id: i64) -> bool {
+        self.id_row
+            .get(&id)
+            .map(|&idx| self.rows[idx].kind == crate::video::kind::MOVIE)
+            .unwrap_or(false)
     }
 
     /// 属性详情:名称 / 位置 / 大小+修改日期 + Property-Value 两列清单。
@@ -12656,21 +13118,23 @@ impl App {
         self.sel_anchor = Some(id);
     }
 
-    /// 双击打开(双击 = 进单图编辑视图;视频不进库内渲染,
-    /// 交给系统关联播放器)。与快速查找页双击同一套状态复位。
+    /// 双击打开(双击 = 进单图编辑视图;视频走应用内播放器,失败时回退系统播放器)。
+    /// 与快速查找页双击同一套状态复位。
     fn open_photo_editor(&mut self, id: i64, movie: bool) {
         if movie {
-            if let Some(p) = self.photo_path(id) {
-                if !crate::win::shell_open(Path::new(&p)) {
-                    self.status = t_with("无法打开视频(无关联播放器):{p}", &[("p", p.to_string())]);
-                }
-            }
+            self.preview = Some(id);
+            self.preview_tex = None;
+            self.preview_failed = None;
+            self.anim_reset();
+            self.preview_reset_zoom();
+            self.video_open(id);
         } else {
             self.preview = Some(id);
             self.preview_tex = None;
             self.preview_failed = None;
             self.anim_reset();
             self.preview_reset_zoom();
+            self.video_close();
         }
     }
 
@@ -13522,6 +13986,157 @@ impl App {
         self.anim = None;
         self.anim_rx = None;
         self.anim_req_for = None;
+    }
+
+    fn video_close(&mut self) {
+        self.video_player = None;
+        self.video_player_id = None;
+        self.video_playing = false;
+        self.video_tex = None;
+        self.video_frame = None;
+        self.video_last_frame = None;
+        self.video_err = None;
+    }
+
+    fn video_open(&mut self, id: i64) {
+        self.video_close();
+        self.video_player_id = Some(id);
+        let Some(path) = self.photo_path(id) else {
+            self.video_err = Some(t("找不到视频路径").into());
+            return;
+        };
+        match crate::video_player::VideoPlayer::open(std::path::Path::new(&path)) {
+            Ok(mut p) => {
+                match p.read_frame() {
+                    Ok(Some(frame)) => {
+                        self.video_frame = Some(frame);
+                    }
+                    Ok(None) => {}
+                    Err(e) => self.video_err = Some(e),
+                }
+                self.video_player = Some(p);
+                self.video_playing = self.video_err.is_none();
+                self.video_last_frame = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                self.video_err = Some(e);
+            }
+        }
+    }
+
+    fn video_ensure_tex(&mut self, ctx: &egui::Context, id: i64) {
+        if let Some((rgba, w, h)) = self.video_frame.take() {
+            let color =
+                egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+            self.video_tex = Some(ctx.load_texture(
+                format!("video-{id}"),
+                color,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+    }
+
+    fn video_tick(&mut self, ctx: &egui::Context, id: i64) {
+        if self.video_player_id != Some(id) {
+            return;
+        }
+        if !self.video_playing {
+            return;
+        }
+        let (ended, fd, has_audio) = match self.video_player.as_ref() {
+            Some(p) => (p.ended(), p.frame_duration(), p.has_audio()),
+            None => return,
+        };
+        if ended {
+            self.video_playing = false;
+            if let Some(p) = self.video_player.as_mut() {
+                let _ = p.set_audio_playing(false);
+            }
+            return;
+        }
+        // 有音频时用音频播放位置当主时钟:先把 PCM 补进设备,再按音频时间推进视频帧。
+        if has_audio {
+            let fed = match self.video_player.as_mut() {
+                Some(p) => p.feed_audio().is_ok(),
+                None => return,
+            };
+            if !fed {
+                if let Some(p) = self.video_player.as_mut() {
+                    p.drop_audio();
+                }
+            } else {
+                let mut advanced = false;
+                let mut audio_lost = false;
+                // 每次最多补 8 帧,避免一次 tick 解码过久卡住 UI。
+                for _ in 0..8 {
+                    let pair = match self.video_player.as_ref() {
+                        Some(p) => p.audio_position_secs().map(|a| (a, p.position_secs())),
+                        None => return,
+                    };
+                    let Some((apos, vpos)) = pair else {
+                        audio_lost = true;
+                        break;
+                    };
+                    if vpos + fd.as_secs_f64() >= apos {
+                        break;
+                    }
+                    let result = match self.video_player.as_mut() {
+                        Some(p) => p.read_frame(),
+                        None => return,
+                    };
+                    match result {
+                        Ok(Some(frame)) => {
+                            self.video_frame = Some(frame);
+                            advanced = true;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            self.video_err = Some(e);
+                            self.video_playing = false;
+                            return;
+                        }
+                    }
+                }
+                if !audio_lost {
+                    if advanced {
+                        self.video_ensure_tex(ctx, id);
+                    }
+                    // 音频时钟连续推进,固定 16ms 复查一次即可。
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
+                // 音频中途失效:退回墙钟节奏。
+                self.video_last_frame = Some(std::time::Instant::now());
+            }
+        }
+        let now = std::time::Instant::now();
+        let due = self
+            .video_last_frame
+            .map(|t| now.duration_since(t) >= fd)
+            .unwrap_or(true);
+        if !due {
+            ctx.request_repaint_after(fd);
+            return;
+        }
+        self.video_last_frame = Some(now);
+        let result = match self.video_player.as_mut() {
+            Some(p) => p.read_frame(),
+            None => return,
+        };
+        match result {
+            Ok(Some(frame)) => {
+                self.video_frame = Some(frame);
+                self.video_ensure_tex(ctx, id);
+            }
+            Ok(None) => {
+                self.video_playing = false;
+            }
+            Err(e) => {
+                self.video_err = Some(e);
+                self.video_playing = false;
+            }
+        }
+        ctx.request_repaint_after(fd);
     }
 
     /// 收后台解码结果;换图后的滞后结果直接丢弃。
@@ -14590,6 +15205,7 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.maybe_leave_projector(ctx);
         // 先给整帧铺一层底色:面板之间万一留出空隙,也不会露出窗口的黑色清屏色。
         // 这一层画在最底层,所有面板照常盖在上面。
         ctx.layer_painter(egui::LayerId::background()).rect_filled(
@@ -15659,6 +16275,10 @@ impl eframe::App for App {
                             self.show_options = true;
                             ui.close();
                         }
+                        if ui.button(t("配置工具栏按钮…")).clicked() {
+                            self.toolbar_cfg_open = true;
+                            ui.close();
+                        }
                         ui.separator();
                         #[cfg(feature = "ai")]
                         {
@@ -15746,6 +16366,52 @@ impl eframe::App for App {
                         ui.separator();
                         if ui.button(t("文件夹管理器…")).clicked() {
                             self.open_folder_mgr();
+                            ui.close();
+                        }
+                        if ui
+                            .button(if self.projector_mode {
+                                t("退出 Projector Mode")
+                            } else {
+                                t("Projector Mode")
+                            })
+                            .clicked()
+                        {
+                            self.toggle_projector(ui.ctx());
+                            ui.close();
+                        }
+                        // 默认照片查看器:Windows 不允许程序静默抢默认关联,
+                        // 只能把用户送到系统「默认应用」页自己选。
+                        if ui.button(t("默认照片查看器设置…")).clicked() {
+                            #[cfg(windows)]
+                            {
+                                let _ = crate::win::shell_open_uri("ms-settings:defaultapps");
+                                self.status = t("已打开系统「默认应用」设置:把图片格式的默认程序选为 Maliang 即可。").into();
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                self.status = t("仅 Windows 支持设置默认照片查看器").into();
+                            }
+                            ui.close();
+                        }
+                        // 屏保设置:Windows 屏保由系统 .scr 机制托管,这里打开系统设置页。
+                        if ui.button(t("屏保设置…")).clicked() {
+                            #[cfg(windows)]
+                            {
+                                match std::process::Command::new("control.exe")
+                                    .arg("desk.cpl,,@screensaver")
+                                    .spawn()
+                                {
+                                    Ok(_) => self.status = t("已打开 Windows 屏保设置。").into(),
+                                    Err(e) => {
+                                        self.status =
+                                            t_with("打开屏保设置失败: {e}", &[("e", e.to_string())])
+                                    }
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            {
+                                self.status = t("仅 Windows 支持系统屏保设置").into();
+                            }
                             ui.close();
                         }
                         let mut watching = self.watch_on.load(Ordering::SeqCst);
@@ -15856,6 +16522,10 @@ impl eframe::App for App {
                                 ui.spinner();
                             }
                         });
+                        if ui.button(t("地图(地理标记)…")).clicked() {
+                            self.open_geo_map();
+                            ui.close();
+                        }
                         if ui.button(t("导出地理标记(KML)…")).clicked() {
                             self.export_kml();
                             ui.close();
@@ -16977,6 +17647,29 @@ impl eframe::App for App {
                             self.show_import_devices = false;
                         }
                     }
+                    // WIA/TWAIN 扫描器段:WIA 用系统对话框 + 落盘扫描;TWAIN 目前诚实提示未实现。
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                self.wpd_rx.is_none(),
+                                egui::Button::new(t("从 WIA 导入照片…")),
+                            )
+                            .clicked()
+                        {
+                            self.acq_import_wia();
+                        }
+                        if ui.button(t("TWAIN 导入…")).clicked() {
+                            self.acq_twain_notice();
+                        }
+                    });
+                    if !self.import_twain_names.is_empty() {
+                        let names = self.import_twain_names.clone();
+                        ui.small(t_with(
+                            "已注册 TWAIN 扫描仪:{p1}",
+                            &[("p1", names.join("、"))],
+                        ));
+                    }
                     if let Some(device_id) = self.import_device_id.clone() {
                         ui.separator();
                         ui.strong(t_with("设备照片:{p1}", &[("p1", device_id)]));
@@ -17164,6 +17857,9 @@ impl eframe::App for App {
                         if ui.button(t("添加")).clicked() {
                             self.add_email_contact();
                         }
+                        if ui.button(t("通讯簿…")).clicked() {
+                            self.open_contact_picker();
+                        }
                     });
                     ui.small(t("留空则由邮件客户端补全收件人"));
                     ui.separator();
@@ -17183,6 +17879,109 @@ impl eframe::App for App {
                 });
             self.email_win = open;
         }
+
+        // 系统通讯簿(Windows Contacts)选择窗。
+        if self.contact_pick_open {
+            let mut open = self.contact_pick_open;
+            egui::Window::new(t("系统通讯簿"))
+                .open(&mut open)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.small(t("读取 Windows「联系人」文件夹里的 .contact 条目;点选加入收件人。"));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.contact_pick_filter)
+                                .hint_text(t("过滤姓名或地址"))
+                                .desired_width(260.0),
+                        );
+                        if ui.button(t("重新读取")).clicked() {
+                            self.contact_pick_list = crate::contacts::load_system_contacts();
+                            self.contact_pick_loaded = true;
+                        }
+                    });
+                    ui.separator();
+                    let q = self.contact_pick_filter.trim().to_lowercase();
+                    let list: Vec<crate::contacts::Contact> = self
+                        .contact_pick_list
+                        .iter()
+                        .filter(|c| {
+                            q.is_empty()
+                                || c.display.to_lowercase().contains(&q)
+                                || c.email.contains(&q)
+                        })
+                        .cloned()
+                        .collect();
+                    if !self.contact_pick_loaded {
+                        ui.small(t("尚未读取通讯簿"));
+                    } else if list.is_empty() {
+                        ui.small(t("没有匹配的联系人"));
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for c in &list {
+                                    let on = self.email_to.iter().any(|a| a == &c.email);
+                                    let label = if c.display.is_empty() || c.display == c.email {
+                                        c.email.clone()
+                                    } else {
+                                        format!("{} <{}>", c.display, c.email)
+                                    };
+                                    if ui.selectable_label(on, label).clicked() {
+                                        self.add_picked_contact(c);
+                                    }
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.small(t_with(
+                        "已选 {n} 个收件人",
+                        &[("n", (self.email_to.len()).to_string())],
+                    ));
+                });
+            self.contact_pick_open = open;
+        }
+
+        // 工具栏按钮配置窗。
+        if self.toolbar_cfg_open {
+            let mut open = self.toolbar_cfg_open;
+            let mut changed = false;
+            egui::Window::new(t("配置工具栏按钮"))
+                .open(&mut open)
+                .default_width(380.0)
+                .show(ctx, |ui| {
+                    ui.small(t("勾选要显示的按钮;隐藏只影响工具栏,菜单入口仍在。"));
+                    ui.separator();
+                    for &(key, label) in TOOLBAR_BUTTONS {
+                        let mut show = !self.toolbar_hidden.contains(key);
+                        if ui.checkbox(&mut show, t(label)).changed() {
+                            if show {
+                                self.toolbar_hidden.remove(key);
+                            } else {
+                                self.toolbar_hidden.insert(key.to_string());
+                            }
+                            changed = true;
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(t("恢复默认(全部显示)")).clicked() {
+                        self.toolbar_hidden.clear();
+                        changed = true;
+                    }
+                });
+            if changed {
+                let joined = self
+                    .toolbar_hidden
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = self.store.set_setting("toolbar_hidden", &joined);
+            }
+            self.toolbar_cfg_open = open;
+        }
+
+        // 地理标记地图窗(OSM 瓦片 + 当前视图 GPS 点)。
+        self.geo_map_ui(ctx);
 
         // 礼品光盘窗口(IMAPI2 刻录)。
         if self.cd_win {

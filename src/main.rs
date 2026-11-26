@@ -3,6 +3,10 @@
 // 命令行子命令的输出由 win::attach_parent_console 挂回调用方终端。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acq;
+mod contacts;
+mod geo;
+mod video_player;
 mod anim;
 mod app;
 mod assets;

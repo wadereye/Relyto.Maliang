@@ -657,16 +657,27 @@ impl App {
             self.preview_missing = None;
             self.anim_reset();
             self.preview_reset_zoom();
+            self.video_close();
             self.editor_ensure_photo(nid);
+            if self.is_video_id(nid) {
+                self.video_open(nid);
+            }
         }
         nid
     }
 
     /// 上一张 / 下一张:切完立刻同步草稿。
     fn editor_step(&mut self, delta: i32) -> i64 {
+        let prev = self.preview;
         self.step_preview(delta);
         let id = self.preview.unwrap_or_default();
+        if prev != Some(id) {
+            self.video_close();
+        }
         self.editor_ensure_photo(id);
+        if self.is_video_id(id) && self.video_player_id != Some(id) {
+            self.video_open(id);
+        }
         id
     }
 
@@ -675,6 +686,7 @@ impl App {
         self.preview_tex = None;
         self.preview_base = None;
         self.anim_reset();
+        self.video_close();
         self.preview_reset_zoom();
         self.zoom_active_for = None;
         self.editor_tool = None;
@@ -1614,7 +1626,127 @@ impl App {
     }
 
     /// 中间图区:缩放/平移/双击、裁剪框、识别框、对比显示,底部一行照片说明。
+    fn editor_video_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: i64) {
+        if self.video_player_id != Some(id) && self.video_err.is_none() {
+            self.video_open(id);
+        }
+        self.video_ensure_tex(ctx, id);
+        self.video_tick(ctx, id);
+
+        if let Some(err) = self.video_err.clone() {
+            ui.vertical_centered(|ui| {
+                ui.add_space(40.0);
+                ui.label(t("应用内播放失败,可用系统播放器打开。"));
+                ui.colored_label(egui::Color32::from_rgb(200, 80, 80), err);
+                if ui.button(t("用系统播放器打开")).clicked() {
+                    if let Some(p) = self.photo_path(id) {
+                        let _ = crate::win::shell_open(std::path::Path::new(&p));
+                    }
+                }
+            });
+            return;
+        }
+
+        let avail = ui.available_size();
+        let (rect, _resp) = ui.allocate_exact_size(avail, egui::Sense::hover());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, egui::Color32::BLACK);
+
+        if let Some(tex) = &self.video_tex {
+            let [tw, th] = tex.size();
+            let fit = (rect.width() / tw.max(1) as f32)
+                .min((rect.height() - 56.0).max(60.0) / th.max(1) as f32)
+                .min(1.0);
+            let size = egui::vec2(tw as f32 * fit, th as f32 * fit);
+            let img_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.center().x, rect.min.y + (rect.height() - 56.0) / 2.0),
+                size,
+            );
+            painter.image(
+                tex.id(),
+                img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                t("视频加载中…"),
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+        }
+
+        let ctrl_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 8.0, rect.max.y - 48.0),
+            egui::pos2(rect.max.x - 8.0, rect.max.y - 6.0),
+        );
+        let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(ctrl_rect));
+        child_ui.horizontal(|ui| {
+            let play_label = if self.video_playing { "⏸" } else { "▶" };
+            if ui.button(play_label).clicked() {
+                let next = !self.video_playing;
+                if let Some(player) = self.video_player.as_mut() {
+                    if next && player.ended() {
+                        let _ = player.seek_secs(0.0);
+                    }
+                    let _ = player.set_audio_playing(next);
+                }
+                self.video_playing = next;
+                if next {
+                    self.video_last_frame = Some(std::time::Instant::now());
+                    ctx.request_repaint();
+                }
+            }
+            if self
+                .video_player
+                .as_ref()
+                .is_some_and(|p| p.has_audio())
+            {
+                ui.label("🔊").on_hover_text(t("音频已接入"));
+            }
+            let (pos, dur) = self
+                .video_player
+                .as_ref()
+                .map(|p| (p.position_secs(), p.duration_secs()))
+                .unwrap_or((0.0, 0.0));
+            let mut seek = pos;
+            let slider = egui::Slider::new(&mut seek, 0.0..=dur.max(0.001))
+                .show_value(false)
+                .clamping(egui::SliderClamping::Always);
+            if ui.add_sized([ui.available_width() - 160.0, 18.0], slider).changed() {
+                let new_frame = if let Some(player) = self.video_player.as_mut() {
+                    let _ = player.seek_secs(seek);
+                    player.read_frame().ok().flatten()
+                } else {
+                    None
+                };
+                if let Some(frame) = new_frame {
+                    self.video_frame = Some(frame);
+                    self.video_ensure_tex(ctx, id);
+                }
+            }
+            ui.label(format!(
+                "{:02}:{:02} / {:02}:{:02}",
+                (pos / 60.0) as i32,
+                (pos % 60.0) as i32,
+                (dur / 60.0) as i32,
+                (dur % 60.0) as i32
+            ));
+            if ui.button(t("系统播放器")).clicked() {
+                if let Some(p) = self.photo_path(id) {
+                    let _ = crate::win::shell_open(std::path::Path::new(&p));
+                }
+            }
+        });
+    }
+
     fn editor_center_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, id: i64) {
+        if self.is_video_id(id) {
+            self.editor_video_ui(ui, ctx, id);
+            return;
+        }
         let hint = self.readonly_hint(id);
         if let Some(hint) = hint {
             let c = ui.visuals().warn_fg_color;
