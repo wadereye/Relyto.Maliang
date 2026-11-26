@@ -693,6 +693,11 @@ pub struct App {
     email_to: Vec<String>,
     /// 邮件窗内新地址输入框草稿。
     email_new: String,
+    /// 系统通讯簿选择窗(打开状态 / 过滤词 / 缓存清单)。
+    contact_pick_open: bool,
+    contact_pick_filter: String,
+    contact_pick_list: Vec<crate::contacts::Contact>,
+    contact_pick_loaded: bool,
     /// 礼品光盘窗口开关 + 尺寸档。
     cd_win: bool,
     cd_size: crate::share::ShareSize,
@@ -3067,6 +3072,10 @@ impl App {
             email_size,
             email_to: Vec::new(),
             email_new: String::new(),
+            contact_pick_open: false,
+            contact_pick_filter: String::new(),
+            contact_pick_list: Vec::new(),
+            contact_pick_loaded: false,
             cd_win: false,
             cd_size: crate::share::ShareSize::Px800,
             share_rx: None,
@@ -7094,6 +7103,29 @@ impl App {
         }
         let _ = self.store.touch_contact(&addr, "");
         self.status = t_with("已添加收件人 {p1}", &[("p1", addr)]);
+    }
+
+    /// 打开系统通讯簿(Windows Contacts)选择窗;读取失败时给明确提示。
+    fn open_contact_picker(&mut self) {
+        self.contact_pick_list = crate::contacts::load_system_contacts();
+        self.contact_pick_loaded = true;
+        self.contact_pick_open = true;
+        if self.contact_pick_list.is_empty() {
+            self.status = if crate::contacts::contacts_dir().is_some() {
+                t("系统通讯簿里没有可用的邮箱地址").into()
+            } else {
+                t("未找到系统通讯簿(Windows 联系人)目录").into()
+            };
+        }
+    }
+
+    /// 通讯簿条目入收件人并刷新最近使用时间(已存在只刷新)。
+    fn add_picked_contact(&mut self, c: &crate::contacts::Contact) {
+        if !self.email_to.iter().any(|a| a == &c.email) {
+            self.email_to.push(c.email.clone());
+        }
+        let _ = self.store.touch_contact(&c.email, &c.display);
+        self.status = t_with("已添加收件人 {p1}", &[("p1", c.email.clone())]);
     }
 
     /// 后台线程暂存礼品光盘内容并走 IMAPI2 刻录。
@@ -17341,6 +17373,9 @@ impl eframe::App for App {
                         if ui.button(t("添加")).clicked() {
                             self.add_email_contact();
                         }
+                        if ui.button(t("通讯簿…")).clicked() {
+                            self.open_contact_picker();
+                        }
                     });
                     ui.small(t("留空则由邮件客户端补全收件人"));
                     ui.separator();
@@ -17359,6 +17394,67 @@ impl eframe::App for App {
                     }
                 });
             self.email_win = open;
+        }
+
+        // 系统通讯簿(Windows Contacts)选择窗。
+        if self.contact_pick_open {
+            let mut open = self.contact_pick_open;
+            egui::Window::new(t("系统通讯簿"))
+                .open(&mut open)
+                .default_width(440.0)
+                .show(ctx, |ui| {
+                    ui.small(t("读取 Windows「联系人」文件夹里的 .contact 条目;点选加入收件人。"));
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.contact_pick_filter)
+                                .hint_text(t("过滤姓名或地址"))
+                                .desired_width(260.0),
+                        );
+                        if ui.button(t("重新读取")).clicked() {
+                            self.contact_pick_list = crate::contacts::load_system_contacts();
+                            self.contact_pick_loaded = true;
+                        }
+                    });
+                    ui.separator();
+                    let q = self.contact_pick_filter.trim().to_lowercase();
+                    let list: Vec<crate::contacts::Contact> = self
+                        .contact_pick_list
+                        .iter()
+                        .filter(|c| {
+                            q.is_empty()
+                                || c.display.to_lowercase().contains(&q)
+                                || c.email.contains(&q)
+                        })
+                        .cloned()
+                        .collect();
+                    if !self.contact_pick_loaded {
+                        ui.small(t("尚未读取通讯簿"));
+                    } else if list.is_empty() {
+                        ui.small(t("没有匹配的联系人"));
+                    } else {
+                        egui::ScrollArea::vertical()
+                            .max_height(320.0)
+                            .show(ui, |ui| {
+                                for c in &list {
+                                    let on = self.email_to.iter().any(|a| a == &c.email);
+                                    let label = if c.display.is_empty() || c.display == c.email {
+                                        c.email.clone()
+                                    } else {
+                                        format!("{} <{}>", c.display, c.email)
+                                    };
+                                    if ui.selectable_label(on, label).clicked() {
+                                        self.add_picked_contact(c);
+                                    }
+                                }
+                            });
+                    }
+                    ui.separator();
+                    ui.small(t_with(
+                        "已选 {n} 个收件人",
+                        &[("n", (self.email_to.len()).to_string())],
+                    ));
+                });
+            self.contact_pick_open = open;
         }
 
         // 礼品光盘窗口(IMAPI2 刻录)。
