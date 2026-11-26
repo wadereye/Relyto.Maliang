@@ -693,6 +693,10 @@ pub struct App {
     email_to: Vec<String>,
     /// 邮件窗内新地址输入框草稿。
     email_new: String,
+    /// 工具栏按钮配置:被隐藏按钮的 key(空 = 全部显示)。
+    toolbar_hidden: BTreeSet<String>,
+    /// 「配置工具栏按钮」窗口开关。
+    toolbar_cfg_open: bool,
     /// 系统通讯簿选择窗(打开状态 / 过滤词 / 缓存清单)。
     contact_pick_open: bool,
     contact_pick_filter: String,
@@ -1726,6 +1730,19 @@ const MISSING_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
 /// 缩略图纹理缓存上限。每张 256×256 RGBA 纹理约 256KB,
 /// 768 张 ≈ 192MB 显存,取一个既能覆盖常见滚动范围又不会撑爆的量。
 const TEX_CACHE_CAP: usize = 768;
+
+/// 工具栏可配置按钮:(key, 显示名)。
+/// key 同时是 `toolbar_hidden` 设置串里的项名,改 key 会让旧配置失效。
+const TOOLBAR_BUTTONS: &[(&str, &str)] = &[
+    ("nav", "前进 / 后退"),
+    ("import", "导入"),
+    ("device", "从设备导入"),
+    ("album", "新建相簿"),
+    ("slideshow", "幻灯片放映"),
+    ("folderview", "平铺 / 树形视图"),
+    ("effects", "效果面板"),
+    ("batch", "批量编辑"),
+];
 
 /// 10 色彩色标签(color:red..gray)。
 const TAG_COLORS: [(&str, egui::Color32); 10] = [
@@ -3010,6 +3027,14 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1024),
         );
+        // 工具栏按钮显隐(逗号分隔的隐藏 key;空 = 全部显示)。
+        let toolbar_hidden: BTreeSet<String> = store
+            .get_setting("toolbar_hidden")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         #[cfg(feature = "ai")]
         let face_scope_common = crate::faces::scan_scope_common(&store);
         Self {
@@ -3072,6 +3097,8 @@ impl App {
             email_size,
             email_to: Vec::new(),
             email_new: String::new(),
+            toolbar_hidden,
+            toolbar_cfg_open: false,
             contact_pick_open: false,
             contact_pick_filter: String::new(),
             contact_pick_list: Vec::new(),
@@ -4883,75 +4910,88 @@ impl App {
 
     /// 顶部工具条,左→右:
     /// 导入 · 新建相簿 · 放映 · 平铺/树形 · 查看选项 ▾ …… 过滤四开关 · 尺寸滑块 · 搜索框 · 活动灯。
+    /// 工具栏按钮是否显示(「配置工具栏按钮」里勾掉的不显示)。
+    fn toolbar_show(&self, key: &str) -> bool {
+        !self.toolbar_hidden.contains(key)
+    }
+
     fn toolbar_ui(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.add_space(2.0);
             // 前后导航(浏览器式历史;Alt+←/→ 同一条路)。
-            if ui
-                .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
-                .on_hover_text(t("后退(Alt+←)"))
-                .clicked()
-            {
-                self.nav_back();
-            }
-            if ui
-                .add_enabled(
-                    self.nav_at + 1 < self.nav_hist.len(),
-                    tool_button("arrow-right", false),
-                )
-                .on_hover_text(t("前进(Alt+→)"))
-                .clicked()
-            {
-                self.nav_forward();
+            if self.toolbar_show("nav") {
+                if ui
+                    .add_enabled(self.nav_at > 0, tool_button("arrow-left", false))
+                    .on_hover_text(t("后退(Alt+←)"))
+                    .clicked()
+                {
+                    self.nav_back();
+                }
+                if ui
+                    .add_enabled(
+                        self.nav_at + 1 < self.nav_hist.len(),
+                        tool_button("arrow-right", false),
+                    )
+                    .on_hover_text(t("前进(Alt+→)"))
+                    .clicked()
+                {
+                    self.nav_forward();
+                }
             }
             ui.separator();
             // 主「导入」按钮开的是整页导入面板(选源 → 看清单 → 入库),
             // 直接挑文件夹的一次性入口仍在 文件 菜单里。
             let on_import = self.page == PageKind::Import;
-            if ui
-                .add(tool_button("folder-plus", on_import))
-                .on_hover_text(t("导入(打开导入页:选源 → 看清单 → 入库)"))
-                .clicked()
+            if self.toolbar_show("import")
+                && ui
+                    .add(tool_button("folder-plus", on_import))
+                    .on_hover_text(t("导入(打开导入页:选源 → 看清单 → 入库)"))
+                    .clicked()
             {
                 self.go_page(PageKind::Import);
             }
-            if ui
-                .add(tool_button("smartphone", false))
-                .on_hover_text(t("从设备导入…"))
-                .clicked()
+            if self.toolbar_show("device")
+                && ui
+                    .add(tool_button("smartphone", false))
+                    .on_hover_text(t("从设备导入…"))
+                    .clicked()
             {
                 self.open_import_devices();
             }
-            if ui
-                .add(tool_button("image-plus", false))
-                .on_hover_text(t("新建相簿(有选中照片则一并放入)"))
-                .clicked()
+            if self.toolbar_show("album")
+                && ui
+                    .add(tool_button("image-plus", false))
+                    .on_hover_text(t("新建相簿(有选中照片则一并放入)"))
+                    .clicked()
             {
                 self.album_input.clear();
                 self.album_new_win = true;
             }
             ui.separator();
-            if ui
-                .add(tool_button("images", false))
-                .on_hover_text(t("幻灯片放映(选中照片;未选中则放映当前视图)"))
-                .clicked()
+            if self.toolbar_show("slideshow")
+                && ui
+                    .add(tool_button("images", false))
+                    .on_hover_text(t("幻灯片放映(选中照片;未选中则放映当前视图)"))
+                    .clicked()
             {
                 self.start_slideshow();
             }
             ui.separator();
-            if ui
-                .add(tool_button("layout-grid", !self.folder_tree))
-                .on_hover_text(t("平铺文件夹视图"))
-                .clicked()
-            {
-                self.set_folder_tree(false);
-            }
-            if ui
-                .add(tool_button("list-tree", self.folder_tree))
-                .on_hover_text(t("树形视图(只显示有照片的目录)"))
-                .clicked()
-            {
-                self.set_folder_tree(true);
+            if self.toolbar_show("folderview") {
+                if ui
+                    .add(tool_button("layout-grid", !self.folder_tree))
+                    .on_hover_text(t("平铺文件夹视图"))
+                    .clicked()
+                {
+                    self.set_folder_tree(false);
+                }
+                if ui
+                    .add(tool_button("list-tree", self.folder_tree))
+                    .on_hover_text(t("树形视图(只显示有照片的目录)"))
+                    .clicked()
+                {
+                    self.set_folder_tree(true);
+                }
             }
             ui.menu_button(toolbar_icon("sliders-horizontal"), |ui| {
                 self.view_options_menu(ui)
@@ -4959,22 +4999,24 @@ impl App {
             .response
             .on_hover_text(t("查看选项"));
             ui.separator();
-            if ui
-                .add(tool_button("wand-sparkles", self.fx_panel))
-                .on_hover_text(t("效果面板"))
-                .clicked()
+            if self.toolbar_show("effects")
+                && ui
+                    .add(tool_button("wand-sparkles", self.fx_panel))
+                    .on_hover_text(t("效果面板"))
+                    .clicked()
             {
                 self.fx_panel = !self.fx_panel;
             }
             let can_batch = self.page == PageKind::Library && self.sel.len() >= 2;
-            if ui
-                .add_enabled(can_batch, tool_button("sliders-horizontal", self.batch_edit_open))
-                .on_hover_text(if can_batch {
-                    t("批量编辑…")
-                } else {
-                    t("先选中至少 2 张照片")
-                })
-                .clicked()
+            if self.toolbar_show("batch")
+                && ui
+                    .add_enabled(can_batch, tool_button("sliders-horizontal", self.batch_edit_open))
+                    .on_hover_text(if can_batch {
+                        t("批量编辑…")
+                    } else {
+                        t("先选中至少 2 张照片")
+                    })
+                    .clicked()
             {
                 self.open_batch_edit();
             }
@@ -15877,6 +15919,10 @@ impl eframe::App for App {
                             self.show_options = true;
                             ui.close();
                         }
+                        if ui.button(t("配置工具栏按钮…")).clicked() {
+                            self.toolbar_cfg_open = true;
+                            ui.close();
+                        }
                         ui.separator();
                         #[cfg(feature = "ai")]
                         {
@@ -17455,6 +17501,45 @@ impl eframe::App for App {
                     ));
                 });
             self.contact_pick_open = open;
+        }
+
+        // 工具栏按钮配置窗。
+        if self.toolbar_cfg_open {
+            let mut open = self.toolbar_cfg_open;
+            let mut changed = false;
+            egui::Window::new(t("配置工具栏按钮"))
+                .open(&mut open)
+                .default_width(380.0)
+                .show(ctx, |ui| {
+                    ui.small(t("勾选要显示的按钮;隐藏只影响工具栏,菜单入口仍在。"));
+                    ui.separator();
+                    for &(key, label) in TOOLBAR_BUTTONS {
+                        let mut show = !self.toolbar_hidden.contains(key);
+                        if ui.checkbox(&mut show, t(label)).changed() {
+                            if show {
+                                self.toolbar_hidden.remove(key);
+                            } else {
+                                self.toolbar_hidden.insert(key.to_string());
+                            }
+                            changed = true;
+                        }
+                    }
+                    ui.separator();
+                    if ui.button(t("恢复默认(全部显示)")).clicked() {
+                        self.toolbar_hidden.clear();
+                        changed = true;
+                    }
+                });
+            if changed {
+                let joined = self
+                    .toolbar_hidden
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let _ = self.store.set_setting("toolbar_hidden", &joined);
+            }
+            self.toolbar_cfg_open = open;
         }
 
         // 礼品光盘窗口(IMAPI2 刻录)。
