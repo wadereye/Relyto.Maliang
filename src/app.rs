@@ -14032,13 +14032,71 @@ impl App {
         if !self.video_playing {
             return;
         }
-        let (ended, fd) = match self.video_player.as_ref() {
-            Some(p) => (p.ended(), p.frame_duration()),
+        let (ended, fd, has_audio) = match self.video_player.as_ref() {
+            Some(p) => (p.ended(), p.frame_duration(), p.has_audio()),
             None => return,
         };
         if ended {
             self.video_playing = false;
+            if let Some(p) = self.video_player.as_mut() {
+                let _ = p.set_audio_playing(false);
+            }
             return;
+        }
+        // 有音频时用音频播放位置当主时钟:先把 PCM 补进设备,再按音频时间推进视频帧。
+        if has_audio {
+            let fed = match self.video_player.as_mut() {
+                Some(p) => p.feed_audio().is_ok(),
+                None => return,
+            };
+            if !fed {
+                if let Some(p) = self.video_player.as_mut() {
+                    p.drop_audio();
+                }
+            } else {
+                let mut advanced = false;
+                let mut audio_lost = false;
+                // 每次最多补 8 帧,避免一次 tick 解码过久卡住 UI。
+                for _ in 0..8 {
+                    let pair = match self.video_player.as_ref() {
+                        Some(p) => p.audio_position_secs().map(|a| (a, p.position_secs())),
+                        None => return,
+                    };
+                    let Some((apos, vpos)) = pair else {
+                        audio_lost = true;
+                        break;
+                    };
+                    if vpos + fd.as_secs_f64() >= apos {
+                        break;
+                    }
+                    let result = match self.video_player.as_mut() {
+                        Some(p) => p.read_frame(),
+                        None => return,
+                    };
+                    match result {
+                        Ok(Some(frame)) => {
+                            self.video_frame = Some(frame);
+                            advanced = true;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            self.video_err = Some(e);
+                            self.video_playing = false;
+                            return;
+                        }
+                    }
+                }
+                if !audio_lost {
+                    if advanced {
+                        self.video_ensure_tex(ctx, id);
+                    }
+                    // 音频时钟连续推进,固定 16ms 复查一次即可。
+                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                    return;
+                }
+                // 音频中途失效:退回墙钟节奏。
+                self.video_last_frame = Some(std::time::Instant::now());
+            }
         }
         let now = std::time::Instant::now();
         let due = self

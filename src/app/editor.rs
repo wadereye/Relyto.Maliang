@@ -1686,17 +1686,25 @@ impl App {
         child_ui.horizontal(|ui| {
             let play_label = if self.video_playing { "⏸" } else { "▶" };
             if ui.button(play_label).clicked() {
+                let next = !self.video_playing;
                 if let Some(player) = self.video_player.as_mut() {
-                    if player.ended() {
+                    if next && player.ended() {
                         let _ = player.seek_secs(0.0);
-                        self.video_last_frame = Some(std::time::Instant::now());
                     }
+                    let _ = player.set_audio_playing(next);
                 }
-                self.video_playing = !self.video_playing;
-                if self.video_playing {
+                self.video_playing = next;
+                if next {
                     self.video_last_frame = Some(std::time::Instant::now());
                     ctx.request_repaint();
                 }
+            }
+            if self
+                .video_player
+                .as_ref()
+                .is_some_and(|p| p.has_audio())
+            {
+                ui.label("🔊").on_hover_text(t("音频已接入"));
             }
             let (pos, dur) = self
                 .video_player
